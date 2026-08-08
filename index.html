@@ -2,32 +2,77 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>RTS deploy smoke test</title>
-<style>
-  body {
-    margin: 0;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 1rem;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    background: #111;
-    color: #eee;
-  }
-  h1 { font-size: clamp(1.5rem, 6vw, 3rem); margin: 0; }
-  dl { display: grid; grid-template-columns: auto auto; gap: 0.25rem 1rem; margin: 0; font-size: 0.9rem; }
-  dt { color: #888; }
-  dd { margin: 0; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#1a1410">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Age of Skirmish</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>&#127984;</text></svg>">
+<link rel="stylesheet" href="src/ui/hud.css">
 </head>
 <body>
-  <h1>RTS deploy works</h1>
-  <dl>
-    <dt>commit</dt><dd id="commit">__COMMIT_SHA__</dd>
-    <dt>built</dt><dd id="built">__BUILD_TIME__</dd>
-  </dl>
+  <div id="game-root"></div>
+
+  <!-- HUD overlay. Pointer events are opt-in per control so the map stays
+       draggable everywhere the HUD is not. -->
+  <div id="hud" class="hud" hidden>
+    <div class="hud-top">
+      <div class="res-bar" id="res-bar">
+        <div class="res" id="res-food"><i class="ico ico-food"></i><span>0</span></div>
+        <div class="res" id="res-wood"><i class="ico ico-wood"></i><span>0</span></div>
+        <div class="res" id="res-gold"><i class="ico ico-gold"></i><span>0</span></div>
+        <div class="res" id="res-pop"><i class="ico ico-pop"></i><span>0/0</span></div>
+      </div>
+      <button class="icon-btn" id="btn-menu" aria-label="Menu">&#9776;</button>
+    </div>
+
+    <div class="hud-minimap" id="minimap-wrap">
+      <canvas id="minimap" width="160" height="160"></canvas>
+    </div>
+
+    <div class="hud-toasts" id="toasts" aria-live="polite"></div>
+
+    <div class="hud-bottom" id="hud-bottom">
+      <div class="sel-panel" id="sel-panel"></div>
+      <div class="cmd-panel" id="cmd-panel"></div>
+    </div>
+
+    <div class="idle-vill" id="idle-vill" hidden>
+      <button class="icon-btn wide" id="btn-idle"><i class="ico ico-vill"></i><span id="idle-count">0</span></button>
+    </div>
+  </div>
+
+  <div id="boot" class="boot">
+    <div class="boot-card">
+      <h1>Age of Skirmish</h1>
+      <p class="boot-sub">A pocket-sized real-time strategy skirmish</p>
+      <div class="boot-status" id="boot-status">Loading&hellip;</div>
+      <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
+      <details class="boot-help">
+        <summary>How to play</summary>
+        <ul>
+          <li><b>Tap</b> a unit to select it. <b>Double-tap</b> selects every unit of that type on screen.</li>
+          <li><b>Drag</b> on empty ground to box-select a group.</li>
+          <li><b>Tap</b> the ground to move, a resource to gather, an enemy to attack.</li>
+          <li><b>Two fingers</b> pan and pinch to zoom.</li>
+          <li>Villagers gather food, wood and gold and drop off at the Town Center.</li>
+          <li>Build houses for population, a barracks for soldiers, then go win.</li>
+        </ul>
+      </details>
+      <p class="boot-build">build <span id="commit">__COMMIT_SHA__</span> &middot; <span id="built">__BUILD_TIME__</span></p>
+    </div>
+  </div>
+
+  <div id="endcard" class="endcard" hidden>
+    <div class="endcard-inner">
+      <h2 id="end-title">Victory</h2>
+      <p id="end-sub"></p>
+      <button id="btn-again" class="start-btn">Play again</button>
+    </div>
+  </div>
+
+  <script src="vendor/phaser.min.js"></script>
+  <script type="module" src="src/main.js"></script>
 </body>
 </html>
