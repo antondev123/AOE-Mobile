@@ -1,0 +1,791 @@
+/* ---------------------------------------------------------------------------
+   Age of Skirmish — HUD
+   Mobile-first. Dark wood + parchment, sized for a 390x844 phone with the
+   chrome kept under ~30% of the viewport. Landscape gets its own layout.
+   This is the only stylesheet the page loads, so it also dresses the boot
+   card and the end card.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --bg:        #140f0a;
+  --wood:      #241a11;
+  --wood-2:    #332517;
+  --wood-3:    #43301e;
+  --edge:      #6b4c2c;
+  --edge-soft: rgba(107, 76, 44, 0.55);
+  --parch:     #ecdcba;
+  --parch-dim: #b6a582;
+  --gold:      #d9ab4f;
+  --gold-dim:  #8a6a2a;
+  --danger:    #d1452f;
+  --ok:        #6aa84f;
+  --team-you:  #3d8bfd;
+  --team-foe:  #e03131;
+
+  --pad: 8px;
+  --tap: 44px;
+  --r: 9px;
+
+  --safe-t: env(safe-area-inset-top, 0px);
+  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-l: env(safe-area-inset-left, 0px);
+  --safe-r: env(safe-area-inset-right, 0px);
+
+  --panel: linear-gradient(180deg, #3a2919 0%, #241a11 60%, #1d150e 100%);
+  --panel-btn: linear-gradient(180deg, #4a351f 0%, #2f2114 100%);
+  --shadow: 0 3px 10px rgba(0, 0, 0, 0.55);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--parch);
+  font-family: "Trebuchet MS", "Segoe UI", Roboto, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  position: fixed;
+  inset: 0;
+  /* No text selection, no callouts, no double-tap zoom anywhere in the game. */
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+#game-root {
+  position: absolute;
+  inset: 0;
+  touch-action: none;
+}
+
+#game-root canvas {
+  display: block;
+  touch-action: none;
+  /* The input layer owns every gesture on the map. */
+}
+
+[hidden] { display: none !important; }
+
+/* --- HUD shell -------------------------------------------------------------
+   The overlay itself never eats pointer events; each control opts back in. */
+
+.hud {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+  font-size: 13px;
+  line-height: 1.25;
+}
+
+.hud button,
+.hud .tappable {
+  pointer-events: auto;
+  touch-action: manipulation;
+  font-family: inherit;
+  color: var(--parch);
+  border: 1px solid var(--edge);
+  background: var(--panel-btn);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  cursor: pointer;
+}
+
+.hud button:active { filter: brightness(1.35); transform: translateY(1px); }
+.hud button[disabled],
+.hud button.off {
+  opacity: 0.42;
+  filter: grayscale(0.7);
+  cursor: default;
+}
+.hud button[disabled]:active, .hud button.off:active { transform: none; filter: grayscale(0.7); }
+
+/* --- Top row: resources + menu --------------------------------------------- */
+
+.hud-top {
+  position: absolute;
+  top: calc(var(--safe-t) + 6px);
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  /* Swallow taps: an order issued under the HUD would land where you cannot see. */
+  pointer-events: auto;
+}
+
+.res-bar {
+  pointer-events: auto;
+  display: flex;
+  gap: 2px;
+  flex: 0 1 auto;
+  padding: 4px 6px;
+  min-height: 34px;
+  align-items: center;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+}
+
+.res {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.2px;
+  border-radius: 6px;
+  transition: background-color 140ms linear, color 140ms linear;
+}
+.res span { min-width: 1.6em; }
+
+.res.flash {
+  background: var(--danger);
+  color: #fff;
+  animation: resflash 480ms ease-out 2;
+}
+@keyframes resflash {
+  0%, 100% { background: rgba(209, 69, 47, 0.15); }
+  40%      { background: rgba(209, 69, 47, 0.95); }
+}
+
+.res.low span { color: #ffb4a6; }
+
+/* Simple geometric resource icons — no external assets. */
+.ico {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  flex: none;
+  border-radius: 3px;
+}
+.ico-food { border-radius: 50%; background: radial-gradient(circle at 34% 30%, #ff9a8a, #9e2318); }
+.ico-wood { border-radius: 2px; background: linear-gradient(90deg, #6a3f1d, #b07c42 45%, #5d3717); }
+.ico-gold { border-radius: 50%; background: radial-gradient(circle at 34% 28%, #ffeaa0, #bd8c17); }
+.ico-pop  { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #e2d4b4 45%, #8d7f63 46%); }
+.ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
+
+.icon-btn {
+  min-width: var(--tap);
+  min-height: var(--tap);
+  flex: none;
+  margin-left: auto;
+  font-size: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+.icon-btn.wide { padding: 0 12px; }
+
+/* --- Minimap --------------------------------------------------------------- */
+
+.hud-minimap {
+  position: absolute;
+  top: calc(var(--safe-t) + 48px);
+  right: calc(var(--safe-r) + 6px);
+  padding: 3px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+  touch-action: none;
+  line-height: 0;
+}
+
+#minimap {
+  display: block;
+  width: 116px;
+  height: 116px;
+  border-radius: 5px;
+  /* Mirrors OCEAN_DEEP (gfx/textures.js), which the minimap bakes as its
+     out-of-map sea — this only shows for the frame before the first draw. */
+  background: #0d2740;
+  touch-action: none;
+}
+
+/* --- Toasts ---------------------------------------------------------------- */
+
+/* The stack overlays the top-left of the map — your own base, usually — so it
+   is kept deliberately small: two routine lines at most (hud.js), and an alert
+   replaces them rather than stacking on top. At 390px wide that is a box about
+   180px across and one or two lines tall, instead of the 56%-by-180px slab that
+   hid the Town Center an alert was telling the player to look at. */
+.hud-toasts {
+  position: absolute;
+  top: calc(var(--safe-t) + 48px);
+  left: calc(var(--safe-l) + 8px);
+  width: min(46vw, 182px);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.toast {
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  background: rgba(28, 20, 13, 0.92);
+  border: 1px solid var(--edge);
+  border-left: 4px solid var(--gold);
+  color: var(--parch);
+  box-shadow: var(--shadow);
+  animation: toastin 160ms ease-out;
+}
+.toast.warn { border-left-color: var(--danger); color: #ffd9d1; }
+.toast.out { animation: toastout 260ms ease-in forwards; }
+@keyframes toastin  { from { opacity: 0; transform: translateX(-14px); } }
+@keyframes toastout { to   { opacity: 0; transform: translateY(-8px); } }
+
+/* The under-attack alert. Nothing about it reads like a routine toast: the
+   others are parchment on dark wood and sit still, this one is red, bigger,
+   pulsing, and — uniquely in the stack — tappable, because its whole value is
+   that it takes you to the fight. */
+.toast.alert {
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  /* It is a button you are meant to hit while panicking: keep the full 44px
+     touch target even though the box is now a compact one. */
+  min-height: var(--tap);
+  padding: 6px 9px;
+  text-align: left;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: #fff2ec;
+  background: linear-gradient(180deg, rgba(176, 38, 22, 0.97), rgba(104, 17, 9, 0.97));
+  border: 1px solid #ff7a5e;
+  border-left: 4px solid #ff2f18;
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(255, 47, 24, 0.42);
+  animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
+  cursor: pointer;
+}
+.toast.alert .siren { margin-right: 5px; }
+.toast.alert .sub {
+  display: block;
+  margin-top: 1px;
+  font-size: 9.5px;
+  font-weight: 700;
+  opacity: 0.85;
+  letter-spacing: 0.2px;
+}
+.toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
+/* The shared exit animation must still win when the toast is retired. */
+.toast.alert.out { animation: toastout 260ms ease-in forwards; }
+@keyframes alertin { from { opacity: 0; transform: translateX(-14px) scale(0.96); } }
+@keyframes alertpulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(255, 47, 24, 0.35); }
+  50%      { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 22px rgba(255, 47, 24, 0.95); }
+}
+/* The minimap frame flashes too: the ping is small, and this is what makes the
+   eye go and look for it. */
+.hud-minimap.alarm { animation: minialarm 700ms ease-in-out infinite; }
+@keyframes minialarm {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(255, 47, 24, 0.35); }
+  50%      { box-shadow: 0 0 0 2px rgba(255, 47, 24, 0.95), 0 0 14px rgba(255, 47, 24, 0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast.alert { animation: alertin 170ms ease-out; }
+  .hud-minimap.alarm { box-shadow: 0 0 0 2px rgba(255, 47, 24, 0.9); animation: none; }
+}
+
+/* --- Gesture mode chip ------------------------------------------------------
+   Removes all doubt about what a one-finger drag will do right now. */
+
+.mode-chip {
+  position: absolute;
+  left: calc(var(--safe-l) + 8px);
+  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
+  min-width: var(--tap);
+  min-height: 36px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  opacity: 0.92;
+}
+.mode-chip .glyph { font-size: 14px; line-height: 1; }
+.mode-chip .auto {
+  font-size: 9px;
+  color: var(--gold);
+  border: 1px solid var(--gold-dim);
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.mode-chip.is-box { border-color: var(--gold); color: var(--gold); }
+
+/* --- Idle villager button --------------------------------------------------- */
+
+.idle-vill {
+  position: absolute;
+  right: calc(var(--safe-r) + 8px);
+  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
+}
+.idle-vill .icon-btn {
+  margin: 0;
+  min-height: var(--tap);
+  font-weight: 800;
+  font-size: 14px;
+  border-color: var(--gold-dim);
+  animation: idlepulse 1.8s ease-in-out infinite;
+}
+@keyframes idlepulse {
+  0%, 100% { box-shadow: var(--shadow); }
+  50%      { box-shadow: 0 0 0 3px rgba(217, 171, 79, 0.28), var(--shadow); }
+}
+
+/* --- Bottom bar: selection + commands --------------------------------------- */
+
+.hud-bottom {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 6px calc(var(--safe-r) + 6px) calc(var(--safe-b) + 6px) calc(var(--safe-l) + 6px);
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+  pointer-events: auto;
+  background: linear-gradient(180deg, rgba(15, 11, 7, 0) 0%, rgba(15, 11, 7, 0.72) 42%, rgba(15, 11, 7, 0.95) 100%);
+}
+
+.sel-panel, .cmd-panel {
+  pointer-events: auto;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  padding: 5px 6px;
+  min-height: 96px;
+}
+
+.sel-panel { flex: 0 0 40%; max-width: 168px; overflow: hidden; }
+.cmd-panel { flex: 1 1 auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 5px; }
+
+.sel-empty {
+  color: var(--parch-dim);
+  font-size: 12px;
+  padding: 6px 2px;
+}
+.sel-hint { display: block; margin-top: 5px; font-size: 11px; opacity: 0.75; }
+
+.sel-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+.sel-title {
+  font-weight: 800;
+  font-size: 12.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sel-clear {
+  margin-left: auto;
+  min-width: 30px !important;
+  min-height: 30px !important;
+  flex: none;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.sel-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+
+.chip {
+  position: relative;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 2px 4px 5px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: 11px;
+  font-weight: 800;
+  border-radius: 7px;
+}
+.chip .badge {
+  width: 22px; height: 22px;
+  border-radius: 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 900; letter-spacing: -0.3px;
+  color: #0e0a06;
+  background: var(--team-you);
+  border: 1px solid rgba(0, 0, 0, 0.35);
+}
+.chip.foe .badge { background: var(--team-foe); color: #fff; }
+.chip.neutral .badge { background: #9c8a63; }
+.chip .n { font-size: 11px; }
+
+.hpbar {
+  margin-top: 5px;
+  height: 6px;
+  border-radius: 3px;
+  background: #16100a;
+  border: 1px solid #000;
+  overflow: hidden;
+}
+.hpbar > i {
+  display: block;
+  height: 100%;
+  background: linear-gradient(180deg, #7fc45c, #3f7a28);
+}
+.hpbar.mid > i { background: linear-gradient(180deg, #e6c860, #a58a23); }
+.hpbar.low > i { background: linear-gradient(180deg, #e8705c, #a02b1b); }
+.hp-text { font-size: 10.5px; color: var(--parch-dim); margin-top: 2px; }
+
+/* How much is left in a bush, a tree, a gold vein or a farm. Deliberately not
+   green-to-red like health: an empty node is not a wounded one, it is a node
+   you have finished with — so it reads as a stockpile draining, in gold. */
+.hpbar.stock > i,
+.hpbar.stock.mid > i { background: linear-gradient(180deg, #f0d38a, #b3861f); }
+.hpbar.stock.low > i { background: linear-gradient(180deg, #c9a765, #7d5d14); }
+
+/* Command buttons — every one is at least a 44px touch target. */
+.cbtn {
+  min-width: var(--tap);
+  min-height: var(--tap);
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  font-size: 11px;
+  font-weight: 800;
+}
+.cbtn .label { white-space: nowrap; }
+.cbtn .cost {
+  display: flex;
+  gap: 5px;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--parch-dim);
+  font-variant-numeric: tabular-nums;
+}
+.cbtn .cost b { font-weight: 700; display: inline-flex; align-items: center; gap: 2px; }
+.cbtn .cost .ico { width: 9px; height: 9px; }
+.cbtn.primary { border-color: var(--gold); }
+.cbtn.danger  { border-color: #7d2b1e; }
+.cbtn .short { display: none; }
+
+.cmd-note { font-size: 11px; color: var(--parch-dim); padding: 4px 2px; }
+
+/* Attack-move. Red-edged so it never reads as "one more thing to train", and
+   unmistakably lit while it is armed and owns your next tap. */
+.cbtn.attack { border-color: #8c3b26; }
+.cbtn.attack .label { color: #f0b9ac; }
+.cbtn.attack.armed {
+  border-color: var(--danger);
+  background: linear-gradient(180deg, #7a3020 0%, #3d1a10 100%);
+  animation: armpulse 1.1s ease-in-out infinite;
+}
+.cbtn.attack.armed .label { color: #ffe3db; }
+.cbtn.attack.armed .cost { color: #ffb9a9; }
+@keyframes armpulse {
+  0%, 100% { box-shadow: var(--shadow); }
+  50%      { box-shadow: 0 0 0 3px rgba(209, 69, 47, 0.45), var(--shadow); }
+}
+
+/* Demolish. The only irreversible button in the game, so it is the only one
+   wearing hazard stripes: it must not read as "one more order" at thumb speed,
+   and it must not be mistaken for Stop (which is merely red-edged). It also
+   sits on its own row, away from the train buttons the player taps by reflex.
+   Armed, it goes solid red and pulses — the same arm-then-confirm language as
+   attack-move and the placement bar. */
+.cbtn.demolish {
+  border-color: #a33321;
+  background:
+    repeating-linear-gradient(-45deg,
+      rgba(209, 69, 47, 0.20) 0 7px,
+      rgba(0, 0, 0, 0) 7px 14px),
+    var(--panel-btn);
+}
+.cbtn.demolish .label { color: #f2b2a4; }
+.cbtn.demolish .label::before { content: "⛏ "; }
+.cbtn.demolish .cost { color: #c39288; }
+.cbtn.demolish.armed {
+  border-color: #ff6a4d;
+  background:
+    repeating-linear-gradient(-45deg,
+      rgba(255, 106, 77, 0.28) 0 7px,
+      rgba(0, 0, 0, 0) 7px 14px),
+    linear-gradient(180deg, #8e2414 0%, #45120a 100%);
+  animation: armpulse 1.1s ease-in-out infinite;
+}
+.cbtn.demolish.armed .label { color: #fff0ea; }
+.cbtn.demolish.armed .label::before { content: "⚠ "; }
+.cbtn.demolish.armed .cost { color: #ffc0b2; }
+
+/* Rally line under a production building: what the next unit out of it will do.
+   Full width so it never squeezes a train button below 44px. */
+.rally-note {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.rally-note .flag { font-style: normal; color: #9ad8ff; font-size: 12px; }
+.rally-note.is-gather { color: #f0d98a; }
+.rally-note.is-gather .flag { color: var(--gold); }
+.rally-note.is-build { color: #cbd9a8; }
+.rally-note.is-hint { opacity: 0.85; }
+
+/* Training queue */
+.queue { flex: 1 1 100%; display: flex; align-items: center; gap: 5px; }
+.qprog {
+  flex: 1 1 auto;
+  height: 10px;
+  border-radius: 5px;
+  background: #16100a;
+  border: 1px solid #000;
+  overflow: hidden;
+}
+.qprog > i {
+  display: block; height: 100%;
+  background: linear-gradient(180deg, var(--gold), var(--gold-dim));
+  transition: width 90ms linear;
+}
+.qslots { display: flex; gap: 3px; }
+.qslot {
+  min-width: 26px; min-height: 26px;
+  padding: 0;
+  font-size: 10px; font-weight: 900;
+  border-radius: 5px;
+}
+.qslot.head { border-color: var(--gold); }
+
+/* --- Build menu sheet -------------------------------------------------------- */
+
+.build-menu {
+  position: absolute;
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
+  padding: 7px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: stretch;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+  animation: sheetin 140ms ease-out;
+}
+@keyframes sheetin { from { opacity: 0; transform: translateY(10px); } }
+
+.build-menu .title {
+  flex: 1 1 100%;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.build-menu .cbtn { flex: 1 1 0; min-width: 62px; }
+.build-menu .cbtn .label { white-space: normal; line-height: 1.1; text-align: center; }
+
+/* --- Placement bar ----------------------------------------------------------- */
+
+.place-bar {
+  position: absolute;
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
+  padding: 6px 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--gold);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+  animation: sheetin 140ms ease-out;
+}
+.place-bar .txt { flex: 1 1 auto; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
+.place-bar .txt small { display: block; font-weight: 600; color: var(--parch-dim); font-size: 10.5px; }
+.place-bar button { min-height: var(--tap); min-width: var(--tap); padding: 0 10px; font-weight: 800; font-size: 12px; }
+
+/* Same bar, armed for a fight: red edge and a pulse, so "my next tap is an
+   attack-move" is readable at a glance from across the room. */
+.place-bar.attack {
+  border-color: var(--danger);
+  animation: sheetin 140ms ease-out, armpulse 1.1s ease-in-out infinite;
+}
+.place-bar.attack .txt { color: #ffd9d1; }
+.place-bar.attack .txt small { color: #e0a99d; }
+
+/* --- Menu sheet -------------------------------------------------------------- */
+
+.menu-sheet {
+  position: absolute;
+  top: calc(var(--safe-t) + 52px);
+  right: calc(var(--safe-r) + 6px);
+  width: 190px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  pointer-events: auto;
+  z-index: 3;
+  animation: sheetin 140ms ease-out;
+}
+.menu-sheet button {
+  min-height: var(--tap);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-align: left;
+  padding: 0 10px;
+}
+
+/* --- Landscape --------------------------------------------------------------- */
+
+@media (orientation: landscape) and (max-height: 500px) {
+  .sel-panel, .cmd-panel { min-height: 58px; padding: 3px 5px; }
+  .hud-bottom { padding: 4px calc(var(--safe-r) + 6px) calc(var(--safe-b) + 4px) calc(var(--safe-l) + 6px); }
+  .sel-head { margin-bottom: 2px; }
+  .hpbar { margin-top: 3px; }
+  .mode-chip { min-height: 32px; font-size: 11px; }
+  .sel-panel { flex: 0 0 156px; }
+  .chip { min-width: 34px; min-height: 34px; }
+  .chip .badge { width: 18px; height: 18px; font-size: 9px; }
+  .hp-text { display: none; }
+  .sel-empty { font-size: 11px; }
+  .place-bar { flex-wrap: nowrap; }
+  .hud-minimap { top: calc(var(--safe-t) + 6px); right: calc(var(--safe-r) + 56px); }
+  #minimap { width: 92px; height: 92px; }
+  .hud-toasts { top: calc(var(--safe-t) + 44px); width: min(34vw, 182px); }
+  .cbtn { font-size: 10.5px; }
+  .cbtn .cost { font-size: 9.5px; }
+}
+
+@media (max-width: 340px) {
+  .cbtn .label { font-size: 10px; }
+  #minimap { width: 96px; height: 96px; }
+}
+
+/* --- Boot card / end card ------------------------------------------------------ */
+
+.boot, .endcard {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(var(--safe-t) + 16px) 16px calc(var(--safe-b) + 16px);
+  background:
+    radial-gradient(120% 80% at 50% 0%, #3a2a19 0%, #150f09 65%),
+    var(--bg);
+  overflow: auto;
+}
+
+.boot-card, .endcard-inner {
+  width: min(420px, 100%);
+  padding: 20px 18px;
+  text-align: center;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 14px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.65);
+}
+
+.boot-card h1, .endcard-inner h2 {
+  margin: 0 0 4px;
+  font-size: 27px;
+  letter-spacing: 0.5px;
+  color: var(--gold);
+  text-shadow: 0 2px 0 #000;
+}
+.endcard-inner h2.lose { color: var(--danger); }
+.boot-sub { margin: 0 0 14px; color: var(--parch-dim); font-size: 13px; }
+.boot-status { font-size: 12px; color: var(--parch-dim); margin-bottom: 12px; }
+.boot-status.error { color: #ff9d8c; }
+
+.start-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  min-height: 52px;
+  width: 100%;
+  padding: 0 18px;
+  font: inherit;
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  color: #1d1409;
+  background: linear-gradient(180deg, #f0cd7d, #c08f2c);
+  border: 1px solid #7a5a1c;
+  border-radius: 11px;
+  box-shadow: 0 3px 0 #5d4315, var(--shadow);
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.start-btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #5d4315; }
+
+.boot-help {
+  margin-top: 14px;
+  text-align: left;
+  font-size: 12.5px;
+  color: var(--parch-dim);
+}
+.boot-help summary {
+  cursor: pointer;
+  padding: 10px 0;
+  font-weight: 700;
+  color: var(--parch);
+  list-style: none;
+}
+.boot-help summary::-webkit-details-marker { display: none; }
+.boot-help summary::before { content: "▸ "; color: var(--gold); }
+.boot-help[open] summary::before { content: "▾ "; }
+.boot-help ul { margin: 0; padding-left: 18px; }
+.boot-help li { margin: 5px 0; line-height: 1.45; }
+.boot-help b { color: var(--parch); }
+
+.boot-build { margin: 14px 0 0; font-size: 10px; color: #6d6047; }
+.endcard-inner p { color: var(--parch-dim); font-size: 13.5px; margin: 6px 0 16px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .hud *, .boot *, .endcard * { animation: none !important; transition: none !important; }
+}

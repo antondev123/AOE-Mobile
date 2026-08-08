@@ -1,0 +1,17 @@
+{
+  "name": "age-of-skirmish",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "A pocket-sized real-time strategy skirmish in Phaser 3",
+  "scripts": {
+    "serve": "python3 -m http.server 8080",
+    "test": "node --test \"tests/*.test.mjs\"",
+    "smoke": "node tests/smoke.mjs",
+    "standalone": "node tools/build-standalone.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1",
+    "playwright-core": "^1.49.0"
+  }
+}
