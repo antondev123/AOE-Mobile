@@ -33,7 +33,7 @@
 
 import {
   UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES, PLAYER,
-  MILITARY_TYPES as ROSTER, BONUS_DAMAGE, ARMOR_CLASS,
+  MILITARY_TYPES as ROSTER, BONUS_DAMAGE,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
