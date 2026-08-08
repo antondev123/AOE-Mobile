@@ -21,7 +21,10 @@ import { depthFor } from '../core/iso.js';
 import {
   buildTextures, ATLAS, TILE_TEX_W, TILE_TEX_H, TILE_TEX_OFF_X, TILE_TEX_OFF_Y,
   terrainFrame, unitFrame, buildingFrame, foundationFrame, resourceFrame,
-  markerFrame, TERRAIN_VARIANTS, RESOURCE_VARIANTS,
+  markerFrame, farmFrame, farmFoundationFrame,
+  oceanFrame, edgeBlendFrame, shoreFrame, BLOB_FRAME,
+  TERRAIN_VARIANTS, RESOURCE_VARIANTS,
+  TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
 } from './textures.js';
 import { createFx } from './fx.js';
 
@@ -45,14 +48,22 @@ export function createRenderer(scene, world) {
 
   // --- camera --------------------------------------------------------------
   // The playable diamond spans x in [-MAP_H*HALF_W, MAP_W*HALF_W] and
-  // y in [0, (MAP_W+MAP_H)*HALF_H] (see the header of iso.js).
-  const worldLeft = -MAP_H * HALF_W - TILE_W;
-  const worldTop = -TILE_H * 3;
-  const worldRight = MAP_W * HALF_W + TILE_W;
-  const worldBottom = (MAP_W + MAP_H) * HALF_H + TILE_H * 3;
+  // y in [0, (MAP_W+MAP_H)*HALF_H] (see the header of iso.js). Its bounding
+  // box therefore has four empty corners, which used to show as raw canvas
+  // background — a dead black band across the top of the opening view.
+  //
+  // Camera bounds and the terrain bake now use the *same* rectangle, so there
+  // is no reachable pixel the bake has not painted, and the pad is kept small
+  // so the player cannot drift far off the coast.
+  const worldRect = {
+    minX: -MAP_H * HALF_W - TILE_W,
+    minY: -TILE_H * 2,
+    maxX: MAP_W * HALF_W + TILE_W,
+    maxY: (MAP_W + MAP_H) * HALF_H + TILE_H * 2,
+  };
   camera.setBounds(
-    worldLeft, worldTop,
-    worldRight - worldLeft, worldBottom - worldTop,
+    worldRect.minX, worldRect.minY,
+    worldRect.maxX - worldRect.minX, worldRect.maxY - worldRect.minY,
     true,
   );
   camera.setZoom(ZOOM_DEFAULT);
@@ -106,7 +117,7 @@ export function createRenderer(scene, world) {
   // --- terrain -------------------------------------------------------------
   // Baked once, over the whole map diamond rather than the boot-time view, so
   // no viewport change, zoom-out or pan can reach unpainted ground.
-  const chunks = bakeTerrain(scene, world);
+  const chunks = bakeTerrain(scene, world, worldRect);
 
   // --- pools ---------------------------------------------------------------
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
@@ -145,7 +156,8 @@ export function createRenderer(scene, world) {
     const f = unitFrame(type, player, back);
     return has(f) ? f : unitFrame('villager', player, back);
   }
-  function buildingFrameFor(type, player) {
+  function buildingFrameFor(type, player, b) {
+    if (type === 'farm') return farmFrame(player, farmStage(b));
     const f = buildingFrame(type, player);
     return has(f) ? f : buildingFrame('house', player);
   }
@@ -332,7 +344,9 @@ export function createRenderer(scene, world) {
 
       let fo = null;
       if (!b.complete) {
-        const fFrame = foundationFrame(b.fw >= 3 ? 3 : 2, player);
+        const fFrame = b.type === 'farm'
+          ? farmFoundationFrame(player)
+          : foundationFrame(b.fw >= 3 ? 3 : 2, player);
         fo = origins.get(fFrame);
         const fs = bldPool.get();
         setFrame(fs, fFrame, origins);
@@ -342,7 +356,7 @@ export function createRenderer(scene, world) {
         fs.setScale(1);
       }
 
-      const bFrame = buildingFrameFor(b.type, player);
+      const bFrame = buildingFrameFor(b.type, player, b);
       const s = bldPool.get();
       setFrame(s, bFrame, origins);
       s.setPosition(wx, wy);
@@ -616,6 +630,36 @@ function mkImage(scene, frame, depth) {
   return s;
 }
 
+/**
+ * Which of the three farm arts to draw: 0 fresh, 1 worked, 2 spent.
+ *
+ * The farm's gameplay side is owned elsewhere, so this reads whatever field
+ * that code ends up using for "food left" rather than insisting on one name,
+ * and falls back to "fresh" if it finds nothing. A farm you cannot tell apart
+ * from a full one is a worse failure than a farm that never looks spent.
+ */
+function farmStage(b) {
+  if (!b) return 0;
+  if (b.depleted || b.exhausted || b.spent) return 2;
+  const st = BUILDING_STATS.farm;
+  const max =
+    num(b.maxAmount) ?? num(b.maxResource) ??
+    num(st && st.provides && st.provides.amount);
+  let cur = num(b.amount);
+  if (cur === undefined) cur = num(b.remaining);
+  if (cur === undefined) cur = num(b.resourceLeft);
+  if (cur === undefined) cur = num(b.provides && b.provides.amount);
+  if (cur === undefined || max === undefined || max <= 0) return 0;
+  const f = cur / max;
+  if (f <= 0.03) return 2;
+  if (f <= 0.5) return 1;
+  return 0;
+}
+
+function num(v) {
+  return typeof v === 'number' && isFinite(v) ? v : undefined;
+}
+
 /** Set a pooled sprite's frame and re-apply that frame's origin. */
 function setFrame(s, frame, origins) {
   if (s._frameKey !== frame) {
@@ -684,14 +728,23 @@ function strokeDiamond(g, cx, cy, hw, hh) {
 }
 
 /**
- * Bake every terrain tile into a grid of RenderTextures. Terrain never changes
- * after map generation, so this happens exactly once.
+ * Bake the whole world into a grid of RenderTextures. Terrain never changes
+ * after map generation, so this happens exactly once and costs nothing per
+ * frame — which is why every one of the passes below is done here and not in
+ * update().
+ *
+ * Passes, in order:
+ *   0. flat deep-water fill over the entire bake rect
+ *   1. a tiled sea shelf that deepens away from the island, so the fill is
+ *      never met head-on
+ *   2. the map's own terrain tiles
+ *   3. edge-blend washes, which feather the hard diamond staircases where
+ *      grass/dirt/sand meet
+ *   4. surf along the coastline
+ *   5. very faint map-scale mottling, so wide single-terrain regions vary
  */
-function bakeTerrain(scene, world) {
-  const minX = -MAP_H * HALF_W - TILE_W;
-  const minY = -TILE_H;
-  const maxX = MAP_W * HALF_W + TILE_W;
-  const maxY = (MAP_W + MAP_H) * HALF_H + TILE_H;
+function bakeTerrain(scene, world, rect) {
+  const { minX, minY, maxX, maxY } = rect;
   const cols = Math.ceil((maxX - minX) / TERRAIN_CHUNK);
   const rows = Math.ceil((maxY - minY) / TERRAIN_CHUNK);
 
@@ -714,38 +767,134 @@ function bakeTerrain(scene, world) {
     }
   }
 
-  // Precompute each tile's blit position and frame once.
-  const n = world.width * world.height;
-  const posX = new Float32Array(n);
-  const posY = new Float32Array(n);
-  const frames = new Array(n);
-  for (let ty = 0; ty < world.height; ty++) {
-    for (let tx = 0; tx < world.width; tx++) {
-      const i = ty * world.width + tx;
-      const terrainId = world.terrain[i];
-      const nVar = TERRAIN_VARIANTS[terrainId] || 1;
-      frames[i] = terrainFrame(terrainId, tileHash(tx, ty) % nVar);
-      posX[i] = (tx - ty) * HALF_W - TILE_TEX_W / 2 + TILE_TEX_OFF_X;
-      posY[i] = (tx + ty + 1) * HALF_H - TILE_TEX_H / 2 + TILE_TEX_OFF_Y;
-    }
-  }
+  const ops = buildTerrainOps(world);
 
   for (const rt of chunks) {
-    const x0 = rt._ox - TILE_TEX_W;
-    const y0 = rt._oy - TILE_TEX_H;
-    const x1 = rt._ox + rt._size;
-    const y1 = rt._oy + rt._size;
+    const x0 = rt._ox - TILE_TEX_W - 90;
+    const y0 = rt._oy - TILE_TEX_H - 60;
+    const x1 = rt._ox + rt._size + 90;
+    const y1 = rt._oy + rt._size + 60;
+    rt.fill(OCEAN_DEEP, 1);
     rt.beginDraw();
-    for (let i = 0; i < n; i++) {
-      const px = posX[i];
-      const py = posY[i];
-      if (px < x0 || px > x1 || py < y0 || py > y1) continue;
-      rt.batchDrawFrame(ATLAS, frames[i], px - rt._ox, py - rt._oy);
+    for (let i = 0; i < ops.length; i++) {
+      const o = ops[i];
+      if (o.x < x0 || o.x > x1 || o.y < y0 || o.y > y1) continue;
+      rt.batchDrawFrame(ATLAS, o.f, o.x - rt._ox, o.y - rt._oy, o.a, o.t);
     }
     rt.endDraw();
   }
 
   return chunks;
+}
+
+/** Screen position for a tile's terrain blit. */
+function tilePos(tx, ty, out) {
+  out.x = (tx - ty) * HALF_W - TILE_TEX_W / 2 + TILE_TEX_OFF_X;
+  out.y = (tx + ty + 1) * HALF_H - TILE_TEX_H / 2 + TILE_TEX_OFF_Y;
+  return out;
+}
+
+/**
+ * Flatten every bake pass into one ordered draw list. Built once; each chunk
+ * then walks it and culls. Order in this array *is* paint order.
+ */
+function buildTerrainOps(world) {
+  const W = world.width;
+  const H = world.height;
+  const B = TERRAIN_BORDER;
+  const ops = [];
+  const p = { x: 0, y: 0 };
+  const push = (frame, alpha, tint) => {
+    ops.push({ f: frame, x: p.x, y: p.y, a: alpha, t: tint });
+  };
+  const terrainAt = (tx, ty) =>
+    (tx < 0 || ty < 0 || tx >= W || ty >= H ? -1 : world.terrain[ty * W + tx]);
+
+  // --- 1. sea shelf ---------------------------------------------------------
+  for (let ty = -B; ty < H + B; ty++) {
+    for (let tx = -B; tx < W + B; tx++) {
+      if (tx >= 0 && ty >= 0 && tx < W && ty < H) continue;
+      const dx = tx < 0 ? -tx : tx >= W ? tx - W + 1 : 0;
+      const dy = ty < 0 ? -ty : ty >= H ? ty - H + 1 : 0;
+      const ring = Math.max(dx, dy);
+      let level;
+      if (ring >= B - 1) {
+        // The last ring has to match the flat fill exactly, or the changeover
+        // from tiles to fill draws a visible line around the whole map.
+        level = OCEAN_LEVELS - 1;
+      } else {
+        // Dither between adjacent depths instead of stepping, so the shelf
+        // does not read as concentric diamonds drawn around the island.
+        const dd = ((ring - 1) * (OCEAN_LEVELS - 1)) / (B - 1)
+          + (tileHash(tx, ty) & 255) / 256 - 0.5;
+        level = Math.max(0, Math.min(OCEAN_LEVELS - 1, Math.round(dd)));
+      }
+      tilePos(tx, ty, p);
+      push(oceanFrame(level), 1, undefined);
+    }
+  }
+
+  // --- 2. terrain -----------------------------------------------------------
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      const id = world.terrain[ty * W + tx];
+      const nVar = TERRAIN_VARIANTS[id] || 1;
+      tilePos(tx, ty, p);
+      push(terrainFrame(id, tileHash(tx, ty) % nVar), 1, undefined);
+    }
+  }
+
+  // --- 3. transition washes -------------------------------------------------
+  // Edge index order matches textures.js: 0 = -y, 1 = +x, 2 = +y, 3 = -x.
+  const NEIGH = [[0, -1], [1, 0], [0, 1], [-1, 0]];
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      const id = world.terrain[ty * W + tx];
+      const mine = TERRAIN_PRIORITY[id];
+      let placed = false;
+      for (let e = 0; e < 4; e++) {
+        const nId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
+        if (nId < 0 || nId === id) continue;
+        if (TERRAIN_PRIORITY[nId] <= mine) continue;
+        if (!placed) {
+          tilePos(tx, ty, p);
+          placed = true;
+        }
+        push(edgeBlendFrame(e), 0.85, TERRAIN_BASE[nId]);
+      }
+    }
+  }
+
+  // --- 4. surf along the coast ---------------------------------------------
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      if (tx !== 0 && ty !== 0 && tx !== W - 1 && ty !== H - 1) continue;
+      tilePos(tx, ty, p);
+      if (ty === 0) push(shoreFrame(0), 0.75, 0xdff1ff);
+      if (tx === W - 1) push(shoreFrame(1), 0.75, 0xdff1ff);
+      if (ty === H - 1) push(shoreFrame(2), 0.75, 0xdff1ff);
+      if (tx === 0) push(shoreFrame(3), 0.75, 0xdff1ff);
+    }
+  }
+
+  // --- 5. map-scale mottling ------------------------------------------------
+  // Six tiles apart with hashed jitter: far coarser than a tile, so it reads
+  // as ground shading rather than as more quilting.
+  for (let ty = 2; ty < H; ty += 6) {
+    for (let tx = 2; tx < W; tx += 6) {
+      const h = tileHash(tx * 7 + 1, ty * 13 + 5);
+      const jx = tx + ((h >>> 2) % 5) - 2;
+      const jy = ty + ((h >>> 7) % 5) - 2;
+      if (jx < 0 || jy < 0 || jx >= W || jy >= H) continue;
+      if (world.terrain[jy * W + jx] === 2) continue; // never over water
+      p.x = (jx - jy) * HALF_W - 84;
+      p.y = (jx + jy + 1) * HALF_H - 50;
+      const warm = (h & 1) === 0;
+      push(BLOB_FRAME, warm ? 0.16 : 0.13, warm ? 0x6b5a3a : 0x9fd07a);
+    }
+  }
+
+  return ops;
 }
 
 /** Well-mixed per-tile hash — a weak one leaves visible stripes of variants. */

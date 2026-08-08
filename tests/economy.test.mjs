@@ -18,9 +18,10 @@ import {
 } from '../src/core/constants.js';
 import {
   canAfford, pay, refund, addResource,
-  queueTrain, cancelTrain, placeFoundation,
+  queueTrain, cancelTrain, placeFoundation, cancelFoundation,
   gatherTick, depositCarry, buildTick, updateEconomy,
   nearestDropoff, acceptsDropoff, gatherRateFor,
+  isGatherableBuilding, gatherableBuildings, canGatherFrom, providesOf,
 } from '../src/systems/economy.js';
 
 // --- tiny harness -----------------------------------------------------------
@@ -262,6 +263,138 @@ test('gathering a second resource type banks the first load', () => {
   assert.ok(v.carrying.amount > 0);
   assert.equal(gatherTick(world, v, tree, SIM_DT), true, 'must deposit before switching');
   assert.equal(v.carrying.type, RES.FOOD);
+});
+
+// --- farms ------------------------------------------------------------------
+//
+// A farm is wood turned into a food node. Everything below is about it being
+// *exactly* a node — same harvest, same carry, same walk home — because the
+// whole point is that it fixes the 4:00 food cliff without inventing a second,
+// invisible income model.
+
+/** Place a farm next to the town centre and build it to completion. */
+function buildFarm(world, tc, builder) {
+  const spot = findSpot(world, tc, BUILDING_STATS.farm.fw, BUILDING_STATS.farm.fh);
+  const farm = placeFoundation(world, PLAYER, 'farm', spot.gx, spot.gy);
+  assert.ok(farm, 'farm foundation should have been placed');
+  let done = false;
+  for (let i = 0; i < 4000 && !done; i++) done = buildTick(world, builder, farm, SIM_DT);
+  assert.equal(farm.complete, true, 'farm should have finished building');
+  return farm;
+}
+
+test('a farm costs wood only — it is the sink wood was missing', () => {
+  const c = BUILDING_STATS.farm.cost;
+  assert.equal(c.food || 0, 0);
+  assert.equal(c.gold || 0, 0);
+  assert.ok(c.wood > 0, 'a farm has to cost wood to be a wood sink');
+  assert.equal(providesOf('farm').type, RES.FOOD);
+  assert.ok(providesOf('farm').amount > 0);
+  assert.equal(providesOf('house'), null, 'only providers are harvestable');
+});
+
+test('a finished farm is a food node; a foundation is not', () => {
+  const { world, tc, villagers } = setup();
+  const v = villagers[0];
+
+  const spot = findSpot(world, tc, BUILDING_STATS.farm.fw, BUILDING_STATS.farm.fh);
+  const farm = placeFoundation(world, PLAYER, 'farm', spot.gx, spot.gy);
+  assert.equal(isGatherableBuilding(farm), false, 'a foundation is a build job, not food');
+  assert.equal(gatherTick(world, v, farm, SIM_DT), true, 'nothing to harvest yet');
+  assert.equal(v.carrying.amount, 0);
+
+  let done = false;
+  for (let i = 0; i < 4000 && !done; i++) done = buildTick(world, v, farm, SIM_DT);
+
+  assert.equal(isGatherableBuilding(farm), true);
+  assert.equal(farm.resourceType, RES.FOOD);
+  assert.equal(farm.amount, BUILDING_STATS.farm.provides.amount);
+  assert.equal(farm.maxAmount, BUILDING_STATS.farm.provides.amount);
+  assert.deepEqual(gatherableBuildings(world, PLAYER), [farm]);
+  assert.equal(canGatherFrom(v, farm), true);
+});
+
+test('a farm is harvested exactly like a bush, and pays on deposit only', () => {
+  const { world, tc, villagers, p } = setup();
+  const v = villagers[0];
+  const farm = buildFarm(world, tc, v);
+
+  const ticks = record(world, EV.GATHER_TICK);
+  const foodBefore = p.resources.food;
+
+  const t = gatherUntilReturn(world, v, farm);
+  assert.equal(v.carrying.type, RES.FOOD);
+  assert.equal(v.carrying.amount, CARRY_CAPACITY);
+  assert.equal(ticks.length, CARRY_CAPACITY, 'one GATHER_TICK per unit harvested');
+  assert.equal(farm.amount, BUILDING_STATS.farm.provides.amount - CARRY_CAPACITY);
+  assert.ok(t < 6 && t > 1, `a farm leg should read as a loop, took ${t.toFixed(1)}s`);
+
+  // The load has to be *carried*: nothing trickles in while standing on it.
+  assert.equal(p.resources.food, foodBefore, 'a farm must not pay passively');
+  assert.equal(acceptsDropoff(farm, RES.FOOD), false, 'a farm is not a drop-off');
+  assert.equal(depositCarry(world, v, tc), CARRY_CAPACITY);
+  assert.equal(p.resources.food, foodBefore + CARRY_CAPACITY);
+});
+
+test('a farm is exhausted after exactly what it provides, then removed', () => {
+  const { world, tc, villagers, p } = setup();
+  const v = villagers[0];
+  const farm = buildFarm(world, tc, v);
+  const tiles = farm.tiles.map(([x, y]) => y * world.width + x);
+
+  const depleted = record(world, EV.NODE_DEPLETED);
+  const removed = record(world, EV.REMOVED);
+
+  let banked = 0;
+  for (let trip = 0; trip < 60 && !farm.dead; trip++) {
+    gatherUntilReturn(world, v, farm);
+    banked += depositCarry(world, v, tc);
+  }
+
+  assert.equal(banked, BUILDING_STATS.farm.provides.amount, 'a farm yields exactly its stock');
+  assert.equal(depleted.length, 1, 'exhaustion is announced once');
+  assert.equal(depleted[0].node, farm);
+  assert.ok(removed.some((r) => r.entity === farm), 'the spent farm is removed');
+  assert.equal(farm.dead, true);
+  assert.equal(world.entities.has(farm.id), false);
+  assert.equal(world.buildings.includes(farm), false);
+  // ...and its ground is free again, so the replacement farm can go right there.
+  for (const i of tiles) assert.equal(world.blocked[i], 0, 'spent farm frees its tiles');
+  assert.equal(isGatherableBuilding(farm), false);
+
+  // Calling again with the dead farm is safe and still says "stop".
+  assert.equal(gatherTick(world, v, farm, SIM_DT), true);
+  assert.equal(depleted.length, 1, 'NODE_DEPLETED is not re-emitted');
+  assert.equal(p.resources.food >= banked, true);
+});
+
+test('a farm belongs to its owner — nobody else may harvest it', () => {
+  const { world, tc, villagers } = setup();
+  const v = villagers[0];
+  const farm = buildFarm(world, tc, v);
+  const thief = spawnUnit(world, 'villager', 1, farm.x + 2, farm.y);
+
+  assert.equal(canGatherFrom(thief, farm), false);
+  assert.equal(gatherTick(world, thief, farm, 1), true, 'an enemy farm gives nothing');
+  assert.equal(thief.carrying.amount, 0);
+  assert.equal(farm.amount, BUILDING_STATS.farm.provides.amount);
+  assert.deepEqual(gatherableBuildings(world, 1), []);
+});
+
+test('cancelling a foundation refunds it and gives the ground back', () => {
+  const { world, tc, p } = setup();
+  const woodBefore = p.resources.wood;
+  const spot = findSpot(world, tc, BUILDING_STATS.farm.fw, BUILDING_STATS.farm.fh);
+  const farm = placeFoundation(world, PLAYER, 'farm', spot.gx, spot.gy);
+  assert.equal(p.resources.wood, woodBefore - BUILDING_STATS.farm.cost.wood);
+  const tiles = farm.tiles.map(([x, y]) => y * world.width + x);
+
+  assert.equal(cancelFoundation(world, farm), true);
+  assert.equal(p.resources.wood, woodBefore, 'the wood comes back');
+  assert.equal(farm.dead, true);
+  for (const i of tiles) assert.equal(world.blocked[i], 0);
+  assert.equal(cancelFoundation(world, farm), false, 'cancelling twice is a no-op');
+  assert.equal(cancelFoundation(world, tc), false, 'a finished building cannot be cancelled');
 });
 
 // --- training ---------------------------------------------------------------

@@ -466,6 +466,245 @@ test('a trained unit walks to the rally point', () => {
   assert(!u.pendingRally, 'pendingRally should be consumed');
 });
 
+// --- Rally points that actually put the villager to work --------------------
+//
+// B2: a Town Center hands the player a new body every 8 seconds. If a rally on
+// a berry bush only walks the villager next to it and drops it to idle, every
+// one of those bodies costs a camera hunt, a select and a tap — which is the
+// concrete reason a thumb cannot keep pace with the AI.
+
+test('a rally point on a berry bush makes the new villager gather and bank food', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const berry = spawnResource(w, 'berry', 5, 16);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  step(w, 1); // let unitAI subscribe before economy emits
+
+  tc.rally = { x: berry.x, y: berry.y };
+  const food0 = w.players[PLAYER].resources.food;
+  assert(queueTrain(w, tc, 'villager'), 'training should have been queued');
+
+  const trained = stepUntil(w, 400, () => w.units.length > 0);
+  assert(trained > 0, 'no villager was produced');
+  const u = w.units[0];
+  assert(u.task && u.task.type === 'gather', `rally on a resource must be a gather order, got ${u.task && u.task.type}`);
+  eq(u.task.node, berry, 'it should be gathering the bush it was rallied onto');
+
+  const working = stepUntil(w, 900, () => u.state === 'gather');
+  assert(working > 0, 'the rallied villager never started gathering');
+  const banked = stepUntil(w, 1800, () => w.players[PLAYER].resources.food > food0 + 50);
+  assert(banked > 0, 'the rallied villager never banked any food');
+  assert(!isIdle(u), 'a rallied villager must never fall idle beside the food');
+});
+
+test('a rally point beside a bush still counts as gathering it', () => {
+  // The HUD sets a rally by tapping *ground*, so the point usually lands a tile
+  // off the node. Landing next to the bush has to mean the same thing.
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const berry = spawnResource(w, 'berry', 5, 16);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  step(w, 1);
+
+  tc.rally = { x: berry.x + 1, y: berry.y };
+  assert(queueTrain(w, tc, 'villager'), 'training should have been queued');
+  stepUntil(w, 400, () => w.units.length > 0);
+  const u = w.units[0];
+  assert(u.task && u.task.type === 'gather', 'a rally one tile off the bush is still a gather order');
+  eq(u.task.node, berry);
+
+  // ...but a rally out in the open is still just a walk.
+  const tc2 = spawnBuilding(w, 'towncenter', PLAYER, 30, 30);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  tc2.rally = { x: 34.5, y: 34.5 };
+  assert(queueTrain(w, tc2, 'villager'), 'second training should have been queued');
+  const before = w.units.length;
+  stepUntil(w, 400, () => w.units.length > before);
+  const u2 = w.units[w.units.length - 1];
+  assert(u2.task && u2.task.type === 'move', `bare ground is a move order, got ${u2.task && u2.task.type}`);
+});
+
+test('a rally point on a foundation sends the new villager to build it', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  step(w, 1);
+  const site = placeFoundation(w, PLAYER, 'house', 16, 16);
+  assert(site && !site.complete, 'foundation should have been placed');
+  reindex(w);
+
+  tc.rally = { x: site.x, y: site.y };
+  assert(queueTrain(w, tc, 'villager'), 'training should have been queued');
+  stepUntil(w, 400, () => w.units.length > 0);
+  const u = w.units[0];
+  assert(u.task && u.task.type === 'build', `rally on a foundation must build, got ${u.task && u.task.type}`);
+  eq(u.task.building, site);
+  const done = stepUntil(w, 1200, () => site.complete);
+  assert(done > 0, 'the rallied villager never finished the house');
+});
+
+test('soldiers rallied onto a resource just muster there', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const barracks = spawnBuilding(w, 'barracks', PLAYER, 16, 10);
+  const berry = spawnResource(w, 'berry', 22, 16);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  step(w, 1);
+
+  barracks.rally = { x: berry.x, y: berry.y };
+  assert(queueTrain(w, barracks, 'militia'), 'militia should have been queued');
+  const trained = stepUntil(w, 600, () => w.units.length > 0);
+  assert(trained > 0, 'no militia was produced');
+  const u = w.units[0];
+  eq(u.type, 'militia');
+  assert(u.task && u.task.type === 'move', `a soldier rally is a move order, got ${u.task && u.task.type}`);
+  eq(berry.amount, berry.maxAmount, 'and it certainly does not pick berries');
+});
+
+// --- Farms ------------------------------------------------------------------
+
+test('a villager works a farm exactly like a bush: walk, harvest, deposit, return', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const farm = spawnBuilding(w, 'farm', PLAYER, 15, 10);
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 12.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  const food0 = w.players[PLAYER].resources.food;
+  commandUnits(w, [vil], { type: 'gather', target: farm });
+  eq(vil.state, 'move', 'the order registers at once');
+
+  const seen = new Set();
+  const toGather = stepUntil(w, 600, () => { seen.add(vil.state); return vil.state === 'gather'; });
+  assert(toGather > 0, 'villager never reached the farm');
+  const toFull = stepUntil(w, 600, () => vil.carrying.amount >= CARRY_CAPACITY);
+  assert(toFull > 0, 'villager never filled up at the farm');
+  const toDeposit = stepUntil(w, 600, () => { seen.add(vil.state); return vil.state === 'deposit'; });
+  assert(toDeposit > 0, 'villager never carried the harvest home');
+  assert(w.players[PLAYER].resources.food > food0, 'farm food should have been banked');
+
+  const back = stepUntil(w, 600, () => vil.state === 'gather');
+  assert(back > 0, 'villager did not go back to the field');
+  eq(vil.task.node, farm, 'it should keep working the same farm');
+  assert(seen.has('move') && seen.has('gather') && seen.has('deposit'),
+    `expected the full state loop, saw ${[...seen].join(',')}`);
+});
+
+test('a spent farm retasks its worker onto the next food source', () => {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const farm = spawnBuilding(w, 'farm', PLAYER, 15, 10);
+  const berry = spawnResource(w, 'berry', 18, 13);
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 12.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, [vil], { type: 'gather', target: farm });
+  stepUntil(w, 600, () => vil.state === 'gather');
+  farm.amount = 4; // nearly spent
+
+  const gone = stepUntil(w, 900, () => farm.dead);
+  assert(gone > 0, 'the farm should have been exhausted');
+  const retasked = stepUntil(w, 900, () => vil.task && vil.task.node === berry);
+  assert(retasked > 0, 'villager should have moved onto the berries');
+  const working = stepUntil(w, 900, () => vil.state === 'gather');
+  assert(working > 0, 'villager should be harvesting again');
+  assert(!isIdle(vil), 'a spent farm must not leave a villager standing around');
+});
+
+test('a villager whose bush runs dry adopts a nearby farm', () => {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const berry = spawnResource(w, 'berry', 14, 10);
+  const farm = spawnBuilding(w, 'farm', PLAYER, 17, 12);
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 12.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  berry.amount = 4;
+
+  commandUnits(w, [vil], { type: 'gather', target: berry });
+  const gone = stepUntil(w, 900, () => berry.dead);
+  assert(gone > 0, 'the bush should have been exhausted');
+  const retasked = stepUntil(w, 900, () => vil.task && vil.task.node === farm);
+  assert(retasked > 0, 'the farm should count as replacement food');
+  const working = stepUntil(w, 900, () => vil.state === 'gather');
+  assert(working > 0, 'villager should be working the field');
+});
+
+test('a villager that finishes a farm starts harvesting it', () => {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 12.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  const site = placeFoundation(w, PLAYER, 'farm', 15, 13);
+  assert(site, 'farm foundation should have been placed');
+  reindex(w);
+
+  commandUnits(w, [vil], { type: 'gather', target: site });
+  assert(vil.task && vil.task.type === 'build', 'gathering an unbuilt farm means planting it');
+  const done = stepUntil(w, 900, () => site.complete);
+  assert(done > 0, 'the farm was never finished');
+  const working = stepUntil(w, 600, () => vil.task && vil.task.type === 'gather');
+  assert(working > 0, 'the builder should turn round and work the field it just planted');
+  eq(vil.task.node, site);
+});
+
+test('several villagers share one farm without shoving each other off it', () => {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const farm = spawnBuilding(w, 'farm', PLAYER, 16, 16);
+  const vils = [];
+  for (let i = 0; i < 3; i++) vils.push(spawnUnit(w, 'villager', PLAYER, 12.5 + i * 0.6, 13.5));
+  recomputePop(w, PLAYER);
+  reindex(w);
+  commandUnits(w, vils, { type: 'gather', target: farm });
+
+  const reached = new Set();
+  const all = stepUntil(w, 900, () => {
+    for (const v of vils) if (v.state === 'gather') reached.add(v.id);
+    return reached.size === vils.length;
+  });
+  assert(all > 0, `only ${reached.size}/${vils.length} villagers reached the field`);
+
+  // Working the field, not queueing on one square and not jittering.
+  step(w, 40);
+  for (let i = 0; i < vils.length; i++) {
+    for (let j = i + 1; j < vils.length; j++) {
+      const d = dist(vils[i], vils[j]);
+      assert(d > 0.5, `villagers ${i} and ${j} are stacked on the farm (${d.toFixed(2)} apart)`);
+    }
+  }
+  const food0 = w.players[PLAYER].resources.food;
+  step(w, 600);
+  assert(w.players[PLAYER].resources.food > food0, 'three on one field should still bank food');
+});
+
+test('two builders on one foundation take separate tiles and finish it', () => {
+  // Both walking at the same stand tile used to shove each other just outside
+  // build range, and the foundation never moved — which cost the AI its barracks.
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10, 10);
+  const a = spawnUnit(w, 'villager', PLAYER, 18.5, 20.5);
+  const b = spawnUnit(w, 'villager', PLAYER, 18.9, 20.9);
+  recomputePop(w, PLAYER);
+  reindex(w);
+  const site = placeFoundation(w, PLAYER, 'barracks', 22, 16);
+  assert(site, 'barracks foundation should have been placed');
+  reindex(w);
+
+  commandUnits(w, [a], { type: 'build', target: site });
+  commandUnits(w, [b], { type: 'build', target: site });
+  const done = stepUntil(w, 1200, () => site.complete);
+  assert(done > 0, `the pair never finished the barracks (progress ${(site.buildProgress || 0).toFixed(1)})`);
+});
+
 test('a new building across a path makes units re-plan, not freeze', () => {
   const w = blankWorld();
   const u = spawnUnit(w, 'villager', PLAYER, 5.5, 20.5);

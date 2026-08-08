@@ -138,7 +138,10 @@ export function createFx(scene, world, opts) {
   /** Where a floating label should sit relative to an entity's ground point. */
   function entityAnchorY(e) {
     if (!e) return 0;
-    if (e.kind === 'building') return -((e.fw || 2) >= 3 ? 120 : 80);
+    // A farm is a flat field: hanging its labels at house height would leave
+    // them floating in empty sky above the crop.
+    if (e.kind === 'building' && e.type === 'farm') return -44;
+    if (e.kind === 'building') return -((e.fw || 2) >= 3 ? 150 : 70);
     if (e.kind === 'resource') return -34;
     return -48;
   }

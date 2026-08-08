@@ -16,6 +16,8 @@
 //   0:00  first House the moment wood allows (the TC alone only gives 5 pop)
 //   ~1:30 gold assignment opens up so military is affordable
 //   ~1:45 Barracks; Mill if the berries are a long walk
+//   ~3:00 Farms, once the berries within working range thin out — and from then
+//         on continuously, because a farm is spent as fast as it is worked
 //   ~2:00 militia + archers train continuously, aiming at 2:1 melee:ranged
 //   ~2:55 first wave: 5 units, sent as one group at a soft edge of your base
 //         (it lands on your town around 3:45)
@@ -36,7 +38,11 @@ import { EV } from '../core/events.js';
 import {
   ownedBy, findNearestGlobal, forEachNear, canPlace,
 } from '../core/world.js';
-import { canAfford, queueTrain, placeFoundation } from './economy.js';
+import {
+  canAfford, queueTrain, placeFoundation, cancelFoundation,
+  isGatherableBuilding, gatherableBuildings,
+} from './economy.js';
+import { findPath } from './pathfinding.js';
 import { commandUnits, isIdle } from './unitAI.js';
 
 // --- Tuning -----------------------------------------------------------------
@@ -44,13 +50,39 @@ import { commandUnits, isIdle } from './unitAI.js';
 const THINK_PERIOD = 0.5;      // seconds of sim time between decision passes
 const REBALANCE_PERIOD = 2.0;  // seconds between villager re-assignment passes
 
-// Food is a *finite* resource on this map — there are no farms, only berries
-// (6 nodes x 150 = 900, plus the 250 you start with). So villager count is
-// budgeted against remaining food rather than run up to the pop cap, and the
-// late-game army leans on archers, which cost wood and gold but no food.
-const MAX_VILLAGERS = 16;
+// Villager cap.
+//
+// The old figure (16) was derived from "food is finite: 6 nodes x 150 = 900".
+// Both halves of that were wrong. Measured on the shipped mapgen across seeds,
+// the map carries 37-45 berry nodes of 200 (7400-9000 food), of which 3800-6600
+// sits within this AI's own 26-tile scan — about seven times the assumed budget.
+// And food is no longer finite at all: a Farm converts 60 wood into 300 food,
+// against 39000-44000 wood standing in trees.
+//
+// So food does not set the cap any more; population does. The hard cap is 50.
+// A wave tops out at MAX_WAVE_SIZE (16) and the AI wants a standing army of
+// roughly that plus replacements — call it 26 pop — to keep launching full-sized
+// waves while absorbing losses. 50 - 26 = 24 villagers, which is also about what
+// this economy can keep employed: ~10 on food (2-3 farms running), ~8 on wood
+// (farms and houses to pay for) and ~6 on gold.
+const MAX_VILLAGERS = 24;
+// ...but not before there is a Barracks. Villagers arrive faster than houses do,
+// and an economy booming to 24 keeps pushing "we are 2 off the cap, build a
+// house" in front of the Barracks, which pushed the first wave from ~4:15 out to
+// ~6:00. 16 is the old cap and the opening it produces is the tested one.
+const PRE_BARRACKS_VILLAGERS = 16;
 const MAX_HOUSES = 9;          // TC(5) + 9 x 5 = the 50-pop hard cap
 const FOOD_SCAN = 26;          // how far out we count food still in the ground
+
+// Farms. FARM_SCAN is the radius that counts as "berries we can actually work
+// without a 17-second walk each way", and is deliberately much tighter than
+// FOOD_SCAN: the cliff the player hits is local exhaustion, not map-wide.
+const FARM_SCAN = 14;
+const FARM_BERRY_FLOOR = 1200; // berries left inside FARM_SCAN before we farm
+const FARM_MIN_VILLAGERS = 5;  // don't spend the opening's wood on fields
+const FARM_WOOD_RESERVE = 30;  // always leave enough wood for the next House
+const FARM_FOOD_CEILING = 2000; // banked food above which another field is waste
+const MAX_FARMS = 8;
 
 const BARRACKS_TIME = 105;     // earliest barracks (seconds)
 const BARRACKS2_TIME = 330;    // second barracks, for wave escalation
@@ -137,6 +169,7 @@ class EnemyAI {
 
     this.pending = null;       // { type, entity, since, progress }
     this.abandoned = new Set(); // foundation ids nobody could ever reach
+    this.badSpots = [];        // sites that proved unreachable, never retried
     this.buildBlockedUntil = 0;
     this.placeCursor = 0;
 
@@ -159,6 +192,7 @@ class EnemyAI {
       housesStarted: 0,
       barracksStarted: 0,
       millsStarted: 0,
+      farmsStarted: 0,
       villagersQueued: 0,
       militaryQueued: 0,
       wavesLaunched: 0,
@@ -419,10 +453,18 @@ class EnemyAI {
       } else if (f && f.complete) {
         this.pending = null;             // done
       } else if (w.time - this.pending.since > FOUNDATION_STALL) {
-        // Nobody can reach it. Forget it and let the next pass pick something
-        // else, so a bad site can never trap the whole build order.
-        this.abandoned.add(this.pending.entity && this.pending.entity.id);
+        // Nobody can reach it. Tear the site down — refunding what it cost and
+        // freeing the ground — and blacklist the spot. Leaving the husk standing
+        // used to suppress the whole type forever: an unreachable Barracks
+        // foundation meant `anyOf('barracks') === 1`, so the AI never placed
+        // another one and never trained a single soldier for the rest of a
+        // ten-minute match.
+        this.abandoned.add(f && f.id);
+        this.badSpots.push({ x: f.x, y: f.y });
+        if (this.badSpots.length > 12) this.badSpots.shift();
+        try { cancelFoundation(w, f); } catch { /* keep playing */ }
         this.pending = null;
+        this.releaseBuilders();
       } else if (f) {
         this.staffConstruction(f);
         return;
@@ -486,6 +528,7 @@ class EnemyAI {
     if (want === 'house') this.stats.housesStarted++;
     else if (want === 'barracks') this.stats.barracksStarted++;
     else if (want === 'mill') this.stats.millsStarted++;
+    else if (want === 'farm') this.stats.farmsStarted++;
 
     this.pending = {
       type: want, entity: foundation, since: w.time,
@@ -523,6 +566,10 @@ class EnemyAI {
     const housed = pop.cap >= MAX_POP_CAP;
     if (!housed && anyOf('house') < MAX_HOUSES && pop.room <= 2) return 'house';
 
+    // 1b. Starving: the berries in reach are gone and the larder is nearly
+    //     empty. A field beats a barracks we could not staff anyway.
+    if (this.wantsFarm() && this.foodStarving()) return 'farm';
+
     // 2. Barracks, once the economy is on its feet.
     if (w.time >= BARRACKS_TIME && villagers >= 5 && anyOf('barracks') === 0) {
       return 'barracks';
@@ -530,6 +577,11 @@ class EnemyAI {
 
     // 3. Mill, if the berries are a real walk from the drop-off.
     if (complete('barracks') && anyOf('mill') === 0 && this.millWorthIt()) return 'mill';
+
+    // 3b. Farms, from the moment the local berries thin out and for the rest of
+    //     the match — a farm is consumed as fast as it is worked, so this is a
+    //     standing order, not a one-off building.
+    if (this.wantsFarm()) return 'farm';
 
     // 4. Keep a house buffer as pop grows (build one at 3 spare, not 2).
     if (!housed && anyOf('house') < MAX_HOUSES && pop.room <= 3 && villagers >= 8) {
@@ -543,6 +595,79 @@ class EnemyAI {
     }
 
     return null;
+  }
+
+  // --- farms ---------------------------------------------------------------
+
+  /** Berries still standing inside comfortable working range of home. */
+  berriesNearby(radius = FARM_SCAN) {
+    let total = 0;
+    for (const n of this.world.resources) {
+      if (n.dead || n.resourceType !== RES.FOOD || n.amount <= 0) continue;
+      if (dist(n.x, n.y, this.home.x, this.home.y) > radius) continue;
+      total += n.amount;
+    }
+    return total;
+  }
+
+  /** Farms of ours that are standing — foundations included, they are coming. */
+  myFarms() {
+    return this.myBuildings('farm');
+  }
+
+  /** Food left in our finished farms. */
+  farmStock() {
+    let total = 0;
+    for (const b of gatherableBuildings(this.world, this.id)) total += b.amount || 0;
+    return total;
+  }
+
+  /** Do we have anywhere to bank food? A farm with no drop-off is wood binned. */
+  hasFoodDropoff() {
+    return this.myBuildings().some(
+      (b) => b.complete && !b.dead && b.dropoff && b.dropoff.includes(RES.FOOD),
+    );
+  }
+
+  /**
+   * How many fields we want running right now.
+   *
+   * A villager pulls ~0.9 food/second including the walk, so one 300-food farm
+   * is about five minutes of one villager. Keeping roughly three fields per four
+   * food villagers means there is always one being worked and one being built,
+   * which is what stops the AI hitting the same 4:00 cliff the player does.
+   */
+  farmTarget() {
+    let onFood = 0;
+    for (const j of this.jobs.values()) if (j.res === RES.FOOD) onFood++;
+    const want = Math.ceil(Math.max(2, onFood) * 0.75);
+    return Math.min(MAX_FARMS, want);
+  }
+
+  foodStarving() {
+    const r = this.res();
+    return (r.food || 0) < 120 && this.berriesNearby() < 200 && this.farmStock() < 100;
+  }
+
+  /** Should the next building be a field? */
+  wantsFarm() {
+    const r = this.res();
+    if (this.myUnits('villager').length < FARM_MIN_VILLAGERS) return false;
+    if (!this.hasFoodDropoff()) return false;
+    if ((r.wood || 0) < BUILDING_STATS.farm.cost.wood + FARM_WOOD_RESERVE) return false;
+    if (this.myFarms().length >= this.farmTarget()) return false;
+    // Berries in reach are still worth walking to — no need to spend wood yet.
+    if (this.berriesNearby() >= FARM_BERRY_FLOOR) return false;
+
+    // Swimming in food *and* there is still a bush worth walking to: another
+    // field would be wood better spent on units. Once the last local bush is
+    // gone the stockpile stops being the question — without fields the food line
+    // decays into 25-tile round trips, which is exactly the cliff we are here to
+    // remove — so from then on we farm regardless of what is banked.
+    const berry = this.nearestBerry();
+    const walk = berry ? dist(berry.x, berry.y, this.home.x, this.home.y) : Infinity;
+    if ((r.food || 0) > FARM_FOOD_CEILING && walk <= FARM_SCAN) return false;
+    return true;
   }
 
   nearestBerry() {
@@ -579,12 +704,20 @@ class EnemyAI {
    * The scan is bounded (MAX_TRIES candidates) and starts at a seeded rotating
    * cursor so successive buildings spread around the base instead of stacking
    * on one side, and so a failed search cannot spin.
+   *
+   * A clearing being *open* is not the same as it being *reachable*: a 5x5 hole
+   * in the middle of the forest passes every canPlace test and then swallows the
+   * build order, because the builders can never walk to it. So the handful of
+   * candidates that survive the cheap tests are path-checked from home, at most
+   * MAX_REACH_CHECKS of them, and anywhere a foundation has already stalled is
+   * struck off for good.
    */
   findBuildSpot(type, anchor) {
     const w = this.world;
     const s = BUILDING_STATS[type];
     if (!s) return null;
     const MAX_TRIES = 90;
+    const MAX_REACH_CHECKS = 8;
     const n = PLACEMENT_RING.length;
     if (!n) return null;
 
@@ -592,6 +725,8 @@ class EnemyAI {
     this.placeCursor = (this.placeCursor + w.rng.int(1, 17)) % n;
 
     let tried = 0;
+    let checks = 0;
+    let fallback = null;
     let i = this.placeCursor;
     while (tried < MAX_TRIES) {
       const off = PLACEMENT_RING[i % n];
@@ -604,9 +739,37 @@ class EnemyAI {
       if (!canPlace(w, gx, gy, s.fw, s.fh)) continue;
       // ...and so must a one-tile ring around it, so we never self-wall.
       if (!canPlace(w, gx, gy, s.fw + 2, s.fh + 2)) continue;
+      if (this.isBadSpot(gx, gy)) continue;
+      if (checks >= MAX_REACH_CHECKS) {
+        // Out of path budget: remember the first plausible site and stop.
+        fallback = fallback || { gx, gy };
+        break;
+      }
+      checks++;
+      if (!this.reachableFromHome(gx, gy)) {
+        fallback = fallback || { gx, gy };
+        continue;
+      }
       return { gx, gy };
     }
-    return null;
+    return fallback;
+  }
+
+  isBadSpot(gx, gy) {
+    for (const s of this.badSpots) if (dist(s.x, s.y, gx, gy) < 2.5) return true;
+    return false;
+  }
+
+  /** Can a villager actually walk from the base to this site? */
+  reachableFromHome(gx, gy) {
+    try {
+      const p = findPath(this.world, this.home.x, this.home.y, gx + 0.5, gy + 0.5, {
+        smooth: false,
+      });
+      return !!(p && p.length && !p.partial);
+    } catch {
+      return true; // never let a pathfinder hiccup stop us building
+    }
   }
 
   /** Put the right number of villagers on a foundation and keep them there. */
@@ -717,20 +880,31 @@ class EnemyAI {
     return !!(this.available && this.available[resType]);
   }
 
-  /** Best node of `resType` for a villager at (x,y): near, and not crowded. */
+  /**
+   * Best node of `resType` for a villager at (x,y): near, and not crowded.
+   * Our own finished farms count as food nodes and are scored the same way, so
+   * a field beside the Town Center naturally beats a bush across the map.
+   */
   pickNode(resType, x, y) {
     const w = this.world;
     let best = null;
     let bestScore = Infinity;
-    for (const n of w.resources) {
-      if (n.dead || n.resourceType !== resType || n.amount <= 0) continue;
+    const consider = (n) => {
+      if (n.dead || n.resourceType !== resType || !(n.amount > 0)) return;
       const d = dist(n.x, n.y, x, y);
-      if (d > 30) continue;
+      if (d > 30) return;
       // Spread out: each villager already on a node costs it 1.2 tiles of appeal.
       const score = d + (n.workers || 0) * 1.2 + (this.claimCount(n.id) * 1.2);
       if (score < bestScore) {
         bestScore = score;
         best = n;
+      }
+    };
+    for (const n of w.resources) consider(n);
+    if (resType === RES.FOOD) {
+      for (const b of w.buildings) {
+        if (b.player !== this.id || !isGatherableBuilding(b)) continue;
+        consider(b);
       }
     }
     return best;
@@ -910,7 +1084,10 @@ class EnemyAI {
 
   // --- training ------------------------------------------------------------
 
-  /** Food still sitting in nodes we could plausibly walk to. */
+  /**
+   * Food we could plausibly walk to: berries in the ground plus whatever is
+   * still standing in our own fields.
+   */
   foodInGround() {
     let total = 0;
     for (const n of this.world.resources) {
@@ -918,19 +1095,33 @@ class EnemyAI {
       if (dist(n.x, n.y, this.home.x, this.home.y) > FOOD_SCAN) continue;
       total += n.amount;
     }
-    return total;
+    return total + this.farmStock();
   }
 
   /**
-   * How many villagers this map can actually support. Every villager past the
-   * point where food gets tight is a militia we will never build, so the target
-   * shrinks as the berries run out.
+   * Food we could *make*: banked wood, at 60 wood to a 300-food field. Only
+   * counted while we still have somewhere to bank the harvest.
+   */
+  farmPotential() {
+    if (!this.hasFoodDropoff()) return 0;
+    const s = BUILDING_STATS.farm;
+    const spare = Math.max(0, (this.res().wood || 0) - FARM_WOOD_RESERVE);
+    return Math.floor(spare / s.cost.wood) * s.provides.amount;
+  }
+
+  /**
+   * How many villagers this economy can actually support.
+   *
+   * Before farms existed this shrank as the berries ran out, because they were
+   * the only food on the map. They are not: a field turns 60 wood into 300 food,
+   * so as long as there is wood banked and a drop-off standing the workforce
+   * keeps growing. The throttle only bites when food *and* wood are both gone.
    */
   villagerTarget() {
     const r = this.res();
     const hasBarracks = this.myBuildings('barracks').some((b) => b.complete);
-    if (!hasBarracks) return MAX_VILLAGERS;
-    const budget = (r.food || 0) + this.foodInGround();
+    if (!hasBarracks) return PRE_BARRACKS_VILLAGERS;
+    const budget = (r.food || 0) + this.foodInGround() + this.farmPotential();
     if (budget < 200) return 8;
     if (budget < 450) return 11;
     return MAX_VILLAGERS;

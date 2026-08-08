@@ -19,15 +19,20 @@
 // The shape of `task` matters to world.js: removeEntity() clears any task whose
 // `node`, `target` or `building` field points at a removed entity, so those
 // three names are used verbatim and every stage tolerates them turning null.
+//
+// `task.node` is a resource node *or* one of the player's finished farms — see
+// the Farms note in economy.js. Both carry `resourceType` and `amount`, and are
+// worked, emptied and retasked away from identically; the only difference is
+// that a farm is a building, so distances to it use edgeDist().
 
 import { dirIndex } from '../core/iso.js';
-import { forEachNear, edgeDist, findNearestGlobal } from '../core/world.js';
+import { forEachNear, edgeDist, edgeDist2, findNearestGlobal } from '../core/world.js';
 import { EV } from '../core/events.js';
 import {
   findPath, findAdjacentStandTile, isWalkable, nearestWalkable, hasLineOfSight,
 } from './pathfinding.js';
 import {
-  gatherTick, depositCarry, buildTick, nearestDropoff,
+  gatherTick, depositCarry, buildTick, nearestDropoff, isGatherableBuilding,
 } from './economy.js';
 import { inRange, canAttack, attackReach } from './combat.js';
 
@@ -115,6 +120,12 @@ const FORMATION_SPACING = 1.0;
 const RETASK_RADIUS = 24;
 const FOLLOWUP_WORK_RADIUS = 14;
 
+// A rally point this close (edge distance) to something workable *is* an order
+// to work it. One and a bit tiles: it covers the node the player actually tapped
+// and the ring of ground around it, without a rally dropped in the middle of a
+// clearing quietly hijacking a bush two tiles away.
+const RALLY_SNAP = 1.5;
+
 // --- Per-world context ------------------------------------------------------
 
 const CTX = new WeakMap();
@@ -141,7 +152,49 @@ function onTrained(world, unit, rally) {
   const r = rally || unit.pendingRally;
   if (!r) return;
   unit.pendingRally = null;
-  commandUnits(world, [unit], { type: 'move', gx: r.x, gy: r.y });
+  commandUnits(world, [unit], rallyOrder(world, unit, r));
+}
+
+/**
+ * Turn a rally point into the order the player actually meant.
+ *
+ * A rally is a standing macro instruction, and on a phone it is *the* one that
+ * matters: a Town Center hands you a fresh villager every 8 seconds, and hunting
+ * each one down to tap it onto a bush is the thing no thumb can keep up with.
+ * So a rally that lands on (or beside) something workable is a work order:
+ *
+ *   resource node or one of our finished farms -> gather it
+ *   one of our foundations                     -> go help build it
+ *   anything else                              -> walk there
+ *
+ * Only villagers get the work orders; soldiers rallying onto a bush just muster
+ * there, which is what a barracks rally means.
+ */
+function rallyOrder(world, unit, r) {
+  const move = { type: 'move', gx: r.x, gy: r.y };
+  if (!unit || unit.type !== 'villager') return move;
+
+  let best = null;
+  let bestD = Infinity;
+  const consider = (e, type) => {
+    const d = edgeDist2(e, r.x, r.y);
+    if (d > RALLY_SNAP * RALLY_SNAP || d >= bestD) return;
+    bestD = d;
+    best = { e, type };
+  };
+  forEachNear(world, r.x, r.y, RALLY_SNAP, (e) => {
+    if (e.dead) return;
+    if (e.kind === 'resource') {
+      if (e.amount > 0) consider(e, 'gather');
+      return;
+    }
+    if (e.kind !== 'building' || e.player !== unit.player) return;
+    if (!e.complete) consider(e, 'build');
+    else if (isGatherableBuilding(e)) consider(e, 'gather');
+  });
+
+  if (!best) return move;
+  return { type: best.type, target: best.e, gx: best.e.x, gy: best.e.y };
 }
 
 // --- Public API -------------------------------------------------------------
@@ -170,6 +223,13 @@ export function commandUnits(world, units, order) {
 
     case 'move':
       orderMove(world, list, order, ctx);
+      return;
+
+    // Walk there, but fight anything met on the way. combat.js does the seeing
+    // and the swinging (isAttackMoving reads the flag we set on the task); this
+    // module owns stopping for the fight and picking the walk back up.
+    case 'attackMove':
+      orderMove(world, list, { ...order, attackMove: true }, ctx);
       return;
 
     case 'patrol':
@@ -278,10 +338,11 @@ function orderMove(world, list, order, ctx) {
   const gy = order.gy !== undefined ? order.gy : order.target ? order.target.y : null;
   if (gx === null || gy === null) return;
   const slots = assignSlots(world, list, gx, gy);
+  const attackMove = !!order.attackMove;
   for (let i = 0; i < list.length; i++) {
     const u = list[i];
     const s = slots[i];
-    setTask(world, u, { type: 'move', gx: s.x, gy: s.y }, ctx, s.x, s.y);
+    setTask(world, u, { type: 'move', gx: s.x, gy: s.y, attackMove }, ctx, s.x, s.y);
   }
 }
 
@@ -305,10 +366,21 @@ function orderPatrol(world, list, order, ctx) {
 
 function orderGather(world, list, order, ctx) {
   let node = order.target;
-  if (!node || node.kind !== 'resource') {
-    node = order.gx !== undefined
-      ? findNearestGlobal(world, order.gx, order.gy, world.resources, (e) => e.amount > 0)
-      : null;
+
+  // Farms are gathered from exactly like bushes, and an *unfinished* farm is a
+  // build order — tapping the field you just placed means "go plant it".
+  if (node && node.kind === 'building') {
+    if (!node.complete && node.player === list[0].player) {
+      orderBuild(world, list, { ...order, target: node }, ctx);
+      return;
+    }
+    if (!isGatherableBuilding(node) || node.player !== list[0].player) node = null;
+  } else if (!node || node.kind !== 'resource' || node.amount <= 0) {
+    node = null;
+  }
+
+  if (!node && order.gx !== undefined) {
+    node = nearestWorkSource(world, list[0], order.gx, order.gy);
   }
   if (!node) {
     // Tapped bare ground with a gather order — walk there instead of refusing.
@@ -497,7 +569,7 @@ function stepUnit(world, u, dt, ctx) {
   if (u.pendingRally && !u.task) {
     const r = u.pendingRally;
     u.pendingRally = null;
-    commandUnits(world, [u], { type: 'move', gx: r.x, gy: r.y });
+    commandUnits(world, [u], rallyOrder(world, u, r));
   }
 
   // Panicking villager (combat.js sets these). Running away outranks any job;
@@ -646,7 +718,9 @@ function tickGather(world, u, dt, ctx) {
   }
 
   const node = t.node;
-  const reach = Math.hypot(u.x - node.x, u.y - node.y);
+  // Edge distance, so a 2x2 farm is reached from beside its field rather than
+  // requiring the villager to stand on its centre tile.
+  const reach = edgeDist(node, u.x, u.y);
   if (reach <= GATHER_REACH && (!u.dest || reach <= GATHER_START)) {
     t.tries = 0;
     clearMovement(u);
@@ -790,7 +864,11 @@ function tickBuild(world, u, dt, ctx) {
       onJobFinished(world, u, ctx);
       return;
     }
-    const stand = findAdjacentStandTile(world, b, u.x, u.y, { maxRing: 1 });
+    // Take a tile no other builder has claimed. Two villagers walking at the
+    // same square shove each other off it forever: each ends up ~1.6 tiles from
+    // the wall — just outside BUILD_REACH — and the foundation never moves.
+    const stand = pickBuildStand(world, u, b);
+    t.stand = stand || null;
     if (stand) requestPath(world, u, stand.x, stand.y, ctx, false);
     else requestPath(world, u, b.x, b.y, ctx, false);
   }
@@ -807,7 +885,7 @@ function onJobFinished(world, u, ctx) {
   u.state = 'idle';
   if (u.type !== 'villager') return;
   const preferred = u.aiMemory ? u.aiMemory.resourceType : null;
-  const node = findWorkNode(world, u.x, u.y, FOLLOWUP_WORK_RADIUS, preferred);
+  const node = findWorkNode(world, u, u.x, u.y, FOLLOWUP_WORK_RADIUS, preferred);
   if (node) beginGatherTask(world, u, node, ctx, pickStand(world, u, node));
 }
 
@@ -868,23 +946,47 @@ function releaseNode(u) {
   u.aiNode = null;
 }
 
-function findWorkNode(world, x, y, radius, preferredType, exclude) {
+/**
+ * Everything `unit` may harvest: every resource node on the map, plus its own
+ * player's finished farms. A farm is deliberately indistinguishable from a bush
+ * from here down — same task, same walk, same drop-off trip.
+ */
+function eachWorkSource(world, unit, fn) {
+  for (const n of world.resources) fn(n);
+  if (!unit) return;
+  for (const b of world.buildings) {
+    if (b.player !== unit.player) continue;
+    if (isGatherableBuilding(b)) fn(b);
+  }
+}
+
+function findWorkNode(world, unit, x, y, radius, preferredType, exclude) {
   let best = null;
   let bestScore = Infinity;
-  const r2 = radius * radius;
-  for (const n of world.resources) {
-    if (n.dead || n === exclude || n.amount <= 0) continue;
-    const dx = n.x - x;
-    const dy = n.y - y;
-    const d2 = dx * dx + dy * dy;
-    if (d2 > r2) continue;
-    let score = Math.sqrt(d2);
+  eachWorkSource(world, unit, (n) => {
+    if (n.dead || n === exclude || !(n.amount > 0)) return;
+    // edgeDist, not centre distance: a 2x2 farm is worked from its edge.
+    const d = edgeDist(n, x, y);
+    if (d > radius) return;
+    let score = d;
     // Prefer the same resource so a retasked lumberjack stays a lumberjack.
     if (preferredType && n.resourceType !== preferredType) score += radius * 0.5;
     // Spread out: an unworked node beats one with a queue on it.
     score += (n.workers || 0) * 0.75;
     if (score < bestScore) { bestScore = score; best = n; }
-  }
+  });
+  return best;
+}
+
+/** Nearest thing `unit` could work, at any distance. */
+function nearestWorkSource(world, unit, x, y) {
+  let best = null;
+  let bestD = Infinity;
+  eachWorkSource(world, unit, (n) => {
+    if (n.dead || !(n.amount > 0)) return;
+    const d = edgeDist2(n, x, y);
+    if (d < bestD) { bestD = d; best = n; }
+  });
   return best;
 }
 
@@ -896,7 +998,7 @@ function retargetNode(world, u, t, ctx) {
     || null;
   const ox = old && !old.dead ? old.x : u.x;
   const oy = old && !old.dead ? old.y : u.y;
-  const node = findWorkNode(world, ox, oy, RETASK_RADIUS, type, old);
+  const node = findWorkNode(world, u, ox, oy, RETASK_RADIUS, type, old);
   if (!node) { releaseNode(u); return false; }
 
   releaseNode(u);
@@ -957,16 +1059,25 @@ function onBuilt(world, building) {
  * villagers share tiles and separation shuffles them apart.
  */
 function pickStand(world, u, node) {
+  return standAvoidingPeers(world, u, node, 'gather', (t) => t.node === node);
+}
+
+/** The same idea for construction: one tile per builder on a foundation. */
+function pickBuildStand(world, u, building) {
+  return standAvoidingPeers(world, u, building, 'build', (t) => t.building === building);
+}
+
+function standAvoidingPeers(world, u, target, taskType, sameJob) {
   const avoid = new Set();
   for (const other of world.units) {
     if (other === u || other.dead) continue;
     const ot = other.task;
-    if (!ot || ot.type !== 'gather' || ot.node !== node || !ot.stand) continue;
+    if (!ot || ot.type !== taskType || !ot.stand || !sameJob(ot)) continue;
     avoid.add(`${ot.stand.tx},${ot.stand.ty}`);
   }
   return (
-    findAdjacentStandTile(world, node, u.x, u.y, { avoid, maxRing: 1 }) ||
-    findAdjacentStandTile(world, node, u.x, u.y, { maxRing: 1 })
+    findAdjacentStandTile(world, target, u.x, u.y, { avoid, maxRing: 1 }) ||
+    findAdjacentStandTile(world, target, u.x, u.y, { maxRing: 1 })
   );
 }
 

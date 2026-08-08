@@ -36,6 +36,78 @@ export function gatherRateFor(resourceType) {
 /** Longest a training queue may get (AoE2 uses 5 per building tab). */
 export const MAX_QUEUE = 5;
 
+// --- Farms (buildings you harvest) ------------------------------------------
+//
+// A building whose stats carry `provides: { type, amount }` — currently the
+// Farm — is a resource node you paid wood for. Once complete it behaves exactly
+// like a berry bush: a villager stands next to it, fills its pack, and walks the
+// load to a drop-off. Nothing trickles in passively, so the visible gather loop
+// is identical and a farm is worth exactly as much as the villager working it.
+//
+// EXHAUSTION: a spent farm is removed from the world, the same way an emptied
+// bush is, and the player (or the AI) rebuilds one for another 60 wood. Reasons:
+//   * There is no demolish order in this game. A derelict 2x2 husk would block
+//     its ground forever with no way to clear it — the worst outcome on a phone.
+//   * Auto re-seeding (AoE2's farm queue) would have to spend the player's wood
+//     without an order, off-screen, which is not readable on a 390px HUD.
+//   * Removal reuses the exact depleted-node path, so villagers retask to the
+//     next food source, tasks pointing at it are cleared, and the tile is free
+//     for the replacement farm — all behaviour that already exists and is tested.
+
+/** The `provides` block for a building type, or null if it is not harvestable. */
+export function providesOf(type) {
+  const s = BUILDING_STATS[type];
+  return (s && s.provides) || null;
+}
+
+/**
+ * Stamp the node fields (`resourceType`, `amount`, `maxAmount`) onto a completed
+ * provider building. Idempotent, and a no-op for everything else — call it
+ * anywhere a farm might first be looked at.
+ */
+export function initProvider(building) {
+  if (!building || building.dead || !building.complete) return building;
+  const p = providesOf(building.type);
+  if (!p) return building;
+  if (building.resourceType === undefined || building.resourceType === null) {
+    building.resourceType = p.type;
+    building.amount = p.amount;
+    building.maxAmount = p.amount;
+    building.workers = building.workers || 0;
+  }
+  return building;
+}
+
+/** True when `b` is a finished farm (or other provider) with food still in it. */
+export function isGatherableBuilding(b) {
+  if (!b || b.dead || b.kind !== 'building' || !b.complete) return false;
+  if (!providesOf(b.type)) return false;
+  initProvider(b);
+  return b.amount > 0;
+}
+
+/**
+ * Every harvestable farm belonging to `playerId`. Cheap (one pass over
+ * buildings) and used by the unit AI and the enemy AI when looking for food.
+ */
+export function gatherableBuildings(world, playerId) {
+  const out = [];
+  for (const b of world.buildings) {
+    if (b.player !== playerId) continue;
+    if (isGatherableBuilding(b)) out.push(b);
+  }
+  return out;
+}
+
+/** Can `unit` harvest `node`? Farms are private; bushes belong to nobody. */
+export function canGatherFrom(unit, node) {
+  if (!node || node.dead) return false;
+  if (node.kind === 'building') {
+    return isGatherableBuilding(node) && node.player === unit.player;
+  }
+  return node.kind === 'resource' && node.amount > 0;
+}
+
 /** Seconds between repeated "population capped" nags, per player. */
 const POP_CAP_NAG_INTERVAL = 6;
 
@@ -130,12 +202,16 @@ function ensureCarry(unit) {
 }
 
 function nodeIsLive(world, node) {
-  return !!node && !node.dead && node.amount > 0 && world.entities.has(node.id);
+  if (!node || node.dead || !world.entities.has(node.id)) return false;
+  // A farm is only a node once it is finished; a foundation is a build job.
+  if (node.kind === 'building') return isGatherableBuilding(node);
+  return node.amount > 0;
 }
 
 /**
  * Harvest from `node` for `dt` seconds. Called every sim step by the unit AI
- * while `unit.state === 'gather'`.
+ * while `unit.state === 'gather'`. `node` is either a resource node or one of
+ * this player's completed farms — they are harvested identically.
  *
  * Returns true when the villager should stop and walk to a drop-off: either the
  * pack is full or the node is gone.
@@ -144,9 +220,14 @@ export function gatherTick(world, unit, node, dt) {
   if (!unit || unit.dead) return true;
   const carry = ensureCarry(unit);
 
+  // Someone else's farm is not food you may take.
+  if (node && node.kind === 'building' && node.player !== unit.player) return true;
+
   // Node vanished or was already emptied by someone else.
   if (!nodeIsLive(world, node)) {
-    if (node && !node.dead && node.amount <= 0) depleteNode(world, node);
+    if (node && !node.dead && node.amount <= 0 && node.resourceType) {
+      depleteNode(world, node);
+    }
     return true;
   }
 
@@ -190,7 +271,13 @@ export function gatherTick(world, unit, node, dt) {
   return full;
 }
 
-/** Announce, then remove, an exhausted node. */
+/**
+ * Announce, then remove, an exhausted node.
+ *
+ * A spent farm goes through here too: it is removed exactly like an emptied
+ * bush, which frees its ground for the replacement farm and lets every villager
+ * on it retask through the path that already exists. See the Farms note above.
+ */
 function depleteNode(world, node) {
   if (!node || node.dead) return;
   node.amount = 0;
@@ -285,6 +372,22 @@ export function placeFoundation(world, playerId, type, gx, gy) {
 }
 
 /**
+ * Abandon an unfinished building: refund what it cost and take the site back.
+ *
+ * A foundation nobody can reach is otherwise permanent — there is no demolish
+ * order — and it goes on blocking both its ground and, for the AI, the "do I
+ * already have one of these" test. Returns false for anything already finished.
+ */
+export function cancelFoundation(world, building, { giveBack = true } = {}) {
+  if (!building || building.dead || building.kind !== 'building') return false;
+  if (building.complete) return false;
+  const s = BUILDING_STATS[building.type];
+  if (giveBack && s) refund(world, building.player, s.cost, `cancel:${building.type}`);
+  removeEntity(world, building);
+  return true;
+}
+
+/**
  * Advance construction by one builder for `dt` seconds. Several villagers may
  * each call this in the same step — progress simply adds up, so a second
  * builder halves the wall-clock time.
@@ -308,6 +411,9 @@ export function buildTick(world, unit, building, dt) {
     building.complete = true;
     building.hp = building.maxHp;
     building.state = 'idle';
+    // A finished Farm is a food node from this instant, so the villager that
+    // built it can turn round and start harvesting without a new order.
+    initProvider(building);
     applyPopBonus(world, building.player);
     recomputePop(world, building.player);
     world.events.emit(EV.BUILT, { building, builder: unit || null });

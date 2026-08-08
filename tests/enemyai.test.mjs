@@ -85,8 +85,13 @@ function dist(ax, ay, bx, by) {
  *   full wave schedule can be observed instead of ending at the first kill.
  * @param {number} [opts.razeAt] raze the enemy's Town Center and Barracks at
  *   this sim time, to check it rebuilds instead of softlocking.
+ * @param {number} [opts.starveAt] strip every berry within STARVE_RADIUS of the
+ *   enemy Town Center at this sim time — the 4:00 food cliff, forced. With farms
+ *   the AI has to trade wood for food and keep growing; without them it stalls.
  */
-function runMatch({ seed, raid = false, propUp = false, razeAt = 0, verbose = false }) {
+function runMatch({
+  seed, raid = false, propUp = false, razeAt = 0, starveAt = 0, verbose = false,
+}) {
   const world = createWorld(seed);
   generateMap(world);
   recomputePop(world, PLAYER);
@@ -129,6 +134,16 @@ function runMatch({ seed, raid = false, propUp = false, razeAt = 0, verbose = fa
 
   let raided = false;
   let razed = false;
+  let starved = false;
+  const STARVE_RADIUS = 20;
+  m.minFoodAfterStarve = Infinity;
+  m.farmFood = 0;
+  world.events.on(EV.GATHER_TICK, (p) => {
+    // Food harvested out of a field rather than out of the ground.
+    if (!p || !p.node || p.node.kind !== 'building') return;
+    if (!p.unit || p.unit.player !== ENEMY) return;
+    m.farmFood += p.amount;
+  });
 
   try {
     for (let step = 0; step < STEPS; step++) {
@@ -169,6 +184,24 @@ function runMatch({ seed, raid = false, propUp = false, razeAt = 0, verbose = fa
         const b = ownedBy(world, PLAYER, 'building');
         const v = ownedBy(world, PLAYER, 'unit').filter((u) => u.type === 'villager');
         if (!b.length && !v.length) m.playerLostAt = world.time;
+      }
+
+      // Force the food cliff: every berry near the enemy base disappears.
+      if (starveAt && !starved && world.time >= starveAt) {
+        starved = true;
+        const tc = ownedBy(world, ENEMY, 'building', 'towncenter')[0];
+        const at = tc ? { x: tc.x, y: tc.y } : { x: 39, y: 39 };
+        for (const n of world.resources.slice()) {
+          if (n.resourceType !== 'food') continue;
+          if (dist(n.x, n.y, at.x, at.y) > STARVE_RADIUS) continue;
+          removeEntity(world, n);
+        }
+        m.starvedAt = world.time;
+      }
+      if (starved) {
+        m.minFoodAfterStarve = Math.min(
+          m.minFoodAfterStarve, world.players[ENEMY].resources.food,
+        );
       }
 
       // Decapitate the enemy: take out its Town Center and every Barracks.
@@ -226,6 +259,8 @@ function runMatch({ seed, raid = false, propUp = false, razeAt = 0, verbose = fa
   m.militia = ownedBy(world, ENEMY, 'unit', 'militia').length;
   m.archers = ownedBy(world, ENEMY, 'unit', 'archer').length;
   m.buildings = ownedBy(world, ENEMY, 'building').map((b) => b.type);
+  m.endFood = world.players[ENEMY].resources.food;
+  m.endWood = world.players[ENEMY].resources.wood;
   m.stats = ai.stats;
   m.popCap = world.players[ENEMY].popCap;
   m.world = world;
@@ -382,6 +417,44 @@ check('first wave is beatable but real (4-8 units)', () => {
   const first = waveLog[0];
   assert.ok(first.size >= 4 && first.size <= 8, `first wave was ${first.size}`);
   assert.ok(first.t >= 150 && first.t <= 330, `first wave launched at ${first.t}s`);
+});
+
+// Food: the AI must not walk off the same 4:00 cliff the player was falling
+// off. Berries near its base are deleted outright at 3:00; from then on the only
+// food within reach is what it grows.
+const starved = runMatch({ seed: 12345, propUp: true, starveAt: 180 });
+console.log(
+  `  starved at ${Math.round(starved.starvedAt)}s (every berry within 20 tiles removed): ` +
+  `farms started ${starved.stats.farmsStarted}, ` +
+  `${Math.round(starved.farmFood)} food harvested from fields, ` +
+  `villagers ${starved.startVillagers} -> ${starved.endVillagers}, ` +
+  `army ${starved.endArmy}, food low-water ${Math.round(starved.minFoodAfterStarve)}, ` +
+  `ends with ${Math.round(starved.endFood)} food / ${Math.round(starved.endWood)} wood\n`,
+);
+
+check('builds farms when the berries near its base run out', () => {
+  assert.equal(starved.thrown, null, starved.thrown && starved.thrown.stack);
+  assert.equal(starved.stats.errors, 0, starved.stats.lastError);
+  assert.ok(starved.stats.farmsStarted >= 2, `only ${starved.stats.farmsStarted} farms started`);
+  assert.ok(
+    starved.farmFood >= 200,
+    `only ${Math.round(starved.farmFood)} food actually came out of the fields`,
+  );
+});
+check('does not starve once its berries are gone', () => {
+  // Still growing, still fighting, still eating: no cliff.
+  assert.ok(
+    starved.endVillagers >= starved.startVillagers + 8,
+    `villager count collapsed to ${starved.endVillagers}`,
+  );
+  assert.ok(starved.militaryTrained >= 8, `only ${starved.militaryTrained} soldiers trained`);
+  assert.ok(starved.endFood > 100, `ended on ${Math.round(starved.endFood)} food`);
+});
+check('with farms it comfortably passes the old 16-villager cap', () => {
+  assert.ok(
+    main.endVillagers > 16 && starved.endVillagers > 16,
+    `normal run ${main.endVillagers}, starved run ${starved.endVillagers}`,
+  );
 });
 
 // Robustness: take away its Town Center and Barracks mid-match.
