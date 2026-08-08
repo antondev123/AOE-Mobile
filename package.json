@@ -8,6 +8,7 @@
     "serve": "python3 -m http.server 8080",
     "test": "node --test \"tests/*.test.mjs\"",
     "smoke": "node tests/smoke.mjs",
+    "audio-samples": "node tools/render-audio-samples.mjs",
     "standalone": "node tools/build-standalone.mjs"
   },
   "devDependencies": {
