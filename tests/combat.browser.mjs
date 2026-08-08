@@ -93,9 +93,14 @@ const run = async () => {
       const c = document.getElementById('minimap');
       const g = c.getContext('2d');
       const frame = () => new Promise((r) => requestAnimationFrame(r));
-      // Where the attack should be drawn (gridToMini, inlined).
-      const SPAN = 96;
-      const ex = ((f.gx - f.gy + 48) / SPAN) * c.width;
+      // Where the attack should be drawn (gridToMini, inlined). The map size is
+      // read from the live world rather than written out: this assertion is
+      // about the ping landing where the minimap puts it, and a hardcoded 48
+      // silently started pointing at the wrong pixels the moment the map grew.
+      const W = window.__game.world.width;
+      const H = window.__game.world.height;
+      const SPAN = W + H;
+      const ex = ((f.gx - f.gy + H) / SPAN) * c.width;
       const ey = ((f.gx + f.gy) / SPAN) * c.width;
       const x0 = Math.max(0, Math.min(c.width - 32, Math.round(ex) - 16));
       const y0 = Math.max(0, Math.min(c.height - 32, Math.round(ey) - 16));

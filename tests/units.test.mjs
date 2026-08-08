@@ -115,7 +115,8 @@ test('a unit arrives on time and stops cleanly', () => {
   const goal = { x: 25.5, y: 5.5 };
   commandUnits(w, [u], { type: 'move', gx: goal.x, gy: goal.y });
 
-  // 20 tiles at 1.5 tiles/sec = 13.3s. Allow 20% slack for steering.
+  // 20 tiles at 1.35 tiles/sec = 14.8s. Allow 20% slack for steering. The
+  // figure is derived from u.speed below, so it follows a pacing change.
   const expected = Math.ceil((20 / u.speed) / SIM_DT);
   const used = stepUntil(w, Math.ceil(expected * 1.2), (_, i) => dist(u, goal) < 0.2);
   assert(used > 0, 'unit never arrived');
@@ -250,7 +251,8 @@ test('the loop keeps banking wood over time without stalling', () => {
   commandUnits(w, [vil], { type: 'gather', target: tree });
   step(w, 1200);
   const wood2 = w.players[PLAYER].resources.wood;
-  // A trip is ~3s of harvesting plus ~8 tiles of walking: at least 3 trips/min.
+  // A trip is ~8s of harvesting plus ~8 tiles of walking: about 4 trips/min at
+  // the shipped pacing, so three is a floor with real headroom under it.
   assert(wood2 >= wood0 + 3 * CARRY_CAPACITY,
     `expected several full trips in 60s, banked ${wood2 - wood0}`);
   assert(!isIdle(vil), 'the villager should still be working');
@@ -530,7 +532,10 @@ test('a rally point on a berry bush makes the new villager gather and bank food'
 
   const working = stepUntil(w, 900, () => u.state === 'gather');
   assert(working > 0, 'the rallied villager never started gathering');
-  const banked = stepUntil(w, 1800, () => w.players[PLAYER].resources.food > food0 + 50);
+  // Five full loads. The bush is eight tiles out, so at the shipped pacing that
+  // is five ~19s round trips — the window has to cover the loop this test is
+  // about, not just the first trip.
+  const banked = stepUntil(w, 3200, () => w.players[PLAYER].resources.food > food0 + 50);
   assert(banked > 0, 'the rallied villager never banked any food');
   assert(!isIdle(u), 'a rallied villager must never fall idle beside the food');
 });
@@ -1137,8 +1142,13 @@ test('sixteen villagers on one bush keep the food coming', () => {
 
   // Sustained rate, measured once the first trips have landed.
   const perVillager = (at(SECONDS) - at(20)) / (SECONDS - 20) / vils.length;
-  assert(perVillager > 1.05,
-    `only ${perVillager.toFixed(2)} food per villager per second (was 0.93 before the fix)`);
+  // The floor moved with the pacing pass, not because the spill got worse: a
+  // ~4.5 tile haul each way at 1.35 tiles/s plus a 7.3s harvest is a 14s round
+  // trip, so a perfectly spread crowd tops out near 0.85/villager/s. This
+  // guards the collapse, which measured 0.36 before the spill fix and would land
+  // near 0.66 at today's rates — well under this floor.
+  assert(perVillager > 0.75,
+    `only ${perVillager.toFixed(2)} food per villager per second (a stalled crowd reads ~0.66)`);
 
   // No long dead windows, and never the whole crew walking with nothing coming in.
   let worstZero = 0;

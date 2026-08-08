@@ -160,11 +160,15 @@ test('villager gathers to capacity then signals a return trip', () => {
   assert.equal(v.carrying.amount, CARRY_CAPACITY);
   assert.equal(ticks.length, CARRY_CAPACITY, 'one GATHER_TICK per unit harvested');
   assert.equal(berry.amount, before - CARRY_CAPACITY, 'node pays for what was taken');
-  assert.ok(t < 6, `harvest leg should read as a loop, took ${t.toFixed(1)}s`);
-  assert.ok(t > 1, `harvest leg should not be instant, took ${t.toFixed(1)}s`);
+  // The pacing pass moved the harvest leg from ~3s to ~7.3s on berries (see
+  // GATHER_SPEED in economy.js). The bounds here are what "an AoE2 rhythm, not
+  // a clicker" means in seconds: long enough that a villager visibly works,
+  // short enough that a player watching one never wonders if it is stuck.
+  assert.ok(t < 11, `harvest leg should still read as a loop, took ${t.toFixed(1)}s`);
+  assert.ok(t > 4, `harvest leg should not be a sprint, took ${t.toFixed(1)}s`);
 });
 
-test('a full round trip is a few seconds, not thirty', () => {
+test('a full round trip is a dozen seconds, not thirty', () => {
   const { world, tc, villagers } = setup();
   const v = villagers[0];
   const berry = nearestNode(world, 'berry', tc.x, tc.y);
@@ -174,7 +178,10 @@ test('a full round trip is a few seconds, not thirty', () => {
   const d = Math.hypot(berry.x - tc.x, berry.y - tc.y);
   const walk = (2 * d) / UNIT_STATS.villager.speed;
   const round = harvest + walk;
-  assert.ok(round < 15, `round trip ${round.toFixed(1)}s is too slow to read`);
+  // ~7.3s of harvesting plus a 3-4 tile walk each way at 1.35 tiles/s lands
+  // around 12-14s. Twenty is the ceiling: past that the villager spends more of
+  // its life walking than working and the economy stops feeling like one.
+  assert.ok(round < 20, `round trip ${round.toFixed(1)}s is too slow to read`);
 });
 
 test('depositing banks the carry and clears the villager', () => {
@@ -329,7 +336,7 @@ test('a farm is harvested exactly like a bush, and pays on deposit only', () => 
   assert.equal(v.carrying.amount, CARRY_CAPACITY);
   assert.equal(ticks.length, CARRY_CAPACITY, 'one GATHER_TICK per unit harvested');
   assert.equal(farm.amount, BUILDING_STATS.farm.provides.amount - CARRY_CAPACITY);
-  assert.ok(t < 6 && t > 1, `a farm leg should read as a loop, took ${t.toFixed(1)}s`);
+  assert.ok(t < 11 && t > 4, `a farm leg should read as a loop, took ${t.toFixed(1)}s`);
 
   // The load has to be *carried*: nothing trickles in while standing on it.
   assert.equal(p.resources.food, foodBefore, 'a farm must not pay passively');

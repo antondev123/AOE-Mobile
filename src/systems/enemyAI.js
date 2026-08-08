@@ -596,11 +596,27 @@ class EnemyAI {
     const noTC = !buildings.some((b) => b.type === 'towncenter');
     if (noTC && villagers > 0) {
       if (this.afford(BUILDING_STATS.towncenter.cost)) return 'towncenter';
-      // Cannot afford one, and with no drop-off at all nothing can be banked —
-      // that is a dead end. A Mill is cheaper and restores a food drop-off, so
-      // the economy can restart and pay for the Town Center later.
-      const hasDropoff = buildings.some((b) => b.complete && b.dropoff);
-      if (!hasDropoff && anyOf('mill') === 0 && this.hasNodeFor(RES.FOOD) &&
+
+      // Cannot afford one. What matters now is not "have a drop-off" but "have a
+      // drop-off for the resource the Town Center costs" — and a Town Center is
+      // 275 wood. With only a Mill standing, every villager sent to the trees
+      // fills its pack, finds nowhere to put it, and stands there: the AI can
+      // hold a thousand food and still never rebuild, which is exactly what a
+      // decapitated base did before the Lumber Camp existed.
+      //
+      // So: a Lumber Camp first, at 100 wood — a third of a Town Center, and the
+      // only building that turns standing timber back into a bank balance. A
+      // Mill second, so food can be banked and villagers replaced. Both are
+      // strictly cheaper than the thing being saved for, so neither delays it.
+      const takes = (res) =>
+        buildings.some((b) => b.complete && b.dropoff && b.dropoff.includes(res));
+
+      if (!takes(RES.WOOD) && anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD) &&
+          this.afford(BUILDING_STATS.lumbercamp.cost)) {
+        this.campAnchor = this.campAnchorFor(this.available.wood);
+        return 'lumbercamp';
+      }
+      if (!takes(RES.FOOD) && anyOf('mill') === 0 && this.hasNodeFor(RES.FOOD) &&
           this.afford(BUILDING_STATS.mill.cost)) {
         return 'mill';
       }
