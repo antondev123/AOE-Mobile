@@ -8,9 +8,7 @@
 // blitted; only entities and the viewport rectangle are drawn per redraw
 // (~10Hz, driven by hud.js).
 
-import {
-  MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN, PLAYER, ENEMY,
-} from '../core/constants.js';
+import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
 
 const SPAN = MAP_W + MAP_H;
 
@@ -157,6 +155,7 @@ function bake(g, world, size) {
   g.stroke();
 }
 
+
 function tileDiamond(g, tx, ty, size) {
   // Grown by a hair so neighbouring tiles do not leave hairline seams.
   const c = gridToMini(tx + 0.5, ty + 0.5, size);
@@ -169,5 +168,3 @@ function tileDiamond(g, tx, ty, size) {
   g.lineTo(c.x - hw, c.y);
   g.closePath();
 }
-
-export { PLAYER, ENEMY };

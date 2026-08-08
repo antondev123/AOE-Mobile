@@ -38,25 +38,37 @@ import { commandUnits, isIdle } from './unitAI.js';
 const THINK_PERIOD = 0.5;      // seconds of sim time between decision passes
 const REBALANCE_PERIOD = 2.0;  // seconds between villager re-assignment passes
 
-const MAX_VILLAGERS = 22;      // stop growing eco past this, spend on army
-const MAX_HOUSES = 8;
+// Food is a *finite* resource on this map — there are no farms, only berries
+// (6 nodes x 150 = 900, plus the 250 you start with). So villager count is
+// budgeted against remaining food rather than run up to the pop cap, and the
+// late-game army leans on archers, which cost wood and gold but no food.
+const MAX_VILLAGERS = 16;
+const MAX_HOUSES = 9;          // TC(5) + 9 x 5 = the 50-pop hard cap
+const FOOD_SCAN = 26;          // how far out we count food still in the ground
 
 const BARRACKS_TIME = 105;     // earliest barracks (seconds)
 const BARRACKS2_TIME = 330;    // second barracks, for wave escalation
-const MILL_MIN_WALK = 6.5;     // build a Mill if berries are further than this
+const MILL_MIN_WALK = 5.0;     // build a Mill if berries are further than this
 
 const FIRST_WAVE_TIME = 170;   // earliest first attack
 const FIRST_WAVE_SIZE = 5;
 const WAVE_SIZE_STEP = 2;
 const MAX_WAVE_SIZE = 16;
-const WAVE_INTERVAL_MIN = 100; // gap between waves once one has landed
-const WAVE_INTERVAL_MAX = 130;
+// Waves are scheduled from the moment one *launches*, not from when it dies,
+// so pressure arrives on a predictable ~90-125 s beat whatever happens out
+// there. A wave that has been grinding for 80 s without finishing the job
+// comes home rather than feeding itself in one unit at a time.
+const WAVE_INTERVAL_MIN = 90;
+const WAVE_INTERVAL_MAX = 125;
 const WAVE_REGROUP_AFTER_LOSS = 135; // longer pause after a wave is wiped
-const WAVE_TIMEOUT = 200;      // give up on a wave that has achieved nothing
+const WAVE_TIMEOUT = 80;
+const WAVE_BREATHER = 15;      // minimum regroup before the next launch
 
 const STAGING_DIST = 5.5;      // rally point, tiles from the TC toward the foe
 const DEFEND_RADIUS = 13;      // hostiles this close to home trigger defence
 const DEFEND_CLEAR_TIME = 12;  // all-clear delay before resuming offence
+const STUCK_WINDOW = 1.5;      // seconds between motion samples
+const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
 const BUILD_RETRY_DELAY = 6;   // no infinite placement retries
 const FOUNDATION_STALL = 60;   // abandon a foundation nobody is finishing
 
@@ -112,16 +124,22 @@ class EnemyAI {
     // Villagers pulled off gathering to construct something: unitId -> true
     this.builders = new Set();
 
+    // Nearest reachable node of each resource, refreshed once per think.
+    this.available = { food: null, wood: null, gold: null };
     this.home = null;          // last known base centre, survives TC loss
     this.staging = null;       // rally point for fresh soldiers
 
-    this.pending = null;       // { type, gx, gy, entity, since }
+    this.pending = null;       // { type, entity, since, progress }
+    this.abandoned = new Set(); // foundation ids nobody could ever reach
     this.buildBlockedUntil = 0;
     this.placeCursor = 0;
 
     this.wave = null;          // { ids, target, launchedAt, size }
     this.waveNumber = 0;
     this.nextWaveTime = FIRST_WAVE_TIME;
+
+    // Stuck-watchdog bookkeeping: unitId -> { x, y, t, strikes }
+    this.motion = new Map();
 
     this.lastDamageTime = -999;
     this.lastDamageAt = null;
@@ -141,6 +159,7 @@ class EnemyAI {
       wavesReachedBase: 0,
       minDistToFoeBase: Infinity,
       lastWaveSize: 0,
+      waveLog: [],   // [{ t, size }] — one entry per launch
     };
 
     // Cheap "am I being attacked" signal. Combat emits DAMAGE synchronously.
@@ -185,6 +204,7 @@ class EnemyAI {
     const w = this.world;
 
     this.refreshHome();
+    this.refreshAvailability();
     this.trackWaveProgress();
     this.assessThreat();
 
@@ -192,12 +212,81 @@ class EnemyAI {
     const doRebalance = this.rebalanceAcc >= REBALANCE_PERIOD;
     if (doRebalance) this.rebalanceAcc = 0;
 
+    this.watchStuck();
     this.manageConstruction();
     this.manageVillagers(doRebalance);
     this.manageTraining();
     this.manageArmy();
 
     void w;
+  }
+
+  /**
+   * Crowd watchdog.
+   *
+   * Units that are walking but not actually moving — head-on jams in a
+   * corridor, a pile-up on a drop-off tile — would otherwise sit there for the
+   * rest of the match with a full load of gold and freeze a whole resource
+   * line. Two consecutive 1.5 s windows of "state says move, position says no"
+   * and we shove the unit sideways and let it re-task from scratch.
+   *
+   * Bounded work: one pass over our own units per think, no allocation.
+   */
+  watchStuck() {
+    const w = this.world;
+    const units = this.myUnits();
+    const seen = new Set();
+
+    for (const u of units) {
+      seen.add(u.id);
+      let rec = this.motion.get(u.id);
+      if (!rec) {
+        this.motion.set(u.id, { x: u.x, y: u.y, t: w.time, strikes: 0 });
+        continue;
+      }
+      if (w.time - rec.t < STUCK_WINDOW) continue;
+      const moved = dist(u.x, u.y, rec.x, rec.y);
+      // Only 'move' counts: gathering, building and fighting are meant to be
+      // stationary.
+      if (u.state === 'move' && moved < STUCK_DIST) rec.strikes++;
+      else rec.strikes = 0;
+      rec.x = u.x;
+      rec.y = u.y;
+      rec.t = w.time;
+      if (rec.strikes >= 2) {
+        rec.strikes = 0;
+        this.unstick(u);
+      }
+    }
+
+    if (this.motion.size > units.length * 2) {
+      for (const id of Array.from(this.motion.keys())) {
+        if (!seen.has(id)) this.motion.delete(id);
+      }
+    }
+  }
+
+  /** Break a jam: drop the task, sidestep, and let the next pass re-task. */
+  unstick(u) {
+    const w = this.world;
+    this.jobs.delete(u.id);
+    this.builders.delete(u.id);
+    if (this.wave) {
+      const i = this.wave.ids.indexOf(u.id);
+      if (i >= 0) this.wave.ids.splice(i, 1);
+    }
+    // A short hop at a seeded random angle, onto ground we know is open.
+    for (let i = 0; i < 6; i++) {
+      const a = w.rng.range(0, Math.PI * 2);
+      const gx = Math.round(u.x + Math.cos(a) * 2.5);
+      const gy = Math.round(u.y + Math.sin(a) * 2.5);
+      if (gx < 1 || gy < 1 || gx >= w.width - 1 || gy >= w.height - 1) continue;
+      if (!canPlace(w, gx + 0.5, gy + 0.5, 1, 1)) continue;
+      this.command([u], { type: 'stop' });
+      this.command([u], { type: 'move', gx: gx + 0.5, gy: gy + 0.5 });
+      return;
+    }
+    this.command([u], { type: 'stop' });
   }
 
   // --- base bookkeeping ----------------------------------------------------
@@ -316,12 +405,20 @@ class EnemyAI {
     // Track the in-flight foundation.
     if (this.pending) {
       const f = this.pending.entity;
-      if (f && (!liveIn(w, f))) {
+      const progress = f ? (f.buildProgress || 0) : 0;
+      if (progress > this.pending.progress + 1e-6) {
+        this.pending.progress = progress;
+        this.pending.since = w.time;     // it is moving; reset the stall clock
+      }
+      if (f && !liveIn(w, f)) {
         this.pending = null;             // it died mid-build
       } else if (f && f.complete) {
         this.pending = null;             // done
       } else if (w.time - this.pending.since > FOUNDATION_STALL) {
-        this.pending = null;             // stalled; re-decide next pass
+        // Nobody can reach it. Forget it and let the next pass pick something
+        // else, so a bad site can never trap the whole build order.
+        this.abandoned.add(this.pending.entity && this.pending.entity.id);
+        this.pending = null;
       } else if (f) {
         this.staffConstruction(f);
         return;
@@ -333,9 +430,14 @@ class EnemyAI {
     if (!this.pending) this.releaseBuilders();
 
     // Anything of ours half-built that we did not start (or lost track of)?
-    const orphan = this.myBuildings().find((b) => !b.complete && !b.dead);
+    const orphan = this.myBuildings().find(
+      (b) => !b.complete && !b.dead && !this.abandoned.has(b.id),
+    );
     if (orphan) {
-      this.pending = { type: orphan.type, entity: orphan, since: w.time };
+      this.pending = {
+        type: orphan.type, entity: orphan, since: w.time,
+        progress: orphan.buildProgress || 0,
+      };
       this.staffConstruction(orphan);
       return;
     }
@@ -381,7 +483,10 @@ class EnemyAI {
     else if (want === 'barracks') this.stats.barracksStarted++;
     else if (want === 'mill') this.stats.millsStarted++;
 
-    this.pending = { type: want, entity: foundation, since: w.time };
+    this.pending = {
+      type: want, entity: foundation, since: w.time,
+      progress: foundation.buildProgress || 0,
+    };
     this.staffConstruction(foundation);
   }
 
@@ -506,30 +611,34 @@ class EnemyAI {
       .map((id) => this.world.entities.get(id))
       .filter((u) => live(u));
 
+    const order = {
+      type: 'build',
+      target: foundation,
+      gx: foundation.x,
+      gy: foundation.y,
+    };
+
     if (current.length < want) {
       const pool = this.myUnits('villager')
         .filter((u) => !this.builders.has(u.id))
         .sort((a, b) =>
           dist(a.x, a.y, foundation.x, foundation.y) -
           dist(b.x, b.y, foundation.x, foundation.y));
-      for (const u of pool.slice(0, want - current.length)) {
+      const recruits = pool.slice(0, want - current.length);
+      for (const u of recruits) {
         this.builders.add(u.id);
         this.jobs.delete(u.id);
         current.push(u);
       }
+      // A recruit is mid-gather, so it is *not* idle — it must be re-ordered
+      // unconditionally or it will happily chop wood forever.
+      if (recruits.length) this.command(recruits, order);
     }
 
-    // Only nudge builders that have gone idle — re-issuing every pass would
-    // reset their build task forever.
+    // Existing builders only get nudged once they fall idle; re-issuing every
+    // pass would restart their build task and stall construction outright.
     const slack = current.filter((u) => this.idle(u));
-    if (slack.length) {
-      this.command(slack, {
-        type: 'build',
-        target: foundation,
-        gx: foundation.x,
-        gy: foundation.y,
-      });
-    }
+    if (slack.length) this.command(slack, order);
   }
 
   releaseBuilders() {
@@ -575,11 +684,23 @@ class EnemyAI {
     return { food: F.v, wood: W.v, gold: G.v };
   }
 
+  /**
+   * Refresh, once per think, which resources we can actually reach.
+   *
+   * This has to agree with pickNode's radius: "there is gold somewhere on the
+   * map" is useless if it is a 40-tile walk, and treating it as available made
+   * the whole workforce fall through to wood.
+   */
+  refreshAvailability() {
+    this.available = {
+      food: this.pickNode(RES.FOOD, this.home.x, this.home.y),
+      wood: this.pickNode(RES.WOOD, this.home.x, this.home.y),
+      gold: this.pickNode(RES.GOLD, this.home.x, this.home.y),
+    };
+  }
+
   hasNodeFor(resType) {
-    for (const n of this.world.resources) {
-      if (!n.dead && n.resourceType === resType && n.amount > 0) return true;
-    }
-    return false;
+    return !!(this.available && this.available[resType]);
   }
 
   /** Best node of `resType` for a villager at (x,y): near, and not crowded. */
@@ -673,8 +794,10 @@ class EnemyAI {
         if (res && !this.hasNodeFor(res)) res = null;
         if (!res) res = this.neediestResource(free);
         if (!this.assign(v, res)) {
-          // Nothing of that kind left anywhere — take whatever still exists.
-          for (const alt of [RES.FOOD, RES.WOOD, RES.GOLD]) {
+          // That node vanished between the scan and the order. Fall back down
+          // the priority list rather than to a fixed one — defaulting to wood
+          // is how an AI ends up with 5000 wood and no gold.
+          for (const alt of this.byNeed(free)) {
             if (alt !== res && this.assign(v, alt)) break;
           }
         }
@@ -702,16 +825,25 @@ class EnemyAI {
     for (const k of ['food', 'wood', 'gold']) if (!this.hasNodeFor(k)) want[k] = 0;
     if (want.food === 0 && this.hasNodeFor(RES.FOOD)) want.food = 1;
 
-    for (let swaps = 0; swaps < 2; swaps++) {
+    let swaps = 0;
+    for (let attempt = 0; attempt < 6 && swaps < 2; attempt++) {
       let over = null;
       let under = null;
       for (const k of ['food', 'wood', 'gold']) {
-        if (counts[k] - want[k] >= 1 && (!over || counts[k] - want[k] > counts[over] - want[over])) over = k;
-        if (want[k] - counts[k] >= 1 && (!under || want[k] - counts[k] > want[under] - counts[under])) under = k;
+        if (counts[k] - want[k] >= 1 &&
+            (!over || counts[k] - want[k] > counts[over] - want[over])) over = k;
+        if (want[k] - counts[k] >= 1 &&
+            (!under || want[k] - counts[k] > want[under] - counts[under])) under = k;
       }
       if (!over || !under) break;
+
       const target = this.pickNode(under, this.home.x, this.home.y);
-      if (!target) break;
+      if (!target) {
+        // Cannot staff that resource after all — drop its quota and consider
+        // the next-neediest instead of abandoning the whole rebalance.
+        want[under] = 0;
+        continue;
+      }
       const movers = free
         .filter((v) => {
           const j = this.jobs.get(v.id);
@@ -719,14 +851,22 @@ class EnemyAI {
         })
         .sort((a, b) =>
           dist(a.x, a.y, target.x, target.y) - dist(b.x, b.y, target.x, target.y));
-      if (!movers.length) break;
-      if (!this.assign(movers[0], under)) break;
+      if (!movers.length) {
+        want[under] = counts[under];
+        continue;
+      }
+      if (!this.assign(movers[0], under)) {
+        want[under] = 0;
+        continue;
+      }
       counts[over]--;
       counts[under]++;
+      swaps++;
     }
   }
 
-  neediestResource(free) {
+  /** Resources we can reach, neediest first. */
+  byNeed(free) {
     const split = this.desiredSplit();
     const counts = { food: 0, wood: 0, gold: 0 };
     for (const v of free) {
@@ -734,17 +874,13 @@ class EnemyAI {
       if (j && counts[j.res] !== undefined) counts[j.res]++;
     }
     const n = Math.max(1, free.length);
-    let best = RES.FOOD;
-    let bestGap = -Infinity;
-    for (const k of ['food', 'wood', 'gold']) {
-      if (!this.hasNodeFor(k)) continue;
-      const gap = split[k] * n - counts[k];
-      if (gap > bestGap) {
-        bestGap = gap;
-        best = k;
-      }
-    }
-    return best;
+    return ['food', 'wood', 'gold']
+      .filter((k) => this.hasNodeFor(k))
+      .sort((a, b) => (split[b] * n - counts[b]) - (split[a] * n - counts[a]));
+  }
+
+  neediestResource(free) {
+    return this.byNeed(free)[0] || RES.WOOD;
   }
 
   evacuate(villagers) {
@@ -760,16 +896,43 @@ class EnemyAI {
 
   // --- training ------------------------------------------------------------
 
+  /** Food still sitting in nodes we could plausibly walk to. */
+  foodInGround() {
+    let total = 0;
+    for (const n of this.world.resources) {
+      if (n.dead || n.resourceType !== RES.FOOD || n.amount <= 0) continue;
+      if (dist(n.x, n.y, this.home.x, this.home.y) > FOOD_SCAN) continue;
+      total += n.amount;
+    }
+    return total;
+  }
+
+  /**
+   * How many villagers this map can actually support. Every villager past the
+   * point where food gets tight is a militia we will never build, so the target
+   * shrinks as the berries run out.
+   */
+  villagerTarget() {
+    const r = this.res();
+    const hasBarracks = this.myBuildings('barracks').some((b) => b.complete);
+    if (!hasBarracks) return MAX_VILLAGERS;
+    const budget = (r.food || 0) + this.foodInGround();
+    if (budget < 200) return 8;
+    if (budget < 450) return 11;
+    return MAX_VILLAGERS;
+  }
+
   manageTraining() {
     const pop = this.popState();
     const r = this.res();
     const villagers = this.myUnits('villager').length;
+    const villTarget = this.villagerTarget();
 
     // Town Center: villagers, non-stop, while pop and food allow.
     const tc = this.townCenter();
     if (tc && tc.complete && !tc.dead) {
       const queued = tc.queue ? tc.queue.length : 0;
-      if (pop.room > 0 && queued < 2 && villagers + queued < MAX_VILLAGERS &&
+      if (pop.room > 0 && queued < 2 && villagers + queued < villTarget &&
           this.afford(UNIT_STATS.villager.cost)) {
         this.train(tc, 'villager');
       }
@@ -798,15 +961,17 @@ class EnemyAI {
       if (state.room <= 0) break;
       if ((b.queue ? b.queue.length : 0) >= 2) continue;
 
-      // 2:1 target. Fall back to whichever we can actually pay for.
-      let type = militia < archers * 2 ? 'militia' : 'archer';
+      // Aim for 2:1 melee:ranged. When food dries up the ratio drifts toward
+      // archers by necessity — they are the only unit that costs no food.
+      const foodTight = (r.food || 0) < 120 && this.foodInGround() < 150;
+      let type = foodTight ? 'archer' : (militia < archers * 2 ? 'militia' : 'archer');
       if (!this.affordUnit(type, r)) {
         const other = type === 'militia' ? 'archer' : 'militia';
         if (!this.affordUnit(other, r)) break;
         type = other;
       }
-      // Leave the TC enough food to keep making villagers early on.
-      if (type === 'militia' && villagers < 12 &&
+      // Leave the TC enough food to keep making villagers while still growing.
+      if (type === 'militia' && villagers < villTarget &&
           r.food < UNIT_STATS.militia.cost.food + UNIT_STATS.villager.cost.food) {
         continue;
       }
@@ -995,6 +1160,9 @@ class EnemyAI {
     this.waveNumber++;
     this.stats.wavesLaunched++;
     this.stats.lastWaveSize = units.length;
+    this.stats.waveLog.push({ t: Math.round(w.time), size: units.length });
+    // Schedule the next beat from this launch, so the cadence is steady.
+    this.nextWaveTime = w.time + this.waveInterval();
     this.command(units, { type: 'attack', target, gx: target.x, gy: target.y });
   }
 
@@ -1024,10 +1192,12 @@ class EnemyAI {
     }
 
     if (w.time - wave.launchedAt > WAVE_TIMEOUT) {
+      // Grinding without result — come home. The next wave stays on the beat
+      // set at launch; only a wipe earns a longer pause.
       const s = this.staging || this.home;
       this.command(alive, { type: 'move', gx: s.x, gy: s.y });
       this.wave = null;
-      this.nextWaveTime = w.time + this.waveInterval();
+      this.nextWaveTime = Math.max(this.nextWaveTime, w.time + WAVE_BREATHER);
       return;
     }
 
@@ -1037,8 +1207,9 @@ class EnemyAI {
       const cy = alive.reduce((a, u) => a + u.y, 0) / alive.length;
       const next = this.chooseWaveTarget({ x: cx, y: cy });
       if (!next) {
+        // Nothing of theirs left standing anywhere. Regroup and look again.
         this.wave = null;
-        this.nextWaveTime = w.time + this.waveInterval();
+        this.nextWaveTime = Math.max(this.nextWaveTime, w.time + WAVE_BREATHER);
         return;
       }
       wave.target = next;
@@ -1078,9 +1249,8 @@ class EnemyAI {
     if (this.wave && !this.wave.arrived && min <= 10) {
       this.wave.arrived = true;
       this.stats.wavesReachedBase++;
-      // A wave that has landed sets the clock for the next one.
-      this.nextWaveTime = Math.max(this.nextWaveTime, w.time + this.waveInterval());
     }
+    void w;
     void edgeDist; // kept for callers that need footprint-aware distance
   }
 }
