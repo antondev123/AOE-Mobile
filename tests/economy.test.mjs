@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 
 import {
   createWorld, ownedBy, recomputePop, canPlace, spawnUnit, removeEntity,
+  spawnBuilding, setBlocked,
 } from '../src/core/world.js';
 import { generateMap } from '../src/core/mapgen.js';
 import { EV } from '../src/core/events.js';
@@ -22,6 +23,7 @@ import {
   gatherTick, depositCarry, buildTick, updateEconomy,
   nearestDropoff, acceptsDropoff, gatherRateFor,
   isGatherableBuilding, gatherableBuildings, canGatherFrom, providesOf,
+  canPlaceReachable,
 } from '../src/systems/economy.js';
 
 // --- tiny harness -----------------------------------------------------------
@@ -617,6 +619,119 @@ test('updateEconomy keeps pop and cap honest every step', () => {
   updateEconomy(world, SIM_DT);
   assert.equal(p.pop, pop + 1);
   assert.equal(p.popCap, cap);
+});
+
+// --- placement reachability (B1) --------------------------------------------
+//
+// The ghost went green for a farm that closed the last gap around a one-tile
+// hole with eight villagers standing in it. canPlace() only ever asked whether
+// the ground was empty.
+
+/**
+ * The base from the B1 report, on bare ground:
+ *
+ *   y=8   ..#####...
+ *   y=9   ..#####...
+ *   y=10  ..##.##...   <- (9,10), where the villagers stand
+ *   y=11  ..##......   <- their only way out, until a farm goes in at (10,12)
+ */
+function entombmentBase() {
+  const world = createWorld(2468);
+  spawnBuilding(world, 'towncenter', PLAYER, 8.5, 8.5);
+  spawnBuilding(world, 'house', PLAYER, 11, 8);
+  spawnBuilding(world, 'house', PLAYER, 8, 11);
+  spawnBuilding(world, 'farm', PLAYER, 11, 10);
+  recomputePop(world, PLAYER);
+  return world;
+}
+
+test('canPlaceReachable refuses the placement that entombs your own villagers', () => {
+  const world = entombmentBase();
+  for (let i = 0; i < 8; i++) spawnUnit(world, 'villager', PLAYER, 9.5, 10.5);
+  recomputePop(world, PLAYER);
+
+  // canPlace is perfectly happy: the ground is empty, in bounds and dry.
+  assert.equal(canPlace(world, 10, 12, 2, 2), true, 'the tiles themselves are free');
+  assert.equal(canPlaceReachable(world, PLAYER, 'farm', 10, 12), false,
+    'but it would seal the pocket the villagers are standing in');
+});
+
+test('placeFoundation refuses it too, charges nothing, and says why', () => {
+  const world = entombmentBase();
+  for (let i = 0; i < 8; i++) spawnUnit(world, 'villager', PLAYER, 9.5, 10.5);
+  recomputePop(world, PLAYER);
+  const p = world.players[PLAYER];
+  const toasts = record(world, EV.TOAST);
+  const woodBefore = p.resources.wood;
+  const buildingsBefore = world.buildings.length;
+
+  assert.equal(placeFoundation(world, PLAYER, 'farm', 10, 12), null);
+  assert.equal(p.resources.wood, woodBefore, 'a refused placement charges nothing');
+  assert.equal(world.buildings.length, buildingsBefore, 'and puts nothing on the map');
+  assert.equal(toasts.length, 1, 'the player is told why the tap did nothing');
+  assert.match(toasts[0].text, /trap/i, `unhelpful message: ${toasts[0].text}`);
+  // hud.js swallows anything not tagged `warn` while an alert is on screen, and
+  // this message is the player's only explanation.
+  assert.equal(toasts[0].tone, 'warn');
+});
+
+test('with nobody in the pocket the same placement is allowed', () => {
+  const world = entombmentBase();
+  spawnUnit(world, 'villager', PLAYER, 13.5, 12.5);
+  recomputePop(world, PLAYER);
+  assert.equal(canPlaceReachable(world, PLAYER, 'farm', 10, 12), true,
+    'sealing an empty hole traps nobody, so it is not the rules\' business');
+  assert.ok(placeFoundation(world, PLAYER, 'farm', 10, 12));
+});
+
+test('ordinary building goes up, and walling is still legal', () => {
+  const { world, tc } = setup();
+  const spot = findSpot(world, tc, BUILDING_STATS.house.fw, BUILDING_STATS.house.fh);
+  assert.equal(canPlaceReachable(world, PLAYER, 'house', spot.gx, spot.gy), true,
+    'a normal house near the Town Center must not be refused');
+
+  // A long wall of houses across open ground cuts the map in two. Both halves
+  // are enormous, so nobody is trapped and the placement must go through — over
+  // -restricting placement would be its own bug.
+  const w2 = createWorld(1357);
+  spawnBuilding(w2, 'towncenter', PLAYER, 8.5, 8.5);
+  spawnUnit(w2, 'villager', PLAYER, 12.5, 12.5);
+  recomputePop(w2, PLAYER);
+  for (let y = 0; y < 46; y += 2) setBlocked(w2, 24, y, 1, 999), setBlocked(w2, 25, y, 1, 999);
+  for (let y = 0; y < 46; y += 2) setBlocked(w2, 24, y + 1, 1, 999), setBlocked(w2, 25, y + 1, 1, 999);
+  assert.equal(canPlaceReachable(w2, PLAYER, 'house', 25, 47), true,
+    'closing off half the map traps nobody and must stay allowed');
+});
+
+test('a placement that seals the last exit of a Town Center is refused', () => {
+  const world = createWorld(864);
+  const tc = spawnBuilding(world, 'towncenter', PLAYER, 20.5, 20.5); // tiles 19..21
+  recomputePop(world, PLAYER);
+  // Wall the Town Center in except for a 2x2 doorway running east to the field.
+  const doorway = (x, y) => x >= 22 && x <= 24 && y >= 19 && y <= 20;
+  for (let y = 17; y <= 24; y++) {
+    for (let x = 17; x <= 24; x++) {
+      if (x >= 19 && x <= 21 && y >= 19 && y <= 21) continue; // the footprint
+      if (doorway(x, y)) continue;
+      setBlocked(world, x, y, 1, 999);
+    }
+  }
+  assert.equal(tc.complete, true);
+  // A house exactly fills the doorway: canPlace is happy, the ground is free.
+  assert.equal(canPlace(world, 23, 20, 2, 2), true);
+  assert.equal(canPlaceReachable(world, PLAYER, 'house', 23, 20), false,
+    'plugging the last doorway would strand every unit the Town Center trains');
+  const toasts = record(world, EV.TOAST);
+  assert.equal(placeFoundation(world, PLAYER, 'house', 23, 20), null);
+  assert.match(toasts[0].text, /Town Center/i);
+});
+
+test('canPlaceReachable still says no to the things canPlace says no to', () => {
+  const { world, tc } = setup();
+  assert.equal(canPlaceReachable(world, PLAYER, 'house', Math.round(tc.x), Math.round(tc.y)), false,
+    'on top of a building');
+  assert.equal(canPlaceReachable(world, PLAYER, 'house', 0, 0), false, 'off the map edge');
+  assert.equal(canPlaceReachable(world, PLAYER, 'nosuchbuilding', 10, 10), false, 'unknown type');
 });
 
 // --- summary ----------------------------------------------------------------

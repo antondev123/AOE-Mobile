@@ -318,12 +318,11 @@ function solidAt(world, i, extra) {
  *   limit        stop after this many tiles (default POCKET_LIMIT)
  *   extraBlocked Set of tile indices to treat as solid — "what if I built here"
  *   goal         { x, y } to look for while filling
- *   collect      also return the tile indices as a Set
  *
- * Returns { size, open, reachedGoal, tiles }.
+ * Returns { size, open, reachedGoal }.
  *   `open` — the fill hit `limit`, so this is map-sized ground, not a pocket.
- *            When it is true the fill stopped early and `size`/`tiles` are
- *            truncated and `reachedGoal` is not meaningful.
+ *            When it is true the fill stopped early, so `size` is truncated and
+ *            `reachedGoal` is not meaningful.
  *   `size` 0 means (tx,ty) is itself solid: there is no region to speak of.
  */
 export function floodRegion(world, tx, ty, opts = {}) {
@@ -331,16 +330,10 @@ export function floodRegion(world, tx, ty, opts = {}) {
   const H = world.height;
   const limit = opts.limit == null ? POCKET_LIMIT : opts.limit;
   const extra = opts.extraBlocked || null;
-  const collect = !!opts.collect;
   const gtx = opts.goal ? Math.floor(opts.goal.x) : -1;
   const gty = opts.goal ? Math.floor(opts.goal.y) : -1;
 
-  const out = {
-    size: 0,
-    open: false,
-    reachedGoal: false,
-    tiles: collect ? new Set() : null,
-  };
+  const out = { size: 0, open: false, reachedGoal: false };
 
   const x0 = Math.floor(tx);
   const y0 = Math.floor(ty);
@@ -359,7 +352,6 @@ export function floodRegion(world, tx, ty, opts = {}) {
   while (head < tail) {
     const cur = queue[head++];
     out.size++;
-    if (collect) out.tiles.add(cur);
     const cx = cur % W;
     const cy = (cur - cx) / W;
     if (cx === gtx && cy === gty) out.reachedGoal = true;

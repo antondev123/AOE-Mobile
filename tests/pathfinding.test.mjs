@@ -8,6 +8,8 @@ import { createWorld, setBlocked, spawnBuilding, spawnResource } from '../src/co
 import { generateMap } from '../src/core/mapgen.js';
 import {
   findPath, findAdjacentStandTile, isWalkable, nearestWalkable, pathStats,
+  floodRegion, isPocket, isSealedFrom, pointsSealedBy, hasOpenPerimeter,
+  POCKET_LIMIT,
 } from '../src/systems/pathfinding.js';
 
 // --- Micro test framework ---------------------------------------------------
@@ -324,6 +326,133 @@ test('the same-tick memo answers repeated group orders for free', () => {
   const mid = pathStats.searches;
   findPath(w, 10.5, 25.5, 30.5, 25.5);
   assert(pathStats.searches > mid, 'a new tick must re-plan');
+});
+
+// --- Enclosure --------------------------------------------------------------
+//
+// Regression cover for B1: eight villagers sealed into a one-tile pocket by the
+// player's own houses and farms, with no way for the planner to say so.
+
+/**
+ * The base from the B1 report, reconstructed tile for tile.
+ *
+ *   y=8   ..#####...
+ *   y=9   ..#####...
+ *   y=10  ..##.##...   <- (9,10) is the pocket
+ *   y=11  ..##......
+ *
+ * Returns the world *before* the sealing farm goes in: (9,10) still has a way
+ * out to the south through (9,11).
+ */
+function entombmentBase() {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', 0, 8.5, 8.5); // tiles 7..9 x 7..9
+  spawnBuilding(w, 'house', 0, 11, 8);         // tiles 10..11 x 7..8
+  spawnBuilding(w, 'house', 0, 8, 11);         // tiles 7..8  x 10..11
+  spawnBuilding(w, 'farm', 0, 11, 10);         // tiles 10..11 x 9..10
+  return w;
+}
+
+/** The footprint of the farm that closes the last gap: tiles 9..10 x 11..12. */
+const SEALING_FARM = [[9, 11], [10, 11], [9, 12], [10, 12]];
+
+test('the reported base really does leave one free tile, with a way out', () => {
+  const w = entombmentBase();
+  const row = (y) => {
+    let s = '';
+    for (let x = 5; x <= 14; x++) s += isWalkable(w, x, y) ? '.' : '#';
+    return s;
+  };
+  eq(row(8), '..#####...', 'y=8');
+  eq(row(9), '..#####...', 'y=9');
+  eq(row(10), '..##.##...', 'y=10 — (9,10) is the only free tile in the ring');
+  eq(row(11), '..##......', 'y=11 still open');
+  assert(!isPocket(w, 9.5, 10.5), '(9,10) is not yet a pocket — it can reach the map');
+});
+
+test('floodRegion tells a one-tile pocket from open ground', () => {
+  const w = blankWorld();
+  wall(w, 20, 20, 22, 22);
+  setBlocked(w, 21, 21, 0);
+  const pocket = floodRegion(w, 21, 21);
+  eq(pocket.size, 1, 'the hole is exactly one tile');
+  eq(pocket.open, false, 'and it is not open ground');
+  assert(isPocket(w, 21.5, 21.5), 'isPocket should say so');
+
+  const field = floodRegion(w, 5, 5);
+  eq(field.open, true, 'open ground stops at the limit rather than enumerating the map');
+  assert(!isPocket(w, 5.5, 5.5), 'open ground is never a pocket');
+  eq(floodRegion(w, 20, 20).size, 0, 'a solid tile has no region at all');
+});
+
+test('a large walled compound is not a pocket — walling stays legal', () => {
+  const w = blankWorld();
+  // A 14x14 enclosure: 196 free tiles inside, comfortably over the limit.
+  wall(w, 10, 10, 25, 25);
+  for (let y = 11; y <= 24; y++) for (let x = 11; x <= 24; x++) setBlocked(w, x, y, 0);
+  assert(196 > POCKET_LIMIT, 'the fixture must be bigger than the pocket limit');
+  assert(!isPocket(w, 17.5, 17.5), 'a base-sized enclosure must never count as a trap');
+  assert(isSealedFrom(w, 17.5, 17.5, 40.5, 40.5) === false,
+    'and a unit inside it is not reported as entombed');
+});
+
+test('isSealedFrom is the honest answer findPath cannot give', () => {
+  const w = entombmentBase();
+  for (const [tx, ty] of SEALING_FARM) setBlocked(w, tx, ty, 1, 4242);
+  assert(isPocket(w, 9.5, 10.5), '(9,10) is now a sealed pocket');
+  assert(isSealedFrom(w, 9.5, 10.5, 30.5, 30.5), 'and it cannot reach the rest of the map');
+  eq(findPath(w, 9.5, 10.5, 30.5, 30.5), null, 'findPath has nothing to offer either');
+  // The goal being inside the pocket with you is not being sealed away from it.
+  assert(!isSealedFrom(w, 9.5, 10.5, 9.5, 10.5), 'the pocket is not sealed from itself');
+});
+
+test('pointsSealedBy catches the farm that entombs eight villagers', () => {
+  const w = entombmentBase();
+  const inPocket = [{ x: 9.5, y: 10.5 }];
+  const outside = [{ x: 13.5, y: 12.5 }];
+  eq(pointsSealedBy(w, SEALING_FARM, inPocket).length, 1, 'the placement seals the pocket');
+  eq(pointsSealedBy(w, SEALING_FARM, outside).length, 0, 'it does not seal open ground');
+  eq(pointsSealedBy(w, [[40, 40], [41, 40]], inPocket).length, 0,
+    'an unrelated placement across the map seals nobody');
+});
+
+test('pointsSealedBy blames only the new building, never an existing pocket', () => {
+  const w = entombmentBase();
+  for (const [tx, ty] of SEALING_FARM) setBlocked(w, tx, ty, 1, 4242);
+  const stuck = [{ x: 9.5, y: 10.5 }];
+  assert(isPocket(w, 9.5, 10.5), 'the villager is already sealed in');
+  eq(pointsSealedBy(w, [[30, 30], [31, 30]], stuck).length, 0,
+    'a later placement elsewhere must not be refused over an existing pocket');
+});
+
+test('hasOpenPerimeter sees when a building loses its last exit', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', 0, 20.5, 20.5); // tiles 19..21
+  assert(hasOpenPerimeter(w, tc.tiles), 'a Town Center in a field has plenty of exits');
+  // Box it in completely, leaving one free tile in the wall against its corner.
+  wall(w, 17, 17, 23, 23);
+  setBlocked(w, 18, 18, 0);
+  assert(!hasOpenPerimeter(w, tc.tiles),
+    'a single walled-off corner tile is not a way out');
+});
+
+test('a stand tile the caller cannot reach is never offered', () => {
+  // Straight from the report: the free tile inside the pocket was the *closest*
+  // tile to the Town Center's south side, so every villager hauling food home
+  // was routed into a wall and froze there — even the ones outside the pocket.
+  const w = entombmentBase();
+  for (const [tx, ty] of SEALING_FARM) setBlocked(w, tx, ty, 1, 4242);
+  const tc = w.buildings.find((b) => b.type === 'towncenter');
+  const stand = findAdjacentStandTile(w, tc, 13.5, 12.5);
+  assert(stand, 'the Town Center still has reachable sides');
+  assert(!(stand.tx === 9 && stand.ty === 10), 'must not pick the sealed pocket tile');
+  const p = findPath(w, 13.5, 12.5, stand.x, stand.y);
+  assert(p && !p.partial, 'the offered stand tile must actually be walkable to');
+
+  // ...but a villager already inside the pocket may of course stand there.
+  const inside = findAdjacentStandTile(w, tc, 9.5, 10.5);
+  assert(inside && inside.tx === 9 && inside.ty === 10,
+    'a unit in the pocket is not sealed away from its own tile');
 });
 
 // --- Summary ----------------------------------------------------------------

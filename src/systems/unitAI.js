@@ -375,6 +375,7 @@ function stopUnit(u) {
   u.aiFails = 0;
   u.aiAnchorT = undefined;
   u.aiTrapped = false;
+  u.aiTrappedJob = null;
 }
 
 /** Begin a task and start moving in the same step the order was given. */
@@ -385,6 +386,7 @@ function setTask(world, u, task, ctx, destX, destY) {
   u.aiFails = 0;
   u.repathTimer = 0;
   u.aiAnchorT = undefined;
+  u.aiTrappedJob = null;
   if (destX !== undefined && destY !== undefined) {
     requestPath(world, u, destX, destY, ctx, true);
     u.state = 'move';
@@ -714,7 +716,12 @@ function stepUnit(world, u, dt, ctx) {
   if (u.aiTrapped) {
     if (world.time >= (u.aiTrappedCheck || 0)) {
       u.aiTrappedCheck = world.time + TRAPPED_RECHECK;
-      if (!isPocket(world, u.x, u.y)) u.aiTrapped = false;
+      if (!isPocket(world, u.x, u.y)) {
+        u.aiTrapped = false;
+        const job = u.aiTrappedJob;
+        u.aiTrappedJob = null;
+        if (job && !u.task && (!job.target || !job.target.dead)) commandUnits(world, [u], job);
+      }
     }
     if (u.aiTrapped && !u.task && !u.target) {
       u.state = 'idle';
@@ -858,6 +865,10 @@ function tickEvict(world, u, dt) {
 function markTrapped(world, u) {
   u.aiTrapped = true;
   u.aiTrappedCheck = world.time + TRAPPED_RECHECK;
+  // Remember the job so freeing the villager puts it straight back to work. It
+  // never chose to stop, and making the player re-task a villager they just dug
+  // out is a second punishment for the same mistake.
+  u.aiTrappedJob = trappedJobOf(u.task);
   releaseNode(u);
   u.task = null;
   u.target = null;
@@ -865,6 +876,22 @@ function markTrapped(world, u) {
   u.state = 'idle';
   u.aiFails = 0;
   u.aiGoal = null;
+}
+
+/** The order that would resume `task`, or null if there is nothing to resume. */
+function trappedJobOf(task) {
+  if (!task) return null;
+  switch (task.type) {
+    case 'gather':
+      return task.node ? { type: 'gather', target: task.node, gx: task.node.x, gy: task.node.y } : null;
+    case 'build':
+      return task.building ? { type: 'build', target: task.building } : null;
+    case 'move':
+    case 'patrol':
+      return { type: 'move', gx: task.gx, gy: task.gy };
+    default:
+      return null;
+  }
 }
 
 /**

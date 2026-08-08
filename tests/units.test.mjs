@@ -14,6 +14,7 @@ import { generateMap } from '../src/core/mapgen.js';
 import { updateEconomy, queueTrain, placeFoundation } from '../src/systems/economy.js';
 import { updateCombat } from '../src/systems/combat.js';
 import { commandUnits, updateUnits, isIdle } from '../src/systems/unitAI.js';
+import { isWalkable } from '../src/systems/pathfinding.js';
 
 // --- Micro test framework ---------------------------------------------------
 
@@ -899,6 +900,273 @@ test('a busy crowd stays well inside the sim step budget', () => {
   assert(wood > 250, `the crowd should still be banking wood (had ${wood})`);
   const stranded = vils.filter((v) => isIdle(v));
   assert(stranded.length === 0, `${stranded.length} villagers were left standing idle`);
+});
+
+// --- Entombment (B1) --------------------------------------------------------
+//
+// Found in ordinary play, building houses and farms around the Town Center:
+// eight of eighteen villagers ended up sealed in a one-tile pocket built
+// entirely from the player's own buildings. findPath returned null, move orders
+// did nothing, and because they never went idle the idle-villager button never
+// surfaced them. The stockpile did not move by a single unit for eight minutes.
+
+/**
+ * The base from the report, reconstructed tile for tile (x = 5..14):
+ *
+ *   y=8   ..#####...
+ *   y=9   ..#####...
+ *   y=10  ..##.##...   <- (9,10) is where the villagers stand
+ *   y=11  ..##......   <- the way out, until a farm is placed at (10,12)
+ *
+ * Occupants match the dump: 9,9 = towncenter, 8,10 = house, 10,10 = farm.
+ * Berries and a second villager crew sit east of it so the stockpile has
+ * somewhere to come from.
+ */
+function entombmentWorld(pocketVillagers = 8, freeVillagers = 3) {
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 8.5, 8.5); // tiles 7..9 x 7..9
+  spawnBuilding(w, 'house', PLAYER, 11, 8);         // tiles 10..11 x 7..8
+  spawnBuilding(w, 'house', PLAYER, 8, 11);         // tiles 7..8  x 10..11
+  spawnBuilding(w, 'farm', PLAYER, 11, 10);         // tiles 10..11 x 9..10
+  for (let i = 0; i < 6; i++) spawnResource(w, 'berry', 14 + (i % 3), 14 + Math.floor(i / 3));
+  const pocket = [];
+  for (let i = 0; i < pocketVillagers; i++) pocket.push(spawnUnit(w, 'villager', PLAYER, 9.5, 10.5));
+  const free = [];
+  for (let i = 0; i < freeVillagers; i++) free.push(spawnUnit(w, 'villager', PLAYER, 13.5, 12.5));
+  recomputePop(w, PLAYER);
+  reindex(w);
+  return { w, pocket, free };
+}
+
+function walkableRow(w, y, x0 = 5, x1 = 14) {
+  let s = '';
+  for (let x = x0; x <= x1; x++) s += w.blocked[y * w.width + x] ? '#' : '.';
+  return s;
+}
+
+test('the entombing placement is refused, and the economy keeps running', () => {
+  const { w, pocket, free } = entombmentWorld();
+  eq(walkableRow(w, 10), '..##.##...', 'the fixture must match the reported dump');
+
+  const toasts = [];
+  w.events.on(EV.TOAST, (p) => toasts.push(p.text));
+  const woodBefore = w.players[PLAYER].resources.wood;
+
+  // The farm the player placed to close the ring.
+  const sealed = placeFoundation(w, PLAYER, 'farm', 10, 12);
+  eq(sealed, null, 'the placement that seals eight villagers in must be refused');
+  eq(w.players[PLAYER].resources.wood, woodBefore, 'and must not charge for it');
+  assert(toasts.some((t) => /trap/i.test(t)), `no honest explanation given: ${toasts}`);
+  eq(walkableRow(w, 11), '..##......', 'the way out is still open');
+
+  // Everyone goes to work; the stockpile must keep climbing.
+  const berry = w.resources[0];
+  commandUnits(w, pocket.concat(free), { type: 'gather', target: berry, gx: berry.x, gy: berry.y });
+  const food0 = w.players[PLAYER].resources.food;
+  step(w, 600); // 30s
+  const food1 = w.players[PLAYER].resources.food;
+  step(w, 1400); // to 100s — comfortably past the eight minutes it used to freeze for
+  const food2 = w.players[PLAYER].resources.food;
+  assert(food1 > food0, `food stalled in the first 30s (${food0} -> ${food1})`);
+  assert(food2 > food1 + 100, `food stopped climbing (${food1} -> ${food2})`);
+
+  // And nobody is left wedged against a wall pretending to be busy.
+  const wedged = pocket.filter((u) => u.state === 'move' && (u.aiStuck || 0) > 2);
+  eq(wedged.length, 0, `${wedged.length} villagers are grinding against a wall`);
+});
+
+test('a villager sealed in anyway ends up idle, not silently stuck forever', () => {
+  // Placement is guarded now, so this is the case that remains: something else
+  // closed the pocket (an enemy building, a wall finished around it).
+  const w = blankWorld();
+  wall(w, 20, 20, 22, 22);
+  setBlocked(w, 21, 21, 0);
+  const u = spawnUnit(w, 'villager', PLAYER, 21.5, 21.5);
+  // A woodline, not a lone tree: with somewhere else to retarget to, the
+  // recovery path used to hand the villager a fresh unreachable destination
+  // every few seconds, forever, and it never once reported itself idle.
+  const tree = spawnResource(w, 'tree', 30, 30);
+  for (let i = 0; i < 12; i++) spawnResource(w, 'tree', 28 + (i % 4), 28 + Math.floor(i / 4));
+  spawnBuilding(w, 'towncenter', PLAYER, 35.5, 35.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, [u], { type: 'gather', target: tree, gx: tree.x, gy: tree.y });
+  const at = { x: u.x, y: u.y };
+
+  // Bounded time to give up: a few seconds, not a match.
+  const gaveUp = stepUntil(w, 400, () => isIdle(u));
+  assert(gaveUp > 0, 'a villager that cannot reach its work must go idle so the HUD surfaces it');
+
+  // ...and it stays that way rather than cycling A* against the wall forever.
+  step(w, 1200); // a full minute
+  assert(isIdle(u), 'it must not quietly re-adopt the same impossible errand');
+  eq(u.state, 'idle', 'and it must report itself idle, not "move"');
+  assert(dist(u, at) < 1.0, 'it must not teleport out of the pocket');
+  assert(isWalkable(w, u.x, u.y), 'nor end up standing inside a wall');
+});
+
+test('an unreachable destination accumulates stuck time instead of pinning it at zero', () => {
+  // The hole this closes: a unit whose path came back empty has no waypoint to
+  // measure progress against, so stuck time reset every frame and no recovery
+  // path in the file ever fired.
+  const w = blankWorld();
+  wall(w, 20, 20, 22, 22);
+  setBlocked(w, 21, 21, 0);
+  const u = spawnUnit(w, 'villager', PLAYER, 21.5, 21.5);
+  for (let i = 0; i < 12; i++) spawnResource(w, 'berry', 28 + (i % 4), 28 + Math.floor(i / 4));
+  spawnBuilding(w, 'towncenter', PLAYER, 35.5, 35.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, [u], { type: 'gather', target: w.resources[0], gx: 28.5, gy: 28.5 });
+  eq(u.path && u.path.length, null, 'there is no path to walk');
+
+  // Escalation must happen, and it must be *terminal*: the unit may not be
+  // handed another impossible destination for the rest of the match.
+  let escalated = false;
+  let searches = 0;
+  for (let i = 0; i < 2400; i++) {
+    step(w);
+    if (u.state === 'move') searches++;
+    if ((u.aiStuck || 0) > 0.3 || isIdle(u)) escalated = true;
+    if (isIdle(u) && i > 400) break;
+  }
+  assert(escalated, 'stuck time stayed pinned at zero — the unit is invisible again');
+  assert(isIdle(u), 'the unit must end up genuinely idle, not cycling forever');
+  assert(searches < 200,
+    `spent ${searches} steps re-planning against a wall — it never gave up`);
+});
+
+test('a villager freed from its pocket goes back to work by itself', () => {
+  const w = blankWorld();
+  wall(w, 20, 20, 22, 22);
+  setBlocked(w, 21, 21, 0);
+  const u = spawnUnit(w, 'villager', PLAYER, 21.5, 21.5);
+  spawnResource(w, 'tree', 26, 21);
+  spawnBuilding(w, 'towncenter', PLAYER, 30.5, 21.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, [u], { type: 'gather', target: w.resources[0], gx: 26.5, gy: 21.5 });
+  assert(stepUntil(w, 200, () => isIdle(u)) > 0, 'sealed in, so idle');
+
+  // Knock a hole in the wall — a demolished or destroyed building.
+  setBlocked(w, 22, 21, 0);
+  reindex(w);
+  const back = stepUntil(w, 400, () => !isIdle(u));
+  assert(back > 0, 'it should pick its job back up without a new order');
+  assert(stepUntil(w, 1200, () => w.players[PLAYER].resources.wood > 250) > 0,
+    'and actually deliver wood again');
+});
+
+test('a building raised on top of a villager pushes it out rather than freezing it', () => {
+  const w = blankWorld();
+  const u = spawnUnit(w, 'villager', PLAYER, 20.5, 20.5);
+  reindex(w);
+  commandUnits(w, [u], { type: 'move', gx: 30.5, gy: 20.5 });
+  // The house lands on the tile the villager is standing on.
+  spawnBuilding(w, 'house', PLAYER, 21, 21); // tiles 20..21 x 20..21
+  reindex(w);
+
+  const out = stepUntil(w, 100, () => isWalkable(w, u.x, u.y));
+  assert(out > 0, 'the villager must walk out from under the new roof');
+  assert(out > 1, 'and walk, not blink — no teleporting');
+  const arrived = stepUntil(w, 400, () => Math.hypot(u.x - 30.5, u.y - 20.5) < 1.0);
+  assert(arrived > 0, 'then carry on with the order it was given');
+});
+
+// --- Crowds (N1, N2) --------------------------------------------------------
+
+test('twenty-four villagers ordered to one tile all settle', () => {
+  const w = blankWorld();
+  const vils = [];
+  for (let i = 0; i < 24; i++) {
+    vils.push(spawnUnit(w, 'villager', PLAYER, 10.5 + (i % 6) * 0.9, 10.5 + Math.floor(i / 6) * 0.9));
+  }
+  reindex(w);
+  commandUnits(w, vils, { type: 'move', gx: 25.5, gy: 25.5 });
+
+  const settled = stepUntil(w, 900, () => vils.every((u) => u.state === 'idle'));
+  assert(settled > 0, `${vils.filter((u) => u.state !== 'idle').length} villagers never stopped orbiting`);
+  assert(settled * SIM_DT < 30, `took ${(settled * SIM_DT).toFixed(1)}s to settle`);
+
+  // Settled means settled: no permanent shuffle once they are there.
+  const at = vils.map((u) => ({ x: u.x, y: u.y }));
+  step(w, 200);
+  const drift = Math.max(...vils.map((u, i) => dist(u, at[i])));
+  assert(drift < 0.5, `arrived villagers drifted ${drift.toFixed(2)} tiles`);
+  // ...and they are spread over the destination, not stacked on one point.
+  for (let i = 0; i < vils.length; i++) {
+    for (let j = i + 1; j < vils.length; j++) {
+      assert(dist(vils[i], vils[j]) > 0.05, 'two villagers ended up occupying the same spot');
+    }
+  }
+});
+
+test('sixteen villagers on one bush keep the food coming', () => {
+  // The two most natural phone actions in the game — select-all then tap the
+  // berries, and rallying the Town Center onto them — both land every villager
+  // you own on a single node. It used to collapse to 0.36 food per villager per
+  // second with twenty-second windows of no income at all.
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10.5, 10.5);
+  const bushes = [];
+  for (let y = 8; y <= 13; y++) {
+    for (let x = 16; x <= 18; x++) bushes.push(spawnResource(w, 'berry', x, y));
+  }
+  const vils = [];
+  for (let i = 0; i < 16; i++) {
+    vils.push(spawnUnit(w, 'villager', PLAYER, 7.5 + (i % 4) * 0.7, 8.5 + Math.floor(i / 4) * 0.7));
+  }
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  // One tap, on the nearest bush, with everybody selected.
+  let bush = bushes[0];
+  for (const b of bushes) if (dist(b, { x: 10.5, y: 10.5 }) < dist(bush, { x: 10.5, y: 10.5 })) bush = b;
+  commandUnits(w, vils, { type: 'gather', target: bush, gx: bush.x, gy: bush.y });
+
+  const SECONDS = 160;
+  const food = [];
+  for (let s = 0; s <= SECONDS / SIM_DT; s++) {
+    food.push(w.players[PLAYER].resources.food);
+    step(w);
+  }
+  const at = (t) => food[Math.round(t / SIM_DT)];
+
+  // Sustained rate, measured once the first trips have landed.
+  const perVillager = (at(SECONDS) - at(20)) / (SECONDS - 20) / vils.length;
+  assert(perVillager > 1.05,
+    `only ${perVillager.toFixed(2)} food per villager per second (was 0.93 before the fix)`);
+
+  // No long dead windows, and never the whole crew walking with nothing coming in.
+  let worstZero = 0;
+  let run = 0;
+  for (let i = Math.round(20 / SIM_DT) + 1; i < food.length; i++) {
+    if (food[i] === food[i - 1]) { run += SIM_DT; worstZero = Math.max(worstZero, run); } else run = 0;
+  }
+  assert(worstZero < 20, `${worstZero.toFixed(1)}s window with no income at all`);
+
+  // The crowd is spread over the patch rather than queueing on the tapped bush.
+  const onTapped = vils.filter((u) => u.task && u.task.node === bush).length;
+  assert(onTapped < vils.length, 'every villager is still stacked on one bush');
+});
+
+test('a small group still goes exactly where it was told', () => {
+  // The spill must not hijack the order: three villagers tapped onto a bush go
+  // to *that* bush, even with an emptier one closer to them.
+  const w = blankWorld();
+  spawnBuilding(w, 'towncenter', PLAYER, 10.5, 10.5);
+  spawnResource(w, 'berry', 12, 10);        // nearer to the villagers
+  const tapped = spawnResource(w, 'berry', 18, 10);
+  const vils = [];
+  for (let i = 0; i < 3; i++) vils.push(spawnUnit(w, 'villager', PLAYER, 10.5, 12.5 + i * 0.8));
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, vils, { type: 'gather', target: tapped, gx: tapped.x, gy: tapped.y });
+  for (const u of vils) eq(u.task.node, tapped, 'the tap is the order');
 });
 
 // --- Summary ----------------------------------------------------------------
