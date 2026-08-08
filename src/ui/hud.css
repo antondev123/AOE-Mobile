@@ -435,7 +435,24 @@ body {
 }
 
 .sel-panel { flex: 0 0 40%; max-width: 168px; overflow: hidden; }
-.cmd-panel { flex: 1 1 auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 5px; }
+/* Capped and scrolling. A Barracks in the Castle Age offers four upgrades on
+   top of two units, a queue row and a rally line, and without a ceiling the
+   bottom bar grew until it owned two thirds of the screen — which is the one
+   thing the whole HUD budget exists to prevent. 40vh is about as tall as this
+   panel may get before the map stops being the game. */
+.cmd-panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 5px;
+  max-height: 40vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* "3 further upgrades unlock behind these" — a full-width footnote, never a
+   button, so it can never be mistaken for something to tap. */
+.research-more { flex: 1 1 100%; font-size: 10px; opacity: 0.8; }
 
 .sel-empty {
   color: var(--parch-dim);

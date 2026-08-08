@@ -695,6 +695,28 @@ test('researchOptions describes every tech at a building, done ones included', (
   assert.equal(researchOptions(w, PLAYER, lumber)[0].status, 'done');
 });
 
+test('researchOptions separates an age lock from a prerequisite lock', () => {
+  // The HUD shows the first and folds away the second, so getting these the
+  // wrong way round either hides what the next age buys or fills a phone panel
+  // with four tiers of the same upgrade line.
+  const { w, lumber } = techWorld();
+  let byId = Object.fromEntries(researchOptions(w, PLAYER, lumber).map((o) => [o.id, o]));
+  assert.equal(byId.doublebitaxe.gate, 'age', 'tier one is behind the Feudal Age');
+  assert.equal(byId.bowsaw.gate, 'prereq',
+    'tier two is behind tier one, even though it is also behind the Castle Age');
+
+  grant(w, PLAYER, 'feudal_age');
+  grant(w, PLAYER, 'doublebitaxe');
+  byId = Object.fromEntries(researchOptions(w, PLAYER, lumber).map((o) => [o.id, o]));
+  assert.equal(byId.doublebitaxe.status, 'done');
+  assert.equal(byId.bowsaw.gate, 'age', 'with its prerequisite done, only the age is left');
+
+  grant(w, PLAYER, 'castle_age');
+  byId = Object.fromEntries(researchOptions(w, PLAYER, lumber).map((o) => [o.id, o]));
+  assert.equal(byId.bowsaw.gate, null);
+  assert.equal(byId.bowsaw.status, 'ready');
+});
+
 test('researchOptions marks affordable-but-broke as poor, not locked', () => {
   const { w, lumber, p } = techWorld();
   grant(w, PLAYER, 'feudal_age');

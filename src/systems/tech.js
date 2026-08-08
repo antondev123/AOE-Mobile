@@ -805,6 +805,14 @@ export function updateResearch(world, dt) {
  *   'ready'     affordable and startable
  *   'poor'      allowed, but the stockpile is short
  *   'locked'    the wrong age, or a prerequisite is missing
+ *
+ * `gate` says *which* of those two locked it — 'age' or 'prereq' — and the HUD
+ * treats them very differently. An age-locked tech is shown, because the list
+ * of things the next age buys is the argument for paying for it. A
+ * prerequisite-locked one is hidden, because it is the same upgrade line one
+ * step further along: it appears in the very slot its predecessor vacates, so
+ * nothing is concealed, and showing all four tiers at once doubled the height
+ * of the Barracks panel for no information.
  */
 export function researchOptions(world, playerId, building) {
   if (!building || building.dead || building.kind !== 'building') return [];
@@ -813,6 +821,7 @@ export function researchOptions(world, playerId, building) {
     const t = TECHS[id];
     let status;
     let reason = null;
+    let gate = null;
     if (hasTech(world, playerId, id) ||
         (t.advancesTo !== undefined && currentAge(world, playerId) >= t.advancesTo)) {
       status = 'done';
@@ -823,6 +832,11 @@ export function researchOptions(world, playerId, building) {
       if (hard) {
         status = 'locked';
         reason = hard;
+        // Order matters and mirrors researchRefusal's: a tech that is behind
+        // both a prerequisite and an age is reported as behind the
+        // prerequisite, because that is the step the player takes next.
+        if (t.requires && !hasTech(world, playerId, t.requires)) gate = 'prereq';
+        else if (currentAge(world, playerId) < t.age) gate = 'age';
       } else if (!affordable(world, playerId, t.cost)) {
         status = 'poor';
         reason = 'Not enough resources';
@@ -830,7 +844,7 @@ export function researchOptions(world, playerId, building) {
         status = 'ready';
       }
     }
-    out.push({ id, tech: t, name: t.name, blurb: t.blurb, cost: t.cost, status, reason });
+    out.push({ id, tech: t, name: t.name, blurb: t.blurb, cost: t.cost, status, reason, gate });
   }
   return out;
 }

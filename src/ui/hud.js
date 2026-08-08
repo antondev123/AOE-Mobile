@@ -1008,8 +1008,14 @@ export function createHud(scene, world) {
   }
 
   function renderResearch(panel, b) {
-    const options = tech.researchOptions(world, PLAYER, b);
-    if (!options.length) return;
+    const all = tech.researchOptions(world, PLAYER, b);
+    if (!all.length) return;
+
+    // Later tiers of a line the player has not started are folded away — see
+    // the note on `gate` in tech.js. Four full-width buttons is already most of
+    // a phone panel; eight was two thirds of the screen.
+    const options = all.filter((o) => o.gate !== 'prereq');
+    const folded = all.length - options.length;
 
     // In-progress first, with its own bar: it is the thing that is happening.
     if ((b.research || []).length) renderResearchQueue(panel, b);
@@ -1059,6 +1065,16 @@ export function createHud(scene, world) {
         });
       }
       panel.appendChild(btn);
+    }
+
+    // Say that the folded ones exist. Without this line a player who finishes
+    // Forging is surprised by a button appearing, and one who never finishes it
+    // never learns the line goes further.
+    if (folded > 0) {
+      panel.appendChild(el('div', 'cmd-note research-more',
+        folded === 1
+          ? 'One further upgrade unlocks behind these'
+          : `${folded} further upgrades unlock behind these`));
     }
   }
 
