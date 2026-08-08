@@ -5,7 +5,7 @@
 // can be exercised headlessly in tests.
 
 import {
-  MAP_W, MAP_H, TERRAIN, RES, STARTING_RESOURCES, START_POP_CAP, MAX_POP_CAP,
+  MAP_W, MAP_H, TERRAIN, RES, STARTING_RESOURCES, MAX_POP_CAP,
   UNIT_STATS, BUILDING_STATS, NODE_AMOUNT, PLAYER, ENEMY,
 } from './constants.js';
 import { EventBus, EV } from './events.js';
@@ -66,7 +66,9 @@ function makePlayer(id) {
     id,
     resources: { ...STARTING_RESOURCES },
     pop: 0,
-    popCap: START_POP_CAP,
+    // Recomputed from standing buildings by applyPopBonus as soon as the Town
+    // Center exists; there is no separate starting allowance.
+    popCap: 0,
     // Set of entity ids owned by this player.
     owned: new Set(),
     defeated: false,

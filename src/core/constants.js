@@ -44,7 +44,9 @@ export const NODE_AMOUNT = { tree: 100, berry: 200, gold: 320 };
 
 // --- Population -------------------------------------------------------------
 export const POP_PER_HOUSE = 5;
-export const START_POP_CAP = 10;
+// There is no separate starting cap: the population cap is always the sum of
+// what your standing buildings provide, so a lone Town Center opens you at 3/5
+// and housing up is the first thing you do. That is the AoE2 dark-age opening.
 export const MAX_POP_CAP = 50;
 
 // --- Unit / building stats --------------------------------------------------
@@ -153,9 +155,9 @@ export const MAX_STEPS_PER_FRAME = 5;
 export const ZOOM_MIN = 0.55;
 export const ZOOM_MAX = 1.9;
 // At 1.0 a phone sees ~229 tiles: your Town Center, three villagers and a wall
-// of trees, but only four berry bushes and one gold — you cannot read your own
-// opening. 0.7 shows ~337 tiles, which puts food, wood and gold on screen at
-// once, the way an AoE2 start is meant to be read.
+// of trees, but typically only four berry bushes and one gold — too tight to
+// read your own opening. 0.7 shows ~337 tiles, enough for your base and the
+// resources around it. Exactly which resources land on screen varies by seed.
 export const ZOOM_DEFAULT = 0.7;
 
 // --- Input tuning (touch-first) --------------------------------------------
