@@ -141,7 +141,10 @@ export function createFx(scene, world, opts) {
     // A farm is a flat field: hanging its labels at house height would leave
     // them floating in empty sky above the crop.
     if (e.kind === 'building' && e.type === 'farm') return -44;
-    if (e.kind === 'building') return -((e.fw || 2) >= 3 ? 150 : 70);
+    if (e.kind === 'building') {
+      if (e.type === 'towncenter') return -150; // clears the mast
+      return -((e.fw || 2) >= 3 ? 115 : 70);
+    }
     if (e.kind === 'resource') return -34;
     return -48;
   }

@@ -651,8 +651,12 @@ function farmStage(b) {
   if (cur === undefined) cur = num(b.provides && b.provides.amount);
   if (cur === undefined || max === undefined || max <= 0) return 0;
   const f = cur / max;
-  if (f <= 0.03) return 2;
-  if (f <= 0.5) return 1;
+  // economy.js deletes a farm the moment it hits zero, so the "spent" art has
+  // to arrive well before that or the player would never see it. Worn-out
+  // reads from the last third, which is when it matters: that is when you go
+  // and queue the replacement.
+  if (f <= 0.3) return 2;
+  if (f <= 0.62) return 1;
   return 0;
 }
 
