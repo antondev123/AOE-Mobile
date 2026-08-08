@@ -143,6 +143,13 @@ export function createInput(scene, world, renderer, hud) {
   function applyCamera() {
     clampCamera();
     camera.centerOn(cx, cy);
+    // The renderer may also call camera.setBounds(), which clamps the scroll
+    // further. Adopt whatever the camera settled on, otherwise our own centre
+    // drifts off-screen and the next drag feels like it does nothing.
+    if (camera.useBounds) {
+      cx = camera.scrollX + camera.width / 2;
+      cy = camera.scrollY + camera.height / 2;
+    }
   }
 
   function centerOnGrid(gx, gy) {
@@ -683,9 +690,11 @@ export function createInput(scene, world, renderer, hud) {
         // One finger left: continue as a pan from where it now is.
         const rest = primary();
         st.mode = 'pan';
+        st.driving = true;
         st.anchor = { x: rest.x, y: rest.y, t: now };
         st.last = { x: rest.x, y: rest.y };
         st.samples.length = 0;
+        sampleVelocity(rest, now);
         return;
       }
       st.mode = 'none';
@@ -763,6 +772,9 @@ export function createInput(scene, world, renderer, hud) {
   // ------------------------------------------------------------------- modes
 
   function effectiveDragMode() {
+    // A box already being drawn (long-press escape hatch) wins, so the HUD chip
+    // always names the gesture that is actually happening.
+    if (st.mode === 'box') return 'box';
     if (st.dragPref !== 'auto') return st.dragPref;
     // Auto: with something of yours in hand a drag picks troops, otherwise it
     // moves the camera. Two fingers always pan, so nothing becomes unreachable.

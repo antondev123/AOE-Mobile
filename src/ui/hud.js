@@ -91,7 +91,9 @@ function costNode(cost) {
 
 export function createHud(scene, world) {
   const doc = document;
-  const root = doc.getElementById('hud');
+  // If the overlay markup is missing, fall back to a detached root so a broken
+  // page still boots into a playable (if chrome-less) game rather than throwing.
+  const root = doc.getElementById('hud') || doc.createElement('div');
   const dom = {
     root,
     food: doc.getElementById('res-food'),
@@ -122,7 +124,8 @@ export function createHud(scene, world) {
     lastToast: new Map(),
     toasts: [],
     // Elements refreshed every frame without a re-render.
-    liveCosts: [],           // { el, cost }
+    liveCosts: [],           // { el, cost } — command panel
+    liveBuild: [],           // { el, cost } — build menu sheet
     liveQueue: null,         // { building, bar, label }
     liveHp: [],              // { el, entity, fill }
     destroyed: false,
@@ -188,6 +191,7 @@ export function createHud(scene, world) {
     const now = performance.now();
     const last = state.lastToast.get(text) || 0;
     if (now - last < TOAST_REPEAT_MS) return; // never spam the same line
+    if (state.lastToast.size > 64) state.lastToast.clear(); // bounded memory
     state.lastToast.set(text, now);
 
     const node = el('div', `toast ${tone === 'warn' ? 'warn' : ''}`, text);
@@ -255,7 +259,9 @@ export function createHud(scene, world) {
     const sel = selectedEntities(world);
     if (sel.length === 0) {
       const empty = el('div', 'sel-empty', 'Nothing selected.');
-      empty.appendChild(el('small', 'sel-hint', 'Tap a unit to select. Drag to box-select.'));
+      // Keep this honest about the gesture model: with an empty selection a
+      // one-finger drag pans, and the box needs a hold first.
+      empty.appendChild(el('small', 'sel-hint', 'Tap a unit. Drag to look around. Hold, then drag, to box-select.'));
       panel.appendChild(empty);
       return;
     }
@@ -461,11 +467,14 @@ export function createHud(scene, world) {
     }
   }
 
+  /**
+   * Keep every costed button honest as the stockpile moves. Both panels are
+   * refreshed every frame: a button that still says "too expensive" a second
+   * after the wood landed is the kind of thing that makes a HUD feel dead.
+   */
   function refreshAffordability() {
-    for (const c of state.liveCosts) {
-      const ok = affordable(world, PLAYER, c.cost);
-      c.el.classList.toggle('off', !ok);
-    }
+    for (const c of state.liveCosts) c.el.classList.toggle('off', !affordable(world, PLAYER, c.cost));
+    for (const c of state.liveBuild) c.el.classList.toggle('off', !affordable(world, PLAYER, c.cost));
   }
 
   function train(building, unitType) {
@@ -494,16 +503,19 @@ export function createHud(scene, world) {
     state.buildMenuOpen = open;
     buildMenu.hidden = !open;
     if (open) renderBuildMenu();
+    else state.liveBuild = []; // stop refreshing buttons nobody can see
   }
 
   function renderBuildMenu() {
     buildMenu.textContent = '';
+    state.liveBuild = [];
     buildMenu.appendChild(el('div', 'title', 'Build'));
     for (const type of BUILDABLE) {
       const s = BUILDING_STATS[type];
       if (!s) continue;
       const ok = affordable(world, PLAYER, s.cost);
       const b = el('button', `cbtn ${ok ? '' : 'off'}`);
+      state.liveBuild.push({ el: b, cost: s.cost });
       b.appendChild(el('span', 'label', s.name));
       b.appendChild(costNode(s.cost));
       b.addEventListener('click', (ev) => {
@@ -766,8 +778,8 @@ export function createHud(scene, world) {
       if (state.buildMenuOpen) renderBuildMenu();
     } else {
       refreshQueue();
-      refreshAffordability();
     }
+    refreshAffordability();
 
     renderModeChip();
 
