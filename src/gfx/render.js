@@ -58,7 +58,54 @@ export function createRenderer(scene, world) {
   camera.setZoom(ZOOM_DEFAULT);
   camera.setRoundPixels(true);
 
+  // --- viewport ------------------------------------------------------------
+  // Phaser's RESIZE-mode ScaleManager can drop an orientation flip.
+  //
+  // Two DOM listeners race on a rotate: the `screen.orientation` "change"
+  // handler calls scale.refresh() straight away, while the window "resize"
+  // handler only sets scale.dirty and leaves the work to the next
+  // ScaleManager.step(). When orientation wins, refresh() -> updateScale()
+  // resizes the canvas from `parentSize`, which is still the *old* size, so
+  // nothing actually changes — and then the getParentBounds() call at the tail
+  // of updateScale() quietly caches the *new* parent size. The following
+  // step() therefore sees "parent unchanged" and never refreshes again.
+  //
+  // The canvas, the WebGL renderer and every camera stay at the portrait size
+  // for good. Terrain, units and effects are all clipped to that stale
+  // rectangle, so everything past the old edge draws as bare background — the
+  // black right-hand half of a rotated phone.
+  //
+  // Re-driving scale.resize() with the parent size the ScaleManager itself has
+  // already measured puts canvas, renderer and cameras back in step. It
+  // re-emits 'resize', but that second pass is a no-op because by then the
+  // sizes agree, so there is no loop and no cost when nothing is wrong.
+  const scaler = scene.scale;
+  let syncing = false;
+  let sinceSizeCheck = 0;
+
+  function syncViewport() {
+    if (syncing || !scaler || scaler.scaleMode !== Phaser.Scale.RESIZE) return;
+    const parent = scaler.parentSize;
+    if (!parent) return;
+    const w = Math.floor(parent.width);
+    const h = Math.floor(parent.height);
+    if (w <= 0 || h <= 0) return;
+    if (scaler.gameSize.width === w && scaler.gameSize.height === h) return;
+    syncing = true;
+    try {
+      scaler.resize(w, h);
+    } finally {
+      syncing = false;
+    }
+    refreshCamMap();
+  }
+
+  const onResize = () => syncViewport();
+  if (scaler) scaler.on('resize', onResize);
+
   // --- terrain -------------------------------------------------------------
+  // Baked once, over the whole map diamond rather than the boot-time view, so
+  // no viewport change, zoom-out or pan can reach unpainted ground.
   const chunks = bakeTerrain(scene, world);
 
   // --- pools ---------------------------------------------------------------
@@ -182,6 +229,18 @@ export function createRenderer(scene, world) {
 
   function update(alpha, dt) {
     t += dt;
+
+    // Belt and braces: the 'resize' event above can fire while the browser is
+    // still settling a rotation, in which case the size we synced to was the
+    // intermediate one and no further event is coming. This re-check only
+    // compares numbers the ScaleManager already keeps — no DOM reads, no
+    // layout, and it does nothing at all once the sizes agree.
+    sinceSizeCheck += dt;
+    if (sinceSizeCheck >= 0.5) {
+      sinceSizeCheck = 0;
+      syncViewport();
+    }
+
     refreshCamMap();
 
     // Visible world rect (exact, straight off the camera transform).
@@ -514,6 +573,9 @@ export function createRenderer(scene, world) {
   }
 
   function destroy() {
+    // The scene is torn down and relaunched on "Play again"; a surviving
+    // listener would pile up one dead renderer per game.
+    if (scaler) scaler.off('resize', onResize);
     fx.destroy();
     markerPool.destroy();
     unitPool.destroy();
