@@ -288,7 +288,10 @@ export function createHud(scene, world) {
   function toast(text, tone = 'info') {
     if (!dom.toasts || !text) return;
     const now = performance.now();
-    const last = state.lastToast.get(text) || 0;
+    // -Infinity, not 0: performance.now() is small for the first second and a
+    // half of the page's life, and defaulting to 0 swallowed every toast raised
+    // in it — including the first orders of the match.
+    const last = state.lastToast.has(text) ? state.lastToast.get(text) : -Infinity;
     if (now - last < TOAST_REPEAT_MS) return; // never spam the same line
     if (state.lastToast.size > 64) state.lastToast.clear(); // bounded memory
     state.lastToast.set(text, now);
