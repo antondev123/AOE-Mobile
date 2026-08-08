@@ -341,8 +341,9 @@ function updateProjectiles(world, dt) {
 function acquire(world, u, dt) {
   // Villagers never pick fights.
   if (isVillager(u) || !(u.attack > 0) || u.fleeing) return;
-  // Busy under an order — leave it alone.
-  if (u.task) return;
+  // Busy under an order — leave it alone. (A unit unitAI has parked as 'idle'
+  // is fair game even if it still carries a spent task object.)
+  if (u.task && u.state !== 'idle') return;
 
   u._acqTimer = (u._acqTimer || 0) - dt;
   if (u._acqTimer > 0) return;

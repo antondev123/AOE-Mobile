@@ -1,0 +1,462 @@
+// Headless tests for systems/combat.js. Run: node tests/combat.test.mjs
+//
+// unitAI.js is being written concurrently, so units are driven here by setting
+// positions and targets directly — nothing in this file imports unitAI.
+
+import {
+  createWorld, spawnUnit, spawnBuilding, reindex, tileIndex,
+} from '../src/core/world.js';
+import {
+  SIM_DT, PLAYER, ENEMY, MIN_DAMAGE, CHASE_LEASH, AGGRO_RANGE, UNIT_STATS,
+  PROJECTILE_SPEED,
+} from '../src/core/constants.js';
+import { EV } from '../src/core/events.js';
+import {
+  updateCombat, applyDamage, canAttack, inRange,
+} from '../src/systems/combat.js';
+
+// --- tiny harness -----------------------------------------------------------
+let passed = 0;
+const failures = [];
+function test(name, fn) {
+  try {
+    fn();
+    passed++;
+    console.log(`  ok   ${name}`);
+  } catch (err) {
+    failures.push(name);
+    console.log(`  FAIL ${name}\n       ${err.message}`);
+  }
+}
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || 'assertion failed');
+}
+function eq(a, b, msg) {
+  if (a !== b) throw new Error(`${msg || 'expected equal'}: ${a} !== ${b}`);
+}
+
+/** One sim step, mirroring GameScene.simStep minus the other systems. */
+function step(world, n = 1) {
+  for (let i = 0; i < n; i++) {
+    reindex(world);
+    updateCombat(world, SIM_DT);
+    world.time += SIM_DT;
+    world.tick++;
+  }
+}
+/** Steps until `pred` or `max` steps; returns the step count used. */
+function stepUntil(world, pred, max = 400) {
+  let n = 0;
+  while (n < max && !pred()) {
+    step(world);
+    n++;
+  }
+  return n;
+}
+function fresh() {
+  return createWorld(4242);
+}
+
+// --- inRange / canAttack ----------------------------------------------------
+
+test('canAttack: hostile units only, no friendly fire, no resources', () => {
+  const w = fresh();
+  const mine = spawnUnit(w, 'militia', PLAYER, 5, 5);
+  const friend = spawnUnit(w, 'villager', PLAYER, 5.5, 5);
+  const foe = spawnUnit(w, 'villager', ENEMY, 5.5, 5);
+  const tree = w.resources[0] || null;
+
+  assert(canAttack(mine, foe), 'should attack an enemy unit');
+  assert(!canAttack(mine, friend), 'must not attack an ally');
+  assert(!canAttack(mine, mine), 'must not attack itself');
+  assert(!canAttack(foe, foe), 'self check both ways');
+  if (tree) assert(!canAttack(mine, tree), 'must not attack resources');
+  const foeTc = spawnBuilding(w, 'towncenter', ENEMY, 20, 20);
+  assert(canAttack(mine, foeTc), 'buildings are attackable');
+  assert(!canAttack(foeTc, mine), 'buildings do not fight back');
+});
+
+test('inRange: melee reaches a 3x3 Town Center by its edge, not its centre', () => {
+  const w = fresh();
+  const tc = spawnBuilding(w, 'towncenter', ENEMY, 20, 20);
+  // Stand just outside the west wall of the footprint.
+  const m = spawnUnit(w, 'militia', PLAYER, tc.x - tc.fw / 2 - 0.5, tc.y);
+  assert(inRange(m, tc), 'melee unit at the wall should be in range');
+  // The same unit could not reach a *unit* standing on the Town Center's centre.
+  const dummy = spawnUnit(w, 'villager', ENEMY, tc.x, tc.y);
+  assert(!inRange(m, dummy), 'the centre itself is far out of melee reach');
+
+  const far = spawnUnit(w, 'militia', PLAYER, tc.x - tc.fw / 2 - 4, tc.y);
+  assert(!inRange(far, tc), 'four tiles from the wall is out of melee range');
+});
+
+test('inRange: archers out-range melee', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+  const m = spawnUnit(w, 'militia', ENEMY, 14, 10);
+  assert(inRange(a, m), 'archer reaches 4 tiles');
+  assert(!inRange(m, a), 'militia does not');
+});
+
+// --- damage / armour --------------------------------------------------------
+
+test('armour reduces damage but never below MIN_DAMAGE', () => {
+  const w = fresh();
+  const attacker = spawnUnit(w, 'militia', PLAYER, 1, 1);
+  const target = spawnUnit(w, 'militia', ENEMY, 2, 1); // armor 1
+
+  const dealt = applyDamage(w, attacker, target, 6);
+  eq(dealt, 5, 'militia armour 1 shaves one point off a 6 hit');
+  eq(target.hp, UNIT_STATS.militia.hp - 5, 'hp reduced by the post-armour amount');
+
+  const tiny = applyDamage(w, attacker, target, 0);
+  eq(tiny, MIN_DAMAGE, 'a 0 damage hit still lands MIN_DAMAGE');
+
+  target.armor = 999;
+  const chipped = applyDamage(w, attacker, target, 6);
+  eq(chipped, MIN_DAMAGE, 'huge armour is floored at MIN_DAMAGE, never immune');
+});
+
+test('EV.DAMAGE reports the post-armour amount', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'militia', PLAYER, 1, 1);
+  const t = spawnUnit(w, 'militia', ENEMY, 2, 1);
+  const seen = [];
+  w.events.on(EV.DAMAGE, (p) => seen.push(p));
+  applyDamage(w, a, t, 6);
+  eq(seen.length, 1, 'one damage event');
+  eq(seen[0].amount, 5, 'post-armour amount');
+  eq(seen[0].entity, a, 'attacker in payload');
+  eq(seen[0].target, t, 'target in payload');
+});
+
+// --- melee resolution -------------------------------------------------------
+
+test('a militia kills a villager in a bounded number of steps', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10.9, 10);
+  m.target = v;
+  assert(inRange(m, v), 'set up in range');
+
+  const steps = stepUntil(w, () => v.dead, 400);
+  assert(v.dead, `villager should die (took ${steps} steps)`);
+  // 30hp / 6dmg = 5 swings at 1.1s => ~5.5s + stagger. Must not grind.
+  const secs = steps * SIM_DT;
+  assert(secs < 9, `fight resolves in seconds, took ${secs.toFixed(1)}s`);
+  assert(secs > 2, `and is not instant, took ${secs.toFixed(1)}s`);
+});
+
+test('a militia beats a villager comfortably in a mutual fight', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10.9, 10);
+  m.target = v;
+  v.target = m; // player-ordered villager: it fights back
+  stepUntil(w, () => v.dead || m.dead, 400);
+  assert(v.dead && !m.dead, 'militia wins');
+  assert(m.hp > m.maxHp * 0.6, `and wins comfortably (hp ${m.hp}/${m.maxHp})`);
+});
+
+test('cooldowns are staggered so a squad does not hit on one frame', () => {
+  const w = fresh();
+  const foe = spawnUnit(w, 'militia', ENEMY, 10, 10);
+  foe.hp = foe.maxHp = 100000;
+  const squad = [];
+  for (let i = 0; i < 4; i++) {
+    const m = spawnUnit(w, 'militia', PLAYER, 10.9 + i * 0.001, 10);
+    m.target = foe;
+    squad.push(m);
+  }
+  const hitTicks = [];
+  w.events.on(EV.DAMAGE, () => hitTicks.push(w.tick));
+  step(w, 40);
+  assert(hitTicks.length >= 4, 'everyone swung');
+  eq(new Set(hitTicks.slice(0, 4)).size > 1, true, 'first swings land on different ticks');
+});
+
+test('attackAnim is set on a swing and decays', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10.9, 10);
+  v.hp = v.maxHp = 100000;
+  m.target = v;
+  stepUntil(w, () => m.attackAnim > 0, 60);
+  assert(m.attackAnim > 0, 'swing pose set for the renderer');
+  const first = m.attackAnim;
+  step(w);
+  assert(m.attackAnim < first, 'and it decays');
+  assert(m.cooldown > 0, 'cooldown reset after firing');
+});
+
+// --- death / cleanup --------------------------------------------------------
+
+test('a dead unit leaves world.units, world.entities and its owner set', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10.9, 10);
+  const deaths = [];
+  w.events.on(EV.DEATH, (p) => deaths.push(p));
+  m.target = v;
+  stepUntil(w, () => v.dead, 400);
+
+  eq(deaths.length, 1, 'one death event');
+  eq(deaths[0].entity, v, 'death payload carries the victim');
+  eq(deaths[0].killer, m, 'and the killer');
+  eq(w.units.includes(v), false, 'removed from world.units');
+  eq(w.entities.has(v.id), false, 'removed from world.entities');
+  eq(w.players[ENEMY].owned.has(v.id), false, "removed from the owner's owned set");
+  eq(m.target, null, 'attacker dropped the dead target');
+});
+
+// --- projectiles ------------------------------------------------------------
+
+test("an archer's projectile spawns, travels and lands damage", () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+  const m = spawnUnit(w, 'militia', ENEMY, 14, 10);
+  a.target = m;
+
+  const launched = [];
+  w.events.on(EV.PROJECTILE, (p) => launched.push(p));
+
+  stepUntil(w, () => w.projectiles.length > 0, 60);
+  eq(w.projectiles.length, 1, 'one arrow in flight');
+  eq(launched.length, 1, 'EV.PROJECTILE emitted');
+  const p = w.projectiles[0];
+  eq(p.owner, a, 'owner is the archer');
+  eq(p.target, m, 'target recorded');
+  // It launched from the archer and has flown at most one step so far.
+  assert(p.x >= a.x && p.x - a.x <= PROJECTILE_SPEED * SIM_DT + 1e-9, 'launched from the archer');
+  assert(Math.abs(p.y - a.y) < 1e-9, 'flying straight down the line');
+  assert(p.x < m.x, 'not there yet');
+  eq(m.hp, m.maxHp, 'no damage yet — the arrow is still in the air');
+
+  const startX = p.x;
+  step(w);
+  assert(p.x > startX, 'arrow advances toward the target');
+  assert(p.x <= m.x + 0.001, 'and does not overshoot');
+
+  stepUntil(w, () => m.hp < m.maxHp, 60);
+  eq(m.hp, m.maxHp - (UNIT_STATS.archer.attack - UNIT_STATS.militia.armor), 'arrow damage landed');
+  eq(w.projectiles.length, 0, 'arrow consumed on impact');
+});
+
+test('an arrow homes onto a moving target', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+  const m = spawnUnit(w, 'militia', ENEMY, 14, 10);
+  a.target = m;
+  stepUntil(w, () => w.projectiles.length > 0, 60);
+  // The militia sidesteps while the arrow is in the air.
+  m.y = 12;
+  const hit = stepUntil(w, () => m.hp < m.maxHp, 120);
+  assert(m.hp < m.maxHp, `arrow still connected after ${hit} steps`);
+});
+
+test('a target dying mid-flight does not break the arrow', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+  const m = spawnUnit(w, 'militia', ENEMY, 14, 10);
+  a.target = m;
+  stepUntil(w, () => w.projectiles.length > 0, 60);
+  eq(w.projectiles.length, 1, 'arrow away');
+
+  // Something else kills the militia while the arrow is still flying.
+  applyDamage(w, null, m, 10000);
+  assert(m.dead, 'target died mid-flight');
+  eq(w.projectiles[0].target, m, 'arrow still points at the corpse this frame');
+
+  step(w, 60);
+  eq(w.projectiles.length, 0, 'arrow landed somewhere and was cleaned up');
+  eq(w.units.includes(m), false, 'corpse gone');
+});
+
+// --- buildings --------------------------------------------------------------
+
+test('a destroyed building frees its footprint in world.blocked', () => {
+  const w = fresh();
+  const house = spawnBuilding(w, 'house', ENEMY, 20, 20);
+  for (const [tx, ty] of house.tiles) {
+    eq(w.blocked[tileIndex(w, tx, ty)], 1, 'footprint blocked while standing');
+  }
+  const m = spawnUnit(w, 'militia', PLAYER, house.x - house.fw / 2 - 0.5, house.y);
+  m.target = house;
+  assert(inRange(m, house), 'militia is at the wall');
+
+  const steps = stepUntil(w, () => house.dead, 3000);
+  assert(house.dead, `house razed in ${steps} steps`);
+  for (const [tx, ty] of house.tiles) {
+    eq(w.blocked[tileIndex(w, tx, ty)], 0, 'footprint freed after destruction');
+    eq(w.occupant[tileIndex(w, tx, ty)], 0, 'occupant cleared');
+  }
+  eq(w.buildings.includes(house), false, 'removed from world.buildings');
+  eq(w.players[ENEMY].owned.has(house.id), false, 'removed from owned set');
+});
+
+test('buildings take full damage (no armour field) and cannot be over-killed', () => {
+  const w = fresh();
+  const b = spawnBuilding(w, 'barracks', ENEMY, 25, 25);
+  const a = spawnUnit(w, 'militia', PLAYER, 25, 25);
+  eq(applyDamage(w, a, b, 6), 6, 'no armour on buildings');
+  applyDamage(w, a, b, 100000);
+  assert(b.dead, 'destroyed');
+  eq(applyDamage(w, a, b, 10), 0, 'further hits on a dead building are no-ops');
+});
+
+// --- auto-acquisition / leashing -------------------------------------------
+
+test('an idle soldier auto-acquires a hostile inside AGGRO_RANGE', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10 + AGGRO_RANGE - 1, 10);
+  step(w);
+  eq(m.target, v, 'target acquired');
+  eq(m.autoTarget, true, 'flagged as auto so it can be leashed');
+  eq(m.postX, 10, 'leash anchored where it engaged');
+});
+
+test('nothing is acquired beyond AGGRO_RANGE', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  spawnUnit(w, 'villager', ENEMY, 10 + AGGRO_RANGE + 3, 10);
+  step(w, 5);
+  eq(m.target, null, 'too far to notice');
+});
+
+test('villagers never auto-attack and flee when struck', () => {
+  const w = fresh();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 6, 6);
+  const v = spawnUnit(w, 'villager', PLAYER, 15, 15);
+  const foe = spawnUnit(w, 'militia', ENEMY, 16, 15);
+  step(w, 3);
+  eq(v.target, null, 'villager did not pick a fight');
+  assert(foe.target === v, 'the militia, however, did');
+
+  stepUntil(w, () => v.fleeing, 80);
+  eq(v.fleeing, true, 'villager panics when hit');
+  eq(v.target, null, 'and is not trading blows');
+  assert(v.fleeTo && v.fleeTo.x === tc.x && v.fleeTo.y === tc.y, 'runs for the Town Center');
+  assert(v.fleeUntil > w.time - 1, 'flee flag has a deadline unitAI can honour');
+});
+
+test('a soldier shot from out of aggro range charges the shooter', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'archer', ENEMY, 10, 10);
+  a.range = AGGRO_RANGE + 4; // a sniper, well outside what the militia can notice
+  const m = spawnUnit(w, 'militia', PLAYER, 10 + AGGRO_RANGE + 2, 10);
+  a.target = m;
+  assert(!inRange(m, a), 'militia cannot see or reach the archer');
+  assert(inRange(a, m), 'but the archer can hit it');
+  stepUntil(w, () => m.hp < m.maxHp, 200);
+  eq(m.target, a, 'retaliates against whoever shot it');
+  eq(m.autoTarget, true, 'and that chase is leashed');
+});
+
+test('leashing drops an auto-acquired target beyond CHASE_LEASH', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 12, 10);
+  v.hp = v.maxHp = 100000;
+  step(w);
+  eq(m.target, v, 'acquired');
+
+  // The villager runs away across the map (unitAI would have walked the
+  // militia after it; here we only care that the leash snaps).
+  v.x = 10 + CHASE_LEASH + 5;
+  step(w, 2);
+  eq(m.target, null, 'target dropped past the leash');
+  eq(m.autoTarget, false, 'auto flag cleared');
+  assert(m.returnTo && m.returnTo.x === 10 && m.returnTo.y === 10, 'told to return to its post');
+
+  // It must not re-acquire the same runaway from its post.
+  step(w, 5);
+  eq(m.target, null, 'stays home');
+});
+
+test('a unit chasing but still swinging keeps its target at the leash edge', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 12, 10);
+  v.hp = v.maxHp = 100000;
+  step(w);
+  eq(m.target, v, 'acquired');
+  // Both moved well past the leash, but they are toe to toe: finish the kill.
+  m.x = 10 + CHASE_LEASH + 4;
+  v.x = m.x + 0.9;
+  step(w);
+  eq(m.target, v, 'does not disengage from a target it is currently hitting');
+});
+
+test('player-ordered attacks are never leashed', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 12, 10);
+  v.hp = v.maxHp = 100000;
+  step(w);
+  eq(m.target, v, 'auto-acquired first');
+
+  // The player now explicitly re-issues the attack on the same unit.
+  m.target = v;
+  m.autoTarget = false;
+  v.x = 10 + CHASE_LEASH + 20;
+  step(w, 5);
+  eq(m.target, v, 'explicit order survives any distance');
+});
+
+test('an auto target that becomes invalid is dropped', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 12, 10);
+  step(w);
+  eq(m.target, v, 'acquired');
+  v.player = PLAYER; // defected
+  step(w);
+  eq(m.target, null, 'no longer hostile, target dropped');
+});
+
+// --- feel ------------------------------------------------------------------
+
+test('an archer kiting a militia wins; standing still it loses', () => {
+  // Archer vs militia toe to toe: the militia should win.
+  {
+    const w = fresh();
+    const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+    const m = spawnUnit(w, 'militia', ENEMY, 10.9, 10);
+    a.target = m;
+    m.target = a;
+    stepUntil(w, () => a.dead || m.dead, 800);
+    assert(a.dead && !m.dead, 'melee wins the brawl it got into');
+  }
+  // Archer holding its range: the militia never lands a blow.
+  {
+    const w = fresh();
+    const a = spawnUnit(w, 'archer', PLAYER, 10, 10);
+    const m = spawnUnit(w, 'militia', ENEMY, 14, 10);
+    a.target = m;
+    m.target = a;
+    const steps = stepUntil(w, () => m.dead, 800);
+    assert(m.dead, `archer kills from range in ${steps} steps`);
+    eq(a.hp, a.maxHp, 'without taking a scratch');
+  }
+});
+
+test('hp drops in legible chunks, not a trickle', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10.9, 10);
+  m.target = v;
+  const amounts = [];
+  w.events.on(EV.DAMAGE, (p) => amounts.push(p.amount));
+  stepUntil(w, () => v.dead, 400);
+  assert(amounts.length <= 6, `few, large hits (${amounts.length} swings)`);
+  assert(amounts.every((a) => a >= v.maxHp * 0.15), 'each hit is a visible chunk');
+});
+
+// --- report -----------------------------------------------------------------
+
+console.log(`\n${passed} passed, ${failures.length} failed`);
+if (failures.length) {
+  for (const f of failures) console.log(`  - ${f}`);
+  process.exit(1);
+}
