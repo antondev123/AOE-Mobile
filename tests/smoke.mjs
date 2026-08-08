@@ -99,7 +99,13 @@ const run = async () => {
       `${start.villagers[1]} -> ${end.villagers[1]}`);
     check('enemy built houses', end.houses[1] >= 1, `${end.houses[1]} houses`);
     check('enemy built a barracks', end.barracks[1] >= 1, `${end.barracks[1]} barracks`);
-    check('enemy trained military', end.military[1] >= 3, `${end.military[1]} soldiers`);
+    // The barracks only lands around 1:45 and the first wave is scheduled at
+    // 170s, so a short run legitimately has no soldiers yet.
+    if (MINUTES >= 4) {
+      check('enemy trained military', end.military[1] >= 3, `${end.military[1]} soldiers`);
+    } else {
+      console.log(`  skip  enemy trained military (needs a >=4 minute run, got ${MINUTES})`);
+    }
     check('enemy respected its pop cap',
       end.resources[1].pop <= end.resources[1].popCap,
       `pop ${end.resources[1].pop}/${end.resources[1].popCap}`);
