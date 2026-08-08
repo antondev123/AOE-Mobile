@@ -524,8 +524,10 @@ test('columns meeting head-on slide past each other instead of deadlocking', () 
   commandUnits(w, east, { type: 'move', gx: 36.5, gy: 20.5 });
   commandUnits(w, west, { type: 'move', gx: 6.5, gy: 20.5 });
 
-  // 28 tiles at 1.5 tiles/s = ~19s. Give them three times that.
-  const worst = runWatchingSpeed(w, all, 1200);
+  // 28 tiles at 1.5 tiles/s = ~19s. Give them three times that. The speed floor
+  // is set well above what a deadlock produces (the bug this guards measured
+  // 0.10 tiles/s) and well below what healthy traffic manages (~1.4).
+  const worst = runWatchingSpeed(w, all, 1200, 0.7);
   for (const u of all) {
     assert(isIdle(u), `unit ${u.id} never finished its walk (state ${u.state})`);
   }
@@ -538,6 +540,7 @@ test('a shared gold line keeps flowing with full carry loads', () => {
   const w = blankWorld();
   const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 20);
   const gold = spawnResource(w, 'gold', 32, 20);
+  gold.amount = 5000; // a deep vein: this test is about traffic, not depletion
   const vils = [];
   for (let i = 0; i < 6; i++) {
     vils.push(spawnUnit(w, 'villager', PLAYER, 13.5 + (i % 2) * 0.5, 19.5 + Math.floor(i / 2) * 0.5));
@@ -547,7 +550,7 @@ test('a shared gold line keeps flowing with full carry loads', () => {
   commandUnits(w, vils, { type: 'gather', target: gold });
 
   const gold0 = w.players[PLAYER].resources.gold;
-  const worst = runWatchingSpeed(w, vils, 3600); // three minutes
+  const worst = runWatchingSpeed(w, vils, 3600, 0.7); // three minutes
   const banked = w.players[PLAYER].resources.gold - gold0;
   assert(banked >= 150, `the gold line should keep delivering (banked ${banked})`);
   for (const v of vils) assert(!isIdle(v), `villager ${v.id} stopped working`);
