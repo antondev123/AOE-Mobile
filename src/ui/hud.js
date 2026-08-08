@@ -355,6 +355,19 @@ export function createHud(scene, world) {
     if (state.lastToast.size > 64) state.lastToast.clear(); // bounded memory
     state.lastToast.set(text, now);
 
+    // A toast lives longer (TOAST_MS) than the window that suppresses repeats
+    // of it (TOAST_REPEAT_MS), so a line raised again in the gap between the two
+    // used to put a second, identical copy of itself on the map — two "That
+    // would seal in your Town Center" boxes stacked over the base they are
+    // about. The same sentence is never worth saying twice at once: refresh the
+    // one already up instead, which also keeps it on screen for the repeat.
+    for (const rec of state.toasts) {
+      if (!rec.alert && rec.node.textContent === text) {
+        rec.at = now;
+        return;
+      }
+    }
+
     const node = el('div', `toast ${tone === 'warn' ? 'warn' : ''}`, text);
     dom.toasts.appendChild(node);
     pushToast({ node, at: now, ttl: TOAST_MS });
@@ -674,17 +687,43 @@ export function createHud(scene, world) {
       }));
     }
 
-    // A foundation under construction: show progress + let villagers finish it.
+    // A foundation under construction: show progress + let villagers finish it,
+    // or take the site back.
     const site = own.find((e) => e.kind === 'building' && !e.complete);
     if (site) {
       const pct = Math.round(progressOf(site) * 100);
       panel.appendChild(el('div', 'cmd-note', `${displayName(site)} under construction — ${pct}%`));
+      panel.appendChild(cmdButton('Cancel', {
+        cls: 'danger',
+        sub: 'full refund',
+        aria: `Cancel the ${displayName(site)} under construction. The cost is refunded.`,
+        onTap: () => cancelSite(site),
+      }));
     }
 
     // Demolish, last and on its own: the only irreversible thing in the panel.
     if (buildings.length) renderDemolish(panel, buildings);
 
     refreshAffordability();
+  }
+
+  // --- Cancel a foundation ---------------------------------------------------
+  // The other half of Demolish, and deliberately not the same button. A
+  // foundation is a site with a receipt on it: economy.cancelFoundation() hands
+  // the wood straight back and nothing that was built is lost, because nothing
+  // has been built. So it needs no arm-then-confirm — that ceremony is there to
+  // protect you from destroying something, and there is nothing here to destroy.
+  // Without it the only way out of a misplaced site was to finish paying for it
+  // in villager-seconds and then demolish it for nothing.
+
+  function cancelSite(b) {
+    if (!b || b.dead || b.kind !== 'building' || b.player !== PLAYER || b.complete) return;
+    if (typeof economy.cancelFoundation !== 'function') return;
+    const what = displayName(b);
+    if (!economy.cancelFoundation(world, b)) return;
+    toast(`${what} cancelled — cost refunded`, 'info');
+    state.cmdSig = '';
+    state.selSig = '';
   }
 
   // --- Demolish -------------------------------------------------------------

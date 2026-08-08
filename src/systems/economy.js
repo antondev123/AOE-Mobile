@@ -392,6 +392,21 @@ function placementTrapReason(world, playerId, type, gx, gy) {
 }
 
 /**
+ * The sentence explaining why this placement would be refused, or null when it
+ * is fine — geometry first, then the reachability rules above.
+ *
+ * This is the same text placeFoundation() would toast, so the ghost can refuse
+ * a tile in the player's own words instead of a generic "cannot build there",
+ * and the refusal is worded identically wherever it is raised.
+ */
+export function placementRefusal(world, playerId, type, gx, gy) {
+  const s = BUILDING_STATS[type];
+  if (!s) return 'Cannot build there';
+  if (!canPlace(world, gx, gy, s.fw, s.fh)) return 'Cannot build there';
+  return placementTrapReason(world, playerId, type, gx, gy);
+}
+
+/**
  * canPlace() plus the reachability rules above: true when `playerId` may put a
  * `type` here without sealing its own units in.
  *
@@ -400,10 +415,7 @@ function placementTrapReason(world, playerId, type, gx, gy) {
  * the tap is worse than no ghost at all.
  */
 export function canPlaceReachable(world, playerId, type, gx, gy) {
-  const s = BUILDING_STATS[type];
-  if (!s) return false;
-  if (!canPlace(world, gx, gy, s.fw, s.fh)) return false;
-  return placementTrapReason(world, playerId, type, gx, gy) === null;
+  return placementRefusal(world, playerId, type, gx, gy) === null;
 }
 
 /**

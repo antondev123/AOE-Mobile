@@ -303,6 +303,13 @@ export function createInput(scene, world, renderer, hud) {
     return e.kind === 'building' && e.complete && e.trains && e.trains.length > 0;
   }
 
+  /** A finished farm of ours with food still in it — a bush you paid wood for. */
+  function isOwnFarm(e) {
+    return !!(e && e.kind === 'building' && e.player === PLAYER && e.complete &&
+      typeof economy.isGatherableBuilding === 'function' &&
+      economy.isGatherableBuilding(e));
+  }
+
   /**
    * What a tap means while a production building is in hand:
    *
@@ -410,6 +417,18 @@ export function createInput(scene, world, renderer, hud) {
       return;
     }
 
+    // Own, finished farm: harvest it. A farm is a resource node you paid wood
+    // for, so this is the resource branch above, word for word — same order,
+    // same yellow gather ping, and the soldiers in a mixed group still just
+    // walk there rather than being told to farm.
+    if (isOwnFarm(pick) && villagers.length) {
+      command(villagers, { type: 'gather', gx: pick.x, gy: pick.y, target: pick });
+      const rest = units.filter((u) => u.type !== 'villager');
+      if (rest.length) command(rest, { type: 'move', gx: pick.x, gy: pick.y });
+      fx(pick.x, pick.y, 'gather');
+      return;
+    }
+
     // Own, incomplete building: go finish it.
     if (pick.kind === 'building' && !pick.complete && villagers.length) {
       command(villagers, { type: 'build', gx: pick.x, gy: pick.y, target: pick });
@@ -489,13 +508,21 @@ export function createInput(scene, world, renderer, hud) {
       }
     }
 
-    // Tapping something of yours selects it — unless it is a foundation and you
-    // have villagers in hand, in which case it is obviously a build order.
+    // Tapping something of yours selects it — unless it is a building villagers
+    // in hand could obviously *work*: a foundation (go and finish it) or a
+    // finished farm (go and harvest it, exactly as for a bush).
+    //
+    // Both exceptions matter for the same reason: without them the tap silently
+    // replaces the whole selection with the building, issues no order and shows
+    // nothing, so a dozen villagers stop working and nothing on screen says why.
+    // The rule mirrors rallyTargetAt() above and unitAI's rallyOrder(), which
+    // both already treat a farm as something a villager works.
     if (pick && pick.player === PLAYER) {
-      if (pick.kind === 'building' && !pick.complete && villagers.length &&
-          !world.selection.has(pick.id)) {
-        command(villagers, { type: 'build', gx: pick.x, gy: pick.y, target: pick });
-        fx(pick.x, pick.y, 'build');
+      const workable = pick.kind === 'building' && villagers.length &&
+        !world.selection.has(pick.id) &&
+        (!pick.complete || isOwnFarm(pick));
+      if (workable) {
+        issueOrder(units, pick, g);
         return;
       }
       setSelection(world, [pick]);
@@ -584,6 +611,37 @@ export function createInput(scene, world, renderer, hud) {
 
   // --------------------------------------------------------------- placement
 
+  /**
+   * Why this tile would be refused, or null when it would be taken — the exact
+   * predicate placeFoundation() applies, so the ghost and the rule can never
+   * disagree. canPlace() alone is not it: it answers "is the ground empty",
+   * which went green on the farm that sealed eight villagers into a pocket.
+   *
+   * CACHED, because this runs on every pointermove while the finger drags the
+   * ghost around and the reachability half does a bounded flood fill (~0.08ms
+   * against a mid-game base, against ~0.001ms for canPlace alone). The answer
+   * can only change when the tile under the finger changes or when the world
+   * moves on, so it is recomputed per tile per simulation step and reused for
+   * every pointer event in between — a drag costs one check per tile, not one
+   * per event, and a finger held still costs nothing at all.
+   */
+  let placeCache = null; // { key, tick, reason }
+  function refusalFor(type, gx, gy) {
+    const key = `${type}:${gx}:${gy}`;
+    if (placeCache && placeCache.key === key && placeCache.tick === world.tick) {
+      return placeCache.reason;
+    }
+    const s = BUILDING_STATS[type];
+    let reason;
+    if (typeof economy.placementRefusal === 'function') {
+      reason = economy.placementRefusal(world, PLAYER, type, gx, gy);
+    } else {
+      reason = s && canPlace(world, gx, gy, s.fw, s.fh) ? null : 'Cannot build there';
+    }
+    placeCache = { key, tick: world.tick, reason };
+    return reason;
+  }
+
   function ghostAt(sx, sy) {
     const type = st.placeType;
     const s = BUILDING_STATS[type];
@@ -592,8 +650,10 @@ export function createInput(scene, world, renderer, hud) {
     // Snap exactly the way spawnBuilding() will, so the ghost never lies.
     const gx = Math.floor(g.x - s.fw / 2) + s.fw / 2;
     const gy = Math.floor(g.y - s.fh / 2) + s.fh / 2;
-    const valid = canPlace(world, gx, gy, s.fw, s.fh) && canAffordType(type);
-    return { type, gx, gy, valid };
+    // Being broke outranks the ground being wrong, as it always has: it is the
+    // thing the player has to fix first, and it is true of every tile.
+    const reason = canAffordType(type) ? refusalFor(type, gx, gy) : 'Not enough resources';
+    return { type, gx, gy, valid: !reason, reason: reason || null };
   }
 
   function canAffordType(type) {
@@ -620,7 +680,10 @@ export function createInput(scene, world, renderer, hud) {
     const gh = st.ghost;
     if (!gh) return;
     if (!gh.valid) {
-      hud.toast(canAffordType(gh.type) ? 'Cannot build there' : 'Not enough resources', 'warn');
+      // The ghost has already worked out why, and says so in the same words
+      // placeFoundation() would. Refusing here rather than letting the economy
+      // refuse again is what keeps one tap to one explanation.
+      hud.toast(gh.reason || 'Cannot build there', 'warn');
       return; // stay in placement mode — the player just needs to move a bit
     }
     if (typeof economy.placeFoundation !== 'function') return;

@@ -1273,6 +1273,395 @@ async function trappedVillagerRun() {
   }
 }
 
+// --- Run 8: putting villagers on your own farm -------------------------------
+//
+// The fourth playtest tapped a finished farm with thirteen villagers in hand and
+// lost all thirteen: the tap selected the farm, gave no order, drew no ping and
+// said nothing, so the whole workforce went idle in silence. A farm is a food
+// node you paid wood for — tapping it has to mean what tapping a bush means.
+// With nothing in hand it must still select, because its panel is where you read
+// how much food is left in it.
+
+async function farmTapRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    await watchToasts(page);
+    // Command pings are recorded off the event bus: "the tap drew a ping" is a
+    // claim about the order that went out, not about the renderer.
+    await page.evaluate(async () => {
+      const { EV } = await import('/src/core/events.js');
+      window.__fx = [];
+      window.__game.world.events.on(EV.COMMAND_FX, (p) => window.__fx.push(p.kind));
+    });
+
+    // A finished farm of ours with a tile of margin all round, so a tap on it
+    // can only mean the farm.
+    const farm = await page.evaluate(async () => {
+      const { spawnBuilding, canPlace } = await import('/src/core/world.js');
+      const economy = await import('/src/systems/economy.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      let at = null;
+      for (let r = 3; r <= 12 && !at; r++) {
+        for (const [dx, dy] of [[r, 0], [0, r], [-r, 0], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+          const gx = Math.floor(tc.x) + dx + 1;
+          const gy = Math.floor(tc.y) + dy + 1;
+          if (canPlace(w, gx, gy, 4, 4) && canPlace(w, gx, gy, 2, 2)) { at = { gx, gy }; break; }
+        }
+      }
+      if (!at) return { fail: 'nowhere to put a farm' };
+      const f = spawnBuilding(w, 'farm', 0, at.gx, at.gy);
+      economy.initProvider(f);
+      return { id: f.id, x: f.x, y: f.y, amount: f.amount, food: w.players[0].resources.food };
+    });
+    check('there is a finished farm of ours to tap', !farm.fail, farm.fail || `${farm.amount} food in it`);
+    if (farm.fail) return;
+
+    // --- Nothing in hand: the tap still selects it. --------------------------
+    let p = await aim(page, farm.x, farm.y);
+    await tapSlow(page, p.x, p.y);
+    await paint(page);
+    const inspected = await page.evaluate((id) => {
+      const w = window.__game.world;
+      const sel = document.getElementById('sel-panel');
+      return {
+        selected: w.selection.has(id),
+        only: w.selection.size,
+        rows: [...sel.querySelectorAll('.hp-text')].map((n) => n.textContent),
+      };
+    }, farm.id);
+    check('tapping the farm with nothing selected selects it',
+      inspected.selected && inspected.only === 1, `${inspected.only} selected`);
+    check('and its panel shows hit points and the food left in it',
+      inspected.rows.length === 2 && /hp$/.test(inspected.rows[0]) && /food left$/.test(inspected.rows[1]),
+      inspected.rows.join(' / '));
+
+    // --- Villagers in hand: the tap is a gather order. -----------------------
+    await page.locator('#btn-menu').click();
+    await page.locator('#menu-sheet button', { hasText: 'Select all villagers' }).click();
+    const crew = await page.evaluate(() => [...window.__game.world.selection]);
+    check('every villager we own is in hand', crew.length > 1, `${crew.length} villagers selected`);
+
+    const fxMark = await page.evaluate(() => window.__fx.length);
+    p = await aim(page, farm.x, farm.y);
+    await tapSlow(page, p.x, p.y);
+
+    const ordered = await page.evaluate(([id, ids, n]) => {
+      const w = window.__game.world;
+      const us = ids.map((i) => w.entities.get(i)).filter(Boolean);
+      return {
+        tasks: us.map((u) => u.task && u.task.type),
+        onFarm: us.filter((u) => u.task && u.task.node && u.task.node.id === id).length,
+        stillSelected: ids.filter((i) => w.selection.has(i)).length,
+        grabbedFarm: w.selection.has(id),
+        fx: window.__fx.slice(n),
+      };
+    }, [farm.id, crew, fxMark]);
+
+    check('tapping the farm with villagers in hand issues a gather order',
+      ordered.tasks.length > 0 && ordered.tasks.every((t) => t === 'gather') && ordered.onFarm > 0,
+      `${ordered.onFarm} of ${ordered.tasks.length} sent to the farm, tasks: ${[...new Set(ordered.tasks)].join(',')}`);
+    check('the selection survives the tap',
+      ordered.stillSelected === crew.length && !ordered.grabbedFarm,
+      `${ordered.stillSelected} of ${crew.length} still selected, farm selected: ${ordered.grabbedFarm}`);
+    check('and it pings like any other gather order',
+      ordered.fx.includes('gather'), `fx=[${ordered.fx.join(',')}]`);
+
+    // --- And the loop closes: food actually lands in the bank. ---------------
+    await step(page, 1200); // one minute
+    const worked = await page.evaluate(([id, before]) => {
+      const w = window.__game.world;
+      const f = w.entities.get(id);
+      return {
+        left: f && !f.dead ? f.amount : 0,
+        gone: !f || f.dead,
+        food: w.players[0].resources.food,
+        gained: w.players[0].resources.food - before,
+      };
+    }, [farm.id, farm.food]);
+    check('the farm is eaten into', worked.left < farm.amount,
+      worked.gone ? 'eaten out entirely' : `${farm.amount} -> ${worked.left.toFixed(0)} food left`);
+    check('and the food is banked', worked.gained > 0,
+      `${farm.food.toFixed(0)} -> ${worked.food.toFixed(0)} food`);
+
+    await page.evaluate((at) => window.__game.input.centerOnGrid(at.x, at.y), farm);
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-farm-gathering.png') });
+
+    check('no console errors (farm run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 9: the placement ghost, the refusal, and cancelling a site ----------
+//
+// Three findings from the fourth playtest, all in one tap:
+//   * the ghost went green on a tile the game then refused, because it asked
+//     canPlace() (is the ground empty) rather than the rule the placement
+//     itself uses (would this seal somebody in);
+//   * the refusal then stacked two identical toasts over the base;
+//   * and a site you regret could not be taken back, only finished and razed.
+//
+// The pen below is built with setBlocked on ground that has been checked clear,
+// so the map's own trees cannot decide whether this run is meaningful: a
+// villager sits in a 5x5 yard whose only door is exactly the size of a house.
+
+async function placementGhostRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    await watchToasts(page);
+
+    const pen = await page.evaluate(async () => {
+      const { setBlocked, canPlace } = await import('/src/core/world.js');
+      const economy = await import('/src/systems/economy.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+
+      const clear = (tx, ty, n) => {
+        if (tx < 1 || ty < 1 || tx + n >= w.width - 1 || ty + n >= w.height - 1) return false;
+        for (let y = ty; y < ty + n; y++) {
+          for (let x = tx; x < tx + n; x++) {
+            if (w.blocked[y * w.width + x] !== 0) return false;
+            if (w.terrain[y * w.width + x] === 2) return false; // water
+          }
+        }
+        return true;
+      };
+      let origin = null;
+      let bestD = Infinity;
+      for (let ty = 1; ty < w.height - 9; ty++) {
+        for (let tx = 1; tx < w.width - 9; tx++) {
+          if (!clear(tx, ty, 9)) continue;
+          const d = Math.hypot(tx + 4 - tc.x, ty + 4 - tc.y);
+          if (d < bestD) { bestD = d; origin = { tx, ty }; }
+        }
+      }
+      if (!origin) return { fail: 'no clear 9x9 block on this map' };
+      const { tx, ty } = origin;
+
+      // A 7x7 ring inside the block, with a one-tile-wide, two-tile-tall door in
+      // its right-hand wall. A 2x2 house plugs that door exactly.
+      for (let y = ty + 1; y <= ty + 7; y++) {
+        for (let x = tx + 1; x <= tx + 7; x++) {
+          const onRing = x === tx + 1 || x === tx + 7 || y === ty + 1 || y === ty + 7;
+          if (!onRing) continue;
+          if (x === tx + 7 && (y === ty + 3 || y === ty + 4)) continue; // the door
+          setBlocked(w, x, y, 1, 999);
+        }
+      }
+
+      // One of ours in the yard, and the world held still so the taps below
+      // measure the rules rather than a villager walking about between them.
+      const v = w.units.find((u) => u.player === 0 && u.type === 'villager');
+      v.x = tx + 4.5;
+      v.y = ty + 4.5;
+      v.task = null;
+      window.__game.scene.simStep = () => {};
+      w.players[0].resources.wood = 500;
+
+      const plug = { gx: tx + 8, gy: ty + 4 }; // tiles (tx+7,tx+8) x (ty+3,ty+4)
+
+      // Somewhere legitimate to build, for the other half of the claim.
+      let good = null;
+      for (let r = 3; r <= 14 && !good; r++) {
+        for (const [dx, dy] of [[r, 0], [0, r], [-r, 0], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+          const gx = Math.floor(tc.x) + dx + 1;
+          const gy = Math.floor(tc.y) + dy + 1;
+          if (canPlace(w, gx, gy, 4, 4) && economy.canPlaceReachable(w, 0, 'house', gx, gy)) {
+            good = { gx, gy };
+            break;
+          }
+        }
+      }
+
+      return {
+        tx, ty, plug, good, vill: v.id,
+        wood: w.players[0].resources.wood,
+        canPlace: canPlace(w, plug.gx, plug.gy, 2, 2),
+        reachable: economy.canPlaceReachable(w, 0, 'house', plug.gx, plug.gy),
+      };
+    });
+    check('the pen is built: a villager in a yard with one house-sized door',
+      !pen.fail && pen.canPlace && pen.reachable === false && !!pen.good,
+      pen.fail || `canPlace=${pen.canPlace}, canPlaceReachable=${pen.reachable}, ` +
+        `somewhere legal to build=${!!pen.good}`);
+    if (pen.fail || !pen.canPlace || pen.reachable !== false || !pen.good) return;
+
+    // Aim the ghost at the door and lift, reading what the renderer was handed.
+    // Real PointerEvents, because the ghost has to be inspected *between* the
+    // press and the lift and the CDP pipeline cannot be interrupted mid-gesture.
+    const refused = await page.evaluate((s) => {
+      const g = window.__game;
+      const calls = [];
+      const orig = g.renderer.setPlacementGhost;
+      g.renderer.setPlacementGhost = (...a) => { calls.push(a); return orig.apply(g.renderer, a); };
+      g.input.centerOnGrid(s.plug.gx, s.plug.gy);
+      g.hud.setPlacementMode('house');
+      const p = g.input._toScreen(s.plug.gx, s.plug.gy);
+      const canvas = g.scene.game.canvas;
+      const r = canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      const GHOST_LIFT = 62; // must match ui/input.js
+      const opts = {
+        pointerId: 11,
+        pointerType: 'touch',
+        clientX: r.left + (p.x * r.width) / size.width,
+        clientY: r.top + ((p.y + GHOST_LIFT) * r.height) / size.height,
+        bubbles: true,
+        cancelable: true,
+      };
+      canvas.dispatchEvent(new PointerEvent('pointerdown', opts));
+      const ghost = { ...g.input._state.ghost };
+      window.dispatchEvent(new PointerEvent('pointerup', opts));
+      g.renderer.setPlacementGhost = orig;
+      const drawn = calls[calls.length - 1] || [];
+      return {
+        ghost,
+        drawnValid: drawn[3],
+        drawnAt: `${drawn[1]},${drawn[2]}`,
+        armed: g.hud.getPlacementType(),
+        sites: g.world.buildings.filter((b) => b.player === 0 && !b.complete).length,
+        wood: g.world.players[0].resources.wood,
+      };
+    }, pen);
+
+    check('the ghost sits on the tile the finger is aiming at',
+      refused.ghost.gx === pen.plug.gx && refused.ghost.gy === pen.plug.gy,
+      `ghost at ${refused.ghost.gx},${refused.ghost.gy}, aimed at ${pen.plug.gx},${pen.plug.gy}`);
+    check('and it is RED on the tile the game will refuse',
+      refused.ghost.valid === false && refused.drawnValid === false,
+      `ghost.valid=${refused.ghost.valid}, drawn valid=${refused.drawnValid} at ${refused.drawnAt}`);
+    check('the refused tap builds nothing and charges nothing',
+      refused.sites === 0 && refused.wood === pen.wood,
+      `${refused.sites} site(s), ${pen.wood} -> ${refused.wood} wood`);
+    check('and placement stays armed so the player can just move a bit',
+      refused.armed === 'house', String(refused.armed));
+
+    await page.waitForTimeout(120);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-ghost-refused.png') });
+
+    // One refusal, one toast — and a second refusal a beat later must refresh
+    // that line rather than stack an identical copy of it over the base.
+    const first = await page.evaluate(() => ({
+      nodes: [...document.querySelectorAll('#toasts .toast:not(.out)')].map((n) => n.textContent),
+      all: window.__toasts.slice(),
+    }));
+    const refusals = (list) => list.filter((t) => /trap your villagers|seal in your Town Center/i.test(t));
+    check('the refusal says which rule it is', refusals(first.all).length === 1,
+      first.all.join(' | '));
+    check('and it is on screen exactly once', refusals(first.nodes).length === 1,
+      `${first.nodes.length} toast(s): ${first.nodes.join(' | ')}`);
+
+    // 1.8s: past the repeat window (1600ms), inside the toast's own life (2400ms)
+    // — the gap the two stacked copies used to appear in.
+    await page.waitForTimeout(1800);
+    const again = await page.evaluate((s) => {
+      const g = window.__game;
+      const p = g.input._toScreen(s.plug.gx, s.plug.gy);
+      const canvas = g.scene.game.canvas;
+      const r = canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      const opts = {
+        pointerId: 12,
+        pointerType: 'touch',
+        clientX: r.left + (p.x * r.width) / size.width,
+        clientY: r.top + ((p.y + 62) * r.height) / size.height,
+        bubbles: true,
+        cancelable: true,
+      };
+      canvas.dispatchEvent(new PointerEvent('pointerdown', opts));
+      window.dispatchEvent(new PointerEvent('pointerup', opts));
+      return [...document.querySelectorAll('#toasts .toast:not(.out)')].map((n) => n.textContent);
+    }, pen);
+    check('refusing the same tile again never stacks a second copy of the line',
+      refusals(again).length === 1, `${again.length} toast(s): ${again.join(' | ')}`);
+
+    // --- Green where it will actually go through. ----------------------------
+    const placed = await page.evaluate((s) => {
+      const g = window.__game;
+      g.input.centerOnGrid(s.good.gx, s.good.gy);
+      const p = g.input._toScreen(s.good.gx, s.good.gy);
+      const canvas = g.scene.game.canvas;
+      const r = canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      const opts = {
+        pointerId: 13,
+        pointerType: 'touch',
+        clientX: r.left + (p.x * r.width) / size.width,
+        clientY: r.top + ((p.y + 62) * r.height) / size.height,
+        bubbles: true,
+        cancelable: true,
+      };
+      const woodBefore = g.world.players[0].resources.wood;
+      canvas.dispatchEvent(new PointerEvent('pointerdown', opts));
+      const ghost = { ...g.input._state.ghost };
+      window.dispatchEvent(new PointerEvent('pointerup', opts));
+      const site = g.world.buildings.find((b) => b.player === 0 && !b.complete);
+      return {
+        ghost,
+        woodBefore,
+        wood: g.world.players[0].resources.wood,
+        site: site ? { id: site.id, x: site.x, y: site.y, tiles: site.tiles, type: site.type } : null,
+        armed: g.hud.getPlacementType(),
+      };
+    }, pen);
+    check('the ghost is GREEN where the placement will be taken',
+      placed.ghost.valid === true, `ghost.valid=${placed.ghost.valid}`);
+    check('and lifting there really does put the foundation down',
+      !!placed.site && placed.wood === placed.woodBefore - 25,
+      placed.site ? `${placed.woodBefore} -> ${placed.wood} wood` : 'no foundation');
+    if (!placed.site) return;
+    check('placement mode is spent once it is used', placed.armed === null, String(placed.armed));
+
+    // --- Cancelling the site you regret. -------------------------------------
+    const p2 = await aim(page, placed.site.x, placed.site.y);
+    await tapSlow(page, p2.x, p2.y);
+    await paint(page);
+    const panel = await page.evaluate((id) => ({
+      selected: window.__game.world.selection.has(id),
+      note: (document.querySelector('#cmd-panel .cmd-note') || {}).textContent,
+      cancels: document.querySelectorAll('#cmd-panel .cbtn.danger').length,
+      demolish: document.querySelectorAll('#cmd-panel .cbtn.demolish').length,
+    }), placed.site.id);
+    check('tapping our own foundation selects it', panel.selected);
+    check('the panel offers a Cancel for it, and not a Demolish',
+      panel.cancels === 1 && panel.demolish === 0,
+      `${panel.cancels} cancel, ${panel.demolish} demolish — note: ${panel.note}`);
+    const box = await page.locator('#cmd-panel .cbtn.danger').first().boundingBox();
+    check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
+      box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-cancel-foundation.png') });
+
+    const mark = await toastMark(page);
+    await page.locator('#cmd-panel .cbtn.danger').first().click();
+    await paint(page);
+    const cancelled = await page.evaluate((s) => {
+      const w = window.__game.world;
+      return {
+        gone: !w.entities.get(s.id) && !w.buildings.some((b) => b.id === s.id),
+        selected: w.selection.has(s.id),
+        free: s.tiles.every(([tx, ty]) => w.blocked[ty * w.width + tx] === 0),
+        wood: w.players[0].resources.wood,
+      };
+    }, placed.site);
+    check('one tap cancels the site — no confirmation needed, nothing is destroyed',
+      cancelled.gone && !cancelled.selected, `removed=${cancelled.gone}`);
+    check('the ground comes back', cancelled.free, `${placed.site.tiles.length} tiles`);
+    check('and so does the wood', cancelled.wood === placed.woodBefore,
+      `${placed.wood} -> ${cancelled.wood}, paid ${placed.woodBefore}`);
+    check('a toast says so', /cancelled/i.test(await toastsSince(page, mark)),
+      await toastsSince(page, mark));
+
+    check('no console errors (placement ghost run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
 // `--only rally` runs just the runs whose name contains "rally" — the whole
 // file is four browser boots and well over a minute, which is a long wait when
 // you are iterating on one of them.
@@ -1288,6 +1677,8 @@ const run = async () => {
     ['attack-move', attackMoveRun],
     ['demolish one of your own buildings', demolishRun],
     ['demolish your way out of a trap', trappedVillagerRun],
+    ['put villagers on your own farm', farmTapRun],
+    ['the placement ghost, the refusal and cancelling a site', placementGhostRun],
   ];
   for (const [name, fn] of runs) {
     if (ONLY && !name.includes(ONLY)) continue;
