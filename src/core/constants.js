@@ -37,7 +37,10 @@ export const CARRY_CAPACITY = 10;
 export const GATHER_RATE = { food: 0.55, wood: 0.5, gold: 0.45 };
 
 // How much a node holds before it is exhausted.
-export const NODE_AMOUNT = { tree: 100, berry: 150, gold: 700 };
+// Gold is deliberately the scarcest: only soldiers cost it, so a rich vein just
+// banks thousands of unspendable coins. Food is the early bottleneck but has to
+// last, or both economies drift into all-archer armies once the berries die.
+export const NODE_AMOUNT = { tree: 100, berry: 200, gold: 320 };
 
 // --- Population -------------------------------------------------------------
 export const POP_PER_HOUSE = 5;

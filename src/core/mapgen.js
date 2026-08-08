@@ -21,6 +21,7 @@ export function generateMap(world) {
   // then clear anything that would sit on top of a base.
   scatterForests(world, bases);
   scatterGold(world, bases);
+  scatterBerries(world, bases);
 
   for (const b of bases) buildBase(world, b);
 
@@ -132,6 +133,16 @@ function scatterGold(world, bases) {
   }
 }
 
+/** Neutral berry patches, so a long game has food worth walking out for. */
+function scatterBerries(world, bases) {
+  const { rng } = world;
+  for (let i = 0; i < 6; i++) {
+    const cx = rng.int(10, MAP_W - 11);
+    const cy = rng.int(10, MAP_H - 11);
+    placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, 10);
+  }
+}
+
 function placeCluster(world, cx, cy, type, count, bases, minBaseDist) {
   const { rng } = world;
   let placed = 0;
@@ -154,9 +165,13 @@ function buildBase(world, base) {
 
   const tc = spawnBuilding(world, 'towncenter', player, x, y);
 
-  // Berries: the opening food source, placed just off the Town Center.
+  // Berries: the opening food source, placed just off the Town Center, plus a
+  // second patch a little further out. Food is finite — with only the opening
+  // patch both economies run dry around the six minute mark and armies decay
+  // into archers, which cost no food.
   const dir = player === PLAYER ? 1 : -1;
   placeCluster(world, x - 5 * dir, y + 3 * dir, 'berry', 6, [], 0);
+  placeCluster(world, x + 4 * dir, y + 7 * dir, 'berry', 5, [], 0);
 
   // Three starting villagers, fanned out in front of the Town Center.
   const spawned = [];

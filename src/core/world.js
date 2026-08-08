@@ -12,14 +12,17 @@ import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
 import { dist2 } from './iso.js';
 
-let nextId = 1;
-
 export function createWorld(seed = 12345) {
   const rng = makeRng(seed);
 
   const world = {
     seed,
     rng,
+    // Entity id counter. This lives on the world rather than in module scope so
+    // that replaying a seed produces identical ids: combat staggers swings and
+    // unit AI breaks ties off `entity.id`, so a shared global would make "play
+    // again" on the same seed diverge from the first match.
+    nextId: 1,
     events: new EventBus(),
     time: 0,
     tick: 0,
@@ -137,7 +140,7 @@ export function spawnUnit(world, type, player, gx, gy) {
   const s = UNIT_STATS[type];
   if (!s) throw new Error(`unknown unit type: ${type}`);
   const e = {
-    id: nextId++,
+    id: world.nextId++,
     kind: 'unit',
     type,
     player,
@@ -186,7 +189,7 @@ export function spawnBuilding(world, type, player, gx, gy, { complete = true } =
   const cy = oy + s.fh / 2;
 
   const e = {
-    id: nextId++,
+    id: world.nextId++,
     kind: 'building',
     type,
     player,
@@ -223,7 +226,7 @@ export function spawnResource(world, type, gx, gy) {
   const tx = Math.floor(gx);
   const ty = Math.floor(gy);
   const e = {
-    id: nextId++,
+    id: world.nextId++,
     kind: 'resource',
     type,
     player: null,
