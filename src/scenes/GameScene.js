@@ -17,7 +17,7 @@ import { EV } from '../core/events.js';
 
 import { createRenderer } from '../gfx/render.js';
 import { updateEconomy } from '../systems/economy.js';
-import { updateUnits } from '../systems/unitAI.js';
+import { updateUnits, commandUnits } from '../systems/unitAI.js';
 import { updateCombat } from '../systems/combat.js';
 import { createEnemyAI } from '../systems/enemyAI.js';
 import { createInput } from '../ui/input.js';
@@ -56,6 +56,8 @@ export class GameScene extends Phaser.Scene {
       step: (n = 1) => {
         for (let i = 0; i < n; i++) this.simStep();
       },
+      // Issue orders from the console or from the test harness.
+      command: (units, order) => commandUnits(world, units, order),
     };
 
     this.accumulator = 0;
