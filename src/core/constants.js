@@ -105,6 +105,18 @@ export const BUILDING_STATS = {
     trains: ['militia', 'archer'],
     lineOfSight: 5,
   },
+  farm: {
+    name: 'Farm',
+    hp: 120, fw: 2, fh: 2,
+    cost: { food: 0, wood: 60, gold: 0 },
+    buildTime: 8,
+    trains: [],
+    lineOfSight: 2,
+    // A farm is a building you gather food from until it is exhausted, then
+    // rebuild. It is what stops food being a cliff once the berries die, and
+    // it is the sink that gives late-game wood somewhere to go.
+    provides: { type: 'food', amount: 300 },
+  },
   mill: {
     name: 'Mill',
     hp: 400, fw: 2, fh: 2,
@@ -117,7 +129,7 @@ export const BUILDING_STATS = {
 };
 
 // Buildings a villager may place.
-export const BUILDABLE = ['house', 'barracks', 'mill', 'towncenter'];
+export const BUILDABLE = ['house', 'farm', 'barracks', 'mill', 'towncenter'];
 
 // Villagers contribute this much build progress per second (per builder).
 export const BUILD_RATE = 1.0;
@@ -140,7 +152,11 @@ export const MAX_STEPS_PER_FRAME = 5;
 // --- Camera / view ----------------------------------------------------------
 export const ZOOM_MIN = 0.55;
 export const ZOOM_MAX = 1.9;
-export const ZOOM_DEFAULT = 1.0;
+// At 1.0 a phone sees ~229 tiles: your Town Center, three villagers and a wall
+// of trees, but only four berry bushes and one gold — you cannot read your own
+// opening. 0.7 shows ~337 tiles, which puts food, wood and gold on screen at
+// once, the way an AoE2 start is meant to be read.
+export const ZOOM_DEFAULT = 0.7;
 
 // --- Input tuning (touch-first) --------------------------------------------
 // A pointer that moves less than this (screen px) counts as a tap, not a drag.

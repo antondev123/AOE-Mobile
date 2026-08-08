@@ -49,6 +49,9 @@ export const EV = {
 
   // { entity, target, amount } — damage actually applied (post-armor)
   DAMAGE: 'damage',
+  // { player, entity, gx, gy } — one of this player's things is being attacked.
+  // Throttled by the emitter: this drives an alert, not a damage log.
+  UNDER_ATTACK: 'underAttack',
   // { from, to } — a projectile was launched
   PROJECTILE: 'projectile',
 
