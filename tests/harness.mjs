@@ -110,9 +110,11 @@ export async function snapshot(page) {
       resources: w.players.map((p) => ({ ...p.resources, pop: p.pop, popCap: p.popCap })),
       units: w.players.map((_, i) => count(i, 'unit')),
       villagers: w.players.map((_, i) => count(i, 'unit', 'villager')),
-      military: w.players.map(
-        (_, i) => count(i, 'unit', 'militia') + count(i, 'unit', 'archer')
-      ),
+      // Everything that is not a villager. Naming the military types here meant
+      // hardcoding a pair, and the day the roster grew a spearman, a scout and
+      // a ram, a seed where the enemy opened with any of them reported an army
+      // of zero and the smoke run failed on a game that was working perfectly.
+      military: w.players.map((_, i) => count(i, 'unit') - count(i, 'unit', 'villager')),
       buildings: w.players.map((_, i) => count(i, 'building')),
       houses: w.players.map((_, i) => count(i, 'building', 'house')),
       barracks: w.players.map((_, i) => count(i, 'building', 'barracks')),

@@ -52,7 +52,7 @@
 import {
   TAP_SLOP, TAP_TIME_MS, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS,
   ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
-  PLAYER, BUILDING_STATS, isWallType,
+  PLAYER, BUILDING_STATS, isWallType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { screenDist, worldToGrid } from '../core/iso.js';
@@ -89,7 +89,12 @@ const SAMPLE_KEEP = 8;
 const REST_MS = 200;
 const MAX_FLING = 4200;       // world px/s
 
-const MILITARY = new Set(['militia', 'archer']);
+// Derived from the roster, never written out. When this was a hand-written
+// pair the spearman, scout and ram were silently excluded from attack-move and
+// from double-tap "select every soldier like this one" the day they shipped —
+// the kind of omission that reads as a broken command rather than a missing
+// unit, because the units exist and simply refuse the order.
+const MILITARY = new Set(MILITARY_TYPES);
 
 export function createInput(scene, world, renderer, hud) {
   const game = scene.game;
@@ -656,8 +661,17 @@ export function createInput(scene, world, renderer, hud) {
     if (!s) return null;
     const g = toGrid(sx, sy - GHOST_LIFT);
     // Snap exactly the way spawnBuilding() will, so the ghost never lies.
-    const gx = Math.floor(g.x - s.fw / 2) + s.fw / 2;
-    const gy = Math.floor(g.y - s.fh / 2) + s.fh / 2;
+    //
+    // The nudge is not cosmetic. Aiming at a tile corner inverts to a grid
+    // coordinate a fraction of an ulp below the integer, and floor() then
+    // charges that whole error to the tile: aim at exactly 5 and the footprint
+    // lands on 4. A finger rarely hits a corner to the pixel, but the placement
+    // bar's centre-screen ghost does it every time it opens, so the building
+    // you are shown before you move your thumb was consistently one tile up
+    // and left of the one you were aiming at.
+    const EPS = 1e-6;
+    const gx = Math.floor(g.x + EPS - s.fw / 2) + s.fw / 2;
+    const gy = Math.floor(g.y + EPS - s.fh / 2) + s.fh / 2;
     // Being broke outranks the ground being wrong, as it always has: it is the
     // thing the player has to fix first, and it is true of every tile.
     const reason = canAffordType(type) ? refusalFor(type, gx, gy) : 'Not enough resources';
