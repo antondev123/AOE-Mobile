@@ -12,8 +12,10 @@ import {
 } from '../src/core/constants.js';
 import { EV } from '../src/core/events.js';
 import {
-  updateCombat, applyDamage, canAttack, inRange,
+  updateCombat, applyDamage, canAttack, inRange, isAttackMoving, ENGAGE_RANGE,
 } from '../src/systems/combat.js';
+// Pure naming helper; importing the HUD module headlessly touches no DOM.
+import { underAttackText } from '../src/ui/hud.js';
 
 // --- tiny harness -----------------------------------------------------------
 let passed = 0;
@@ -451,6 +453,241 @@ test('hp drops in legible chunks, not a trickle', () => {
   stepUntil(w, () => v.dead, 400);
   assert(amounts.length <= 6, `few, large hits (${amounts.length} swings)`);
   assert(amounts.every((a) => a >= v.maxHp * 0.15), 'each hit is a visible chunk');
+});
+
+// --- under-attack alerts ----------------------------------------------------
+//
+// B1 from the playtest: a full match produced zero alerts, so a player lost
+// three villagers and a Town Center with no feedback at all. These tests pin
+// down both halves of the contract: it fires, and it stays an alert rather than
+// becoming a damage log.
+
+test('EV.UNDER_ATTACK fires when one of your units is hit', () => {
+  const w = fresh();
+  const v = spawnUnit(w, 'villager', PLAYER, 12, 9);
+  spawnUnit(w, 'militia', ENEMY, 12.9, 9);
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => seen.push(p));
+
+  stepUntil(w, () => seen.length > 0, 200);
+  eq(seen.length, 1, 'exactly one alert for the first blow');
+  eq(seen[0].player, PLAYER, 'addressed to the victim’s owner');
+  eq(seen[0].entity, v, 'and names the thing being hit');
+  eq(seen[0].gx, 12, 'carries the grid position so the HUD can jump there');
+  eq(seen[0].gy, 9, 'both axes');
+  assert(v.hp < v.maxHp, 'it really was damage that triggered it');
+});
+
+test('EV.UNDER_ATTACK fires for buildings too, and even on a killing blow', () => {
+  const w = fresh();
+  const house = spawnBuilding(w, 'house', PLAYER, 20, 20);
+  const foe = spawnUnit(w, 'militia', ENEMY, 20, 20);
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => seen.push(p));
+
+  applyDamage(w, foe, house, 1);
+  eq(seen.length, 1, 'a building being hit is an alert');
+  eq(seen[0].entity, house, 'the building is named');
+
+  // A killing blow is the moment you most need telling.
+  const w2 = fresh();
+  const v = spawnUnit(w2, 'villager', PLAYER, 8, 8);
+  const killer = spawnUnit(w2, 'militia', ENEMY, 8.9, 8);
+  const seen2 = [];
+  w2.events.on(EV.UNDER_ATTACK, (p) => seen2.push(p));
+  applyDamage(w2, killer, v, 100000);
+  assert(v.dead, 'villager died in one hit');
+  eq(seen2.length, 1, 'the death still raised the alarm');
+});
+
+test('the alert is per player, not player-0 only — the HUD filters, not combat', () => {
+  const w = fresh();
+  const foeVill = spawnUnit(w, 'villager', ENEMY, 30, 30);
+  const mine = spawnUnit(w, 'militia', PLAYER, 30.9, 30);
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => seen.push(p));
+  applyDamage(w, mine, foeVill, 1);
+  eq(seen.length, 1, 'the AI’s things raise alerts as well');
+  eq(seen[0].player, ENEMY, 'tagged with the owner');
+});
+
+test('nothing unowned, and no friendly fire, ever raises an alert', () => {
+  const w = fresh();
+  const a = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const b = spawnUnit(w, 'villager', PLAYER, 11, 10);
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => seen.push(p));
+  applyDamage(w, a, b, 3); // same player: not an attack, whatever caused it
+  eq(seen.length, 0, 'your own units hurting each other is not an alarm');
+});
+
+test('a sustained beating produces a handful of alerts, not one per hit', () => {
+  const w = fresh();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 20, 20);
+  tc.hp = tc.maxHp = 1000000; // it must survive the whole minute
+  spawnUnit(w, 'militia', ENEMY, 17.5, 20);
+
+  const alerts = [];
+  const hits = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => alerts.push(p));
+  w.events.on(EV.DAMAGE, (p) => hits.push(p));
+
+  step(w, 60 * 20); // a full minute of being ground down
+
+  assert(hits.length > 40, `the beating landed (${hits.length} hits)`);
+  assert(alerts.length >= 2, `a minute-long siege re-warns you (${alerts.length})`);
+  assert(alerts.length <= 6, `but it is an alert, not a log (${alerts.length})`);
+  assert(alerts.length < hits.length / 8, 'orders of magnitude fewer than hits');
+});
+
+test('alerts are throttled per player and per locality', () => {
+  const w = fresh();
+  // A distant attacker so nothing auto-engages while we drive damage by hand.
+  const foe = spawnUnit(w, 'militia', ENEMY, 45, 45);
+  const near = spawnUnit(w, 'villager', PLAYER, 5, 5);
+  const far = spawnUnit(w, 'villager', PLAYER, 30, 30);
+  near.hp = near.maxHp = 100000;
+  far.hp = far.maxHp = 100000;
+
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => seen.push(p));
+
+  applyDamage(w, foe, near, 1);
+  eq(seen.length, 1, 'first blow warns you');
+
+  applyDamage(w, foe, far, 1);
+  eq(seen.length, 1, 'a second front in the same breath is still one warning');
+
+  step(w, 5 * 20); // past the per-player rate gate
+  applyDamage(w, foe, far, 1);
+  eq(seen.length, 2, 'a genuinely separate front does get its own warning');
+  assert(Math.hypot(seen[1].gx - 30, seen[1].gy - 30) < 0.001, 'pointing at the new fight');
+
+  applyDamage(w, foe, near, 1);
+  eq(seen.length, 2, 'and the first locality stays quiet inside its window');
+
+  step(w, 20 * 20); // ~25s in: the first locality's window has lapsed
+  applyDamage(w, foe, near, 1);
+  eq(seen.length, 3, 'a raid that is still going does eventually re-warn');
+});
+
+test('the alert names the thing, the way AoE2 does', () => {
+  const w = fresh();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 20, 20);
+  const v = spawnUnit(w, 'villager', PLAYER, 10, 10);
+  const m = spawnUnit(w, 'militia', PLAYER, 11, 10);
+  eq(underAttackText(tc), 'Your Town Center is under attack!', 'buildings by name');
+  eq(underAttackText(v), 'Your villagers are under attack!', 'villagers, plural, as AoE2 says it');
+  eq(underAttackText(m), 'Your Militia is under attack!', 'soldiers by name');
+});
+
+// --- the standoff (finding #2) ----------------------------------------------
+
+test('two idle armies do not stand in lines staring at each other', () => {
+  // The critic swept the gap: engaged at 4.5 tiles, frozen at 5.5. Sweep it.
+  for (let gap = 4.0; gap <= 7.0 + 1e-9; gap += 0.25) {
+    const w = fresh();
+    const mine = [];
+    const foes = [];
+    for (let i = 0; i < 4; i++) {
+      mine.push(spawnUnit(w, 'militia', PLAYER, 10, 8 + i));
+      foes.push(spawnUnit(w, 'militia', ENEMY, 10 + gap, 8 + i));
+    }
+    step(w, 20); // one second of looking at each other
+    const idle = [...mine, ...foes].filter((u) => !u.target).length;
+    eq(idle, 0, `${gap.toFixed(2)} tiles apart: ${idle} soldiers did nothing`);
+  }
+});
+
+test('an army does not watch a comrade die a few tiles away', () => {
+  const w = fresh();
+  const v = spawnUnit(w, 'villager', PLAYER, 20, 20);
+  const foe = spawnUnit(w, 'militia', ENEMY, 20.9, 20);
+  // Far enough that the guard genuinely cannot notice the attacker itself.
+  const guard = spawnUnit(w, 'militia', PLAYER, 20, 12.3);
+  assert(
+    Math.hypot(foe.x - guard.x, foe.y - guard.y) > ENGAGE_RANGE,
+    'the attacker is outside what the guard can see on its own',
+  );
+
+  stepUntil(w, () => v.hp < v.maxHp, 200);
+  eq(guard.target, foe, 'a comrade being cut down pulls the guard in');
+  eq(guard.autoTarget, true, 'and that response is still leashed');
+});
+
+test('villagers are never dragged into a fight by any of this', () => {
+  const w = fresh();
+  const v1 = spawnUnit(w, 'villager', PLAYER, 20, 20);
+  const v2 = spawnUnit(w, 'villager', PLAYER, 21, 20);
+  spawnUnit(w, 'militia', ENEMY, 20.9, 20);
+  stepUntil(w, () => v1.hp < v1.maxHp || v2.hp < v2.maxHp, 200);
+  step(w, 20);
+  eq(v1.target, null, 'the victim does not trade blows');
+  eq(v2.target, null, 'nor does the one standing next to it');
+  assert(v1.fleeing || v2.fleeing, 'they run, as before');
+});
+
+test('a target spotted at the edge of vigilance can actually be reached', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  const v = spawnUnit(w, 'villager', ENEMY, 10 + ENGAGE_RANGE - 0.2, 10);
+  v.hp = v.maxHp = 100000;
+  step(w);
+  eq(m.target, v, 'acquired at the edge of vigilance');
+  // Walk it in by hand (unitAI is not running here). If the leash snapped on
+  // the way the unit would trudge home and re-acquire forever.
+  for (let i = 0; i < 9; i++) {
+    m.x += 0.7;
+    step(w);
+    eq(m.target, v, `still committed after ${i + 1} paces`);
+  }
+});
+
+// --- attack-move -------------------------------------------------------------
+// combat.js only reads the flag; creating the order is unitAI's job. Both the
+// task-shaped and the unit-shaped forms are honoured so the two can land in
+// either order.
+
+test('a plain move order still marches past a fight', () => {
+  const w = fresh();
+  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  m.task = { type: 'move', gx: 30, gy: 10 };
+  m.state = 'move';
+  spawnUnit(w, 'villager', ENEMY, 13, 10);
+  step(w, 10);
+  eq(m.target, null, 'a repositioning army is not hijacked on the way');
+});
+
+test('an attack-moving soldier engages what it passes', () => {
+  for (const mark of [
+    (u) => { u.task = { type: 'move', gx: 30, gy: 10, attackMove: true }; },
+    (u) => { u.task = { type: 'attackMove', gx: 30, gy: 10 }; },
+    (u) => { u.task = { type: 'move', gx: 30, gy: 10 }; u.attackMove = true; },
+  ]) {
+    const w = fresh();
+    const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+    mark(m);
+    m.state = 'move';
+    const v = spawnUnit(w, 'villager', ENEMY, 13, 10);
+    assert(isAttackMoving(m), 'flag recognised');
+    step(w, 10);
+    eq(m.target, v, 'engaged what it walked past');
+    eq(m.autoTarget, true, 'and it is a leashed engagement, not an order');
+  }
+});
+
+test('an attack-move reaches further than a unit parked mid-order', () => {
+  const w = fresh();
+  const parked = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  parked.task = { type: 'move', gx: 30, gy: 10 };
+  parked.state = 'idle'; // unitAI parks units mid-order with a spent task
+  spawnUnit(w, 'villager', ENEMY, 10 + AGGRO_RANGE + 1, 10);
+  step(w, 10);
+  eq(parked.target, null, 'a parked unit only spares AGGRO_RANGE for the world');
+
+  parked.task.attackMove = true;
+  step(w, 10);
+  assert(parked.target, 'the same unit attack-moving does notice');
 });
 
 // --- report -----------------------------------------------------------------

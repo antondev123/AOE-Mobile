@@ -18,8 +18,23 @@
 //               villager panic flags; unitAI may act on them
 //   lastHitAt / lastHitBy
 //               for hp-bar flash and retaliation
+//   postLeash   how far this particular engagement may be chased (see engage)
+//   attackMove  true while the unit is under an attack-move order — see below
 //
 // world.projectiles is owned here and only read by the renderer.
+//
+// --- Attack-move -------------------------------------------------------------
+// A unit is "attack-moving" when either `unit.attackMove` is true or its task is
+// flagged (`task.type === 'attackMove'` or `task.attackMove === true`). Such a
+// unit keeps auto-acquiring *while it walks*, at the wider ENGAGE_RANGE, instead
+// of only when it is standing still. Orders are unitAI's to create; this system
+// only reads the flag, so an attack-move order can be added there without
+// touching combat. See isAttackMoving().
+//
+// --- Alerts ------------------------------------------------------------------
+// Any damage landing on an owned entity may raise EV.UNDER_ATTACK. That is an
+// alert, not a damage log: it is throttled per player *and* per locality here,
+// so a sustained beating produces a handful of events, never one per hit.
 
 import {
   UNIT_STATS, AGGRO_RANGE, CHASE_LEASH, PROJECTILE_SPEED, MIN_DAMAGE,
@@ -49,6 +64,42 @@ const PROJECTILE_MAX_OVERTIME = 1.5;
 const FLEE_TIME = 4.0;
 // How far a fleeing villager runs when it has no Town Center to hide in.
 const FLEE_DISTANCE = 6.0;
+
+/**
+ * How far a soldier that is *not* under orders looks for a fight.
+ *
+ * AGGRO_RANGE (5.0) is the range a unit busy with an order spares for its
+ * surroundings. On its own it produced the standoff the playtest found: two
+ * armies parked 5.5 tiles apart both had "nothing in range" and stood in lines
+ * staring at each other. A soldier with nothing else to do is not that passive —
+ * it holds ground *actively*, which is what ENGAGE_RANGE is. It is deliberately
+ * wider than an archer's 4.5 reach (so an idle archer never gets shot by
+ * something it is choosing to ignore) and wider than CHASE_LEASH is long.
+ * Attack-moving units use it too.
+ */
+export const ENGAGE_RANGE = 7.5;
+// Soldiers this close to one of their own things being hit join the fight. This
+// is the other half of the standoff fix: an army must never watch a comrade die
+// a few tiles away.
+const HELP_RADIUS = 8.0;
+// One call for help per victim per this many seconds — a beating must not turn
+// into a per-hit broadcast.
+const HELP_INTERVAL = 1.0;
+// An engagement may always be chased this much further than the distance it was
+// acquired at. Without it a unit that spots something at the edge of
+// ENGAGE_RANGE would snap its leash the moment it stepped off its post.
+const LEASH_MARGIN = 1.5;
+
+// --- Alert throttling (feel) ------------------------------------------------
+// AoE2 fires roughly one "under attack" per area per 10-20 seconds. These three
+// numbers reproduce that: a locality stays quiet for ALERT_LOCAL_WINDOW after it
+// alerts, and no player gets two alerts closer together than ALERT_MIN_GAP
+// however many separate fights are running.
+const ALERT_LOCAL_RADIUS = 10.0;
+const ALERT_LOCAL_WINDOW = 18.0;
+const ALERT_MIN_GAP = 4.0;
+// Bounded memory: only the most recent localities are remembered.
+const ALERT_SITES_MAX = 8;
 
 // --- Pure predicates (imported by unitAI — keep cheap and side-effect free) --
 
@@ -102,6 +153,11 @@ export function applyDamage(world, attacker, target, amount) {
   target.lastHitBy = attacker || null;
   world.events.emit(EV.DAMAGE, { entity: attacker || null, target, amount: dealt });
 
+  // Both of these fire even on the killing blow: losing a villager is exactly
+  // the moment you need to be told, and the neighbours need to react to it.
+  raiseAlert(world, attacker, target);
+  callForHelp(world, attacker, target);
+
   if (target.hp <= 0) {
     target.hp = 0;
     kill(world, target, attacker || null);
@@ -109,6 +165,86 @@ export function applyDamage(world, attacker, target, amount) {
   }
   reactToDamage(world, attacker, target);
   return dealt;
+}
+
+// --- Under-attack alerts ----------------------------------------------------
+
+// Per-world alert bookkeeping, kept off the world object so nothing else has to
+// know it exists: { [playerId]: { last, sites: [{x, y, at}] } }.
+const ALERTS = new WeakMap();
+
+function alertState(world, playerId) {
+  let byPlayer = ALERTS.get(world);
+  if (!byPlayer) ALERTS.set(world, (byPlayer = new Map()));
+  let st = byPlayer.get(playerId);
+  if (!st) byPlayer.set(playerId, (st = { last: -Infinity, sites: [] }));
+  return st;
+}
+
+/**
+ * Raise EV.UNDER_ATTACK for the owner of `target`, if the throttle allows it.
+ *
+ * Two gates, both required:
+ *   locality — a site that has already alerted stays quiet for
+ *              ALERT_LOCAL_WINDOW, so a Town Center being ground down for a
+ *              minute produces ~3 alerts rather than ~60. The window is not
+ *              refreshed by further hits: a genuinely sustained siege *should*
+ *              re-warn you every so often.
+ *   rate     — no player hears two alerts within ALERT_MIN_GAP, so a wave
+ *              hitting three things at once is one warning, not three.
+ */
+function raiseAlert(world, attacker, target) {
+  const player = target.player;
+  if (player === null || player === undefined) return false;
+  // Only an enemy attacking you is an alarm.
+  if (attacker && !isHostile(attacker, target)) return false;
+
+  const st = alertState(world, player);
+  const now = world.time;
+  const sites = st.sites;
+
+  for (let i = sites.length - 1; i >= 0; i--) {
+    const s = sites[i];
+    if (now - s.at > ALERT_LOCAL_WINDOW) { sites.splice(i, 1); continue; }
+    const dx = s.x - target.x;
+    const dy = s.y - target.y;
+    if (dx * dx + dy * dy <= ALERT_LOCAL_RADIUS * ALERT_LOCAL_RADIUS) return false;
+  }
+  if (now - st.last < ALERT_MIN_GAP) return false;
+
+  st.last = now;
+  sites.push({ x: target.x, y: target.y, at: now });
+  if (sites.length > ALERT_SITES_MAX) sites.shift();
+
+  world.events.emit(EV.UNDER_ATTACK, {
+    player, entity: target, gx: target.x, gy: target.y,
+  });
+  return true;
+}
+
+/**
+ * Something of yours is being hit: soldiers standing around it pile in.
+ *
+ * This is what stops an army watching a single unit die between the lines.
+ * Units that are actually busy with an order are left alone — an attack order
+ * is not silently rewritten by whatever gets hit nearby.
+ */
+function callForHelp(world, attacker, victim) {
+  if (!attacker || attacker.dead) return;
+  if (victim.player === null || victim.player === undefined) return;
+  if (!isHostile(attacker, victim)) return;
+  if (world.time - (victim._helpAt ?? -Infinity) < HELP_INTERVAL) return;
+  victim._helpAt = world.time;
+
+  forEachNear(world, victim.x, victim.y, HELP_RADIUS, (e) => {
+    if (e === victim || e.kind !== 'unit') return;
+    if (e.player !== victim.player) return;
+    if (isVillager(e) || e.fleeing) return;
+    if (e.target) return;                        // already in a fight
+    if (e.task && e.state !== 'idle') return;    // under orders — do not hijack
+    if (!canAttack(e, attacker)) return;
+    engage(e, attacker, true);
+  });
 }
 
 function kill(world, e, killer) {
@@ -185,6 +321,11 @@ function engage(u, target, auto) {
   if (auto) {
     u.postX = u.x;
     u.postY = u.y;
+    // The leash has to be able to reach what was picked. CHASE_LEASH is the
+    // floor, not the rule: a unit that deliberately chose a target at the edge
+    // of ENGAGE_RANGE must be allowed to walk to it and swing, or it would
+    // oscillate between acquiring and trudging home.
+    u.postLeash = Math.max(CHASE_LEASH, edgeDist(target, u.x, u.y) + LEASH_MARGIN);
   }
 }
 
@@ -254,9 +395,10 @@ export function updateCombat(world, dt) {
 
 function leashSnapped(u) {
   if (u.postX === undefined) return false;
+  const leash = u.postLeash || CHASE_LEASH;
   const strayed =
-    dist(u.x, u.y, u.postX, u.postY) > CHASE_LEASH ||
-    edgeDist(u.target, u.postX, u.postY) > CHASE_LEASH;
+    dist(u.x, u.y, u.postX, u.postY) > leash ||
+    edgeDist(u.target, u.postX, u.postY) > leash;
   // Never abandon a target it can hit this very moment — finish the kill.
   return strayed && !inRange(u, u.target);
 }
@@ -338,23 +480,48 @@ function updateProjectiles(world, dt) {
 
 // --- Auto-acquisition -------------------------------------------------------
 
+/**
+ * Is this unit under an attack-move order? See the note at the top of the file.
+ * unitAI sets the flag; combat only reads it, so the two can land separately.
+ */
+export function isAttackMoving(u) {
+  if (!u) return false;
+  if (u.attackMove) return true;
+  const t = u.task;
+  return !!(t && (t.type === 'attackMove' || t.attackMove));
+}
+
+/**
+ * How far this unit looks for a fight right now.
+ *
+ * A unit with no job, and a unit deliberately attack-moving, both hold ground
+ * actively (ENGAGE_RANGE). A unit parked mid-order only spares AGGRO_RANGE for
+ * its surroundings, so ordinary traffic near a border does not start wars.
+ */
+function acquireRange(u) {
+  if (isAttackMoving(u)) return ENGAGE_RANGE;
+  return u.task ? AGGRO_RANGE : ENGAGE_RANGE;
+}
+
 function acquire(world, u, dt) {
   // Villagers never pick fights.
   if (isVillager(u) || !(u.attack > 0) || u.fleeing) return;
   // Busy under an order — leave it alone. (A unit unitAI has parked as 'idle'
-  // is fair game even if it still carries a spent task object.)
-  if (u.task && u.state !== 'idle') return;
+  // is fair game even if it still carries a spent task object.) An attack-move
+  // is the exception: engaging what it passes is the entire point of the order.
+  if (u.task && u.state !== 'idle' && !isAttackMoving(u)) return;
 
   u._acqTimer = (u._acqTimer || 0) - dt;
   if (u._acqTimer > 0) return;
   u._acqTimer = ACQUIRE_INTERVAL + phaseOf(u) * ACQUIRE_INTERVAL;
 
+  const range = acquireRange(u);
   let best = null;
   let bestScore = Infinity;
-  forEachNear(world, u.x, u.y, AGGRO_RANGE, (e) => {
+  forEachNear(world, u.x, u.y, range, (e) => {
     if (!canAttack(u, e)) return;
     // Prefer live threats over masonry: buildings are pushed to the back.
-    const bias = e.kind === 'building' ? AGGRO_RANGE * AGGRO_RANGE : 0;
+    const bias = e.kind === 'building' ? range * range : 0;
     const score = edgeDist2(e, u.x, u.y) + bias;
     if (score < bestScore) {
       bestScore = score;

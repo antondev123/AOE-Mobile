@@ -23,6 +23,24 @@ const RES_COLOR = { tree: '#2e5a24', berry: '#a8324a', gold: '#d8b33c' };
 const TEAM = ['#5aa2ff', '#ff5a5a'];
 const TEAM_DARK = ['#1c56ab', '#a01f1f'];
 
+// --- Under-attack pings ------------------------------------------------------
+// A ping has to be findable on a 160px map in under a second, on grass, dirt,
+// sand or water, and it must not be mistakable for the static red pip of an
+// enemy unit. So it does three things a unit pip cannot: it blinks between
+// white-hot and red, it throws an expanding ring, and it carries a black
+// outline that keeps it legible on pale sand.
+const PING_LIFE = 5.0;      // seconds before a ping is gone
+const PING_PERIOD = 0.7;    // seconds per pulse
+const PING_CORE_R = 4.2;    // px, at size 160 (the map is drawn ~0.73 scale)
+const PING_RING_R = 16;     // px the ring expands to
+const PING_MAX = 6;         // bounded: a raid on five fronts is still cheap
+const PING_HOT = '#ffffff';
+const PING_RED = '#ff2f18';
+
+function now() {
+  return (typeof performance !== 'undefined' ? performance.now() : Date.now()) / 1000;
+}
+
 /** Grid -> minimap pixels (0..size). */
 export function gridToMini(gx, gy, size) {
   return {
@@ -55,6 +73,62 @@ export function createMinimap(canvas, world) {
   bg.width = size;
   bg.height = size;
   bake(bg.getContext('2d'), world, size);
+
+  // Live "something of yours is being hit here" markers. Wall-clock timed, not
+  // sim-timed: this is a UI effect, and it must decay at the same rate whether
+  // the player is watching a live match or a fast-forwarded one.
+  const pings = [];
+
+  /** Flash a decaying red marker at a grid position. Cheap and bounded. */
+  function ping(gx, gy) {
+    if (!(gx >= 0) || !(gy >= 0)) return null;
+    const p = { gx, gy, at: now() };
+    pings.push(p);
+    while (pings.length > PING_MAX) pings.shift();
+    return p;
+  }
+
+  function drawPings() {
+    if (!pings.length) return;
+    const t = now();
+    for (let i = pings.length - 1; i >= 0; i--) {
+      if (t - pings[i].at > PING_LIFE) pings.splice(i, 1);
+    }
+    if (!pings.length) return;
+
+    ctx.save();
+    for (const p of pings) {
+      const age = t - p.at;
+      const fade = 1 - age / PING_LIFE;          // whole marker dies away
+      const phase = (age % PING_PERIOD) / PING_PERIOD;
+      const c = gridToMini(p.gx, p.gy, size);
+      // The two colours swap every half pulse. Whichever way round they are,
+      // white and alarm-red are both on screen at once, so the marker separates
+      // itself from the enemy's red pips *and* from pale sand in every frame.
+      const hot = phase < 0.5;
+
+      // Expanding shockwave.
+      const r = PING_CORE_R + phase * (PING_RING_R - PING_CORE_R);
+      ctx.globalAlpha = fade * (1 - phase) * 0.95;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = hot ? PING_RED : PING_HOT;
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+
+      // Blinking core, outlined so it survives pale sand and dark water alike.
+      ctx.globalAlpha = fade;
+      ctx.beginPath();
+      ctx.arc(c.x, c.y, PING_CORE_R, 0, Math.PI * 2);
+      ctx.fillStyle = hot ? PING_HOT : PING_RED;
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.lineWidth = 1.4;
+      ctx.stroke();
+    }
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
 
   function draw(camera) {
     ctx.clearRect(0, 0, size, size);
@@ -112,9 +186,12 @@ export function createMinimap(canvas, world) {
         Math.max(4, Math.round(b.y - a.y)),
       );
     }
+
+    // Last, so nothing — not even the viewport rectangle — can hide an alarm.
+    drawPings();
   }
 
-  return { draw, size };
+  return { draw, size, ping, pings };
 }
 
 function bake(g, world, size) {

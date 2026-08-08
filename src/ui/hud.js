@@ -28,6 +28,14 @@ const MINIMAP_HZ = 10;
 const TOAST_MS = 2400;
 const TOAST_MAX = 3;
 const TOAST_REPEAT_MS = 1600;
+// An under-attack alert lives longer than a routine toast — it is a thing you
+// are meant to *reach for*, and 2.4s is not enough time to see it and tap it.
+const ALERT_MS = 5200;
+// Combat.js throttles these properly; this is only a floor so a mis-behaving
+// emitter can never machine-gun the DOM.
+const ALERT_MIN_MS = 1200;
+// How long the minimap frame keeps flashing after an alert.
+const ALERT_GLOW_MS = 5000;
 
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
@@ -72,6 +80,84 @@ function el(tag, cls, text) {
   return n;
 }
 
+/**
+ * "Your Town Center is under attack!" — AoE2 names the thing, because the name
+ * is the whole message: losing a villager and losing your Town Center call for
+ * completely different reactions.
+ */
+export function underAttackText(e) {
+  if (!e) return 'You are under attack!';
+  if (e.kind === 'unit' && e.type === 'villager') return 'Your villagers are under attack!';
+  return `Your ${displayName(e)} is under attack!`;
+}
+
+// --- Alert styling ----------------------------------------------------------
+// Owned here rather than in hud.css: this is the one piece of chrome that has to
+// look nothing like the rest of the HUD, and keeping it beside the code that
+// raises it means the two can never drift apart.
+//
+// The routine toasts are parchment on dark wood with a gold edge and they do not
+// move. An alert is the opposite of routine: red, brighter, larger, pulsing,
+// and — uniquely in the toast stack — tappable.
+const ALERT_CSS = `
+.toast.alert {
+  pointer-events: auto;
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: #fff2ec;
+  background: linear-gradient(180deg, rgba(176,38,22,0.97), rgba(104,17,9,0.97));
+  border: 1px solid #ff7a5e;
+  border-left: 4px solid #ff2f18;
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 16px rgba(255,47,24,0.42);
+  animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
+  cursor: pointer;
+}
+.toast.alert .siren { margin-right: 5px; }
+.toast.alert .sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+  opacity: 0.85;
+  letter-spacing: 0.2px;
+}
+.toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
+/* The shared exit animation must still win when the toast is retired. */
+.toast.alert.out { animation: toastout 260ms ease-in forwards; }
+@keyframes alertin { from { opacity: 0; transform: translateX(-14px) scale(0.96); } }
+@keyframes alertpulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 16px rgba(255,47,24,0.35); }
+  50%      { box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 22px rgba(255,47,24,0.95); }
+}
+/* The minimap frame flashes too: the ping is small, and this is what makes the
+   eye go and look for it. */
+.hud-minimap.alarm { animation: minialarm 700ms ease-in-out infinite; }
+@keyframes minialarm {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(255,47,24,0.35); }
+  50%      { box-shadow: 0 0 0 2px rgba(255,47,24,0.95), 0 0 14px rgba(255,47,24,0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast.alert { animation: alertin 170ms ease-out; }
+  .hud-minimap.alarm { box-shadow: 0 0 0 2px rgba(255,47,24,0.9); animation: none; }
+}
+`;
+
+let alertCssNode = null;
+function ensureAlertCss(doc) {
+  if (alertCssNode && alertCssNode.isConnected) return;
+  alertCssNode = doc.createElement('style');
+  alertCssNode.id = 'hud-alert-css';
+  alertCssNode.textContent = ALERT_CSS;
+  (doc.head || doc.documentElement).appendChild(alertCssNode);
+}
+
 /** Cost markup: "25 wood" with the matching pip. */
 function costNode(cost) {
   const box = el('span', 'cost');
@@ -108,7 +194,9 @@ export function createHud(scene, world) {
     idleCount: doc.getElementById('idle-count'),
     menuBtn: doc.getElementById('btn-menu'),
     minimap: doc.getElementById('minimap'),
+    minimapWrap: doc.getElementById('minimap-wrap'),
   };
+  ensureAlertCss(doc);
 
   const state = {
     input: null,             // set by createInput via attachInput()
@@ -123,6 +211,9 @@ export function createHud(scene, world) {
     idleCycle: 0,
     lastToast: new Map(),
     toasts: [],
+    lastAlert: -Infinity,    // performance.now() of the last under-attack alert
+    alarmUntil: 0,           // minimap keeps flashing until this
+    alerts: 0,               // how many alerts this match (tests read it)
     // Elements refreshed every frame without a re-render.
     liveCosts: [],           // { el, cost } — command panel
     liveBuild: [],           // { el, cost } — build menu sheet
@@ -196,21 +287,76 @@ export function createHud(scene, world) {
 
     const node = el('div', `toast ${tone === 'warn' ? 'warn' : ''}`, text);
     dom.toasts.appendChild(node);
-    const rec = { node, at: now };
+    pushToast({ node, at: now, ttl: TOAST_MS });
+  }
+
+  /**
+   * The urgent one. Reads nothing like the economy toasts — red, pulsing, named
+   * — and it is tappable: on a phone the whole value of the alert is that it
+   * takes you to the fight. Hunting for it by dragging the map loses the game.
+   */
+  function underAttackAlert(entity, gx, gy) {
+    if (!dom.toasts) return null;
+    const now = performance.now();
+    if (now - state.lastAlert < ALERT_MIN_MS) return null;
+    state.lastAlert = now;
+    state.alerts++;
+
+    const node = el('button', 'toast alert');
+    node.type = 'button';
+    // Toasts are aria-live="polite"; this one interrupts.
+    node.setAttribute('role', 'alert');
+    node.setAttribute('aria-label', `${underAttackText(entity)} Tap to jump there.`);
+    const line = el('span', 'line');
+    line.appendChild(el('span', 'siren', '⚔'));
+    line.appendChild(document.createTextNode(underAttackText(entity)));
+    node.appendChild(line);
+    node.appendChild(el('span', 'sub', 'Tap to jump there'));
+
+    const rec = { node, at: now, ttl: ALERT_MS, alert: true };
+    node.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      centerOnGrid(gx, gy);
+      killToast(rec);
+    });
+
+    dom.toasts.appendChild(node);
+    pushToast(rec);
+
+    if (minimap && minimap.ping) minimap.ping(gx, gy);
+    if (dom.minimapWrap) {
+      state.alarmUntil = now + ALERT_GLOW_MS;
+      dom.minimapWrap.classList.add('alarm');
+    }
+    return rec;
+  }
+
+  function pushToast(rec) {
     state.toasts.push(rec);
-    while (state.toasts.length > TOAST_MAX) killToast(state.toasts[0]);
+    // Over budget: retire the oldest *routine* toast first. An alert must never
+    // be pushed off the screen by "Training Villager".
+    while (state.toasts.length > TOAST_MAX) {
+      const victim = state.toasts.find((t) => !t.alert) || state.toasts[0];
+      if (victim === rec) break;
+      killToast(victim);
+    }
   }
 
   function killToast(rec) {
     const i = state.toasts.indexOf(rec);
-    if (i >= 0) state.toasts.splice(i, 1);
+    if (i < 0) return;
+    state.toasts.splice(i, 1);
     rec.node.classList.add('out');
     setTimeout(() => rec.node.remove(), 280);
   }
 
   function tickToasts(now) {
     for (const rec of state.toasts.slice()) {
-      if (now - rec.at > TOAST_MS) killToast(rec);
+      if (now - rec.at > (rec.ttl || TOAST_MS)) killToast(rec);
+    }
+    if (state.alarmUntil && now > state.alarmUntil) {
+      state.alarmUntil = 0;
+      if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
     }
   }
 
@@ -655,6 +801,13 @@ export function createHud(scene, world) {
 
   off.push(world.events.on(EV.TOAST, (p) => toast(p && p.text, p && p.tone)));
 
+  // The alert AoE2 is built around. combat.js throttles it to roughly one per
+  // area per 10-20s, so anything that arrives here is worth interrupting for.
+  off.push(world.events.on(EV.UNDER_ATTACK, (p) => {
+    if (!p || p.player !== PLAYER) return;
+    underAttackAlert(p.entity, p.gx, p.gy);
+  }));
+
   off.push(world.events.on(EV.INSUFFICIENT, (p) => {
     if (p && p.player !== undefined && p.player !== PLAYER) return;
     const miss = p && p.cost ? missingResource(world, PLAYER, p.cost) : null;
@@ -820,6 +973,7 @@ export function createHud(scene, world) {
       dom.minimap.removeEventListener('pointercancel', onMiniUp);
     }
     document.removeEventListener('pointerdown', onDocDown, true);
+    if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
     for (const n of [modeChip, buildMenu, placeBar, menuSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
@@ -836,8 +990,11 @@ export function createHud(scene, world) {
     getPlacementType,
     cycleIdle,
     flashRes,
+    underAttackAlert,
+    alertCount: () => state.alerts,
     attachInput(input) { state.input = input; modeChip.dataset.sig = ''; },
     _dom: dom,
+    _minimap: minimap,
   };
 
   // First paint.
