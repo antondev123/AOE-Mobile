@@ -131,29 +131,17 @@ export function buildTextures(scene) {
   const TMP = '__aoe_gfx_tmp';
 
   /**
-   * Draw one sprite and pack it. (ax, ay) is the pixel inside the sprite that
+   * Queue one sprite for packing. (ax, ay) is the pixel inside the sprite that
    * should sit on the entity's world position — stored as an origin fraction.
+   * Nothing is drawn until every frame is known, so the packer can order them
+   * tallest-first; a shelf packer fed in declaration order wastes close to half
+   * the atlas on part-empty rows.
    */
+  const queued = [];
   function put(name, w, h, ax, ay, drawFn) {
-    g.clear();
-    drawFn(g);
-    if (scene.textures.exists(TMP)) scene.textures.remove(TMP);
-    g.generateTexture(TMP, w, h);
-    const src = scene.textures.get(TMP).getSourceImage();
-    if (shelf.x + w + 1 > SIZE) {
-      shelf.x = 1;
-      shelf.y += shelf.h + 1;
-      shelf.h = 0;
-    }
-    ctx.drawImage(src, shelf.x, shelf.y);
-    canvasTex.add(name, 0, shelf.x, shelf.y, w, h);
-    origins.set(name, { w, h, ox: ax / w, oy: ay / h });
-    shelf.x += w + 1;
-    if (h > shelf.h) shelf.h = h;
-    scene.textures.remove(TMP);
+    queued.push({ name, w, h, ax, ay, drawFn });
   }
 
-  // Tall things first so the shelf packer wastes as little as possible.
   buildBuildings(put);
   buildFoundations(put);
   buildResources(put, rng);
@@ -162,8 +150,32 @@ export function buildTextures(scene) {
   buildMarkers(put);
   buildFx(put);
 
+  // Stable sort by descending height: ties keep declaration order, so the same
+  // build always produces the same atlas.
+  queued.forEach((q, i) => { q._i = i; });
+  queued.sort((a, b) => (b.h - a.h) || (a._i - b._i));
+
+  for (const q of queued) {
+    g.clear();
+    q.drawFn(g);
+    if (scene.textures.exists(TMP)) scene.textures.remove(TMP);
+    g.generateTexture(TMP, q.w, q.h);
+    const src = scene.textures.get(TMP).getSourceImage();
+    if (shelf.x + q.w + 1 > SIZE) {
+      shelf.x = 1;
+      shelf.y += shelf.h + 1;
+      shelf.h = 0;
+    }
+    ctx.drawImage(src, shelf.x, shelf.y);
+    canvasTex.add(q.name, 0, shelf.x, shelf.y, q.w, q.h);
+    origins.set(q.name, { w: q.w, h: q.h, ox: q.ax / q.w, oy: q.ay / q.h });
+    shelf.x += q.w + 1;
+    if (q.h > shelf.h) shelf.h = q.h;
+    scene.textures.remove(TMP);
+  }
+
   if (shelf.y + shelf.h > SIZE) {
-    console.warn('[gfx] atlas overflow', shelf.y + shelf.h);
+    console.warn('[gfx] atlas overflow', shelf.y + shelf.h, 'of', SIZE);
   }
 
   canvasTex.refresh();
@@ -370,13 +382,16 @@ function buildOcean(put, rng) {
   const W = TILE_TEX_W;
   const H = TILE_TEX_H;
   const pts = diamondPts(W, H);
-  OCEAN_RAMP.forEach((base, i) => {
-    const deep = i / (OCEAN_RAMP.length - 1);
+  // Indexed off OCEAN_LEVELS rather than the ramp, so the renderer can never
+  // ask for a depth frame that was not generated.
+  for (let i = 0; i < OCEAN_LEVELS; i++) {
+    const base = OCEAN_RAMP[Math.min(i, OCEAN_RAMP.length - 1)];
+    const deep = i / (OCEAN_LEVELS - 1);
     put(oceanFrame(i), W, H, 0, 0, (g) => {
       fillTile(g, pts, base);
       // The outermost ring must be perfectly flat: it butts onto the solid
       // fill, and any detail there would draw the eye to the changeover.
-      if (i === OCEAN_RAMP.length - 1) return;
+      if (i === OCEAN_LEVELS - 1) return;
       g.fillStyle(shade(base, -0.2), 0.42 * (1 - deep));
       g.fillEllipse(W / 2, H / 2, W * 0.62, H * 0.62);
       if (i <= 2) {
@@ -392,7 +407,7 @@ function buildOcean(put, rng) {
         }
       }
     });
-  });
+  }
 }
 
 /** The four diamond corners, in the order the edge indices walk them. */
