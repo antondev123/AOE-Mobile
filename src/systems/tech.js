@@ -24,9 +24,7 @@
 // down exactly like a training queue, so it belongs on the same beat, and
 // routing it through economy keeps the scene's system list unchanged.
 
-import {
-  BUILDING_STATS, UNIT_STATS, RES, GATHER_RATE, PLAYER,
-} from '../core/constants.js';
+import { BUILDING_STATS, UNIT_STATS, PLAYER } from '../core/constants.js';
 import { EV } from '../core/events.js';
 // The stockpile primitives live in economy.js and economy.js imports this
 // module back for updateResearch(), so the two are a cycle. That is safe here
@@ -44,7 +42,6 @@ import { canAfford, pay, refund } from './economy.js';
 // AoE2 skirmish actually plays through in its first twenty minutes, compressed.
 
 export const AGE = { DARK: 0, FEUDAL: 1, CASTLE: 2 };
-export const MAX_AGE = AGE.CASTLE;
 
 export const AGE_NAMES = ['Dark Age', 'Feudal Age', 'Castle Age'];
 /** Short form for the top bar, where there is room for about six characters. */
@@ -862,15 +859,3 @@ export function nextAgeTech(world, playerId) {
   }
   return null;
 }
-
-/**
- * The rate GATHER_RATE would give, times this player's upgrades. Exported so a
- * test (or the AI) can ask "what is my food line actually worth now" without
- * reaching into the totals table.
- */
-export function baseGatherRate(resourceType) {
-  return GATHER_RATE[resourceType] || 0.5;
-}
-
-/** Every resource key the gather upgrades know about. */
-export const UPGRADABLE_RESOURCES = [RES.FOOD, RES.WOOD, RES.GOLD, RES.STONE];
