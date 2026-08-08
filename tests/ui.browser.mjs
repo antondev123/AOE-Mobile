@@ -163,8 +163,8 @@ async function rallyRun() {
       (id) => (window.__game.world.entities.get(id).queue || []).length, spot.tc.id);
     check('the Town Center takes the training order', queued > 0, `${queued} in queue`);
 
-    // 8s of build time at 20Hz, plus slack for the walk out.
-    await step(page, 200);
+    // 16s of build time at 20Hz, plus slack for the walk out.
+    await step(page, 400);
     const rallied = await page.evaluate(() => {
       const w = window.__game.world;
       const v = w.units.filter((u) => u.player === 0 && u.type === 'villager');

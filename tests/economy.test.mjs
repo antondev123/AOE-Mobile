@@ -9,13 +9,13 @@ import assert from 'node:assert/strict';
 
 import {
   createWorld, ownedBy, recomputePop, canPlace, spawnUnit, removeEntity,
-  spawnBuilding, setBlocked,
+  spawnBuilding, spawnResource, setBlocked,
 } from '../src/core/world.js';
 import { generateMap } from '../src/core/mapgen.js';
 import { EV } from '../src/core/events.js';
 import {
   SIM_DT, CARRY_CAPACITY, RES, STARTING_RESOURCES, PLAYER, UNIT_STATS,
-  BUILDING_STATS,
+  BUILDING_STATS, NODE_AMOUNT,
 } from '../src/core/constants.js';
 import {
   canAfford, pay, refund, addResource,
@@ -115,6 +115,67 @@ test('starting stockpile matches constants', () => {
   assert.equal(p.resources.food, STARTING_RESOURCES.food);
   assert.equal(p.resources.wood, STARTING_RESOURCES.wood);
   assert.equal(p.resources.gold, STARTING_RESOURCES.gold);
+  assert.equal(p.resources.stone, STARTING_RESOURCES.stone);
+});
+
+test('stone is a first-class resource: gathered, carried, paid and charged', () => {
+  const { world, tc, villagers, p } = setup();
+  const v = villagers[0];
+  // Stone mines are placed away from the base by design, so this test makes its
+  // own rather than walking one across the map.
+  const mine = spawnResource(world, 'stone', Math.round(tc.x) + 4, Math.round(tc.y) + 4);
+  assert.equal(mine.resourceType, RES.STONE, 'a stone mine pays stone, not gold');
+  assert.equal(mine.amount, NODE_AMOUNT.stone);
+
+  v.x = mine.x + 1;
+  v.y = mine.y;
+  const before = p.resources.stone;
+  gatherUntilReturn(world, v, mine);
+  assert.equal(v.carrying.type, RES.STONE);
+  assert.equal(v.carrying.amount, CARRY_CAPACITY);
+
+  // The Town Center takes it; a Mill does not, and a Mining Camp does.
+  assert.equal(acceptsDropoff(tc, RES.STONE), true);
+  assert.equal(depositCarry(world, v, tc), CARRY_CAPACITY);
+  assert.equal(p.resources.stone, before + CARRY_CAPACITY, 'stone must survive the deposit');
+
+  // ...and it is spendable, which is what makes it real rather than a counter.
+  assert.equal(canAfford(world, PLAYER, { stone: before + CARRY_CAPACITY }), true);
+  assert.equal(canAfford(world, PLAYER, { stone: 999999 }), false);
+  assert.equal(pay(world, PLAYER, { stone: 100 }), true);
+  assert.equal(p.resources.stone, before + CARRY_CAPACITY - 100);
+});
+
+test('drop-off camps take exactly what they are for', () => {
+  const { world, tc } = setup();
+  const lumber = spawnBuilding(world, 'lumbercamp', PLAYER, tc.x + 6, tc.y);
+  const mining = spawnBuilding(world, 'miningcamp', PLAYER, tc.x, tc.y + 6);
+
+  assert.equal(acceptsDropoff(lumber, RES.WOOD), true);
+  assert.equal(acceptsDropoff(lumber, RES.FOOD), false);
+  assert.equal(acceptsDropoff(lumber, RES.GOLD), false);
+  assert.equal(acceptsDropoff(mining, RES.GOLD), true);
+  assert.equal(acceptsDropoff(mining, RES.STONE), true);
+  assert.equal(acceptsDropoff(mining, RES.WOOD), false);
+});
+
+test('a villager banks at the nearest camp, and switches the moment one exists', () => {
+  const { world, tc } = setup();
+  // A tree far enough out that the Town Center is a genuinely long haul.
+  const tree = spawnResource(world, 'tree', Math.round(tc.x) + 14, Math.round(tc.y));
+
+  // With only a Town Center there is exactly one answer.
+  assert.equal(nearestDropoff(world, PLAYER, tree.x, tree.y, RES.WOOD), tc);
+
+  // Plant a camp beside the tree and the answer changes with no re-tasking:
+  // nearestDropoff is asked afresh on every trip.
+  const camp = spawnBuilding(world, 'lumbercamp', PLAYER, tree.x - 2, tree.y);
+  assert.equal(nearestDropoff(world, PLAYER, tree.x, tree.y, RES.WOOD), camp);
+  // ...but only for what it accepts. Food still walks home.
+  assert.equal(nearestDropoff(world, PLAYER, tree.x, tree.y, RES.FOOD), tc);
+  // An unfinished camp is not a drop-off: it is a building site.
+  const site = spawnBuilding(world, 'lumbercamp', PLAYER, tree.x, tree.y + 3, { complete: false });
+  assert.equal(acceptsDropoff(site, RES.WOOD), false);
 });
 
 test('canAfford / pay / refund and EV.INSUFFICIENT', () => {
@@ -704,9 +765,11 @@ test('ordinary building goes up, and walling is still legal', () => {
   spawnBuilding(w2, 'towncenter', PLAYER, 8.5, 8.5);
   spawnUnit(w2, 'villager', PLAYER, 12.5, 12.5);
   recomputePop(w2, PLAYER);
-  for (let y = 0; y < 46; y += 2) setBlocked(w2, 24, y, 1, 999), setBlocked(w2, 25, y, 1, 999);
-  for (let y = 0; y < 46; y += 2) setBlocked(w2, 24, y + 1, 1, 999), setBlocked(w2, 25, y + 1, 1, 999);
-  assert.equal(canPlaceReachable(w2, PLAYER, 'house', 25, 47), true,
+  // Bounded by the world, not by 46: the claim is "half the map is sealed off",
+  // and a wall that stops two thirds of the way down proves nothing.
+  const gap = w2.height - 2;
+  for (let y = 0; y < gap; y++) setBlocked(w2, 24, y, 1, 999), setBlocked(w2, 25, y, 1, 999);
+  assert.equal(canPlaceReachable(w2, PLAYER, 'house', 25, gap + 1), true,
     'closing off half the map traps nobody and must stay allowed');
 });
 

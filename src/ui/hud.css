@@ -186,6 +186,30 @@ body {
   clip-path: polygon(0 22%, 26% 0, 100% 0, 100% 78%, 74% 100%, 0 100%);
 }
 .ico-pop  { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #e2d4b4 45%, #8d7f63 46%); }
+/* The age pip is a shield, because it is the only thing in the bar that is not
+   a quantity and it must not be mistaken for one at a glance. */
+.ico-age {
+  border-radius: 3px 3px 50% 50%;
+  background: linear-gradient(180deg, #f0d38a 0%, #b3861f 55%, #6b4c14 100%);
+}
+
+/* The age itself. It carries a word rather than a number, so it opts out of
+   the tabular-numeric sizing the counters use, and it is set apart with a
+   hairline rule — a glance down the bar should read "four resources, a
+   population, and then something else". It brightens with each age so the
+   Castle Age looks like an achievement rather than a fifth counter. */
+.res.age {
+  font-variant-numeric: normal;
+  letter-spacing: 0.4px;
+  border-left: 1px solid var(--edge-soft);
+  margin-left: 2px;
+  padding-left: 7px;
+  color: var(--parch-dim);
+}
+.res.age span { min-width: 0; }
+.res.age[data-age="1"] { color: var(--parch); }
+.res.age[data-age="2"] { color: var(--gold); }
+.res.age[data-age="2"] .ico-age { box-shadow: 0 0 6px rgba(217, 171, 79, 0.7); }
 .ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
 
 .icon-btn {
@@ -612,6 +636,61 @@ body {
 }
 .qslot.head { border-color: var(--gold); }
 
+/* --- Research ---------------------------------------------------------------
+   Upgrade buttons carry three lines — name, what it does, what it costs —
+   because "what it does" is the line every small-screen RTS drops and it is
+   the one that decides whether the tab gets used. Two per row: a third would
+   put the effect line below 9px, and a full-width one would make a Mill's four
+   upgrades a scroll. */
+.cbtn.research {
+  flex: 1 1 calc(50% - 3px);
+  min-width: 108px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 5px 8px;
+  border-color: #5c6b8c;               /* cool edge: not a unit, not a building */
+}
+.cbtn.research .label { white-space: normal; line-height: 1.15; }
+.cbtn.research .blurb {
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: #a8c6e6;
+}
+.cbtn.research .cost { justify-content: flex-start; }
+
+/* Already ours, permanently. Green and un-tappable-looking, but still tappable
+   — it says so when you tap it. */
+.cbtn.research.is-done {
+  border-color: #46652f;
+  opacity: 0.55;
+  filter: none;                        /* not greyscale: "done" is not "broken" */
+}
+.cbtn.research.is-done .label { color: #bcd6a2; }
+.cbtn.research.is-done .label::before { content: "✓ "; }
+
+/* Under way at this building right now. */
+.cbtn.research.is-active {
+  border-color: var(--gold);
+  opacity: 1;
+  filter: none;
+}
+.cbtn.research.is-active .label { color: var(--gold); }
+
+/* Wrong age, or a prerequisite missing. */
+.cbtn.research.is-locked .label::before { content: "🔒 "; font-size: 9px; }
+
+.research-queue .qlabel {
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--gold);
+  white-space: nowrap;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.research-queue .qprog > i { background: linear-gradient(180deg, #9ac0e8, #4a6f9c); }
+
 /* --- Build menu sheet -------------------------------------------------------- */
 
 .build-menu {
@@ -643,6 +722,36 @@ body {
 }
 .build-menu .cbtn { flex: 1 1 0; min-width: 62px; }
 .build-menu .cbtn .label { white-space: normal; line-height: 1.1; text-align: center; }
+
+/* The menu is capped and scrolls rather than growing: it now lists the whole
+   tech tree, and a sheet tall enough for three shelves of buildings would cover
+   the base the player is standing in. */
+.build-menu { max-height: 46vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+
+/* Age shelves. The locked heading is the label doing the teaching, so it keeps
+   its full contrast even though everything under it is dimmed. */
+.build-menu .title.locked { color: var(--gold-dim); }
+.build-menu .title.locked::after { content: " 🔒"; font-size: 9px; }
+
+/* A locked building. Dimmed, but not with the greyscale the "cannot afford"
+   state uses — the two mean different things and must not look the same, or a
+   player waits for wood that was never the problem. Locked is a cool, flat
+   wash; unaffordable stays desaturated. */
+.build-menu .cbtn.locked {
+  opacity: 0.5;
+  filter: none;
+  border-color: #3d4a5c;
+  border-style: dashed;
+}
+.build-menu .cbtn.locked .label { color: #9fb0c4; }
+.build-menu .cbtn.locked:active { transform: translateY(1px); filter: brightness(1.35); }
+.build-menu .cbtn .cost.need {
+  color: #9fb0c4;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  font-size: 9px;
+}
 
 /* --- Placement bar ----------------------------------------------------------- */
 

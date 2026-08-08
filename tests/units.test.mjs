@@ -11,7 +11,7 @@ import {
 } from '../src/core/world.js';
 import { EV } from '../src/core/events.js';
 import { generateMap } from '../src/core/mapgen.js';
-import { updateEconomy, queueTrain, placeFoundation } from '../src/systems/economy.js';
+import { updateEconomy, queueTrain, placeFoundation, buildTick } from '../src/systems/economy.js';
 import { updateCombat } from '../src/systems/combat.js';
 import { commandUnits, updateUnits, isIdle } from '../src/systems/unitAI.js';
 import { isWalkable } from '../src/systems/pathfinding.js';
@@ -636,6 +636,73 @@ test('a villager works a farm exactly like a bush: walk, harvest, deposit, retur
   eq(vil.task.node, farm, 'it should keep working the same farm');
   assert(seen.has('move') && seen.has('gather') && seen.has('deposit'),
     `expected the full state loop, saw ${[...seen].join(',')}`);
+});
+
+/**
+ * Put a finished building on the map the way the game does — as a foundation
+ * that is then built out — so EV.BUILT actually fires. spawnBuilding(complete)
+ * skips construction entirely and with it every reaction to a new building.
+ */
+function raise(w, type, gx, gy) {
+  const b = spawnBuilding(w, type, PLAYER, gx, gy, { complete: false });
+  let guard = 10000;
+  while (!b.complete && guard-- > 0) buildTick(w, null, b, SIM_DT);
+  reindex(w);
+  return b;
+}
+
+test('a lumber camp shortens the round trip with no new order', () => {
+  // The whole promise of a forward drop-off: you pay 100 wood and the villagers
+  // already out there start using it, without the player touching them.
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 20);
+  const tree = spawnResource(w, 'tree', 32, 20);
+  tree.amount = 5000; // a woodline: this test is about the haul, not depletion
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 20.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  const drops = [];
+  w.events.on(EV.DEPOSIT, ({ building }) => drops.push({ t: w.time, building }));
+
+  commandUnits(w, [vil], { type: 'gather', target: tree });
+  // Two full trips against the Town Center, to measure the walk being removed.
+  assert(stepUntil(w, 4000, () => drops.length >= 2) > 0, 'never banked two loads');
+  eq(drops[1].building, tc, 'with only a Town Center there is one place to go');
+  const withoutCamp = drops[1].t - drops[0].t;
+
+  // Plant the camp beside the trees. No order is given to the villager at all.
+  const camp = raise(w, 'lumbercamp', 29, 20);
+  const n = drops.length;
+  assert(stepUntil(w, 4000, () => drops.length >= n + 2) > 0, 'never banked at the camp');
+  const last = drops[drops.length - 1];
+  eq(last.building, camp, 'the villager should have switched to the nearer drop-off');
+  const withCamp = last.t - drops[drops.length - 2].t;
+
+  assert(withCamp < withoutCamp * 0.6,
+    `round trip should collapse (${withoutCamp.toFixed(1)}s -> ${withCamp.toFixed(1)}s)`);
+  console.log(`       round trip ${withoutCamp.toFixed(1)}s -> ${withCamp.toFixed(1)}s with a lumber camp`);
+});
+
+test('a drop-off finished mid-haul is adopted without waiting for the next trip', () => {
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 20);
+  const tree = spawnResource(w, 'tree', 32, 20);
+  tree.amount = 5000;
+  const vil = spawnUnit(w, 'villager', PLAYER, 12.5, 20.5);
+  recomputePop(w, PLAYER);
+  reindex(w);
+
+  commandUnits(w, [vil], { type: 'gather', target: tree });
+  // Catch it on the way home with a full pack, still far from the Town Center.
+  assert(stepUntil(w, 4000, () => vil.task.stage === 'toDrop' && vil.x > 25) > 0,
+    'villager never set off home with a load');
+  eq(vil.task.building, tc, 'it should be walking to the Town Center');
+
+  const camp = raise(w, 'lumbercamp', 29, 20);
+  eq(vil.task.building, camp, 'a closer drop-off must be adopted mid-walk');
+  assert(stepUntil(w, 600, () => vil.state === 'deposit') > 0, 'never reached the new camp');
+  eq(vil.carrying.amount, 0, 'and the load is banked there');
 });
 
 test('a spent farm retasks its worker onto the next food source', () => {

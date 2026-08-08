@@ -47,6 +47,7 @@ import {
   edgeDist, edgeDist2, forEachNear, isHostile, removeEntity, findNearestGlobal,
 } from '../core/world.js';
 import { dist, dirIndex } from '../core/iso.js';
+import { attackBonus, armorBonus } from './tech.js';
 
 // --- Tuning (feel) ----------------------------------------------------------
 // How long the swing pose is held, as a fraction of the attack cooldown.
@@ -146,6 +147,34 @@ export function canAttack(attacker, target) {
 }
 
 // --- Damage -----------------------------------------------------------------
+//
+// UPGRADES ARE READ AT THE MOMENT OF THE SWING, never copied onto a unit.
+//
+// `unit.attack` and `unit.armor` are the base stats world.js stamped at spawn
+// and they are left exactly as they were; the blacksmith lines are looked up
+// per hit from the *player's* researched set (systems/tech.js). That is the
+// whole reason a Forging finished while your army is in the enemy's base makes
+// that army hit harder immediately, which is how AoE2 works and is the one
+// thing an upgrade system has to get right. The alternative — adding the bonus
+// to `unit.attack` when the tech lands — looks equivalent and is not: it has to
+// remember to walk every live unit, it double-applies if it ever runs twice,
+// and it silently misses anything trained during the research.
+//
+// The lookup is two object reads off a cached per-player total, so doing it on
+// every swing costs nothing measurable next to the target search that preceded
+// it.
+
+/** What this unit actually swings with: base attack plus its class's line. */
+export function effectiveAttack(world, unit) {
+  if (!unit) return 0;
+  return (unit.attack || 0) + attackBonus(world, unit);
+}
+
+/** What this entity actually soaks with: base armour plus its class's line. */
+export function effectiveArmor(world, entity) {
+  if (!entity) return 0;
+  return (entity.armor || 0) + armorBonus(world, entity);
+}
 
 /**
  * Apply one hit. `amount` is raw damage; armour is subtracted here and the
@@ -154,7 +183,7 @@ export function canAttack(attacker, target) {
  */
 export function applyDamage(world, attacker, target, amount) {
   if (!target || target.dead || !world.entities.has(target.id)) return 0;
-  const armor = target.armor || 0;
+  const armor = effectiveArmor(world, target);
   const dealt = Math.max(MIN_DAMAGE, Math.round((amount || 0) - armor));
 
   target.hp -= dealt;
@@ -513,7 +542,7 @@ function fire(world, u, target) {
   if (isRanged(u)) {
     launchProjectile(world, u, target);
   } else {
-    applyDamage(world, u, target, u.attack);
+    applyDamage(world, u, target, effectiveAttack(world, u));
   }
 }
 
@@ -531,7 +560,13 @@ function launchProjectile(world, u, target) {
     tx: target.x,
     ty: target.y,
     target,
-    damage: u.attack,
+    // Snapshotted at launch, not at impact: an arrow already in the air was
+    // loosed by the bow the archer had at the time. Flight is under a second,
+    // so the difference is invisible — but "the arrow carries its damage" is
+    // the rule the projectile struct already implied, and changing it here
+    // would make a Fletching finishing mid-volley retroactively strengthen
+    // arrows that had already left.
+    damage: effectiveAttack(world, u),
     owner: u,
     speed: PROJECTILE_SPEED,
     elapsed: 0,

@@ -71,6 +71,18 @@ export const EV = {
 
   // { building, unitType } — training finished, unit spawned
   TRAINED: 'trained',
+
+  // { player, building, tech, name } — a research was paid for and queued
+  RESEARCH_START: 'researchStart',
+  // { player, building, tech, name } — a research finished. The effect is
+  // already live on the player when this fires; `building` may be null for a
+  // completion granted by something other than a queue.
+  RESEARCH_DONE: 'researchDone',
+  // { player, age } — this player reached a new age (AGE.FEUDAL | AGE.CASTLE in
+  // systems/tech.js). Fired after the age's building-hitpoint scaling has been
+  // applied, so a listener always sees the new world, not the old one.
+  AGE_ADVANCE: 'ageAdvance',
+
   // { building } — construction finished
   BUILT: 'built',
   // { building, builder } — foundation placed

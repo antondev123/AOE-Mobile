@@ -11,6 +11,7 @@ import {
 import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
 import { dist2 } from './iso.js';
+import { createVision } from '../systems/vision.js';
 
 // Side of one spatial bucket, in tiles. Four is what forEachNear's typical
 // query radius (1-5 tiles) wants: small enough that a lookup touches a handful
@@ -67,6 +68,14 @@ export function createWorld(seed = 12345) {
   };
 
   world._buckets = Array.from({ length: world._cols * world._rows }, () => []);
+
+  // Fog of war. Built here rather than in the scene so that every world — the
+  // real one and every headless test world — carries the same masks, and so
+  // that the memory of static objects can subscribe to EV.REMOVED before
+  // anything has had a chance to die. It costs nothing until the game loop
+  // starts calling world.vision.update(): see systems/vision.js.
+  world.vision = createVision(world);
+
   return world;
 }
 

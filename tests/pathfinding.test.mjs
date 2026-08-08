@@ -119,8 +119,11 @@ test('open ground gives a direct path', () => {
 
 test('path around a wall exists, is contiguous, walkable, and reaches the goal', () => {
   const w = blankWorld();
-  // A wall spanning most of the map with a gap at the top.
-  wall(w, 20, 5, 20, 47);
+  // A wall spanning most of the map with a gap at the top. The far end is taken
+  // from the world so this stays a real barrier whatever MAP_H is — pinned to 47
+  // it stopped cutting the map in two the moment the map grew, and the path
+  // could have slipped round the bottom instead of through the gap.
+  wall(w, 20, 5, 20, w.height - 1);
   const raw = findPath(w, 10.5, 25.5, 30.5, 25.5, { smooth: false });
   assert(raw, 'expected a path around the wall');
   assert(!raw.partial, 'the goal is reachable, so the path must not be partial');

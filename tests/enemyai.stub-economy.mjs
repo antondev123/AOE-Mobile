@@ -11,7 +11,7 @@ import { EV } from '../src/core/events.js';
 export function canAfford(world, playerId, cost) {
   const p = world.players[playerId];
   if (!p || !cost) return false;
-  for (const k of ['food', 'wood', 'gold']) {
+  for (const k of ['food', 'wood', 'gold', 'stone']) {
     if ((cost[k] || 0) > (p.resources[k] || 0)) return false;
   }
   return true;
@@ -19,7 +19,7 @@ export function canAfford(world, playerId, cost) {
 
 function spend(world, playerId, cost) {
   const p = world.players[playerId];
-  for (const k of ['food', 'wood', 'gold']) {
+  for (const k of ['food', 'wood', 'gold', 'stone']) {
     p.resources[k] = (p.resources[k] || 0) - (cost[k] || 0);
   }
 }

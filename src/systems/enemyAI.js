@@ -988,7 +988,16 @@ class EnemyAI {
 
   // --- economy -------------------------------------------------------------
 
-  /** Desired villager split across food / wood / gold for the current phase. */
+  /**
+   * Desired villager split across food / wood / gold for the current phase.
+   *
+   * Three ways, not four. Stone is a real resource the AI can gather and bank,
+   * but nothing it can build spends any — the castle, towers and stone walls
+   * that need it belong to a later system. Putting villagers on it now would be
+   * strictly worse than leaving them on wood, so it is left out of the split
+   * entirely rather than given a zero weight that a scarcity nudge could later
+   * push off zero by accident.
+   */
   desiredSplit() {
     const w = this.world;
     const r = this.res();

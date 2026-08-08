@@ -222,9 +222,33 @@ export const BUILDING_STATS = {
   },
 };
 
-// Buildings a villager may place.
+// Buildings a villager may place, in the order the build menu lists them.
+//
+// This is the *candidate* list, not the available one. Two filters run over it:
+//
+//   * anything with no entry in BUILDING_STATS is skipped outright, so a name
+//     below that is not a building yet costs nothing and slots itself in the
+//     moment one is added;
+//   * what survives is gated by age (systems/tech.js, AGE_UNLOCKS), which is
+//     what actually decides whether the player may place it today.
+//
+// The second half of the list is deliberately forward-declared: the Castle, the
+// walls, the tower, the Market and the military buildings are landing from
+// another pass, and naming them here — with the two or three plausible keys
+// each, since their spelling is not settled — means the build menu, the age
+// gating and the placement rules all pick them up with no edit. An unrecognised
+// key is inert; a duplicate is impossible because BUILDING_STATS has one entry
+// per building whatever it is called.
 export const BUILDABLE = [
-  'house', 'farm', 'barracks', 'mill', 'lumbercamp', 'miningcamp', 'towncenter',
+  // Standing today.
+  'house', 'farm', 'mill', 'lumbercamp', 'miningcamp', 'barracks', 'towncenter',
+  // Dark Age, expected.
+  'palisade', 'palisadewall',
+  // Feudal Age, expected.
+  'archeryrange', 'stable', 'blacksmith', 'market',
+  'watchtower', 'tower', 'stonewall', 'wall', 'gate',
+  // Castle Age, expected.
+  'castle', 'siegeworkshop', 'university', 'monastery', 'keep',
 ];
 
 // Villagers contribute this much build progress per second (per builder).

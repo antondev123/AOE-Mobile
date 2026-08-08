@@ -18,6 +18,7 @@ import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js'
 
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
+import * as tech from '../systems/tech.js';
 
 import { createMinimap, miniToGrid } from './minimap.js';
 import {
@@ -58,6 +59,11 @@ const ABBR = {
   lumbercamp: 'LMB', miningcamp: 'MIN',
   berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
 };
+// The build menu lists the whole tech tree, locked entries included, and on a
+// 390px screen that is a lot of buttons. Grouping them under their age turns a
+// scrolling wall into three short shelves, and the shelf heading is also the
+// answer to "when do I get this".
+const AGE_HEADINGS = ['Dark Age', 'Feudal Age', 'Castle Age'];
 const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold', stone: 'stone' };
 // Display order for costs, the resource bar and "not enough X" flashes. One
 // list, so the four resources can never appear in a different order in two
@@ -235,6 +241,7 @@ export function createHud(scene, world) {
     gold: doc.getElementById('res-gold'),
     stone: doc.getElementById('res-stone'),
     pop: doc.getElementById('res-pop'),
+    age: doc.getElementById('res-age'),
     toasts: doc.getElementById('toasts'),
     selPanel: doc.getElementById('sel-panel'),
     cmdPanel: doc.getElementById('cmd-panel'),
@@ -269,6 +276,7 @@ export function createHud(scene, world) {
     liveCosts: [],           // { el, cost } — command panel
     liveBuild: [],           // { el, cost } — build menu sheet
     liveQueue: null,         // { building, bar, label }
+    liveResearch: null,      // { building, fill, label, slots } — research bar
     liveBars: [],            // { kind, list, bar, fill, text } — hp and stock rows
     destroyed: false,
   };
@@ -469,14 +477,20 @@ export function createHud(scene, world) {
 
   function updateResources() {
     const p = world.players[PLAYER];
+    const age = tech.currentAge(world, PLAYER);
     let sig = '';
     for (const k of RES_ORDER) sig += `${p.resources[k] | 0}/`;
-    sig += `${p.pop}/${p.popCap}`;
+    sig += `${p.pop}/${p.popCap}/${age}`;
     if (sig === state.resSig) return;
     state.resSig = sig;
     for (const k of RES_ORDER) setRes(dom[k], String(Math.floor(p.resources[k] || 0)));
     setRes(dom.pop, `${p.pop}/${p.popCap}`);
     if (dom.pop) dom.pop.classList.toggle('low', p.pop >= p.popCap);
+    if (dom.age) {
+      setRes(dom.age, tech.AGE_SHORT[age] || tech.AGE_SHORT[0]);
+      dom.age.title = tech.ageName(age);
+      dom.age.dataset.age = String(age);
+    }
   }
 
   const RES_NODE = {
@@ -699,6 +713,7 @@ export function createHud(scene, world) {
     panel.textContent = '';
     state.liveCosts = [];
     state.liveQueue = null;
+    state.liveResearch = null;
 
     const sel = selectedEntities(world);
     const own = sel.filter((e) => e.player === PLAYER);
@@ -748,6 +763,15 @@ export function createHud(scene, world) {
       renderQueue(panel, trainer);
       renderRallyNote(panel, trainer);
     }
+
+    // Research. Preferring the building that also trains keeps the Town
+    // Center's age-up and the Barracks' blacksmith line on the same panel as
+    // the units they are for; a Mill or a Lumber Camp trains nothing and is
+    // picked up by the fallback.
+    const researcher =
+      (trainer && tech.techsAt(trainer.type).length ? trainer : null) ||
+      buildings.find((b) => tech.techsAt(b.type).length > 0);
+    if (researcher) renderResearch(panel, researcher);
 
     // Attack-move: the one order a phone had no way to give. It arms the next
     // tap on the map rather than asking for a second gesture nobody would find.
@@ -951,6 +975,133 @@ export function createHud(scene, world) {
     }
   }
 
+  // --- Research ---------------------------------------------------------------
+  //
+  // A research button has to answer three questions at a glance — what is it,
+  // what does it cost, what does it *do* — and the third one is the one every
+  // RTS on a small screen drops. "Bow Saw, 150 food 100 wood" tells a player
+  // nothing; "+20% wood gathering" tells them everything, and is the difference
+  // between an upgrade tab that gets used and one that gets ignored. So every
+  // button carries its effect line, and the greyed ones carry the reason they
+  // are grey instead of it — an upgrade you cannot buy raises exactly one
+  // question, and it is "why not".
+
+  /** Word the sub-line under a research button for its current status. */
+  function researchSub(opt) {
+    if (opt.status === 'done') return 'researched';
+    if (opt.status === 'active') return 'researching…';
+    return opt.reason || opt.blurb || '';
+  }
+
+  function renderResearch(panel, b) {
+    const options = tech.researchOptions(world, PLAYER, b);
+    if (!options.length) return;
+
+    // In-progress first, with its own bar: it is the thing that is happening.
+    if ((b.research || []).length) renderResearchQueue(panel, b);
+
+    for (const opt of options) {
+      const usable = opt.status === 'ready' || opt.status === 'poor';
+      const btn = el('button', `cbtn research is-${opt.status}${opt.status === 'poor' ? ' off' : ''}`);
+      btn.appendChild(el('span', 'label', opt.name));
+      // The effect line, always, for anything not already grey for a reason.
+      if (opt.status !== 'done' && opt.status !== 'active' && !opt.reason) {
+        btn.appendChild(el('span', 'blurb', opt.blurb || ''));
+      }
+      if (usable) {
+        btn.appendChild(costNode(opt.cost));
+        // Only 'poor' entries join the live affordability refresh; 'ready' ones
+        // are re-evaluated by it too, so a button un-greys the instant the food
+        // lands rather than on the next panel re-render.
+        state.liveCosts.push({ el: btn, cost: opt.cost });
+      } else {
+        btn.appendChild(el('span', 'cost', researchSub(opt)));
+      }
+      if (usable && opt.blurb && opt.status === 'poor') {
+        btn.title = `${opt.blurb} — ${opt.reason}`;
+      } else if (opt.blurb) {
+        btn.title = opt.blurb;
+      }
+      btn.setAttribute('aria-label',
+        `${opt.name}. ${opt.blurb || ''} ${researchSub(opt)}`.trim());
+
+      if (!usable) {
+        // Not disabled — tapped, it explains itself. A dead button on a phone
+        // is indistinguishable from a missed tap.
+        btn.classList.add('off');
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          toast(`${opt.name}: ${researchSub(opt)}`, opt.status === 'done' ? 'info' : 'warn');
+        });
+      } else {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          startResearch(b, opt);
+        });
+      }
+      panel.appendChild(btn);
+    }
+  }
+
+  function startResearch(building, opt) {
+    if (!affordable(world, PLAYER, opt.cost)) {
+      const miss = missingResource(world, PLAYER, opt.cost);
+      toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
+      flashRes(miss ? [miss] : RES_ORDER);
+      return;
+    }
+    if (typeof tech.queueResearch !== 'function') return;
+    // tech.queueResearch raises its own toast on both success and refusal, so
+    // this only has to force the panel to redraw with the new queue.
+    if (tech.queueResearch(world, building, opt.id)) state.cmdSig = '';
+  }
+
+  function renderResearchQueue(panel, b) {
+    const row = el('div', 'queue research-queue');
+    const prog = el('div', 'qprog');
+    const fill = el('i');
+    prog.appendChild(fill);
+    row.appendChild(prog);
+    const label = el('span', 'qlabel');
+    row.appendChild(label);
+    const slots = el('div', 'qslots');
+    row.appendChild(slots);
+    panel.appendChild(row);
+    state.liveResearch = { building: b, fill, label, slots, drawn: -1 };
+    refreshResearchQueue();
+  }
+
+  function refreshResearchQueue() {
+    const q = state.liveResearch;
+    if (!q || !q.building || q.building.dead) return;
+    const queue = q.building.research || [];
+    q.fill.style.width = `${(tech.researchProgress(q.building) * 100).toFixed(1)}%`;
+    const head = queue[0];
+    const name = head && tech.TECHS[head.id] ? tech.TECHS[head.id].name : '';
+    if (q.label.textContent !== name) q.label.textContent = name;
+
+    if (q.drawn !== queue.length) {
+      q.drawn = queue.length;
+      q.slots.textContent = '';
+      queue.forEach((entry, i) => {
+        const t = tech.TECHS[entry.id];
+        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`,
+          (t ? t.name : entry.id).slice(0, 1).toUpperCase());
+        s.title = `Cancel ${t ? t.name : entry.id} — full refund`;
+        s.setAttribute('aria-label', `Cancel ${t ? t.name : entry.id}. The cost is refunded.`);
+        s.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (typeof tech.cancelResearch !== 'function') return;
+          if (tech.cancelResearch(world, q.building, i)) {
+            toast(`${t ? t.name : 'Research'} cancelled — cost refunded`, 'info');
+            state.cmdSig = '';
+          }
+        });
+        q.slots.appendChild(s);
+      });
+    }
+  }
+
   /**
    * Keep every costed button honest as the stockpile moves. Both panels are
    * refreshed every frame: a button that still says "too expensive" a second
@@ -990,34 +1141,92 @@ export function createHud(scene, world) {
     else state.liveBuild = []; // stop refreshing buttons nobody can see
   }
 
+  /**
+   * The build menu, grouped by age, with the locked entries *shown* rather than
+   * hidden.
+   *
+   * Hiding them is the obvious implementation and it is the wrong one. The
+   * whole reason a player spends 400 food on the Feudal Age is the things it
+   * buys, and a menu that only reveals those things afterwards asks them to
+   * make that decision blind — the age-up reads as a tax rather than a
+   * purchase. So every building in the game is listed from the first minute,
+   * greyed, with the age it needs printed where its cost would go, and tapping
+   * one says so out loud. That is also the cheapest possible tutorial for the
+   * tech tree: the menu *is* the tree.
+   *
+   * Types with no entry in BUILDING_STATS are skipped, so the forward-declared
+   * names in BUILDABLE cost nothing until the buildings behind them exist.
+   */
   function renderBuildMenu() {
     buildMenu.textContent = '';
     state.liveBuild = [];
-    buildMenu.appendChild(el('div', 'title', 'Build'));
+    const myAge = tech.currentAge(world, PLAYER);
+
+    // Bucket by required age, keeping BUILDABLE's order inside each bucket.
+    const shelves = [[], [], []];
     for (const type of BUILDABLE) {
       const s = BUILDING_STATS[type];
       if (!s) continue;
-      const ok = affordable(world, PLAYER, s.cost);
-      const b = el('button', `cbtn ${ok ? '' : 'off'}`);
-      state.liveBuild.push({ el: b, cost: s.cost });
-      b.appendChild(el('span', 'label', s.name));
-      b.appendChild(costNode(s.cost));
-      b.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        if (!affordable(world, PLAYER, s.cost)) {
-          const miss = missingResource(world, PLAYER, s.cost);
-          toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-          flashRes(miss ? [miss] : RES_ORDER);
-          return;
-        }
-        setPlacementMode(type);
-      });
-      buildMenu.appendChild(b);
+      const need = tech.ageForBuilding(type);
+      (shelves[need] || shelves[0]).push({ type, s, need });
     }
+
+    for (let age = 0; age < shelves.length; age++) {
+      const shelf = shelves[age];
+      if (!shelf.length) continue;
+      const locked = age > myAge;
+      const title = el('div', `title ${locked ? 'locked' : ''}`,
+        locked ? `${AGE_HEADINGS[age]} — locked` : AGE_HEADINGS[age]);
+      buildMenu.appendChild(title);
+      for (const entry of shelf) buildMenu.appendChild(buildButton(entry, locked));
+    }
+
     const cancel = el('button', 'cbtn danger');
     cancel.appendChild(el('span', 'label', 'Close'));
     cancel.addEventListener('click', (ev) => { ev.stopPropagation(); toggleBuildMenu(false); });
     buildMenu.appendChild(cancel);
+  }
+
+  function buildButton({ type, s, need }, locked) {
+    const b = el('button', `cbtn ${locked ? 'locked' : ''}`);
+    b.appendChild(el('span', 'label', s.name));
+    if (locked) {
+      // The age replaces the cost, not joins it: what a Castle costs is not the
+      // question you have while you cannot build one.
+      b.appendChild(el('span', 'cost need', tech.AGE_SHORT[need] || 'later'));
+      b.setAttribute('aria-label', `${s.name}. Locked until the ${tech.ageName(need)}.`);
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        toast(tech.lockReason(world, PLAYER, type) || `${s.name} is locked`, 'warn');
+        flashAge();
+      });
+      return b;
+    }
+    // Only unlocked buttons join the affordability refresh — a locked one is
+    // already grey for a different and more important reason.
+    state.liveBuild.push({ el: b, cost: s.cost });
+    b.classList.toggle('off', !affordable(world, PLAYER, s.cost));
+    b.appendChild(costNode(s.cost));
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (!affordable(world, PLAYER, s.cost)) {
+        const miss = missingResource(world, PLAYER, s.cost);
+        toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
+        flashRes(miss ? [miss] : RES_ORDER);
+        return;
+      }
+      setPlacementMode(type);
+    });
+    return b;
+  }
+
+  /** Point at the age chip, the way flashRes points at a resource counter. */
+  function flashAge() {
+    if (!dom.age) return;
+    dom.age.classList.remove('flash');
+    void dom.age.offsetWidth;
+    dom.age.classList.add('flash');
+    setTimeout(() => dom.age.classList.remove('flash'), 1000);
   }
 
   // --- Placement mode -------------------------------------------------------
@@ -1216,6 +1425,25 @@ export function createHud(scene, world) {
     if (world.selection.size === 0) toggleBuildMenu(false);
   }));
 
+  // An age-up changes the whole build menu (three shelves' worth of locked
+  // buttons become live) as well as the command panel, so it is the one event
+  // that forces both to redraw regardless of what is selected.
+  off.push(world.events.on(EV.AGE_ADVANCE, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
+    state.resSig = '';
+    if (state.buildMenuOpen) renderBuildMenu();
+    flashAge();
+  }));
+  off.push(world.events.on(EV.RESEARCH_DONE, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
+  }));
+  off.push(world.events.on(EV.RESEARCH_START, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
+  }));
+
   off.push(world.events.on(EV.FOUNDATION, () => { state.cmdSig = ''; }));
   off.push(world.events.on(EV.BUILT, () => { state.cmdSig = ''; }));
   off.push(world.events.on(EV.TRAINED, () => { state.cmdSig = ''; }));
@@ -1319,6 +1547,7 @@ export function createHud(scene, world) {
       if (state.buildMenuOpen) renderBuildMenu();
     } else {
       refreshQueue();
+      refreshResearchQueue();
     }
     refreshAffordability();
 
@@ -1345,10 +1574,19 @@ export function createHud(scene, world) {
       // the moment the player moves it.
       if (e.kind === 'building') {
         q += `|${e.id}:${(e.queue || []).length}`;
+        // The research queue length is in here for the same reason the training
+        // queue is: starting or cancelling one changes which buttons the panel
+        // must draw, and there is no event for "the queue got shorter".
+        q += `r${(e.research || []).length}`;
         q += e.rally ? `@${e.rally.x.toFixed(1)},${e.rally.y.toFixed(1)}` : '@-';
       }
     }
-    return `${n}/${Array.from(types).sort().join(',')}${q}` +
+    // The age and the number of finished techs both change what the research
+    // buttons say (locked -> ready, ready -> researched), and both change
+    // without the selection changing.
+    const t = `+a${tech.currentAge(world, PLAYER)}` +
+      `t${tech.researchedTechs(world, PLAYER).length}`;
+    return `${n}/${Array.from(types).sort().join(',')}${q}${t}` +
       `${state.attackArmed ? '+am' : ''}${state.demolishArm ? '+dm' : ''}`;
   }
 

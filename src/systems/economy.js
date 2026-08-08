@@ -18,6 +18,12 @@ import {
   applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy,
 } from '../core/world.js';
 import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
+// tech.js imports the three stockpile primitives back out of this module, so
+// the pair is a deliberate (and shallow) import cycle — see the note at the top
+// of tech.js. Research is production, so it ticks on this module's beat.
+import {
+  updateResearch, gatherMultiplier, lockReason, applyAgeHp,
+} from './tech.js';
 
 // --- Tuning (local to this module; constants.js is read-only for me) --------
 //
@@ -41,9 +47,26 @@ import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 // does not slow the game down, it just makes the Town Center idle.
 export const GATHER_SPEED = 2.5;
 
-/** Effective units/second for a resource type, after tuning. */
-export function gatherRateFor(resourceType) {
-  return (GATHER_RATE[resourceType] || 0.5) * GATHER_SPEED;
+/**
+ * Effective units/second for a resource type, after tuning and after whichever
+ * economic upgrades the gathering player has finished.
+ *
+ * `world` and `playerId` are optional and default to "nobody, so no upgrades".
+ * They are trailing arguments rather than leading ones on purpose: the rate is
+ * a property of the *resource* first and of the player second, every existing
+ * caller reads the same way it always did, and a caller that forgets to pass a
+ * player gets the un-upgraded base rate — which is wrong but never a crash, and
+ * shows up immediately as "my Bow Saw did nothing" rather than as a NaN.
+ *
+ * The multiplier is applied here rather than inside gatherTick so that anything
+ * *predicting* income — the HUD, the AI's "is this walk worth it" arithmetic,
+ * the round-trip test in tests/economy.test.mjs — asks one function and gets
+ * the number the villager will actually gather at.
+ */
+export function gatherRateFor(resourceType, world = null, playerId = null) {
+  const base = (GATHER_RATE[resourceType] || 0.5) * GATHER_SPEED;
+  if (!world || playerId === null || playerId === undefined) return base;
+  return base * gatherMultiplier(world, playerId, resourceType);
 }
 
 /** Longest a training queue may get (AoE2 uses 5 per building tab). */
@@ -261,7 +284,8 @@ export function gatherTick(world, unit, node, dt) {
     unit.gatherProgress = unit.gatherProgress || 0;
   }
 
-  unit.gatherProgress = (unit.gatherProgress || 0) + gatherRateFor(type) * dt;
+  unit.gatherProgress =
+    (unit.gatherProgress || 0) + gatherRateFor(type, world, unit.player) * dt;
 
   // Bank whole units only — the renderer draws one "chip" per EV.GATHER_TICK.
   let guard = 64;
@@ -431,6 +455,11 @@ function placementTrapReason(world, playerId, type, gx, gy) {
 export function placementRefusal(world, playerId, type, gx, gy) {
   const s = BUILDING_STATS[type];
   if (!s) return 'Cannot build there';
+  // Age first, and before the geometry: "Stone Wall needs the Feudal Age" is
+  // the true answer wherever you point at, and a ghost that only goes red on
+  // *some* tiles would teach the player that the tile was the problem.
+  const locked = lockReason(world, playerId, type);
+  if (locked) return locked;
   if (!canPlace(world, gx, gy, s.fw, s.fh)) return 'Cannot build there';
   return placementTrapReason(world, playerId, type, gx, gy);
 }
@@ -455,6 +484,11 @@ export function placeFoundation(world, playerId, type, gx, gy) {
   const s = BUILDING_STATS[type];
   if (!s) return null;
 
+  const locked = lockReason(world, playerId, type);
+  if (locked) {
+    if (playerId === PLAYER) world.events.emit(EV.TOAST, { text: locked, tone: 'warn' });
+    return null;
+  }
   if (!canPlace(world, gx, gy, s.fw, s.fh)) {
     world.events.emit(EV.TOAST, { text: `Cannot build there`, tone: 'warn' });
     return null;
@@ -474,6 +508,11 @@ export function placeFoundation(world, playerId, type, gx, gy) {
   if (!pay(world, playerId, s.cost, `build:${type}`)) return null;
 
   const b = spawnBuilding(world, type, playerId, gx, gy, { complete: false });
+  // A building started in the Castle Age is a Castle Age building from the
+  // first shovel, not a Dark Age one that gets a retroactive top-up when the
+  // next age lands. world.js stamps the base hitpoints; this restates them at
+  // the owner's age scale, and it is idempotent so it is safe to call anywhere.
+  applyAgeHp(world, b);
   b.state = 'foundation';
   world.events.emit(EV.FOUNDATION, { building: b, builder: null });
   return b;
@@ -517,6 +556,9 @@ export function buildTick(world, unit, building, dt) {
   if (building.buildProgress >= total) {
     building.buildProgress = total;
     building.complete = true;
+    // Cheap and idempotent; it only does anything for a site that was placed
+    // before an age-up and finished after one.
+    applyAgeHp(world, building);
     building.hp = building.maxHp;
     building.state = 'idle';
     // A finished Farm is a food node from this instant, so the villager that
@@ -655,11 +697,17 @@ function completeTraining(world, building, entry) {
 // --- Per-step update --------------------------------------------------------
 
 /**
- * Advance training queues and keep population figures honest.
- * Called once per fixed sim step from GameScene.
+ * Advance training queues and research queues, and keep population figures
+ * honest. Called once per fixed sim step from GameScene.
+ *
+ * Research rides along here rather than being a system of its own: it is
+ * production — a queue on a building that ticks down and then pays out — and
+ * putting it on the same beat as training means the two can never drift by a
+ * step, which is what a separate updateTech() in the scene would have risked.
  */
 export function updateEconomy(world, dt) {
   const st = econState(world);
+  updateResearch(world, dt);
 
   for (let i = 0; i < world.players.length; i++) {
     if (st.popNag[i] > 0) st.popNag[i] -= dt;
