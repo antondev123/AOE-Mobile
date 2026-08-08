@@ -9,6 +9,9 @@
 // (~10Hz, driven by hud.js).
 
 import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
+// The same deep water the main view now ends in, imported rather than copied so
+// the two surfaces stay in step if it is ever retuned.
+import { OCEAN_DEEP } from '../gfx/textures.js';
 
 const SPAN = MAP_W + MAP_H;
 
@@ -18,6 +21,14 @@ const TERRAIN_COLOR = {
   [TERRAIN.WATER]: '#25456f',
   [TERRAIN.SAND]:  '#9c8a5b',
 };
+
+/** '#rrggbb' for a 0xRRGGBB constant shared with the renderer. */
+function hex(n) {
+  return `#${n.toString(16).padStart(6, '0')}`;
+}
+// Everything outside the playable diamond is open sea, exactly as in the main
+// view. Baked into the terrain layer, so it costs nothing per redraw.
+const OCEAN_CSS = hex(OCEAN_DEEP);
 
 const RES_COLOR = { tree: '#2e5a24', berry: '#a8324a', gold: '#d8b33c' };
 const TEAM = ['#5aa2ff', '#ff5a5a'];
@@ -131,7 +142,8 @@ export function createMinimap(canvas, world) {
   }
 
   function draw(camera) {
-    ctx.clearRect(0, 0, size, size);
+    // The baked layer is opaque edge to edge (sea, then map), so blitting it is
+    // also the clear — no need to pay for both at 10Hz.
     ctx.drawImage(bg, 0, 0);
 
     // Resource nodes: small, dim, but enough to read the map's shape.
@@ -195,7 +207,11 @@ export function createMinimap(canvas, world) {
 }
 
 function bake(g, world, size) {
-  g.clearRect(0, 0, size, size);
+  // Open sea everywhere the map is not. The main view ends in the same water,
+  // and a minimap floating on black was the last surface still saying "the
+  // world stops here" instead of "the world is an island".
+  g.fillStyle = OCEAN_CSS;
+  g.fillRect(0, 0, size, size);
 
   // The playable area is a diamond; fill it with grass, then paint the tiles
   // that differ. That is a few hundred fills instead of MAP_W*MAP_H.

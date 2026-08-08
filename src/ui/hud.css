@@ -212,7 +212,9 @@ body {
   width: 116px;
   height: 116px;
   border-radius: 5px;
-  background: #0d0a07;
+  /* Mirrors OCEAN_DEEP (gfx/textures.js), which the minimap bakes as its
+     out-of-map sea — this only shows for the frame before the first draw. */
+  background: #0d2740;
   touch-action: none;
 }
 

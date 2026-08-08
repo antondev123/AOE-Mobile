@@ -191,66 +191,89 @@ async function attackMoveRun() {
   try {
     await watchToasts(page);
 
-    // An army, a goal well across the map, and one enemy soldier standing on
-    // the route they will actually walk — placed on the planned path rather
-    // than on the straight line, or a detour round a forest would let them
-    // stroll past it and prove nothing.
+    // An army, a goal across the map, and one enemy soldier standing on the
+    // route they will actually walk. The picket is placed by pathing toward the
+    // enemy base and sampling the real route, not by trusting a straight line —
+    // this map is full of forest, and a detour round one would let the army
+    // stroll past the picket and prove nothing.
+    //
+    // The enemy AI is stubbed out for this run: it commands every soldier the
+    // enemy owns, so an un-stubbed picket marches off to raid instead of
+    // standing in the road. This test is about the player's order, not the AI's.
     const fight = await page.evaluate(async () => {
       const { spawnUnit } = await import('/src/core/world.js');
       const { findPath, nearestWalkable } = await import('/src/systems/pathfinding.js');
       const w = window.__game.world;
+      window.__game.scene.enemyAI.update = () => {};
+
       const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
       const etc = w.buildings.find((b) => b.player === 1 && b.type === 'towncenter');
-      const dx = etc.x - tc.x;
-      const dy = etc.y - tc.y;
-      const len = Math.hypot(dx, dy);
-      const along = (t) => {
-        const raw = { x: tc.x + (dx / len) * t, y: tc.y + (dy / len) * t };
-        const ok = nearestWalkable(w, Math.floor(raw.x), Math.floor(raw.y), 10);
-        return ok ? { x: ok.tx + 0.5, y: ok.ty + 0.5 } : raw;
-      };
-
-      const start = along(4);
-      const goal = along(22);
+      const muster = nearestWalkable(w, Math.floor(tc.x) + 3, Math.floor(tc.y) + 3, 8);
+      const start = { x: muster.tx + 0.5, y: muster.ty + 0.5 };
 
       const troops = [];
       for (let i = 0; i < 3; i++) {
-        const s = nearestWalkable(w, Math.floor(start.x) + i - 1, Math.floor(start.y), 6);
+        const s = nearestWalkable(w, muster.tx + i - 1, muster.ty, 6);
         troops.push(spawnUnit(w, 'militia', 0, s.tx + 0.5, s.ty + 0.5).id);
       }
 
-      // Halfway along the real path.
-      const p = findPath(w, start.x, start.y, goal.x, goal.y);
-      const pts = (p && p.length ? p : [goal]);
-      let total = 0;
-      const segs = [];
-      let prev = start;
-      for (const q of pts) {
-        const d = Math.hypot(q.x - prev.x, q.y - prev.y);
-        segs.push({ a: prev, b: q, d });
-        total += d;
-        prev = q;
-      }
-      let want = total * 0.45;
-      let mid = goal;
-      for (const s of segs) {
-        if (want <= s.d) {
-          const t = s.d ? want / s.d : 0;
-          mid = { x: s.a.x + (s.b.x - s.a.x) * t, y: s.a.y + (s.b.y - s.a.y) * t };
-          break;
+      // Sample a real, walkable route: toward the enemy base first, and failing
+      // that any direction that yields a long enough march. Trusting a straight
+      // line here would put the picket in a lake on half the maps.
+      const along = (route, want) => {
+        let prev = start;
+        for (const q of route) {
+          const d = Math.hypot(q.x - prev.x, q.y - prev.y);
+          if (want <= d) {
+            const t = d ? want / d : 0;
+            return { x: prev.x + (q.x - prev.x) * t, y: prev.y + (q.y - prev.y) * t };
+          }
+          want -= d;
+          prev = q;
         }
-        want -= s.d;
+        return null; // route is shorter than `want`
+      };
+      const snap = (pt) => {
+        const s = pt && nearestWalkable(w, Math.floor(pt.x), Math.floor(pt.y), 6);
+        return s ? { x: s.tx + 0.5, y: s.ty + 0.5 } : null;
+      };
+
+      const aims = [{ x: etc.x, y: etc.y }];
+      for (let i = 0; i < 8; i++) {
+        const a = (i / 8) * Math.PI * 2;
+        aims.push({ x: start.x + Math.cos(a) * 22, y: start.y + Math.sin(a) * 22 });
       }
-      const m = nearestWalkable(w, Math.floor(mid.x), Math.floor(mid.y), 6) || { tx: Math.floor(mid.x), ty: Math.floor(mid.y) };
-      const foe = spawnUnit(w, 'militia', 1, m.tx + 0.5, m.ty + 0.5);
+
+      let goal = null;
+      let post = null;
+      for (const aimAt of aims) {
+        const t = snap(aimAt) || aimAt;
+        const route = findPath(w, start.x, start.y, t.x, t.y) || [];
+        const g = snap(along(route, 20));
+        const m = snap(along(route, 9));
+        if (!g || !m) continue;
+        if (Math.hypot(g.x - start.x, g.y - start.y) < 12) continue;
+        goal = g;
+        post = m;
+        break;
+      }
+      if (!goal) return { fail: 'no long walkable route from the muster point' };
+
+      const foe = spawnUnit(w, 'militia', 1, post.x, post.y);
       return {
         troops,
         foe: foe.id,
+        foeHp: foe.hp,
         foeAt: { x: foe.x, y: foe.y },
         goal,
-        route: `${total.toFixed(0)} tiles, picket at ${(total * 0.45).toFixed(0)}`,
+        goalD: Math.hypot(goal.x - start.x, goal.y - start.y),
+        postD: Math.hypot(post.x - start.x, post.y - start.y),
+        route: `picket ${Math.hypot(post.x - start.x, post.y - start.y).toFixed(0)} tiles out, goal ${Math.hypot(goal.x - start.x, goal.y - start.y).toFixed(0)} tiles out`,
       };
     });
+    check('the army has a long march with an enemy standing in it',
+      !fight.fail && fight.goalD >= 12 && fight.postD >= 4, fight.fail || fight.route);
+    if (fight.fail) return;
 
     // Select the army the way a player would.
     await page.locator('#btn-menu').click();
@@ -304,24 +327,23 @@ async function attackMoveRun() {
     check('and the mode disarms once spent', !ordered.armed && !ordered.bar);
 
     // The behaviour that makes it worth having: they must stop and fight.
+    // "Engaging" is unitAI's own word for it — task.engaging is set the moment
+    // an attack-moving unit breaks off to deal with something.
     let engaged = null;
     for (let i = 0; i < 60 && !engaged; i++) {
       await step(page, 20);
-      engaged = await page.evaluate(([ids, foeId]) => {
+      engaged = await page.evaluate(([ids, foeId, hp0]) => {
         const w = window.__game.world;
         const foe = w.entities.get(foeId);
-        const us = ids.map((id) => w.entities.get(id)).filter(Boolean);
-        const fighting = us.filter((u) => u.state === 'attacking' || (u.task && u.task.type === 'attack'));
+        const us = ids.map((id) => w.entities.get(id)).filter((u) => u && !u.dead);
+        const fighting = us.filter((u) => u.state === 'attack' || (u.task && u.task.engaging));
         if (!fighting.length) return null;
-        return {
-          n: fighting.length,
-          foeHp: foe && !foe.dead ? Math.round(foe.hp) : 0,
-          walked: Math.round(Math.hypot(us[0].x - w.entities.get(ids[0]).x, 0)),
-        };
-      }, [fight.troops, fight.foe]);
+        const hp = foe && !foe.dead ? foe.hp : 0;
+        return { n: fighting.length, of: us.length, hp: Math.round(hp), hurt: hp < hp0 };
+      }, [fight.troops, fight.foe, fight.foeHp]);
     }
     check('they stop to fight what they meet on the way', !!engaged,
-      engaged ? `${engaged.n} of 3 engaged, picket down to ${engaged.foeHp} hp` : 'nobody ever engaged');
+      engaged ? `${engaged.n} of ${engaged.of} engaged, picket at ${engaged.hp} hp` : 'nobody ever engaged');
 
     await page.evaluate((g) => window.__game.input.centerOnGrid(g.x, g.y), fight.foeAt);
     await page.waitForTimeout(200);

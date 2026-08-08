@@ -563,7 +563,9 @@ export function createHud(scene, world) {
     // Attack-move: the one order a phone had no way to give. It arms the next
     // tap on the map rather than asking for a second gesture nobody would find.
     if (military.length) {
-      panel.appendChild(cmdButton(state.attackArmed ? 'Cancel' : 'Attack-move', {
+      // The label never changes: it names the mode, and the lit state plus the
+      // bar say whether it is on. (Tapping it again still turns it off.)
+      panel.appendChild(cmdButton('Attack-move', {
         cls: `attack ${state.attackArmed ? 'armed' : ''}`,
         sub: state.attackArmed ? 'tap a spot' : `${military.length} ready`,
         onTap: () => setAttackArmed(!state.attackArmed),
