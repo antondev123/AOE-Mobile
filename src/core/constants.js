@@ -33,7 +33,12 @@ export const STARTING_RESOURCES = { food: 250, wood: 250, gold: 150 };
 
 // Villager carry capacity per resource trip.
 export const CARRY_CAPACITY = 10;
-// Units of resource harvested per second while gathering.
+// Relative harvest speeds, NOT units per second. economy.js scales these by its
+// own GATHER_SPEED multiplier, because the raw numbers took ~20s to fill a pack
+// and read as a stalled villager rather than a loop. What a player actually
+// sees, measured near a Town Center: food 2.78/s on a 3.3s round trip, wood
+// 1.51/s on 6.3s, gold 0.91/s on ~8s. Change the ratios here; change the
+// absolute pace in economy.js.
 export const GATHER_RATE = { food: 0.55, wood: 0.5, gold: 0.45 };
 
 // How much a node holds before it is exhausted.
