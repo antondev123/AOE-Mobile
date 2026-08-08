@@ -220,21 +220,26 @@ body {
 
 /* --- Toasts ---------------------------------------------------------------- */
 
+/* The stack overlays the top-left of the map — your own base, usually — so it
+   is kept deliberately small: two routine lines at most (hud.js), and an alert
+   replaces them rather than stacking on top. At 390px wide that is a box about
+   180px across and one or two lines tall, instead of the 56%-by-180px slab that
+   hid the Town Center an alert was telling the player to look at. */
 .hud-toasts {
   position: absolute;
-  top: calc(var(--safe-t) + 52px);
+  top: calc(var(--safe-t) + 48px);
   left: calc(var(--safe-l) + 8px);
-  width: min(56vw, 230px);
+  width: min(46vw, 182px);
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 4px;
   pointer-events: none;
 }
 
 .toast {
-  padding: 7px 10px;
-  border-radius: 7px;
-  font-size: 12.5px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  font-size: 11.5px;
   font-weight: 700;
   background: rgba(28, 20, 13, 0.92);
   border: 1px solid var(--edge);
@@ -254,12 +259,17 @@ body {
    that it takes you to the fight. */
 .toast.alert {
   pointer-events: auto;
-  display: block;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
   width: 100%;
-  padding: 8px 10px;
+  /* It is a button you are meant to hit while panicking: keep the full 44px
+     touch target even though the box is now a compact one. */
+  min-height: var(--tap);
+  padding: 6px 9px;
   text-align: left;
   font-family: inherit;
-  font-size: 13.5px;
+  font-size: 12.5px;
   font-weight: 800;
   letter-spacing: 0.2px;
   color: #fff2ec;
@@ -274,8 +284,8 @@ body {
 .toast.alert .siren { margin-right: 5px; }
 .toast.alert .sub {
   display: block;
-  margin-top: 2px;
-  font-size: 10.5px;
+  margin-top: 1px;
+  font-size: 9.5px;
   font-weight: 700;
   opacity: 0.85;
   letter-spacing: 0.2px;
@@ -454,6 +464,13 @@ body {
 .hpbar.mid > i { background: linear-gradient(180deg, #e6c860, #a58a23); }
 .hpbar.low > i { background: linear-gradient(180deg, #e8705c, #a02b1b); }
 .hp-text { font-size: 10.5px; color: var(--parch-dim); margin-top: 2px; }
+
+/* How much is left in a bush, a tree, a gold vein or a farm. Deliberately not
+   green-to-red like health: an empty node is not a wounded one, it is a node
+   you have finished with — so it reads as a stockpile draining, in gold. */
+.hpbar.stock > i,
+.hpbar.stock.mid > i { background: linear-gradient(180deg, #f0d38a, #b3861f); }
+.hpbar.stock.low > i { background: linear-gradient(180deg, #c9a765, #7d5d14); }
 
 /* Command buttons — every one is at least a 44px touch target. */
 .cbtn {
@@ -648,7 +665,7 @@ body {
   .place-bar { flex-wrap: nowrap; }
   .hud-minimap { top: calc(var(--safe-t) + 6px); right: calc(var(--safe-r) + 56px); }
   #minimap { width: 92px; height: 92px; }
-  .hud-toasts { top: calc(var(--safe-t) + 46px); width: min(40vw, 210px); }
+  .hud-toasts { top: calc(var(--safe-t) + 44px); width: min(34vw, 182px); }
   .cbtn { font-size: 10.5px; }
   .cbtn .cost { font-size: 9.5px; }
 }

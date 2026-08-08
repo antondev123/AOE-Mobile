@@ -26,7 +26,10 @@ import {
 
 const MINIMAP_HZ = 10;
 const TOAST_MS = 2400;
-const TOAST_MAX = 3;
+// Two, not three. The stack sits over the top-left of the map, which is where
+// your own base tends to be, and three of them plus an alert blanketed the
+// Town Center the player was being told to go and look at.
+const TOAST_MAX = 2;
 const TOAST_REPEAT_MS = 1600;
 // An under-attack alert lives longer than a routine toast — it is a thing you
 // are meant to *reach for*, and 2.4s is not enough time to see it and tap it.
@@ -46,8 +49,12 @@ const RALLY_SNAP = 1.5;
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
+  berry: 'BSH', tree: 'TRE', gold: 'GLD',
 };
 const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold' };
+// Resource nodes have no stats block, so they need their own display names —
+// "berry" in the selection header reads like a bug, "Berry Bush" reads like AoE.
+const NODE_NAME = { berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein' };
 
 const MILITARY = new Set(['militia', 'archer']);
 export function isMilitary(u) { return u.kind === 'unit' && MILITARY.has(u.type); }
@@ -56,8 +63,33 @@ function statsOf(e) {
   return e.kind === 'building' ? BUILDING_STATS[e.type] : UNIT_STATS[e.type];
 }
 function displayName(e) {
+  if (e.kind === 'resource') return NODE_NAME[e.type] || e.type;
   const s = statsOf(e);
   return (s && s.name) || e.type;
+}
+
+/**
+ * Does this entity have a health bar worth drawing? Resource nodes carry
+ * `amount`/`maxAmount` and no hp at all, and rendering the hp row for them
+ * printed "NaN / NaN hp" under an empty (so: red, so: alarming) bar.
+ */
+function hasHp(e) {
+  return Number.isFinite(e.hp) && Number.isFinite(e.maxHp) && e.maxHp > 0;
+}
+
+/**
+ * What is left in a harvestable thing — a bush, a tree, a gold vein, or one of
+ * your farms, which is a building that carries a stock as well as hp. Null for
+ * everything else. This is the number a player wants the instant they tap a
+ * resource: "how much more food is in there", not "how many hit points".
+ */
+function stockOf(e) {
+  if (!e || !Number.isFinite(e.amount)) return null;
+  const max = Number.isFinite(e.maxAmount) && e.maxAmount > 0 ? e.maxAmount : e.amount;
+  if (!(max > 0)) return null;
+  const s = statsOf(e);
+  const res = e.resourceType || (s && s.provides && s.provides.type) || 'food';
+  return { amount: Math.max(0, e.amount), max, res };
 }
 
 /** canAfford, but tolerant of an economy module that has not landed yet. */
@@ -219,7 +251,7 @@ export function createHud(scene, world) {
     liveCosts: [],           // { el, cost } — command panel
     liveBuild: [],           // { el, cost } — build menu sheet
     liveQueue: null,         // { building, bar, label }
-    liveHp: [],              // { el, entity, fill }
+    liveBars: [],            // { kind, list, bar, fill, text } — hp and stock rows
     destroyed: false,
   };
 
@@ -285,8 +317,18 @@ export function createHud(scene, world) {
 
   // --- Toasts ---------------------------------------------------------------
 
+  function activeAlert() {
+    for (const t of state.toasts) if (t.alert) return t;
+    return null;
+  }
+
   function toast(text, tone = 'info') {
     if (!dom.toasts || !text) return;
+    // While an alert is up it owns the corner outright. Routine chatter —
+    // "Training Villager", "Not enough wood" — is not worth a line of map at
+    // the one moment the player has to see the map, and stacking under the
+    // alert is what buried the base it was pointing at.
+    if (activeAlert()) return;
     const now = performance.now();
     // -Infinity, not 0: performance.now() is small for the first second and a
     // half of the page's life, and defaulting to 0 swallowed every toast raised
@@ -312,6 +354,11 @@ export function createHud(scene, world) {
     if (now - state.lastAlert < ALERT_MIN_MS) return null;
     state.lastAlert = now;
     state.alerts++;
+
+    // The alert supersedes the stack rather than joining it: everything already
+    // up goes, including any earlier alert (a second raid replaces the first —
+    // two red boxes are not twice as urgent, they are twice as much map gone).
+    for (const t of state.toasts.slice()) killToast(t);
 
     const node = el('button', 'toast alert');
     node.type = 'button';
@@ -411,7 +458,7 @@ export function createHud(scene, world) {
     const panel = dom.selPanel;
     if (!panel) return;
     panel.textContent = '';
-    state.liveHp = [];
+    state.liveBars = [];
 
     const sel = selectedEntities(world);
     if (sel.length === 0) {
@@ -460,31 +507,55 @@ export function createHud(scene, world) {
     }
     panel.appendChild(chips);
 
-    // Health: one bar for a single entity, an aggregate for a group.
-    const bar = el('div', 'hpbar');
+    // Health: one bar for a single entity, an aggregate for a group. Only for
+    // things that actually have health — a bush does not, and a bar is a claim.
+    const living = sel.filter(hasHp);
+    if (living.length) addBar(panel, 'hp', living);
+
+    // And what is left in anything harvestable. A farm has both, in that order:
+    // it can be burned down *and* eaten out, and the player needs both numbers.
+    const stocked = sel.filter((e) => stockOf(e));
+    if (stocked.length) addBar(panel, 'stock', stocked);
+
+    refreshBars();
+  }
+
+  function addBar(panel, kind, list) {
+    const bar = el('div', `hpbar ${kind === 'stock' ? 'stock' : ''}`);
     const fill = el('i');
     bar.appendChild(fill);
     panel.appendChild(bar);
     const text = el('div', 'hp-text');
     panel.appendChild(text);
-    state.liveHp.push({ list: sel, bar, fill, text });
-    refreshHp();
+    state.liveBars.push({ kind, list, bar, fill, text });
   }
 
-  function refreshHp() {
-    for (const h of state.liveHp) {
-      let hp = 0;
+  function refreshBars() {
+    for (const h of state.liveBars) {
+      let val = 0;
       let max = 0;
+      let res = null;
       for (const e of h.list) {
         if (e.dead) continue;
-        hp += e.hp;
-        max += e.maxHp;
+        if (h.kind === 'stock') {
+          const s = stockOf(e);
+          if (!s) continue;
+          val += s.amount;
+          max += s.max;
+          if (res === null) res = s.res;
+          else if (res !== s.res) res = 'mixed';
+        } else {
+          val += e.hp;
+          max += e.maxHp;
+        }
       }
-      const frac = max > 0 ? Math.max(0, Math.min(1, hp / max)) : 0;
+      const frac = max > 0 ? Math.max(0, Math.min(1, val / max)) : 0;
       h.fill.style.width = `${(frac * 100).toFixed(1)}%`;
       h.bar.classList.toggle('mid', frac <= 0.6 && frac > 0.3);
       h.bar.classList.toggle('low', frac <= 0.3);
-      h.text.textContent = `${Math.ceil(hp)} / ${Math.ceil(max)} hp`;
+      h.text.textContent = h.kind === 'stock'
+        ? `${Math.ceil(val)} / ${Math.ceil(max)} ${res && res !== 'mixed' ? RES_LABEL[res] || res : 'resources'} left`
+        : `${Math.ceil(val)} / ${Math.ceil(max)} hp`;
     }
   }
 
@@ -526,9 +597,10 @@ export function createHud(scene, world) {
     if (own.length === 0) {
       if (sel.length) {
         const e = sel[0];
+        const stock = stockOf(e);
         panel.appendChild(el('div', 'cmd-note',
-          e.kind === 'resource'
-            ? `${displayName(e) || e.type} — ${Math.ceil(e.amount)} left`
+          stock
+            ? `${displayName(e)} — ${Math.ceil(stock.amount)} ${RES_LABEL[stock.res] || stock.res} left`
             : 'Enemy — select your own units to give orders.'));
       } else {
         panel.appendChild(el('div', 'cmd-note', 'Select a unit or building for orders.'));
@@ -1011,7 +1083,7 @@ export function createHud(scene, world) {
       state.selSig = sig;
       renderSelection();
     } else {
-      refreshHp();
+      refreshBars();
     }
 
     // The command panel depends on which types are selected, not on hp, so it

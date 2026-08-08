@@ -27,7 +27,9 @@
 //
 //   units selected      -> ground = move, resource = gather, enemy = attack
 //   a producer selected -> ground = rally, resource / your farm / your
-//                          foundation = rally onto it (a standing work order)
+//                          foundation = rally onto it (a standing work order),
+//                          and those outrank a villager standing on them, so
+//                          the bush you are already working is rally-able
 //   nothing in hand     -> select what you tapped
 //
 // Two HUD buttons can arm the next tap instead — building placement and
@@ -190,6 +192,8 @@ export function createInput(scene, world, renderer, hud) {
     return screenDist(e.x, e.y, g.x, g.y);
   }
 
+  const TIER_COUNT = 5;
+
   function tierOf(e) {
     if (e.player === PLAYER) return e.kind === 'unit' ? 0 : 1;
     if (e.player !== null && e.player !== undefined) return e.kind === 'unit' ? 2 : 3;
@@ -197,10 +201,31 @@ export function createInput(scene, world, renderer, hud) {
   }
 
   /**
+   * The tier order while a production building is in hand and no units are.
+   *
+   * Rally targets — a resource node, one of your farms, one of your foundations
+   * — come first and everything else shifts down a rank, *including your own
+   * units*. Without this the commonest use of rally-to-resource is unreachable:
+   * you add newly trained villagers to the bush you are already working, which
+   * by definition has one of your villagers standing on it, and that villager
+   * wins the tap under the ordinary ranking (see the comment on pickAt).
+   *
+   * It is still only a ranking, applied within TIER_SLACK: tap the villager
+   * itself, more than the slack nearer to it than to the bush, and you select
+   * it as before. So nothing becomes unreachable, and the aim always decides
+   * when the two are not both under the finger.
+   */
+  function rallyTierOf(e) {
+    if (isRallyTarget(e)) return 0;
+    return Math.min(TIER_COUNT - 1, tierOf(e) + 1);
+  }
+
+  /**
    * Best entity within TAP_PICK_RADIUS *screen* pixels of the touch.
    *
    * Fat-finger friendly: two probe points, footprint-aware distances, and the
-   * preference order own units > own buildings > enemies > resources.
+   * preference order own units > own buildings > enemies > resources (or the
+   * rally order above, when a producer is in hand — `rank` chooses).
    *
    * The preference is applied within a tolerance rather than absolutely: a
    * better-ranked entity wins only if it is roughly as close to the finger as
@@ -208,7 +233,7 @@ export function createInput(scene, world, renderer, hud) {
    * with your own troops impossible to tap, which is exactly when you most want
    * to attack it. Within TIER_SLACK the ranking decides; beyond it, aim wins.
    */
-  function pickAt(sx, sy) {
+  function pickAt(sx, sy, rank = tierOf) {
     const z = camera.zoom || 1;
     const radius = TAP_PICK_RADIUS / z; // compare in unzoomed screen px
     const slack = TIER_SLACK / z;
@@ -216,7 +241,7 @@ export function createInput(scene, world, renderer, hud) {
     // Cheap grid-space reject box around both probes.
     const gridPad = radius / HALF_H + 2;
 
-    const bestOf = [null, null, null, null, null]; // one candidate per tier
+    const bestOf = new Array(TIER_COUNT).fill(null); // one candidate per tier
     let minGap = Infinity;
 
     const consider = (e) => {
@@ -228,7 +253,7 @@ export function createInput(scene, world, renderer, hud) {
         if (d < gap) gap = d;
       }
       if (gap > radius) return;
-      const tier = tierOf(e);
+      const tier = rank(e);
       if (!bestOf[tier] || gap < bestOf[tier].gap) bestOf[tier] = { e, gap };
       if (gap < minGap) minGap = gap;
     };
@@ -301,6 +326,17 @@ export function createInput(scene, world, renderer, hud) {
           economy.isGatherableBuilding(pick)) return pick;
     }
     return undefined;
+  }
+
+  /** Is this entity something a rally could be aimed *onto*? */
+  function isRallyTarget(e) {
+    const t = rallyTargetAt(e);
+    return t !== undefined && t !== null;
+  }
+
+  /** pickAt, but ranked for a tap that is allowed to mean "rally onto that". */
+  function pickRallyAt(sx, sy) {
+    return pickAt(sx, sy, rallyTierOf);
   }
 
   /**
@@ -439,8 +475,14 @@ export function createInput(scene, world, renderer, hud) {
     // This is the macro that matters on a phone: a Town Center hands you a body
     // every 8 seconds, and a rally sitting on the berries is the difference
     // between those villagers working and those villagers standing still.
+    //
+    // The pick is re-run with the rally ranking rather than reusing `pick`,
+    // because the bush you want is nearly always the bush you are already
+    // working — and one of your own villagers is standing on that one. Under
+    // the ordinary ranking that villager takes the tap, the rally never gets
+    // set, and the feature silently does nothing exactly when it is wanted.
     if (!units.length && producers.length) {
-      const target = rallyTargetAt(pick);
+      const target = rallyTargetAt(pickRallyAt(sx, sy));
       if (target !== undefined) {
         setRally(producers, target, g);
         return;
@@ -955,6 +997,7 @@ export function createInput(scene, world, renderer, hud) {
     // Test/debug surface.
     _state: st,
     _pick: pickAt,
+    _pickRally: pickRallyAt,
     _toScreen: toScreen,
     _toGrid: toGrid,
   };

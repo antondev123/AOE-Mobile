@@ -1,7 +1,9 @@
-// In-browser verification of the two touch affordances added for the playtest
-// findings: rally-to-resource, and issuing an attack-move.
+// In-browser verification of the HUD and touch findings from the playtests:
+// rally-to-resource (including onto the bush a villager is already working),
+// what the panel says about a resource you tap, how much map the alert stack
+// covers, and issuing an attack-move.
 //
-//   node tests/ui.browser.mjs [--shots screenshots/]
+//   node tests/ui.browser.mjs [--shots screenshots/] [--only <substring>]
 //
 // Nothing here pokes the input layer's internals: every order is given the way
 // a thumb gives it — a real touch on the canvas, a real click on a HUD button —
@@ -9,10 +11,10 @@
 // nothing, so the first run goes all the way through the loop: tap the bush,
 // train a villager out of the Town Center, and watch the food land in the bank.
 //
-// The two halves get a fresh boot each, deliberately. The rally run has to
-// fast-forward three minutes, by which time the AI's first wave is on the move —
-// and an army that is busy being ambushed cannot prove anything about
-// attack-move. Two clean rooms beat one noisy one.
+// Each run gets a fresh boot, deliberately. The rally run has to fast-forward
+// three minutes, by which time the AI's first wave is on the move — and an army
+// that is busy being ambushed cannot prove anything about attack-move. Clean
+// rooms beat one noisy one.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -63,6 +65,24 @@ const watchToasts = (page) => page.evaluate(() => {
     }
   }).observe(document.getElementById('toasts'), { childList: true });
 });
+
+/**
+ * A tap that cannot be read as a double-tap of the previous one.
+ *
+ * These runs centre the camera on whatever they are aiming at, so consecutive
+ * taps land within a few pixels of the middle of the screen — which is a real
+ * double-tap as far as the input layer is concerned, even though the two things
+ * being tapped are nowhere near each other in the world. A player's two taps
+ * are separated in space; a test's are separated in time.
+ */
+async function tapSlow(page, x, y) {
+  await page.waitForTimeout(DOUBLE_TAP_MS + 60);
+  await page.touchscreen.tap(x, y);
+}
+const DOUBLE_TAP_MS = 400; // must match ui/input.js
+
+/** Let killed toasts finish their 280ms exit before counting the DOM. */
+const TOAST_EXIT_MS = 340;
 
 const toastMark = (page) => page.evaluate(() => window.__toasts.length);
 const toastsSince = async (page, mark) =>
@@ -183,7 +203,377 @@ async function rallyRun() {
   }
 }
 
-// --- Run 2: arm an attack-move and spend it ----------------------------------
+// --- Run 2: the bush you are ALREADY working --------------------------------
+//
+// The commonest rally there is: you have villagers on the berries and you want
+// the next ones out of the Town Center to join them. That bush has one of your
+// own villagers standing on it, and the picker used to hand the tap to the
+// villager — the rally silently stayed null and nothing said why.
+//
+// The tap here is aimed 35% of the way from the bush toward its villager: a
+// thumb that is a few pixels off, still unambiguously on the bush. That is the
+// exact offset that used to lose the tap (measured: the old ranking returned
+// the villager from 35% onward).
+
+async function rallyOverVillagerRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    await watchToasts(page);
+
+    // Put a villager on the nearest bush, the way the player would.
+    const s = await page.evaluate(async () => {
+      const { commandUnits } = await import('/src/systems/unitAI.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      let bush = null;
+      let bd = Infinity;
+      for (const n of w.resources) {
+        if (n.type !== 'berry' || n.amount <= 0) continue;
+        const d = Math.hypot(n.x - tc.x, n.y - tc.y);
+        if (d < bd) { bd = d; bush = n; }
+      }
+      if (!bush) return { fail: 'no berries on this map' };
+      const v = w.units.find((u) => u.player === 0 && u.type === 'villager');
+      commandUnits(w, [v], { type: 'gather', gx: bush.x, gy: bush.y, target: bush });
+      return { tc: tc.id, bush: { id: bush.id, x: bush.x, y: bush.y }, vill: v.id };
+    });
+    check('the map has a berry bush and a villager to put on it', !s.fail, s.fail || '');
+    if (s.fail) return;
+
+    await step(page, 300);
+    const posted = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const v = w.entities.get(st.vill);
+      const b = w.entities.get(st.bush.id);
+      return { state: v.state, d: Math.hypot(v.x - b.x, v.y - b.y) };
+    }, s);
+    check('the villager is standing on the bush, working it',
+      posted.state === 'gather' && posted.d <= 1.6,
+      `state=${posted.state}, ${posted.d.toFixed(2)} tiles from the bush`);
+
+    // Select the Town Center with a real touch.
+    const tcAt = await page.evaluate((st) => {
+      const tc = window.__game.world.entities.get(st.tc);
+      return { x: tc.x, y: tc.y };
+    }, s);
+    const p = await aim(page, tcAt.x, tcAt.y);
+    await tapSlow(page, p.x, p.y);
+    check('the Town Center is selected',
+      await page.evaluate((id) => window.__game.world.selection.has(id), s.tc));
+
+    // Aim at the bush, a little off toward the villager on it.
+    const target = await page.evaluate((st) => {
+      const g = window.__game;
+      const w = g.world;
+      const b = w.entities.get(st.bush.id);
+      const v = w.entities.get(st.vill);
+      g.input.centerOnGrid(b.x, b.y);
+      const pb = g.input._toScreen(b.x, b.y);
+      const pv = g.input._toScreen(v.x, v.y);
+      const t = 0.35;
+      const gx = pb.x + (pv.x - pb.x) * t;
+      const gy = pb.y + (pv.y - pb.y) * t;
+      const canvas = g.scene.game.canvas;
+      const r = canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      const hit = g.input._pick(gx, gy);      // what the ordinary ranking says
+      const rhit = g.input._pickRally(gx, gy); // what the rally ranking says
+      return {
+        x: r.left + (gx * r.width) / size.width,
+        y: r.top + (gy * r.height) / size.height,
+        plainPick: hit ? `${hit.kind}:${hit.type}` : 'null',
+        rallyPick: rhit ? `${rhit.kind}:${rhit.type}` : 'null',
+      };
+    }, s);
+    check('the offset tap is one the old ranking gave to the villager',
+      target.plainPick === 'unit:villager',
+      `plain pick ${target.plainPick}, rally pick ${target.rallyPick}`);
+
+    const mark = await toastMark(page);
+    await tapSlow(page, target.x, target.y);
+
+    const after = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const tc = w.entities.get(st.tc);
+      const b = w.entities.get(st.bush.id);
+      return {
+        rally: tc.rally,
+        d: tc.rally ? Math.hypot(tc.rally.x - b.x, tc.rally.y - b.y) : Infinity,
+        stillTc: w.selection.has(st.tc),
+        grabbedVillager: w.selection.has(st.vill),
+        note: (document.querySelector('.rally-note') || {}).textContent,
+      };
+    }, s);
+    check('tapping a bush with your own villager on it sets the rally', after.d < 0.01,
+      after.rally ? `rally ${after.rally.x},${after.rally.y} vs bush ${s.bush.x},${s.bush.y}` : 'no rally');
+    check('and the villager is NOT selected instead',
+      !after.grabbedVillager && after.stillTc,
+      `villager selected: ${after.grabbedVillager}, tc still selected: ${after.stillTc}`);
+    check('a toast still names the outcome',
+      /gather food/i.test(await toastsSince(page, mark)), await toastsSince(page, mark));
+    check('and so does the panel', /gather food/i.test(after.note || ''), after.note);
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-rally-over-villager.png') });
+
+    // --- The ordinary cases must be untouched. -------------------------------
+
+    // 1. Tapping the villager itself still selects it (the rally ranking is a
+    //    tolerance, not an override: aim at the unit and you get the unit).
+    const vp = await page.evaluate((st) => {
+      const g = window.__game;
+      const v = g.world.entities.get(st.vill);
+      const q = g.input._toScreen(v.x, v.y);
+      const r = g.scene.game.canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      return { x: r.left + (q.x * r.width) / size.width, y: r.top + (q.y * r.height) / size.height };
+    }, s);
+    await tapSlow(page, vp.x, vp.y);
+    check('tapping the villager itself still selects it',
+      await page.evaluate((st) => window.__game.world.selection.has(st.vill) &&
+        !window.__game.world.selection.has(st.tc), s));
+
+    // 2. With that villager in hand, tapping the bush is still a gather order.
+    await tapSlow(page, target.x, target.y);
+    const gathering = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const v = w.entities.get(st.vill);
+      const node = v.task && (v.task.node || v.task.target);
+      return {
+        task: v.task && v.task.type,
+        onBush: !!node && node.id === st.bush.id,
+        selectedBush: w.selection.has(st.bush.id),
+      };
+    }, s);
+    check('with units in hand the same tap is still a gather order',
+      gathering.task === 'gather' && gathering.onBush && !gathering.selectedBush,
+      `task=${gathering.task}, on the tapped bush=${gathering.onBush}`);
+
+    // --- The panel a tapped resource shows. ----------------------------------
+    // A bush with nobody standing on it, tapped with nothing in hand: the plain
+    // ranking is in force here (the rally ranking only applies with a producer
+    // selected), so this is a pure "what does the panel say about a bush".
+    const lone = await page.evaluate(async () => {
+      const { clearSelection } = await import('/src/ui/selection.js');
+      const w = window.__game.world;
+      clearSelection(w);
+      let best = null;
+      let bd = Infinity;
+      for (const n of w.resources) {
+        if (n.type !== 'berry' || n.amount <= 0) continue;
+        if (w.units.some((u) => !u.dead && Math.hypot(u.x - n.x, u.y - n.y) < 3)) continue;
+        const d = Math.hypot(n.x - w.units[0].x, n.y - w.units[0].y);
+        if (d < bd) { bd = d; best = n; }
+      }
+      return best ? { id: best.id, x: best.x, y: best.y } : null;
+    });
+    check('there is a bush standing on its own to inspect', !!lone);
+    if (!lone) return;
+    const lp = await aim(page, lone.x, lone.y);
+    await tapSlow(page, lp.x, lp.y);
+
+    const panel = await page.evaluate((id) => {
+      const w = window.__game.world;
+      const b = w.entities.get(id);
+      const sel = document.getElementById('sel-panel');
+      return {
+        selected: w.selection.has(id),
+        title: (sel.querySelector('.sel-title') || {}).textContent,
+        rows: [...sel.querySelectorAll('.hp-text')].map((n) => n.textContent),
+        stockBars: sel.querySelectorAll('.hpbar.stock').length,
+        hpBars: sel.querySelectorAll('.hpbar:not(.stock)').length,
+        fill: (sel.querySelector('.hpbar.stock > i') || { style: {} }).style.width || null,
+        cmd: document.getElementById('cmd-panel').textContent,
+        amount: b.amount,
+        max: b.maxAmount,
+      };
+    }, lone.id);
+    check('tapping a resource with nothing in hand selects it', panel.selected);
+    check('the resource panel shows no NaN anywhere',
+      !/NaN/.test(panel.rows.join(' ') + panel.title + panel.cmd),
+      `${panel.title} | ${panel.rows.join(' / ')} | ${panel.cmd}`);
+    check('it shows how much of the resource is left, not hit points',
+      panel.rows.length === 1 &&
+      new RegExp(`^${Math.ceil(panel.amount)} / ${panel.max} food left$`).test(panel.rows[0]),
+      panel.rows.join(' / '));
+    check('with a stock bar and no health bar',
+      panel.stockBars === 1 && panel.hpBars === 0,
+      `${panel.stockBars} stock, ${panel.hpBars} hp`);
+    check('and the bar is drawn at the true fraction',
+      Math.abs(parseFloat(panel.fill) - (panel.amount / panel.max) * 100) < 0.2,
+      `${panel.fill} for ${panel.amount}/${panel.max}`);
+    check('the header names the bush rather than printing a type id',
+      /berry bush/i.test(panel.title || ''), panel.title);
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-resource-panel.png') });
+
+    // A farm is a building with a stock: it must show both, and no NaN.
+    const farm = await page.evaluate(async () => {
+      const { spawnBuilding, canPlace } = await import('/src/core/world.js');
+      const economy = await import('/src/systems/economy.js');
+      const { setSelection } = await import('/src/ui/selection.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      let at = null;
+      for (let r = 3; r <= 10 && !at; r++) {
+        for (const [dx, dy] of [[r, 0], [0, r], [-r, 0], [0, -r], [r, r], [-r, -r]]) {
+          const gx = Math.floor(tc.x) + dx + 1;
+          const gy = Math.floor(tc.y) + dy + 1;
+          if (canPlace(w, gx, gy, 2, 2)) { at = { gx, gy }; break; }
+        }
+      }
+      if (!at) return { fail: 'nowhere to put a farm' };
+      const f = spawnBuilding(w, 'farm', 0, at.gx, at.gy);
+      economy.initProvider(f);
+      f.hp = Math.round(f.maxHp * 0.5); // wounded, so both rows carry real numbers
+      f.amount = Math.round(f.maxAmount * 0.4);
+      setSelection(w, [f]);
+      window.__game.hud.update(0.016);
+      const sel = document.getElementById('sel-panel');
+      return {
+        rows: [...sel.querySelectorAll('.hp-text')].map((n) => n.textContent),
+        stock: sel.querySelectorAll('.hpbar.stock').length,
+        hp: sel.querySelectorAll('.hpbar:not(.stock)').length,
+      };
+    });
+    check('a farm shows health AND how much food is left in it',
+      !farm.fail && farm.hp === 1 && farm.stock === 1 && farm.rows.length === 2 &&
+      /hp$/.test(farm.rows[0]) && /food left$/.test(farm.rows[1]) &&
+      !/NaN/.test(farm.rows.join(' ')),
+      farm.rows.join(' / '));
+
+    check('no console errors (rally-over-villager run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 3: how much map the alert covers ------------------------------------
+
+async function toastCoverageRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    // Routine chatter first, then the raid. The alert must take the corner over
+    // rather than pile on top of three toasts already sitting there. Counts are
+    // taken after the 280ms exit animation, or retired nodes are still in the
+    // DOM and every number is one stack behind.
+    await page.evaluate(() => {
+      const g = window.__game;
+      g.hud.toast('Training Villager', 'info');
+      g.hud.toast('Not enough wood', 'warn');
+      g.hud.toast('Placing House', 'info');
+      g.hud.toast('12 soldiers selected', 'info');
+    });
+    await page.waitForTimeout(TOAST_EXIT_MS);
+    const before = await page.evaluate(() => document.querySelectorAll('#toasts .toast').length);
+
+    await page.evaluate(() => {
+      const g = window.__game;
+      const tc = g.world.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      g.input.centerOnGrid(tc.x, tc.y);
+      g.hud.underAttackAlert(tc, tc.x, tc.y);
+    });
+    await page.waitForTimeout(TOAST_EXIT_MS);
+
+    const shape = await page.evaluate((beforeCount) => {
+      const nodes = [...document.querySelectorAll('#toasts .toast')];
+      const box = document.getElementById('toasts').getBoundingClientRect();
+      const alert = document.querySelector('#toasts .toast.alert');
+      const ab = alert.getBoundingClientRect();
+      return {
+        before: beforeCount,
+        after: nodes.length,
+        alerts: nodes.filter((n) => n.classList.contains('alert')).length,
+        w: Math.round(box.width),
+        h: Math.round(box.height),
+        vw: window.innerWidth,
+        vh: window.innerHeight,
+        alertBox: { w: Math.round(ab.width), h: Math.round(ab.height) },
+        text: alert.textContent,
+      };
+    }, before);
+
+    check('routine toasts are capped at two', shape.before <= 2, `${shape.before} on screen`);
+    check('the alert supersedes them rather than stacking under them',
+      shape.after === 1 && shape.alerts === 1,
+      `${shape.after} toasts, ${shape.alerts} alerts`);
+    check('the stack covers a small corner of the map, not the base',
+      shape.w / shape.vw <= 0.5 && shape.h <= 72,
+      `${shape.w}x${shape.h} of ${shape.vw}x${shape.vh} — ` +
+      `${Math.round((shape.w / shape.vw) * 100)}% wide, was 56% x 180px`);
+    check('the alert is still a 44px touch target',
+      shape.alertBox.h >= 44 && shape.alertBox.w >= 44,
+      `${shape.alertBox.w}x${shape.alertBox.h}`);
+    check('and still says what is happening', /under attack/i.test(shape.text), shape.text.trim());
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-toast-alert-coverage.png') });
+
+    // Tapping it still jumps the camera.
+    const jumped = await page.evaluate(async () => {
+      const g = window.__game;
+      const w = g.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      g.input.centerOnGrid(1, 1);
+      const from = { x: g.input.camera.midPoint.x, y: g.input.camera.midPoint.y };
+      document.querySelector('#toasts .toast.alert').click();
+      const to = { x: g.input.camera.midPoint.x, y: g.input.camera.midPoint.y };
+      const p = g.input._toScreen(tc.x, tc.y);
+      return { moved: Math.hypot(to.x - from.x, to.y - from.y), onScreen: p };
+    });
+    check('tapping the alert still jumps to the fight', jumped.moved > 50,
+      `camera moved ${Math.round(jumped.moved)} world px`);
+
+    // And the same thing for real: an enemy squad on the Town Center, the alert
+    // raised by combat.js rather than by this test, with the routine toasts a
+    // busy base is generating at the same time. This is the shot the finding
+    // asked for — how much map is left readable while the alarm is up.
+    const live = await page.evaluate(async () => {
+      const { spawnUnit } = await import('/src/core/world.js');
+      const { nearestWalkable } = await import('/src/systems/pathfinding.js');
+      const { commandUnits } = await import('/src/systems/unitAI.js');
+      const g = window.__game;
+      const w = g.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      const raiders = [];
+      for (let i = 0; i < 3; i++) {
+        const s = nearestWalkable(w, Math.floor(tc.x) + 3 + i, Math.floor(tc.y) + 3, 6);
+        raiders.push(spawnUnit(w, 'militia', 1, s.tx + 0.5, s.ty + 0.5));
+      }
+      commandUnits(w, raiders, { type: 'attack', gx: tc.x, gy: tc.y, target: tc });
+      g.input.centerOnGrid(tc.x, tc.y);
+      return { tc: { x: tc.x, y: tc.y }, alerts: g.hud.alertCount() };
+    });
+
+    let fired = null;
+    for (let i = 0; i < 60 && !fired; i++) {
+      await page.evaluate(() => window.__game.step(10));
+      fired = await page.evaluate((was) => {
+        const g = window.__game;
+        if (g.hud.alertCount() <= was) return null;
+        // Real chatter competing with the alarm, exactly as in the playtest.
+        g.hud.toast('Training Villager', 'info');
+        g.hud.toast('Not enough wood', 'warn');
+        const box = document.getElementById('toasts').getBoundingClientRect();
+        const nodes = document.querySelectorAll('#toasts .toast');
+        return { n: nodes.length, w: Math.round(box.width), h: Math.round(box.height) };
+      }, live.alerts);
+    }
+    check('a real raid raises the alert, and it is still alone on screen',
+      !!fired && fired.n === 1,
+      fired ? `${fired.n} toast(s), ${fired.w}x${fired.h}` : 'combat never raised an alert');
+
+    await page.evaluate((at) => window.__game.input.centerOnGrid(at.x, at.y), live.tc);
+    await page.waitForTimeout(120);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-toast-alert-live.png') });
+
+    check('no console errors (toast run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 4: arm an attack-move and spend it ----------------------------------
 
 async function attackMoveRun() {
   const h = await boot();
@@ -381,12 +771,24 @@ async function attackMoveRun() {
   }
 }
 
+// `--only rally` runs just the runs whose name contains "rally" — the whole
+// file is four browser boots and well over a minute, which is a long wait when
+// you are iterating on one of them.
+const ONLY = arg('only', '');
+
 const run = async () => {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
-  console.log('\n--- rally onto a resource ---');
-  await rallyRun();
-  console.log('\n--- attack-move ---');
-  await attackMoveRun();
+  const runs = [
+    ['rally onto a resource', rallyRun],
+    ['rally onto the bush a villager is already working', rallyOverVillagerRun],
+    ['how much map the toast stack covers', toastCoverageRun],
+    ['attack-move', attackMoveRun],
+  ];
+  for (const [name, fn] of runs) {
+    if (ONLY && !name.includes(ONLY)) continue;
+    console.log(`\n--- ${name} ---`);
+    await fn();
+  }
 };
 
 run().then(() => {

@@ -82,10 +82,20 @@ export function selectionSignature(world) {
   if (es.length === 0) return '-';
   let s = `${es.length}`;
   for (const e of es) {
-    s += `|${e.id}:${e.type}:${Math.ceil((e.hp / e.maxHp) * 20)}`;
+    // Resource nodes have no hp at all and farms have both hp and a stock, so
+    // the signature buckets whichever of the two the entity actually carries.
+    // Left as a raw hp ratio it read `NaN` for every bush, which is exactly the
+    // value the panel then printed at the player.
+    s += `|${e.id}:${e.type}:${bucket(e.hp, e.maxHp)}:${bucket(e.amount, e.maxAmount)}`;
     if (e.kind === 'building') {
       s += `:${e.complete ? 1 : 0}:${e.queue ? e.queue.length : 0}`;
     }
   }
   return s;
+}
+
+/** A 0-20 bucket of value/max, or '-' when this entity has no such pair. */
+function bucket(v, max) {
+  if (!Number.isFinite(v) || !Number.isFinite(max) || max <= 0) return '-';
+  return String(Math.ceil((v / max) * 20));
 }
