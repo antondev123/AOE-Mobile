@@ -10,13 +10,14 @@
 
 import {
   RES, CARRY_CAPACITY, GATHER_RATE, BUILD_RATE,
-  UNIT_STATS, BUILDING_STATS, TERRAIN, MAX_POP_CAP,
+  UNIT_STATS, BUILDING_STATS, TERRAIN, MAX_POP_CAP, PLAYER,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
   spawnUnit, spawnBuilding, removeEntity, canPlace, isBlocked, inBounds,
-  applyPopBonus, recomputePop, edgeDist2,
+  applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy,
 } from '../core/world.js';
+import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 
 // --- Tuning (local to this module; constants.js is read-only for me) --------
 //
@@ -347,6 +348,64 @@ export function depositCarry(world, unit, building) {
 
 // --- Foundations & construction --------------------------------------------
 
+// --- Placement reachability --------------------------------------------------
+//
+// world.canPlace() answers the geometric question — in bounds, nothing there,
+// not water. That is not enough: the ghost went green for the farm that closed
+// the last gap around a one-tile hole with eight villagers in it, and those
+// eight were gone for the rest of the match. Demolishing a wall can undo it
+// after the fact, but a player should never have to notice, diagnose and undo
+// a mistake the placement rules let them make in the first place.
+//
+// What this layer forbids is narrow on purpose. Walling is legitimate: enclosing
+// your base, or a whole quarter of the map, is a real AoE2 play and must keep
+// working. The only thing refused is a placement that would leave *the placing
+// player's own* units, or the last way out of their unit-producing buildings,
+// inside a pocket (see POCKET_LIMIT in pathfinding.js). Anything that seals a
+// map-sized area is allowed, and anything already stuck stays this module's
+// business rather than the new building's fault.
+
+const TRAP_UNITS_MSG = 'That would trap your villagers';
+const TRAP_EXIT_MSG = 'That would seal in your Town Center';
+
+/** Why this placement is refused, or null when it is fine. */
+function placementTrapReason(world, playerId, type, gx, gy) {
+  const s = BUILDING_STATS[type];
+  if (!s) return null;
+  const tiles = footprintTiles(gx, gy, s.fw, s.fh);
+
+  const units = ownedBy(world, playerId, 'unit');
+  if (units.length && pointsSealedBy(world, tiles, units).length > 0) return TRAP_UNITS_MSG;
+
+  // Buildings that put units on the map need a way out for them. If every free
+  // tile around one would become a pocket, its queue can never be emptied.
+  const blocked = new Set();
+  for (const [tx, ty] of tiles) {
+    if (inBounds(world, tx, ty)) blocked.add(ty * world.width + tx);
+  }
+  for (const b of ownedBy(world, playerId, 'building')) {
+    if (!b.complete || !b.trains || b.trains.length === 0) continue;
+    if (!hasOpenPerimeter(world, b.tiles)) continue; // already boxed in; not our doing
+    if (!hasOpenPerimeter(world, b.tiles, { extraBlocked: blocked })) return TRAP_EXIT_MSG;
+  }
+  return null;
+}
+
+/**
+ * canPlace() plus the reachability rules above: true when `playerId` may put a
+ * `type` here without sealing its own units in.
+ *
+ * Exported under this exact name so the placement ghost can colour itself with
+ * the same predicate the placement itself uses — a green ghost that then refuses
+ * the tap is worse than no ghost at all.
+ */
+export function canPlaceReachable(world, playerId, type, gx, gy) {
+  const s = BUILDING_STATS[type];
+  if (!s) return false;
+  if (!canPlace(world, gx, gy, s.fw, s.fh)) return false;
+  return placementTrapReason(world, playerId, type, gx, gy) === null;
+}
+
 /**
  * Validate, charge and place a construction site. Returns the new building or
  * null (emitting EV.INSUFFICIENT or EV.TOAST to say why).
@@ -357,6 +416,14 @@ export function placeFoundation(world, playerId, type, gx, gy) {
 
   if (!canPlace(world, gx, gy, s.fw, s.fh)) {
     world.events.emit(EV.TOAST, { text: `Cannot build there`, tone: 'warn' });
+    return null;
+  }
+  const trap = placementTrapReason(world, playerId, type, gx, gy);
+  if (trap) {
+    // Only the human is told: the enemy AI places dozens of buildings a match
+    // and "that would trap your villagers" about someone else's villagers is a
+    // lie on the player's screen.
+    if (playerId === PLAYER) world.events.emit(EV.TOAST, { text: trap, tone: 'warn' });
     return null;
   }
   if (!canAfford(world, playerId, s.cost)) {

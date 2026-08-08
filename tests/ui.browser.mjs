@@ -1,7 +1,9 @@
 // In-browser verification of the HUD and touch findings from the playtests:
 // rally-to-resource (including onto the bush a villager is already working),
 // what the panel says about a resource you tap, how much map the alert stack
-// covers, and issuing an attack-move.
+// covers and what it is allowed to swallow, issuing an attack-move, and
+// demolishing one of your own buildings — including demolishing your way out of
+// a ring of houses you have sealed your own villager into.
 //
 //   node tests/ui.browser.mjs [--shots screenshots/] [--only <substring>]
 //
@@ -564,17 +566,37 @@ async function toastCoverageRun() {
       fired = await page.evaluate((was) => {
         const g = window.__game;
         if (g.hud.alertCount() <= was) return null;
-        // Real chatter competing with the alarm, exactly as in the playtest.
+        // Real chatter competing with the alarm, exactly as in the playtest —
+        // one line of routine narration, and one refusal. The refusal is the
+        // only record the player will ever get that the tap did nothing, so it
+        // has to survive the alert; the narration does not.
         g.hud.toast('Training Villager', 'info');
-        g.hud.toast('Not enough wood', 'warn');
-        const nodes = document.querySelectorAll('#toasts .toast:not(.out)');
-        const box = nodes.length ? nodes[0].getBoundingClientRect() : { width: 0, height: 0 };
-        return { n: nodes.length, w: Math.round(box.width), h: Math.round(box.height) };
+        g.hud.toast('Cannot build there', 'warn');
+        const nodes = [...document.querySelectorAll('#toasts .toast:not(.out)')];
+        const stack = document.getElementById('toasts').getBoundingClientRect();
+        const alert = nodes.find((n) => n.classList.contains('alert'));
+        const ab = alert ? alert.getBoundingClientRect() : { width: 0, height: 0 };
+        return {
+          n: nodes.length,
+          texts: nodes.map((t) => t.textContent),
+          alertFirst: !!nodes[0] && nodes[0].classList.contains('alert'),
+          w: Math.round(ab.width),
+          h: Math.round(ab.height),
+          stackH: Math.round(stack.height),
+        };
       }, live.alerts);
     }
-    check('a real raid raises the alert, and it is still alone on screen',
-      !!fired && fired.n === 1,
-      fired ? `${fired.n} toast(s), ${fired.w}x${fired.h}` : 'combat never raised an alert');
+    check('a real raid raises the alert', !!fired && fired.alertFirst,
+      fired ? fired.texts.join(' | ') : 'combat never raised an alert');
+    check('a refused action still speaks up while the alert is live',
+      !!fired && /cannot build there/i.test(fired.texts.join(' | ')),
+      fired ? fired.texts.join(' | ') : '');
+    check('and routine chatter is still swallowed by it',
+      !!fired && !/training villager/i.test(fired.texts.join(' | ')),
+      fired ? fired.texts.join(' | ') : '');
+    check('the alert still leads, with at most one line under it',
+      !!fired && fired.n <= 2 && fired.alertFirst && fired.stackH <= 96,
+      fired ? `${fired.n} toast(s), alert ${fired.w}x${fired.h}, stack ${fired.stackH}px tall` : '');
 
     await page.evaluate((at) => window.__game.input.centerOnGrid(at.x, at.y), live.tc);
     await page.waitForTimeout(120);
@@ -856,6 +878,401 @@ async function attackMoveRun() {
   }
 }
 
+// --- Run 6: demolishing one of your own buildings ----------------------------
+//
+// The third playtest found there was no way to take a building down, anywhere —
+// not in the command panel, not in the menu sheet. A house in the wrong place
+// was permanent. This proves the escape hatch exists, that it cannot go off by
+// accident, and that it is not offered for things that are not yours.
+
+/** Force a synchronous HUD re-render, so a read never races the frame. */
+const paint = (page) => page.evaluate(() => window.__game.hud.update(0.016));
+
+const demolishBtn = (page) => page.locator('#cmd-panel .cbtn.demolish');
+
+async function demolishRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    await watchToasts(page);
+
+    // One finished house of ours, standing clear of everything else.
+    const house = await page.evaluate(async () => {
+      const { spawnBuilding, canPlace } = await import('/src/core/world.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      let at = null;
+      for (let r = 4; r <= 14 && !at; r++) {
+        for (const [dx, dy] of [[r, 0], [0, r], [-r, 0], [0, -r], [r, r], [-r, -r], [r, -r], [-r, r]]) {
+          const gx = Math.floor(tc.x) + dx + 1;
+          const gy = Math.floor(tc.y) + dy + 1;
+          // A tile of margin all round, so the tap can only mean the house.
+          if (canPlace(w, gx, gy, 4, 4) && canPlace(w, gx, gy, 2, 2)) { at = { gx, gy }; break; }
+        }
+      }
+      if (!at) return { fail: 'nowhere to put a house' };
+      const b = spawnBuilding(w, 'house', 0, at.gx, at.gy);
+      return {
+        id: b.id, x: b.x, y: b.y, tiles: b.tiles,
+        popCap: w.players[0].popCap,
+        wood: w.players[0].resources.wood,
+      };
+    });
+    check('there is a house of ours to demolish', !house.fail, house.fail || '');
+    if (house.fail) return;
+
+    // Select it the way a thumb does.
+    const p = await aim(page, house.x, house.y);
+    await tapSlow(page, p.x, p.y);
+    await paint(page);
+    check('tapping our house selects it',
+      await page.evaluate((id) => window.__game.world.selection.has(id), house.id));
+
+    check('a demolish button is offered for it', await demolishBtn(page).count() > 0);
+    const box = await demolishBtn(page).first().boundingBox();
+    check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
+      box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
+    check('and it does not look like the other, harmless, buttons',
+      await page.evaluate(() => {
+        const d = document.querySelector('#cmd-panel .cbtn.demolish');
+        const other = [...document.querySelectorAll('#cmd-panel .cbtn')].find((b) => b !== d);
+        if (!d) return false;
+        const a = getComputedStyle(d);
+        const b = other ? getComputedStyle(other) : null;
+        return a.borderTopColor !== (b ? b.borderTopColor : '') || /gradient/.test(a.backgroundImage);
+      }));
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-demolish-button.png') });
+
+    // --- One tap must not level anything. ------------------------------------
+    const mark = await toastMark(page);
+    await demolishBtn(page).first().click();
+    await paint(page);
+    const armed = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const b = w.entities.get(st.id);
+      const btn = document.querySelector('#cmd-panel .cbtn.demolish');
+      return {
+        alive: !!b && !b.dead,
+        hp: b ? b.hp : 0,
+        armed: window.__game.hud.isDemolishArmed(),
+        lit: !!document.querySelector('#cmd-panel .cbtn.demolish.armed'),
+        label: btn ? btn.textContent : '',
+        blocked: st.tiles.every(([tx, ty]) => w.blocked[ty * w.width + tx] !== 0),
+      };
+    }, house);
+    check('one tap does NOT destroy the building', armed.alive && armed.blocked,
+      `alive=${armed.alive} at ${armed.hp} hp, tiles still blocked=${armed.blocked}`);
+    check('it arms and asks for a second tap instead', armed.armed && armed.lit, armed.label);
+    check('and says so in words', /tap again/i.test(await toastsSince(page, mark)),
+      await toastsSince(page, mark));
+
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-demolish-confirm.png') });
+
+    // --- The second tap does it. ---------------------------------------------
+    check('the confirmation is still live when we take it',
+      await page.evaluate(() => window.__game.hud.isDemolishArmed()));
+    const mark2 = await toastMark(page);
+    await demolishBtn(page).first().click();
+    await paint(page);
+
+    const gone = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const b = w.entities.get(st.id);
+      return {
+        entity: !!b,
+        inList: w.buildings.some((x) => x.id === st.id),
+        selected: w.selection.has(st.id),
+        free: st.tiles.every(([tx, ty]) => w.blocked[ty * w.width + tx] === 0),
+        popCap: w.players[0].popCap,
+        wood: w.players[0].resources.wood,
+        btns: document.querySelectorAll('#cmd-panel .cbtn.demolish').length,
+      };
+    }, house);
+    check('confirming actually removes the building',
+      !gone.entity && !gone.inList && !gone.selected,
+      `entity=${gone.entity}, in buildings=${gone.inList}, still selected=${gone.selected}`);
+    check('and frees every tile of its footprint', gone.free,
+      `${house.tiles.length} tiles`);
+    check('the population cap it provided goes with it',
+      gone.popCap === house.popCap - 5, `${house.popCap} -> ${gone.popCap}`);
+    check('no resources are refunded, as in AoE2',
+      gone.wood === house.wood, `${house.wood} -> ${gone.wood} wood`);
+    check('a toast confirms the demolition',
+      /demolished/i.test(await toastsSince(page, mark2)), await toastsSince(page, mark2));
+    check('and the button is gone with the building', gone.btns === 0);
+
+    // --- Never offered for things that are not ours to knock down. -----------
+    const others = await page.evaluate(async () => {
+      const { setSelection } = await import('/src/ui/selection.js');
+      const { spawnBuilding } = await import('/src/core/world.js');
+      const g = window.__game;
+      const w = g.world;
+      const out = {};
+      const count = () => {
+        g.hud.update(0.016);
+        return document.querySelectorAll('#cmd-panel .cbtn.demolish').length;
+      };
+
+      const foeB = w.buildings.find((b) => b.player === 1 && b.complete);
+      setSelection(w, [foeB]);
+      out.enemyBuilding = count();
+
+      const vill = w.units.find((u) => u.player === 0 && u.type === 'villager');
+      setSelection(w, [vill]);
+      out.ownUnit = count();
+
+      const foeU = w.units.find((u) => u.player === 1);
+      if (foeU) { setSelection(w, [foeU]); out.enemyUnit = count(); } else out.enemyUnit = 0;
+
+      // A foundation is not a completed building: cancelling one is a different
+      // (and cheaper) thing, so demolish stays off it.
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+      const site = spawnBuilding(w, 'house', 0, Math.floor(tc.x) + 6, Math.floor(tc.y) + 6, { complete: false });
+      setSelection(w, [site]);
+      out.foundation = count();
+
+      // ...and it is offered again for a real building of ours, so the checks
+      // above are measuring the rule and not a broken panel.
+      setSelection(w, [tc]);
+      out.ownBuilding = count();
+      return out;
+    });
+    check('demolish is not offered for an enemy building', others.enemyBuilding === 0,
+      `${others.enemyBuilding} button(s)`);
+    check('nor for a unit', others.ownUnit === 0 && others.enemyUnit === 0,
+      `own unit: ${others.ownUnit}, enemy unit: ${others.enemyUnit}`);
+    check('nor for a foundation still going up', others.foundation === 0,
+      `${others.foundation} button(s)`);
+    check('but it is offered for our own Town Center', others.ownBuilding === 1,
+      `${others.ownBuilding} button(s)`);
+
+    check('no console errors (demolish run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 7: the trap the third playtest got stuck in -------------------------
+//
+// A player walled their own villagers into a pocket with houses and farms; the
+// economy froze at food 10 / wood 3 / gold 5 for eight minutes and there was no
+// way out, because nothing in the game could take a building down. This builds
+// the same cage — a solid two-tile-thick ring of our own houses around one
+// villager, with the food it has been ordered to gather sitting outside — and
+// then recovers from it the way a player now can: select a wall, demolish it,
+// watch the villager walk out and get back to work.
+
+async function trappedVillagerRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    const pen = await page.evaluate(async () => {
+      const { spawnBuilding, spawnUnit, spawnResource, canPlace } = await import('/src/core/world.js');
+      const { findPath } = await import('/src/systems/pathfinding.js');
+      const { commandUnits } = await import('/src/systems/unitAI.js');
+      const w = window.__game.world;
+      const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+
+      // A clear 8x8 block near our base: a ring of 2x2 houses two tiles thick
+      // (12 of them, no overlaps) leaves a 4x4 yard in the middle.
+      const clear = (tx, ty, n) => {
+        if (tx < 1 || ty < 1 || tx + n >= w.width - 1 || ty + n >= w.height - 1) return false;
+        for (let y = ty; y < ty + n; y++) {
+          for (let x = tx; x < tx + n; x++) {
+            if (w.blocked[y * w.width + x] !== 0) return false;
+            if (w.terrain[y * w.width + x] === 2) return false; // water
+          }
+        }
+        return true;
+      };
+      // Nearest clear block to our base, preferring one with elbow room around
+      // it (this map is mostly forest, so take what we can get).
+      let origin = null;
+      for (const margin of [2, 1, 0]) {
+        let bestD = Infinity;
+        for (let ty = 1; ty < w.height - 8; ty++) {
+          for (let tx = 1; tx < w.width - 8; tx++) {
+            if (!clear(tx - margin, ty - margin, 8 + margin * 2)) continue;
+            const d = Math.hypot(tx + 4 - tc.x, ty + 4 - tc.y);
+            if (d < bestD) { bestD = d; origin = { tx, ty }; }
+          }
+        }
+        if (origin) break;
+      }
+      if (!origin) return { fail: 'no clear 8x8 block on this map' };
+      const { tx, ty } = origin;
+
+      // The food goes outside the pen, on a tile the villager could genuinely
+      // walk to — checked *before* the walls exist, so the only thing that can
+      // stop it later is the cage itself.
+      const yard = { x: tx + 3.5, y: ty + 3.5 };
+      let spot = null;
+      for (let d = 2; d <= 7 && !spot; d++) {
+        for (const [ux, uy] of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+          const bx = Math.floor(tx + 3.5 + ux * (4 + d));
+          const by = Math.floor(ty + 3.5 + uy * (4 + d));
+          if (!canPlace(w, bx + 0.5, by + 0.5, 1, 1)) continue;
+          const route = findPath(w, yard.x, yard.y, bx + 0.5, by + 0.5);
+          if (!route || !route.length) continue;
+          const end = route[route.length - 1];
+          if (Math.hypot(end.x - (bx + 0.5), end.y - (by + 0.5)) > 1.5) continue;
+          spot = { bx, by };
+          break;
+        }
+      }
+      if (!spot) return { fail: 'nowhere reachable outside the pen to put the food' };
+      const bush = spawnResource(w, 'berry', spot.bx, spot.by);
+
+      const wall = [];
+      const put = (ox, oy) => wall.push(spawnBuilding(w, 'house', 0, ox + 1, oy + 1));
+      for (let i = 0; i < 8; i += 2) { put(tx + i, ty); put(tx + i, ty + 6); }   // top + bottom bands
+      for (let j = 2; j < 6; j += 2) { put(tx, ty + j); put(tx + 6, ty + j); }   // left + right bands
+
+      // One villager in the yard, ordered to go and gather that food.
+      const v = spawnUnit(w, 'villager', 0, yard.x, yard.y);
+      commandUnits(w, [v], { type: 'gather', gx: bush.x, gy: bush.y, target: bush });
+
+      return {
+        tx, ty,
+        vill: v.id,
+        bush: { id: bush.id, x: bush.x, y: bush.y, amount: bush.amount },
+        wall: wall.map((b) => ({ id: b.id, x: b.x, y: b.y, tiles: b.tiles })),
+        sealed: (() => {
+          // Every tile of the 3-tile-wide band around the yard is blocked.
+          for (let y = ty; y < ty + 8; y++) {
+            for (let x = tx; x < tx + 8; x++) {
+              const inYard = x >= tx + 2 && x < tx + 6 && y >= ty + 2 && y < ty + 6;
+              if (!inYard && w.blocked[y * w.width + x] === 0) return false;
+            }
+          }
+          return true;
+        })(),
+      };
+    });
+    check('the cage is built: a villager sealed in by our own houses',
+      !pen.fail && pen.sealed && pen.wall.length === 12,
+      pen.fail || `${pen.wall && pen.wall.length} houses, sealed=${pen.sealed}`);
+    if (pen.fail) return;
+
+    // A minute of match time. It has food to fetch and cannot reach it.
+    await step(page, 1200);
+    const stuck = await page.evaluate((st) => {
+      const w = window.__game.world;
+      const v = w.entities.get(st.vill);
+      const b = w.entities.get(st.bush.id);
+      const inside = v.x > st.tx + 1.9 && v.x < st.tx + 6.1 && v.y > st.ty + 1.9 && v.y < st.ty + 6.1;
+      return {
+        inside,
+        at: `${v.x.toFixed(1)},${v.y.toFixed(1)}`,
+        bush: b.amount,
+        carrying: v.carrying.amount,
+        progress: v.gatherProgress || 0,
+      };
+    }, pen);
+    check('a minute later it is still in the pen, having gathered nothing at all',
+      stuck.inside && stuck.bush === pen.bush.amount && stuck.carrying === 0 && stuck.progress === 0,
+      `villager at ${stuck.at}, bush ${stuck.bush}/${pen.bush.amount}, carrying ${stuck.carrying}`);
+
+    await page.evaluate((st) => window.__game.input.centerOnGrid(st.tx + 4, st.ty + 4), pen);
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-demolish-trapped.png') });
+
+    // --- Recover: tap a wall, demolish it. -----------------------------------
+    // The wall between the villager and its food — the one a player would pick.
+    const wallHouse = pen.wall.slice().sort((a, b) =>
+      Math.hypot(a.x - pen.bush.x, a.y - pen.bush.y) - Math.hypot(b.x - pen.bush.x, b.y - pen.bush.y))[0];
+    const p = await aim(page, wallHouse.x, wallHouse.y);
+    await tapSlow(page, p.x, p.y);
+    await paint(page);
+    const picked = await page.evaluate(() => {
+      const w = window.__game.world;
+      const id = [...w.selection][0];
+      const e = w.entities.get(id);
+      return e && e.kind === 'building' && e.player === 0
+        ? { id: e.id, tiles: e.tiles, type: e.type } : null;
+    });
+    check('tapping a wall of the pen selects it', !!picked, picked ? picked.type : 'nothing selected');
+    if (!picked) return;
+
+    await demolishBtn(page).first().click();
+    await paint(page);
+    await demolishBtn(page).first().click();
+    await paint(page);
+    const razed = await page.evaluate((st) => {
+      const w = window.__game.world;
+      return {
+        gone: !w.entities.get(st.id),
+        free: st.tiles.every(([tx, ty]) => w.blocked[ty * w.width + tx] === 0),
+      };
+    }, picked);
+    check('two taps take the wall down and open the hole',
+      razed.gone && razed.free, `removed=${razed.gone}, tiles free=${razed.free}`);
+
+    // The villager may have given up on an order it could not carry out while it
+    // was sealed in (that is the idle-villager button's job, and the other half
+    // of this fix). Re-issue it if so — the question here is whether the wall
+    // was what was stopping it.
+    await page.evaluate(async (st) => {
+      const w = window.__game.world;
+      const v = w.entities.get(st.vill);
+      if (v && !v.task) {
+        const { commandUnits } = await import('/src/systems/unitAI.js');
+        commandUnits(w, [v], {
+          type: 'gather', gx: st.bush.x, gy: st.bush.y, target: w.entities.get(st.bush.id),
+        });
+      }
+    }, pen);
+
+    // "Back to work" is judged on the node it is actually working, not on the
+    // bush this test planted: a villager that spends long enough failing to
+    // reach one node retargets to another (unitAI's retargetNode), so which
+    // bush it ends up on is not the claim being made here. Getting out and
+    // harvesting something is.
+    let freed = null;
+    for (let i = 0; i < 60 && !freed; i++) {
+      await step(page, 40);
+      freed = await page.evaluate((st) => {
+        const w = window.__game.world;
+        const v = w.entities.get(st.vill);
+        if (!v || v.dead) return { dead: true };
+        const out = !(v.x > st.tx && v.x < st.tx + 8 && v.y > st.ty && v.y < st.ty + 8);
+        if (!out) return null;
+        // Its own hands, not the node's ledger: another villager could have been
+        // eating that bush all along, so only this one's carry and gather
+        // progress prove this one is working again.
+        const working = v.carrying.amount > 0 || v.gatherProgress > 0 || v.state === 'gather';
+        if (!working) return null;
+        return {
+          at: `${v.x.toFixed(1)},${v.y.toFixed(1)}`,
+          state: v.state,
+          task: v.task && v.task.type,
+          carrying: Number(v.carrying.amount.toFixed(1)),
+          progress: Number((v.gatherProgress || 0).toFixed(2)),
+        };
+      }, pen);
+    }
+    check('the villager walks out of the pen and gets back to work',
+      !!freed && !freed.dead,
+      freed && !freed.dead
+        ? `at ${freed.at}, state=${freed.state} task=${freed.task}, ` +
+          `carrying ${freed.carrying}, gather progress ${freed.progress}`
+        : 'it never got out');
+
+    await page.evaluate((st) => {
+      const w = window.__game.world;
+      const v = w.entities.get(st.vill);
+      window.__game.input.centerOnGrid(v.x, v.y);
+    }, pen);
+    await page.waitForTimeout(150);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'ui-demolish-freed.png') });
+
+    check('no console errors (trapped villager run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
 // `--only rally` runs just the runs whose name contains "rally" — the whole
 // file is four browser boots and well over a minute, which is a long wait when
 // you are iterating on one of them.
@@ -869,6 +1286,8 @@ const run = async () => {
     ['how much map the toast stack covers', toastCoverageRun],
     ['what a double-tap grabs', doubleTapRun],
     ['attack-move', attackMoveRun],
+    ['demolish one of your own buildings', demolishRun],
+    ['demolish your way out of a trap', trappedVillagerRun],
   ];
   for (const [name, fn] of runs) {
     if (ONLY && !name.includes(ONLY)) continue;

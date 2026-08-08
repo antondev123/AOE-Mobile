@@ -14,7 +14,7 @@ import {
   PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
-import { ownedBy, forEachNear, edgeDist2 } from '../core/world.js';
+import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js';
 
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
@@ -39,6 +39,12 @@ const ALERT_MS = 5200;
 const ALERT_MIN_MS = 1200;
 // How long the minimap frame keeps flashing after an alert.
 const ALERT_GLOW_MS = 5000;
+
+// Demolish is destructive and irreversible, so the button arms on the first tap
+// and only destroys on the second — the same arm-then-confirm the game already
+// teaches with attack-move and building placement. The armed state expires on
+// its own so a forgotten arm cannot be spent by a tap thirty seconds later.
+const DEMOLISH_ARM_MS = 4000;
 
 // A rally point this close to something workable *is* an order to work it.
 // Must match unitAI's RALLY_SNAP: the HUD's job below is to say out loud what
@@ -234,6 +240,7 @@ export function createHud(scene, world) {
     input: null,             // set by createInput via attachInput()
     placement: null,         // building type currently being placed
     attackArmed: false,      // next map tap is an attack-move
+    demolishArm: null,       // { key, at } — demolish armed for exactly this set
     buildMenuOpen: false,
     menuOpen: false,
     selSig: '',
@@ -324,11 +331,21 @@ export function createHud(scene, world) {
 
   function toast(text, tone = 'info') {
     if (!dom.toasts || !text) return;
-    // While an alert is up it owns the corner outright. Routine chatter —
-    // "Training Villager", "Not enough wood" — is not worth a line of map at
-    // the one moment the player has to see the map, and stacking under the
-    // alert is what buried the base it was pointing at.
-    if (activeAlert()) return;
+    // While an alert is up it owns the corner — but only against *chatter*.
+    //
+    // "Training Villager", "Halted", "3 units selected" describe something that
+    // already happened and will still be true in five seconds; they are not
+    // worth a line of map at the one moment the player has to see the map, and
+    // stacking them under the alert is what buried the base it pointed at.
+    //
+    // A warn-tone toast is the opposite kind of message: it is the *only*
+    // record that something the player just asked for did not happen. Swallow
+    // "Cannot build there" and placement stays armed with nothing but a red
+    // ghost to explain it; swallow "Not enough wood" or "That would trap your
+    // villagers" and the tap simply appears to do nothing. So warnings get
+    // through, and the toast cap (TOAST_MAX) keeps it to the alert plus one —
+    // the alert is never the toast that gets retired (see pushToast).
+    if (activeAlert() && tone !== 'warn') return;
     const now = performance.now();
     // -Infinity, not 0: performance.now() is small for the first second and a
     // half of the page's life, and defaulting to 0 swallowed every toast raised
@@ -561,8 +578,9 @@ export function createHud(scene, world) {
 
   // --- Command panel --------------------------------------------------------
 
-  function cmdButton(label, { cls = '', cost = null, onTap, disabled = false, sub = null } = {}) {
+  function cmdButton(label, { cls = '', cost = null, onTap, disabled = false, sub = null, aria = null } = {}) {
     const b = el('button', `cbtn ${cls}`);
+    if (aria) b.setAttribute('aria-label', aria);
     b.appendChild(el('span', 'label', label));
     if (cost) {
       const c = costNode(cost);
@@ -663,7 +681,79 @@ export function createHud(scene, world) {
       panel.appendChild(el('div', 'cmd-note', `${displayName(site)} under construction — ${pct}%`));
     }
 
+    // Demolish, last and on its own: the only irreversible thing in the panel.
+    if (buildings.length) renderDemolish(panel, buildings);
+
     refreshAffordability();
+  }
+
+  // --- Demolish -------------------------------------------------------------
+  // AoE2 has the delete key and a confirmation dialog behind it, and it is an
+  // ordinary part of play: you delete a misplaced house or a wall you no longer
+  // want. Here it is also the only way out of a base you have walled yourself
+  // into — without it, a house put down in the wrong spot is permanent, and a
+  // ring of them around your own villagers is unrecoverable.
+  //
+  // No refund, as in AoE2. A partial refund would turn "wall yourself in" into
+  // a resource-shuffling exploit and, more to the point, would make the button
+  // something you might tap speculatively — which is exactly what it must not be.
+
+  function demolishKey(list) {
+    return list.map((b) => b.id).sort((a, b) => a - b).join(',');
+  }
+
+  /** Is demolish armed for exactly this set of buildings, and still fresh? */
+  function demolishArmedFor(list) {
+    const arm = state.demolishArm;
+    if (!arm) return false;
+    if (performance.now() - arm.at > DEMOLISH_ARM_MS) return false;
+    return arm.key === demolishKey(list);
+  }
+
+  function setDemolishArm(list) {
+    state.demolishArm = list ? { key: demolishKey(list), at: performance.now() } : null;
+    state.cmdSig = ''; // the button must redraw as armed/idle immediately
+  }
+
+  function renderDemolish(panel, list) {
+    const armed = demolishArmedFor(list);
+    const what = list.length === 1 ? displayName(list[0]) : `${list.length} buildings`;
+    panel.appendChild(cmdButton(armed ? 'Confirm' : 'Demolish', {
+      cls: `demolish ${armed ? 'armed' : ''}`,
+      sub: armed ? 'destroy it' : 'no refund',
+      aria: armed
+        ? `Confirm: destroy ${what}. This cannot be undone.`
+        : `Demolish ${what}. Asks to confirm.`,
+      onTap: () => demolishTap(list),
+    }));
+  }
+
+  function demolishTap(list) {
+    if (!demolishArmedFor(list)) {
+      setDemolishArm(list);
+      const what = list.length === 1 ? displayName(list[0]) : `${list.length} buildings`;
+      toast(`Demolish ${what}? Tap again`, 'warn');
+      return;
+    }
+    setDemolishArm(null);
+    demolish(list);
+  }
+
+  /**
+   * Destroy our own finished buildings. removeEntity does all the bookkeeping —
+   * frees the footprint tiles (which is the whole point here), drops the id from
+   * the owner's set, clears any task or target pointing at it, recomputes the
+   * population cap and emits EV.REMOVED — so there is nothing to undo by hand.
+   */
+  function demolish(list) {
+    const targets = list.filter((b) =>
+      b && !b.dead && b.kind === 'building' && b.player === PLAYER && b.complete);
+    if (!targets.length) return;
+    const what = targets.length === 1 ? displayName(targets[0]) : `${targets.length} buildings`;
+    for (const b of targets) removeEntity(world, b);
+    toast(`${what} demolished`, 'warn');
+    state.cmdSig = '';
+    state.selSig = '';
   }
 
   /**
@@ -995,6 +1085,9 @@ export function createHud(scene, world) {
     // selection changes in one frame costs one layout.
     state.selSig = '';
     state.cmdSig = '';
+    // An arm belongs to the buildings that were in hand when it was armed;
+    // changing the selection must never carry it over to something else.
+    state.demolishArm = null;
     if (world.selection.size === 0) toggleBuildMenu(false);
   }));
 
@@ -1078,6 +1171,12 @@ export function createHud(scene, world) {
     updateIdle();
     tickToasts(now);
 
+    // A demolish arm that was never confirmed lapses back to safe on its own.
+    if (state.demolishArm && now - state.demolishArm.at > DEMOLISH_ARM_MS) {
+      state.demolishArm = null;
+      state.cmdSig = '';
+    }
+
     const sig = selectionSignature(world);
     if (sig !== state.selSig) {
       state.selSig = sig;
@@ -1124,7 +1223,8 @@ export function createHud(scene, world) {
         q += e.rally ? `@${e.rally.x.toFixed(1)},${e.rally.y.toFixed(1)}` : '@-';
       }
     }
-    return `${n}/${Array.from(types).sort().join(',')}${q}${state.attackArmed ? '+am' : ''}`;
+    return `${n}/${Array.from(types).sort().join(',')}${q}` +
+      `${state.attackArmed ? '+am' : ''}${state.demolishArm ? '+dm' : ''}`;
   }
 
   function destroy() {
@@ -1159,6 +1259,8 @@ export function createHud(scene, world) {
     getPlacementType,
     setAttackArmed,
     isAttackArmed,
+    isDemolishArmed: () => !!state.demolishArm &&
+      performance.now() - state.demolishArm.at <= DEMOLISH_ARM_MS,
     cycleIdle,
     flashRes,
     underAttackAlert,

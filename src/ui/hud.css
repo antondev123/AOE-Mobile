@@ -519,6 +519,36 @@ body {
   50%      { box-shadow: 0 0 0 3px rgba(209, 69, 47, 0.45), var(--shadow); }
 }
 
+/* Demolish. The only irreversible button in the game, so it is the only one
+   wearing hazard stripes: it must not read as "one more order" at thumb speed,
+   and it must not be mistaken for Stop (which is merely red-edged). It also
+   sits on its own row, away from the train buttons the player taps by reflex.
+   Armed, it goes solid red and pulses — the same arm-then-confirm language as
+   attack-move and the placement bar. */
+.cbtn.demolish {
+  border-color: #a33321;
+  background:
+    repeating-linear-gradient(-45deg,
+      rgba(209, 69, 47, 0.20) 0 7px,
+      rgba(0, 0, 0, 0) 7px 14px),
+    var(--panel-btn);
+}
+.cbtn.demolish .label { color: #f2b2a4; }
+.cbtn.demolish .label::before { content: "⛏ "; }
+.cbtn.demolish .cost { color: #c39288; }
+.cbtn.demolish.armed {
+  border-color: #ff6a4d;
+  background:
+    repeating-linear-gradient(-45deg,
+      rgba(255, 106, 77, 0.28) 0 7px,
+      rgba(0, 0, 0, 0) 7px 14px),
+    linear-gradient(180deg, #8e2414 0%, #45120a 100%);
+  animation: armpulse 1.1s ease-in-out infinite;
+}
+.cbtn.demolish.armed .label { color: #fff0ea; }
+.cbtn.demolish.armed .label::before { content: "⚠ "; }
+.cbtn.demolish.armed .cost { color: #ffc0b2; }
+
 /* Rally line under a production building: what the next unit out of it will do.
    Full width so it never squeezes a train button below 44px. */
 .rally-note {

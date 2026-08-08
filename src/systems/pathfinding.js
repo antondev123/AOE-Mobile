@@ -42,6 +42,18 @@ const LOS_STEP = 0.25;
 // path cannot turn into an O(n^2) line-of-sight storm.
 const SMOOTH_LOOKAHEAD = 12;
 
+// How many connected walkable tiles a region needs before it stops counting as
+// a *pocket*. Below it, a unit standing in the region has nowhere to work, no
+// drop-off to reach and no way home — it is entombed.
+//
+// The number is deliberately generous. There is no wall building in this game
+// (BUILDABLE is house / farm / barracks / mill / towncenter), so the smallest
+// enclosure a player can build on purpose is far larger than this, while every
+// accidental seal seen in play has been one to a few tiles. Anything at or above
+// the limit is treated as honest ground and never restricts placement — walling
+// off a quarter of the map stays legal.
+export const POCKET_LIMIT = 96;
+
 /** Counters for tests and debugging. Reset whenever you like. */
 export const pathStats = {
   searches: 0,
@@ -201,20 +213,25 @@ function occupiedTiles(target) {
  * group sent to one tree spreads around it instead of stacking on one tile.
  * `opts.maxRing` (default 1) widens the search when everything nearby is taken.
  *
+ * Candidates the caller could never walk to are dropped, not merely penalised:
+ * a tile sealed into a pocket used to win on raw distance (it is, after all, the
+ * closest tile to the Town Center's south side), and every villager sent to it
+ * walked into a wall forever. `opts.reachable === false` turns the test off for
+ * callers that only want geometry.
+ *
  * Returns { x, y, tx, ty } or null when the target is completely walled in.
  */
 export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
   if (!target) return null;
   const avoid = opts.avoid || null;
   const maxRing = Math.max(1, opts.maxRing || 1);
+  const checkReach = opts.reachable !== false;
   const own = occupiedTiles(target);
   const ownKeys = new Set(own.map(([x, y]) => `${x},${y}`));
 
-  let best = null;
-  let bestScore = Infinity;
-
   for (let ring = 1; ring <= maxRing; ring++) {
     const seen = new Set();
+    const cands = [];
     for (const [ox, oy] of own) {
       for (let dy = -ring; dy <= ring; dy++) {
         for (let dx = -ring; dx <= ring; dx++) {
@@ -235,17 +252,22 @@ export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
           // Prefer orthogonal adjacency: a diagonal neighbour is a longer reach
           // and can be cut off by two blocked corners.
           if (dx !== 0 && dy !== 0) score += 0.45;
-          // Prefer tiles that are not themselves pockets, so the unit can get
+          // Prefer tiles that are not themselves cramped, so the unit can get
           // out again without a second search.
-          if (openness(world, x, y) <= 2) score += 1.5;
-          if (score < bestScore) {
-            bestScore = score;
-            best = tile(x, y);
-          }
+          const open = openness(world, x, y);
+          if (open <= 2) score += 1.5;
+          cands.push({ x, y, score, open });
         }
       }
     }
-    if (best) return best;
+    cands.sort((a, b) => a.score - b.score);
+    for (const c of cands) {
+      // Only cramped tiles can be pockets, and only those pay for a flood fill.
+      if (checkReach && c.open <= 2 && isSealedFrom(world, c.x + 0.5, c.y + 0.5, fromX, fromY)) {
+        continue;
+      }
+      return tile(c.x, c.y);
+    }
   }
   return null;
 }
@@ -257,6 +279,239 @@ function openness(world, x, y) {
   if (isWalkable(world, x, y + 1)) n++;
   if (isWalkable(world, x, y - 1)) n++;
   return n;
+}
+
+// --- Regions and enclosure --------------------------------------------------
+//
+// A* answers "how do I get from A to B". These answer the cheaper question the
+// placement rules and the stuck detector need: "is this patch of ground a sealed
+// pocket, and is that other spot inside it with me?"
+//
+// The fill uses *exactly* A*'s connectivity — 8-way, no corner cutting — so a
+// region that says "reachable" is reachable by a real path, and one that says
+// "sealed" cannot be escaped by any path the planner could find. It stops as
+// soon as it has seen `limit` tiles, so the cost is bounded by POCKET_LIMIT and
+// never by the size of the map.
+
+const REGION = new WeakMap();
+
+function getRegionScratch(world) {
+  const n = world.width * world.height;
+  let r = REGION.get(world);
+  if (!r || r.n !== n) {
+    r = { n, mark: new Uint32Array(n), queue: new Int32Array(n), gen: 0 };
+    REGION.set(world, r);
+  }
+  // Stamps are a Uint32; wrap safely rather than growing stale marks.
+  if (r.gen >= 0xfffffff0) { r.mark.fill(0); r.gen = 0; }
+  return r;
+}
+
+function solidAt(world, i, extra) {
+  return world.blocked[i] !== 0 || (extra !== null && extra.has(i));
+}
+
+/**
+ * Flood the walkable region containing the tile at (tx,ty).
+ *
+ * opts:
+ *   limit        stop after this many tiles (default POCKET_LIMIT)
+ *   extraBlocked Set of tile indices to treat as solid — "what if I built here"
+ *   goal         { x, y } to look for while filling
+ *   collect      also return the tile indices as a Set
+ *
+ * Returns { size, open, reachedGoal, tiles }.
+ *   `open` — the fill hit `limit`, so this is map-sized ground, not a pocket.
+ *            When it is true the fill stopped early and `size`/`tiles` are
+ *            truncated and `reachedGoal` is not meaningful.
+ *   `size` 0 means (tx,ty) is itself solid: there is no region to speak of.
+ */
+export function floodRegion(world, tx, ty, opts = {}) {
+  const W = world.width;
+  const H = world.height;
+  const limit = opts.limit == null ? POCKET_LIMIT : opts.limit;
+  const extra = opts.extraBlocked || null;
+  const collect = !!opts.collect;
+  const gtx = opts.goal ? Math.floor(opts.goal.x) : -1;
+  const gty = opts.goal ? Math.floor(opts.goal.y) : -1;
+
+  const out = {
+    size: 0,
+    open: false,
+    reachedGoal: false,
+    tiles: collect ? new Set() : null,
+  };
+
+  const x0 = Math.floor(tx);
+  const y0 = Math.floor(ty);
+  if (x0 < 0 || y0 < 0 || x0 >= W || y0 >= H) return out;
+  const start = y0 * W + x0;
+  if (solidAt(world, start, extra)) return out;
+
+  const r = getRegionScratch(world);
+  const gen = ++r.gen;
+  const { mark, queue } = r;
+  let head = 0;
+  let tail = 0;
+  mark[start] = gen;
+  queue[tail++] = start;
+
+  while (head < tail) {
+    const cur = queue[head++];
+    out.size++;
+    if (collect) out.tiles.add(cur);
+    const cx = cur % W;
+    const cy = (cur - cx) / W;
+    if (cx === gtx && cy === gty) out.reachedGoal = true;
+    if (out.size >= limit) { out.open = true; break; }
+
+    for (let d = 0; d < 8; d++) {
+      const dx = NDX[d];
+      const dy = NDY[d];
+      const nx = cx + dx;
+      const ny = cy + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (mark[ni] === gen) continue;
+      if (solidAt(world, ni, extra)) continue;
+      if (dx !== 0 && dy !== 0) {
+        // Same no-corner-cutting rule A* uses, or the fill would claim ground
+        // no path can actually reach.
+        if (solidAt(world, cy * W + nx, extra)) continue;
+        if (solidAt(world, ny * W + cx, extra)) continue;
+      }
+      mark[ni] = gen;
+      queue[tail++] = ni;
+    }
+  }
+  return out;
+}
+
+/**
+ * True when the walkable region containing (tx,ty) is a pocket: smaller than
+ * `limit` tiles and therefore somewhere a unit cannot live. A solid tile is not
+ * a pocket — standing inside a wall is a different problem (the unit is evicted
+ * from under it), so this answers false for one.
+ */
+export function isPocket(world, tx, ty, opts = {}) {
+  const r = floodRegion(world, tx, ty, opts);
+  return r.size > 0 && !r.open;
+}
+
+/**
+ * True when a unit at (sx,sy) is sealed away from (gx,gy): its region is a
+ * pocket and the goal is not in it. This is the honest "entombed" test —
+ * findPath returning null is only a hint, since a blocked corner can produce
+ * the same answer for a unit standing in the open.
+ */
+export function isSealedFrom(world, sx, sy, gx, gy, opts = {}) {
+  const r = floodRegion(world, sx, sy, { ...opts, goal: { x: gx, y: gy } });
+  if (r.open || r.size === 0) return false;
+  return !r.reachedGoal;
+}
+
+/** Nearest tile that is free once `extra` is treated as solid, or null. */
+function nearestFree(world, tx, ty, extra, maxR) {
+  const W = world.width;
+  const H = world.height;
+  const cx = Math.floor(tx);
+  const cy = Math.floor(ty);
+  for (let r = 0; r <= maxR; r++) {
+    let best = null;
+    let bestD = Infinity;
+    for (let dy = -r; dy <= r; dy++) {
+      for (let dx = -r; dx <= r; dx++) {
+        if (r > 0 && Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        const x = cx + dx;
+        const y = cy + dy;
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        if (solidAt(world, y * W + x, extra)) continue;
+        const ex = x + 0.5 - tx;
+        const ey = y + 0.5 - ty;
+        const d = ex * ex + ey * ey;
+        if (d < bestD) { bestD = d; best = { x: x + 0.5, y: y + 0.5, tx: x, ty: y }; }
+      }
+    }
+    if (best) return best;
+  }
+  return null;
+}
+
+/**
+ * Which of `points` would be sealed into a pocket if `blockTiles` — an array of
+ * [tx,ty] — turned solid.
+ *
+ * A point that is *already* sealed before the placement is never reported: the
+ * new building is not what trapped it, and refusing every subsequent placement
+ * because of an existing pocket would be its own bug. A point standing on the
+ * new footprint is resolved to the tile it will be pushed out to first.
+ *
+ * Returns the offending points (empty array = the placement seals nobody).
+ */
+export function pointsSealedBy(world, blockTiles, points, opts = {}) {
+  const W = world.width;
+  const H = world.height;
+  const limit = opts.limit == null ? POCKET_LIMIT : opts.limit;
+  const extra = new Set();
+  for (const t of blockTiles || []) {
+    const tx = t[0];
+    const ty = t[1];
+    if (tx < 0 || ty < 0 || tx >= W || ty >= H) continue;
+    extra.add(ty * W + tx);
+  }
+
+  const memo = new Map();
+  const sealed = (p, block) => {
+    const spot = nearestFree(world, p.x, p.y, block, 4);
+    if (!spot) return true; // nowhere at all to stand
+    const key = (block === null ? 'b' : 'a') + (spot.ty * W + spot.tx);
+    let v = memo.get(key);
+    if (v === undefined) {
+      const r = floodRegion(world, spot.tx, spot.ty, { limit, extraBlocked: block });
+      v = r.size > 0 && !r.open;
+      memo.set(key, v);
+    }
+    return v;
+  };
+
+  const out = [];
+  for (const p of points || []) {
+    if (!sealed(p, extra)) continue;
+    if (sealed(p, null)) continue; // was already stuck; not this building's doing
+    out.push(p);
+  }
+  return out;
+}
+
+/**
+ * Is there at least one free tile touching `tiles` (a building footprint) that
+ * sits on map-sized ground? This is how "can anything still get out of my Town
+ * Center" is asked — a building whose whole perimeter is walls or pockets can
+ * never place a trained unit again.
+ */
+export function hasOpenPerimeter(world, tiles, opts = {}) {
+  const W = world.width;
+  const H = world.height;
+  const limit = opts.limit == null ? POCKET_LIMIT : opts.limit;
+  const extra = opts.extraBlocked || null;
+  const own = new Set(tiles.map(([x, y]) => `${x},${y}`));
+  const seen = new Set();
+  for (const [ox, oy] of tiles) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const x = ox + dx;
+        const y = oy + dy;
+        const key = `${x},${y}`;
+        if (seen.has(key) || own.has(key)) continue;
+        seen.add(key);
+        if (x < 0 || y < 0 || x >= W || y >= H) continue;
+        if (solidAt(world, y * W + x, extra)) continue;
+        const r = floodRegion(world, x, y, { limit, extraBlocked: extra });
+        if (r.open) return true;
+      }
+    }
+  }
+  return false;
 }
 
 // --- Line of sight ----------------------------------------------------------

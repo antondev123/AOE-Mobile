@@ -30,9 +30,11 @@ import { forEachNear, edgeDist, edgeDist2, findNearestGlobal } from '../core/wor
 import { EV } from '../core/events.js';
 import {
   findPath, findAdjacentStandTile, isWalkable, nearestWalkable, hasLineOfSight,
+  isSealedFrom, isPocket,
 } from './pathfinding.js';
 import {
   gatherTick, depositCarry, buildTick, nearestDropoff, isGatherableBuilding,
+  acceptsDropoff,
 } from './economy.js';
 import { inRange, canAttack, attackReach } from './combat.js';
 
@@ -75,6 +77,27 @@ const STUCK_FRACTION = 0.2;
 const CROWD_ARRIVE = 2.0;
 const STUCK_TIME = 0.6;
 const REPATH_COOLDOWN = 0.45;
+
+// Headway watchdog.
+//
+// The waypoint-distance test above cannot see two real failures:
+//   * a unit whose destination is unreachable has an *empty* path, so its only
+//     "waypoint" is the destination itself and every measurement is against a
+//     point it will never approach — it can sit there forever;
+//   * a unit orbiting a crowded destination genuinely closes on its waypoint
+//     every other step, so stuck time keeps resetting while it walks nineteen
+//     tiles inside a two-tile box.
+// Both are caught by asking a blunter question: over HEADWAY_TIME seconds, did
+// this unit end up HEADWAY_DIST from where it started? A unit on an honest walk
+// covers 1.5 tiles/second and clears that with room to spare, even braked to
+// 70% by a crowd; a unit going nowhere never does, whatever its waypoints say.
+const HEADWAY_TIME = 3.0;
+const HEADWAY_DIST = 1.5;
+
+// How long an entombed unit stays retired before its pocket is re-tested. Cheap
+// (one capped flood fill), so a villager freed by a demolished or destroyed wall
+// picks its job back up within a few seconds instead of waiting for a new order.
+const TRAPPED_RECHECK = 4.0;
 // Give up on a destination after this many *consecutive* fruitless repaths.
 // Any real headway resets the count: shuffling through a crowd of forty
 // villagers is slow, not hopeless, and a unit must never abandon its job over
@@ -119,6 +142,34 @@ const FORMATION_SPACING = 1.0;
 // How far a villager will walk to find replacement work.
 const RETASK_RADIUS = 24;
 const FOLLOWUP_WORK_RADIUS = 14;
+
+// Crowding on one node.
+//
+// A node is worked from the ring of tiles around it, so beyond a handful of
+// villagers the rest are not gathering, they are queueing — and while they
+// queue they are in `move`, which is income of exactly zero. Sixteen villagers
+// tapped onto one bush used to produce twenty-second windows with no food at
+// all. Past this many, a group order spills the remainder onto equivalent nodes
+// nearby: the same thing the enemy AI does node-by-node, and the reason its
+// food never stalls.
+const MAX_WORKERS_PER_NODE = 5;
+// How far the spill looks for an equivalent node, measured from the node the
+// player actually tapped — far enough to cover the rest of a berry patch or
+// woodline, near enough that nobody is sent across the map.
+const SPREAD_RADIUS = 12;
+// A villager hovering inside GATHER_REACH for this long without closing to
+// GATHER_START is not going to: its spot is taken by its own neighbours. It
+// starts working from where it stands rather than shuffling forever.
+const NEAR_SETTLE = 0.6;
+// What one villager too many on a node is worth, in tiles of walking. Queueing
+// behind a full bush is bad; walking fifteen tiles to an empty one is worse, and
+// that is the trade this number sets. Every alternative is priced against it.
+const QUEUE_COST = 2.5;
+// A node's distance to the nearest drop-off is paid on *every* trip for the
+// rest of its life, while the walk out to it is paid once — so it counts for
+// more when choosing replacement work. Without this a crowd retasking off an
+// exhausted patch fans out across the map and the round trip doubles.
+const HAUL_WEIGHT = 2.0;
 
 // A rally point this close (edge distance) to something workable *is* an order
 // to work it. One and a bit tiles: it covers the node the player actually tapped
@@ -322,6 +373,8 @@ function stopUnit(u) {
   u.state = 'idle';
   u.aiStuck = 0;
   u.aiFails = 0;
+  u.aiAnchorT = undefined;
+  u.aiTrapped = false;
 }
 
 /** Begin a task and start moving in the same step the order was given. */
@@ -331,6 +384,7 @@ function setTask(world, u, task, ctx, destX, destY) {
   u.aiStuck = 0;
   u.aiFails = 0;
   u.repathTimer = 0;
+  u.aiAnchorT = undefined;
   if (destX !== undefined && destY !== undefined) {
     requestPath(world, u, destX, destY, ctx, true);
     u.state = 'move';
@@ -391,13 +445,89 @@ function orderGather(world, list, order, ctx) {
     if (order.gx !== undefined) orderMove(world, list, order, ctx);
     return;
   }
-  const avoid = new Set();
+  // Spread the group over the patch rather than stacking it on one node. The
+  // two most natural phone actions in the game — select-all then tap the
+  // berries, and rallying the Town Center onto them — both land every villager
+  // you own on a single bush, where most of them can only queue.
+  const load = currentNodeLoads(world, new Set(list));
+  const avoid = new Map();
   for (const u of list) {
-    const stand = findAdjacentStandTile(world, node, u.x, u.y, { avoid, maxRing: 1 })
-      || findAdjacentStandTile(world, node, u.x, u.y, { maxRing: 1 });
-    if (stand) avoid.add(`${stand.tx},${stand.ty}`);
-    beginGatherTask(world, u, node, ctx, stand);
+    const target = spreadTarget(world, u, node, load);
+    load.set(target, (load.get(target) || 0) + 1);
+    let taken = avoid.get(target);
+    if (!taken) { taken = new Set(); avoid.set(target, taken); }
+    const stand = findAdjacentStandTile(world, target, u.x, u.y, { avoid: taken, maxRing: 1 })
+      || findAdjacentStandTile(world, target, u.x, u.y, { maxRing: 1 });
+    if (stand) taken.add(`${stand.tx},${stand.ty}`);
+    beginGatherTask(world, u, target, ctx, stand);
   }
+}
+
+/** How many walkable tiles a node can actually be worked from, capped. */
+function nodeCapacity(world, node) {
+  const own = node.kind === 'building' && node.tiles && node.tiles.length
+    ? node.tiles
+    : [[Math.floor(node.x), Math.floor(node.y)]];
+  const ownKeys = new Set(own.map(([x, y]) => `${x},${y}`));
+  const seen = new Set();
+  let free = 0;
+  for (const [ox, oy] of own) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const key = `${ox + dx},${oy + dy}`;
+        if (seen.has(key) || ownKeys.has(key)) continue;
+        seen.add(key);
+        if (isWalkable(world, ox + dx, oy + dy)) free++;
+      }
+    }
+  }
+  return Math.max(1, Math.min(MAX_WORKERS_PER_NODE, free));
+}
+
+/** Villagers already assigned to each node, by task (not by arrival). */
+function currentNodeLoads(world, exclude) {
+  const m = new Map();
+  for (const u of world.units) {
+    if (u.dead || (exclude && exclude.has(u))) continue;
+    const t = u.task;
+    if (!t || t.type !== 'gather' || !t.node) continue;
+    m.set(t.node, (m.get(t.node) || 0) + 1);
+  }
+  return m;
+}
+
+/**
+ * The node this villager should actually work, given how many are already on
+ * the one that was tapped.
+ *
+ * Everything is priced in tiles of walking, so the comparison is honest: an
+ * extra body on a node that already has more than it can hold costs QUEUE_COST
+ * tiles, and the alternative has to be nearer than that to win. Below capacity
+ * nothing is charged, so a small group all lands on the node the player tapped —
+ * only a genuine crowd fans out, and only onto the patch next door. The order is
+ * never refused, just redistributed.
+ */
+function spreadTarget(world, u, primary, load) {
+  // Until the tapped node is genuinely full, the tap *is* the order. Comparing
+  // costs from the first villager would quietly redirect a group onto whatever
+  // happened to be nearer than the thing the player pointed at.
+  if ((load.get(primary) || 0) < nodeCapacity(world, primary)) return primary;
+
+  const type = primary.resourceType;
+  const cost = (n) => {
+    const over = Math.max(0, (load.get(n) || 0) - nodeCapacity(world, n) + 1);
+    return edgeDist(n, u.x, u.y) + over * QUEUE_COST;
+  };
+  let best = primary;
+  let bestC = cost(primary);
+  eachWorkSource(world, u, (n) => {
+    if (n === primary || n.dead || !(n.amount > 0)) return;
+    if (type && n.resourceType !== type) return;
+    if (edgeDist(n, primary.x, primary.y) > SPREAD_RADIUS) return;
+    const c = cost(n);
+    if (c < bestC) { bestC = c; best = n; }
+  });
+  return best;
 }
 
 function orderBuild(world, list, order, ctx) {
@@ -568,6 +698,32 @@ function walkablePoint(world, x, y) {
 function stepUnit(world, u, dt, ctx) {
   if (u.repathTimer > 0) u.repathTimer -= dt;
 
+  // A building went up on the tile this unit was standing on. Every candidate
+  // step now starts inside a wall, so advance() refuses all of them and the unit
+  // is frozen under the roof. Walk it out instead.
+  if (!isWalkable(world, u.x, u.y)) {
+    tickEvict(world, u, dt);
+    return;
+  }
+
+  // Entombed: a pocket closed around it (an enemy building, or a foundation that
+  // finished across the last gap). It has already been retired to idle by
+  // markTrapped, so all that is left is to hold still — and to re-test the
+  // pocket now and then, so a villager freed by a destroyed wall goes back to
+  // work by itself.
+  if (u.aiTrapped) {
+    if (world.time >= (u.aiTrappedCheck || 0)) {
+      u.aiTrappedCheck = world.time + TRAPPED_RECHECK;
+      if (!isPocket(world, u.x, u.y)) u.aiTrapped = false;
+    }
+    if (u.aiTrapped && !u.task && !u.target) {
+      u.state = 'idle';
+      u.vx = 0;
+      u.vy = 0;
+      return;
+    }
+  }
+
   // A unit trained with a rally point set (economy.js stamps pendingRally, and
   // also emits EV.TRAINED, which we handle; this catches anything that slips).
   if (u.pendingRally && !u.task) {
@@ -646,6 +802,69 @@ function adoptFollowUpWork(world, u, ctx) {
     u.task = task;
     routeToDropoff(world, u, task, ctx, false);
   }
+}
+
+/**
+ * Walk out from under a building that went up on top of this unit.
+ *
+ * This is a short walk at normal speed to the nearest free ground, not a
+ * teleport: the villager visibly steps out from under the new roof, which is
+ * what a player expects to see. It is deliberately the *only* way a unit ever
+ * leaves ground it could not otherwise path off — an entombed unit in a sealed
+ * pocket stays where it is (see markTrapped).
+ */
+function tickEvict(world, u, dt) {
+  const spot = nearestWalkable(world, u.x, u.y, 5);
+  if (!spot) {
+    u.state = 'idle';
+    u.vx = 0;
+    u.vy = 0;
+    return;
+  }
+  const dx = spot.x - u.x;
+  const dy = spot.y - u.y;
+  const d = Math.hypot(dx, dy);
+  // The route it was walking started from ground it no longer stands on; the
+  // task re-plans from wherever it lands.
+  u.path = null;
+  u.pathIndex = 0;
+  u.dest = null;
+  u.aiStuck = 0;
+  u.aiLastDist = undefined;
+  u.aiAnchorT = undefined;
+  if (d <= 1e-6) return;
+  const step = Math.min(d, u.speed * dt);
+  u.x += (dx / d) * step;
+  u.y += (dy / d) * step;
+  u.facing = dirIndex(dx, dy);
+  u.vx = (dx / d) * u.speed;
+  u.vy = (dy / d) * u.speed;
+  u.state = 'move';
+}
+
+/**
+ * Give up on a destination this unit is sealed away from.
+ *
+ * A villager walled into a pocket cannot dig itself out, and it must not spend
+ * the rest of the match cycling A* against a wall while reporting itself busy —
+ * that is what made eight of them invisible for eight minutes. It drops the job
+ * and goes *genuinely* idle, which is the one signal the player already reads:
+ * the HUD's idle-villager button surfaces it. It is deliberately not teleported
+ * or squeezed through the wall; a unit appearing on the far side of a building
+ * reads as a bug, and the honest answer to "I am walled in" is to stop and say
+ * so. stepUnit re-tests the pocket every few seconds, so demolishing the wall
+ * puts it straight back to work with no further order.
+ */
+function markTrapped(world, u) {
+  u.aiTrapped = true;
+  u.aiTrappedCheck = world.time + TRAPPED_RECHECK;
+  releaseNode(u);
+  u.task = null;
+  u.target = null;
+  clearMovement(u);
+  u.state = 'idle';
+  u.aiFails = 0;
+  u.aiGoal = null;
 }
 
 /**
@@ -772,8 +991,15 @@ function tickGather(world, u, dt, ctx) {
   // Edge distance, so a 2x2 farm is reached from beside its field rather than
   // requiring the villager to stand on its centre tile.
   const reach = edgeDist(node, u.x, u.y);
-  if (reach <= GATHER_REACH && (!u.dest || reach <= GATHER_START)) {
+  // Time spent hovering in reach but still walking. A clean approach crosses
+  // from GATHER_REACH to GATHER_START in about a third of a second; a villager
+  // that cannot, because its neighbours are standing on the last free tile, has
+  // arrived as far as it ever will and should start working instead of
+  // shuffling. This is where the twenty-second windows of zero income came from.
+  t.near = reach <= GATHER_REACH ? (t.near || 0) + dt : 0;
+  if (reach <= GATHER_REACH && (!u.dest || reach <= GATHER_START || t.near >= NEAR_SETTLE)) {
     t.tries = 0;
+    t.near = 0;
     clearMovement(u);
     u.state = 'gather';
     u.facing = dirIndex(node.x - u.x, node.y - u.y);
@@ -1012,20 +1238,49 @@ function eachWorkSource(world, unit, fn) {
 }
 
 function findWorkNode(world, unit, x, y, radius, preferredType, exclude) {
+  // Load counted by *assignment*, not by arrival: node.workers only rises once a
+  // villager is already standing there gathering, so a whole crowd retasking off
+  // an exhausted bush in the same step all read every node as empty and pile
+  // onto the one next door — the exact stall this is here to stop.
+  const load = currentNodeLoads(world, unit ? new Set([unit]) : null);
+  const drops = unit
+    ? world.buildings.filter((b) => !b.dead && b.player === unit.player && b.dropoff)
+    : [];
+  const haul = (n) => {
+    let best = Infinity;
+    for (const b of drops) {
+      if (!acceptsDropoff(b, n.resourceType)) continue;
+      const d = edgeDist(b, n.x, n.y);
+      if (d < best) best = d;
+    }
+    return best === Infinity ? 0 : best;
+  };
+
   let best = null;
   let bestScore = Infinity;
-  eachWorkSource(world, unit, (n) => {
-    if (n.dead || n === exclude || !(n.amount > 0)) return;
-    // edgeDist, not centre distance: a 2x2 farm is worked from its edge.
-    const d = edgeDist(n, x, y);
-    if (d > radius) return;
-    let score = d;
-    // Prefer the same resource so a retasked lumberjack stays a lumberjack.
-    if (preferredType && n.resourceType !== preferredType) score += radius * 0.5;
-    // Spread out: an unworked node beats one with a queue on it.
-    score += (n.workers || 0) * 0.75;
-    if (score < bestScore) { bestScore = score; best = n; }
-  });
+  // A retasked lumberjack stays a lumberjack: the preferred resource gets the
+  // whole radius to itself, and only when it holds nothing at all does anything
+  // else become work. A penalty instead of a pass used to lose this fight — once
+  // hauling distance was priced in, a berry patch nine tiles out scored worse
+  // than the tree line next door, and a food crew quietly became a wood crew.
+  for (let pass = 0; pass < 2 && !best; pass++) {
+    eachWorkSource(world, unit, (n) => {
+      if (n.dead || n === exclude || !(n.amount > 0)) return;
+      if (pass === 0 && preferredType && n.resourceType !== preferredType) return;
+      // edgeDist, not centre distance: a 2x2 farm is worked from its edge.
+      const d = edgeDist(n, x, y);
+      if (d > radius) return;
+      // The walk out there, once...
+      let score = d;
+      // ...plus the trip home, over and over.
+      score += HAUL_WEIGHT * haul(n);
+      // Spread out, but only once a node is genuinely oversubscribed: queueing
+      // on a bush by the Town Center beats an empty one across the map.
+      score += Math.max(0, (load.get(n) || 0) - nodeCapacity(world, n) + 1) * QUEUE_COST;
+      if (score < bestScore) { bestScore = score; best = n; }
+    });
+    if (!preferredType) break;
+  }
   return best;
 }
 
@@ -1057,6 +1312,20 @@ function retargetNode(world, u, t, ctx) {
   t.stand = null;
   u.aiMemory = { resourceType: node.resourceType };
   if (t.stage === 'toDrop') return true; // finish the trip, then walk to the new node
+
+  // Holding a part-load and the replacement node is further off than the
+  // drop-off? Bank it on the way out. A whole crew migrating to the next patch
+  // otherwise carries half-full packs straight past its own Town Center, and the
+  // resource counter stops dead for the length of the walk — which is exactly
+  // what a player reads as "my economy died".
+  if (u.carrying && u.carrying.amount > 0) {
+    const drop = nearestDropoff(world, u.player, u.x, u.y, u.carrying.type);
+    if (drop && edgeDist(drop, u.x, u.y) < edgeDist(node, u.x, u.y)) {
+      t.stage = 'toDrop';
+      routeToDropoff(world, u, t, ctx, false);
+      return true;
+    }
+  }
   const stand = pickStand(world, u, node);
   t.stand = stand;
   const p = stand || { x: node.x, y: node.y };
@@ -1142,6 +1411,7 @@ function clearMovement(u) {
   u.vy = 0;
   u.aiStuck = 0;
   u.aiLastDist = undefined;
+  u.aiAnchorT = undefined;
 }
 
 /**
@@ -1154,6 +1424,9 @@ function requestPath(world, u, x, y, ctx, immediate) {
   u.aiGoal = { x, y };
   u.aiStuck = 0;
   u.aiLastDist = undefined;
+  // NB: the headway anchor is deliberately *not* reset here. Repathing is the
+  // thing a going-nowhere unit does most, and clearing the anchor on every
+  // repath is exactly how it would stay invisible to the watchdog.
 
   let allowed = false;
   if (immediate && ctx.orderSearches > 0) { ctx.orderSearches--; allowed = true; }
@@ -1177,12 +1450,16 @@ function requestPath(world, u, x, y, ctx, immediate) {
     u.aiPartial = !!p.partial;
     if (p.partial) u.aiFails++;
   } else {
-    // Nowhere to go at all. Keep the straight-line intent; checkStuck() will
-    // retire the task if it really cannot be served.
+    // Nowhere to go at all. Usually a blocked corner, and checkStuck() will
+    // retire the task if it really cannot be served — but this is also what
+    // being entombed looks like, so ask the question properly and retire the
+    // unit at once when the answer is yes. Cycling A* against the inside of a
+    // wall for eight minutes is exactly the failure this closes.
     u.path = null;
     u.pathIndex = 0;
     u.aiPartial = true;
     u.aiFails++;
+    if (isSealedFrom(world, u.x, u.y, x, y)) markTrapped(world, u);
   }
 }
 
@@ -1267,51 +1544,87 @@ function onArrive(u) {
   u.vy = 0;
   u.aiStuck = 0;
   u.aiLastDist = undefined;
+  u.aiAnchorT = undefined;
 }
 
 function checkStuck(world, u, dt, ctx) {
   if (!u.dest) {
     u.aiStuck = 0;
     u.aiLastDist = undefined;
+    u.aiAnchorT = undefined;
     return;
   }
+
+  // --- Headway: net ground covered over a window, whatever the waypoints say.
+  let noHeadway = false;
+  if (u.aiAnchorT === undefined) {
+    u.aiAnchorX = u.x;
+    u.aiAnchorY = u.y;
+    u.aiAnchorT = world.time;
+  } else if (Math.hypot(u.x - u.aiAnchorX, u.y - u.aiAnchorY) >= HEADWAY_DIST) {
+    u.aiAnchorX = u.x;
+    u.aiAnchorY = u.y;
+    u.aiAnchorT = world.time;
+  } else if (world.time - u.aiAnchorT >= HEADWAY_TIME) {
+    noHeadway = true;
+    u.aiAnchorX = u.x;
+    u.aiAnchorY = u.y;
+    u.aiAnchorT = world.time;
+  }
+
   // Progress is measured against the waypoint being walked to, not the final
   // goal: while rounding an obstacle a unit legitimately moves *away* from its
   // destination, and that must not read as being stuck.
-  const wp = currentWaypoint(u);
-  if (!wp) { u.aiStuck = 0; return; }
+  const wp = currentWaypoint(u) || u.dest;
   const d = Math.hypot(wp.x - u.x, wp.y - u.y);
   const prev = u.aiLastDist;
   u.aiLastDist = d;
   // The first sample after a re-plan has nothing to compare against; judging it
   // as progress would silently reset the failure count on every repath, and a
   // hopeless order would never be retired.
-  if (prev === undefined) return;
-  if (prev - d < u.speed * dt * STUCK_FRACTION) {
-    u.aiStuck += dt;
-  } else {
-    u.aiStuck = 0;
-    u.aiFails = 0;
+  if (prev !== undefined) {
+    if (prev - d < u.speed * dt * STUCK_FRACTION) {
+      u.aiStuck += dt;
+    } else {
+      u.aiStuck = 0;
+      u.aiFails = 0;
+    }
   }
 
-  if (u.aiStuck < STUCK_TIME) return;
-  if (u.repathTimer > 0) return;
+  // A unit with no headway has earned an escalation whatever its stuck timer
+  // says — that timer is precisely what a shoved or path-less unit never
+  // accumulates — so it bypasses both the threshold and the repath cooldown.
+  if (!noHeadway) {
+    if (u.aiStuck < STUCK_TIME) return;
+    if (u.repathTimer > 0) return;
+  }
   u.aiStuck = 0;
 
-  // Crowded out of the last stretch of a walk: call it arrived. Only at the end
-  // of the path — being wedged at a corner halfway there is a real problem.
   const t = u.task;
   const walking = !t || t.type === 'move' || t.type === 'patrol';
-  if (
-    walking && isFinalWaypoint(u) && d <= CROWD_ARRIVE &&
-    hasLineOfSight(world, u.x, u.y, wp.x, wp.y)
-  ) {
+  const goal = u.aiGoal || u.dest;
+
+  // Crowded out of the last stretch of a walk: call it arrived. Measured to the
+  // goal itself and gated on plain sight of it, so a unit wedged at a corner
+  // halfway there — a real problem — is never excused, while the nine of
+  // twenty-four that used to orbit a shared destination forever now settle.
+  const gd = Math.hypot(goal.x - u.x, goal.y - u.y);
+  if (walking && gd <= CROWD_ARRIVE && hasLineOfSight(world, u.x, u.y, goal.x, goal.y)) {
     u.path = null;
     u.pathIndex = 0;
     u.dest = null;
     u.vx = 0;
     u.vy = 0;
     u.aiLastDist = undefined;
+    u.aiAnchorT = undefined;
+    return;
+  }
+
+  // Sealed away from where it was sent: retire it now rather than after six more
+  // fruitless searches, and — crucially — retire it for good instead of letting
+  // retargetNode hand it another destination in the same pocket.
+  if (isSealedFrom(world, u.x, u.y, goal.x, goal.y)) {
+    markTrapped(world, u);
     return;
   }
 
@@ -1329,7 +1642,6 @@ function checkStuck(world, u, dt, ctx) {
     u.aiFails = 0;
     return;
   }
-  const goal = u.aiGoal || u.dest;
   requestPath(world, u, goal.x, goal.y, ctx, false);
 }
 

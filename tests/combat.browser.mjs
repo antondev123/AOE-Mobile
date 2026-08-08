@@ -89,27 +89,41 @@ const run = async () => {
     check('it is big enough to hit on a phone', !!alertDom && alertDom.h >= 34 && alertDom.w >= 150,
       alertDom && `${alertDom.w}x${alertDom.h}`);
 
-    const pings = await page.evaluate((f) => {
+    const pings = await page.evaluate(async (f) => {
       const c = document.getElementById('minimap');
       const g = c.getContext('2d');
+      const frame = () => new Promise((r) => requestAnimationFrame(r));
       // Where the attack should be drawn (gridToMini, inlined).
       const SPAN = 96;
       const ex = ((f.gx - f.gy + 48) / SPAN) * c.width;
       const ey = ((f.gx + f.gy) / SPAN) * c.width;
       const x0 = Math.max(0, Math.min(c.width - 32, Math.round(ex) - 16));
       const y0 = Math.max(0, Math.min(c.height - 32, Math.round(ey) - 16));
-      const px = g.getImageData(x0, y0, 32, 32).data;
       // Only the ping paints these two colours: a white-hot core (the camera
       // rectangle is 92% white over terrain, so it never reaches 240 on every
       // channel) and #ff2f18 (enemy pips are #ff5a5a, which never gets below
       // 70 on green while staying above 220 on red).
+      const countHot = () => {
+        const px = g.getImageData(x0, y0, 32, 32).data;
+        let n = 0;
+        for (let i = 0; i < px.length; i += 4) {
+          const r = px[i];
+          const gg = px[i + 1];
+          const b = px[i + 2];
+          if (r > 240 && gg > 240 && b > 240) n++;
+          else if (r > 220 && gg < 70 && b < 60) n++;
+        }
+        return n;
+      };
+      // The ping blinks every 0.35s and its shockwave expands and fades over
+      // five seconds, and the minimap only redraws at 10Hz. A single instant
+      // therefore samples an arbitrary phase — an early version of this check
+      // scored 45 on one run and 4 on the next for identical behaviour. Sweep a
+      // little over a second and keep the best frame.
       let hot = 0;
-      for (let i = 0; i < px.length; i += 4) {
-        const r = px[i];
-        const gg = px[i + 1];
-        const b = px[i + 2];
-        if (r > 240 && gg > 240 && b > 240) hot++;
-        else if (r > 220 && gg < 70 && b < 60) hot++;
+      for (let i = 0; i < 40; i++) {
+        hot = Math.max(hot, countHot());
+        await frame();
       }
       const mm = window.__game.hud._minimap;
       return {
@@ -140,7 +154,19 @@ const run = async () => {
       const c = window.__game.input.camera;
       return { x: c.midPoint.x, y: c.midPoint.y };
     });
-    await page.locator('.toast.alert').click({ timeout: 3000 });
+    // Raise a fresh alert immediately before tapping it. The one the simulation
+    // raised above has a 5.2s life, and the screenshots and frame waits between
+    // here and there routinely outlast it — the toast is then mid-fade and
+    // Playwright refuses to click it. The alert's own content and styling are
+    // already asserted above; this check is only about tap-to-jump, so a
+    // deterministic re-raise through the same event the HUD listens on is the
+    // honest way to test it without racing a timer.
+    await page.evaluate((f) => {
+      const w = window.__game.world;
+      w.events.emit('underAttack', { player: 0, entity: null, gx: f.gx, gy: f.gy });
+    }, fired);
+    await page.waitForSelector('.toast.alert:not(.out)', { timeout: 3000 });
+    await page.locator('.toast.alert:not(.out)').first().click({ timeout: 3000 });
     const after = await page.evaluate((f) => {
       const c = window.__game.input.camera;
       // Where the attack is, in world pixels (HALF_W/HALF_H are 32/16).
