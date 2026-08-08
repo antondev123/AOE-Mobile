@@ -30,11 +30,54 @@ const TERRAIN_COLOR = {
 // Node colours. Stone is deliberately the palest, coolest pip on the map: at
 // two pixels it has to separate from gold's warm yellow *and* from the blue-grey
 // of water underneath it, and a light slate is the only value that does both.
+//
+// Berry used to be #a8324a, which is an RGB distance of 97 from the enemy's
+// #ff5a5a. With around 114 bushes on a map that is 114 things that read as
+// "enemy" at a glance, so it moved to a plum that shares no channel ordering
+// with the team colours: no red pip on this map is now anything but a unit.
 const RES_COLOR = {
-  tree: '#2e5a24', berry: '#a8324a', gold: '#d8b33c', stone: '#b9c3ce',
+  tree: '#2b5122', berry: '#9c3f8f', gold: '#d8b33c', stone: '#b9c3ce',
 };
+
+// Trees are ~1600 of the ~1800 nodes on a 96x96 map. Painted at the same weight
+// as everything else they are the map, and a unit pip lands on top of them as
+// noise on noise. They are drawn a pixel smaller and a shade darker so they
+// still describe where the forests are without competing with anything alive.
+const NODE_SIZE = { tree: 1 };
+const NODE_SIZE_DEFAULT = 2;
+
 const TEAM = ['#5aa2ff', '#ff5a5a'];
 const TEAM_DARK = ['#1c56ab', '#a01f1f'];
+
+// --- Unit pips ---------------------------------------------------------------
+// Units are binned rather than drawn one per unit. A ten-strong raid used to be
+// ten 3x3 pips scattered over three tiles, which measured as 221 changed pixels
+// out of 53824 against the same map without the raid: 0.4%, invisible in
+// practice on the one instrument that can see the 93% of the map the camera
+// cannot. Binned, that raid is a single pip that grows with the size of the
+// stack, so an army reads as an army and a lone scout still reads as a dot.
+//
+// Three tiles per bin is the size of a clumped group at this scale; wider and
+// two separate flanks merge into one blob, narrower and a moving army flickers
+// between bins as it walks.
+const UNIT_BIN = 3;
+const UNIT_PIP_MIN = 3.5;   // px at size 160, a single unit
+const UNIT_PIP_MAX = 12.0;  // px, a doomstack; beyond this it stops meaning more
+
+// Hostile soldiers you can actually see get a ring around them.
+//
+// Binning alone was not enough. Ten scattered 3px pips and one 12px blob cover
+// almost the same number of pixels — the blob is easier to parse, but it is not
+// louder, and "louder" is the requirement: this is the only warning the player
+// gets before a raid lands. The ring roughly triples the marked area and, more
+// importantly, is a shape nothing else on the minimap draws.
+//
+// It is only ever drawn for enemy *military* that is currently in vision, which
+// under fog of war is both rare and, without exception, something the player
+// needs to look at. A ring around every red pip would be noise; a ring around
+// the four that matter is an alarm.
+const THREAT_RING_SCALE = 1.55;
+const THREAT_RING = 'rgba(255,90,90,0.75)';
 
 // --- Fog ---------------------------------------------------------------------
 // The same warm black and the same explored alpha as the main view, so the two
@@ -175,6 +218,94 @@ export function createMinimap(canvas, world) {
     return false;
   }
 
+  // --- Unit binning scratch ------------------------------------------------
+  // Allocated once. `binStamp` carries a generation counter so a redraw only
+  // clears the bins it actually touched, rather than sweeping 1024 bins to find
+  // the handful an army occupies.
+  const binCols = Math.ceil(MAP_W / UNIT_BIN);
+  const binRows = Math.ceil(MAP_H / UNIT_BIN);
+  const binCount = binCols * binRows;
+  const binStamp = new Int32Array(binCount);
+  const binN = [new Int16Array(binCount), new Int16Array(binCount)];
+  const binSx = [new Float32Array(binCount), new Float32Array(binCount)];
+  const binSy = [new Float32Array(binCount), new Float32Array(binCount)];
+  // Set when any unit in the bin is a soldier, so an incoming raid can be drawn
+  // hotter than a line of villagers walking to a woodline.
+  const binMil = [new Uint8Array(binCount), new Uint8Array(binCount)];
+  const binTouched = [];
+  let binGen = 0;
+
+  /**
+   * Bin every visible unit, then draw one pip per occupied bin per player,
+   * sized by how many units are in it and centred on their centroid so a pip
+   * sits where the group actually is rather than on a bin boundary.
+   */
+  function drawUnits() {
+    binGen++;
+    binTouched.length = 0;
+
+    for (const u of world.units) {
+      if (u.dead || !lit(u.x, u.y)) continue;
+      const bx = (u.x / UNIT_BIN) | 0;
+      const by = (u.y / UNIT_BIN) | 0;
+      if (bx < 0 || by < 0 || bx >= binCols || by >= binRows) continue;
+      const i = by * binCols + bx;
+      if (binStamp[i] !== binGen) {
+        binStamp[i] = binGen;
+        binN[0][i] = binN[1][i] = 0;
+        binSx[0][i] = binSx[1][i] = 0;
+        binSy[0][i] = binSy[1][i] = 0;
+        binMil[0][i] = binMil[1][i] = 0;
+        binTouched.push(i);
+      }
+      const p = u.player;
+      binN[p][i]++;
+      binSx[p][i] += u.x;
+      binSy[p][i] += u.y;
+      if (u.type !== 'villager') binMil[p][i] = 1;
+    }
+
+    if (!binTouched.length) return;
+    ctx.save();
+    ctx.lineWidth = 1;
+    for (const i of binTouched) {
+      for (let p = 0; p < 2; p++) {
+        const n = binN[p][i];
+        if (!n) continue;
+        const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size);
+        // sqrt, so the pip grows quickly from one unit to a squad and then
+        // levels off: the difference between 1 and 8 units matters far more
+        // than the difference between 40 and 60.
+        const s = Math.min(UNIT_PIP_MAX, UNIT_PIP_MIN + Math.sqrt(n - 1) * 2.8);
+        const x = c.x - s / 2;
+        const y = c.y - s / 2;
+        // Threat ring first, so the pip sits inside it rather than under it.
+        if (p !== PLAYER && binMil[p][i]) {
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, s * THREAT_RING_SCALE, 0, Math.PI * 2);
+          ctx.strokeStyle = THREAT_RING;
+          ctx.lineWidth = 2;
+          ctx.stroke();
+          ctx.lineWidth = 1;
+        }
+        // A black keyline is what makes a pip survive landing on dark forest,
+        // pale sand or the fog veil. Without it the team colours only read on
+        // grass, which is where they were tested and nowhere else.
+        ctx.fillStyle = TEAM[p];
+        ctx.fillRect(x, y, s, s);
+        ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+        ctx.strokeRect(x + 0.5, y + 0.5, s - 1, s - 1);
+        // Soldiers get a white inner tick. It costs one more rect and it is the
+        // difference between "someone is over there" and "an army is over there".
+        if (binMil[p][i] && s >= 5) {
+          ctx.fillStyle = 'rgba(255,255,255,0.9)';
+          ctx.fillRect(c.x - 1, c.y - 1, 2, 2);
+        }
+      }
+    }
+    ctx.restore();
+  }
+
   // Live "something of yours is being hit here" markers. Wall-clock timed, not
   // sim-timed: this is a UI effect, and it must decay at the same rate whether
   // the player is watching a live match or a fast-forwarded one.
@@ -234,8 +365,9 @@ export function createMinimap(canvas, world) {
   /** One resource pip. Shared by the live pass and the memory pass. */
   function node(type, gx, gy) {
     const p = gridToMini(gx, gy, size);
+    const s = NODE_SIZE[type] || NODE_SIZE_DEFAULT;
     ctx.fillStyle = RES_COLOR[type] || '#888';
-    ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+    ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
   }
 
   /** One building block. Shared by the live pass and the memory pass. */
@@ -283,12 +415,7 @@ export function createMinimap(canvas, world) {
     }
 
     // Units are never remembered — see drawUnits in render.js.
-    for (const u of world.units) {
-      if (u.dead || !lit(u.x, u.y)) continue;
-      const p = gridToMini(u.x, u.y, size);
-      ctx.fillStyle = TEAM[u.player];
-      ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
-    }
+    drawUnits();
 
     // The veil, over the entities so explored ones dim with the ground they
     // stand on, but under the selection pips and the viewport rectangle, which
