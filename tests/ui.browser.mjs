@@ -241,16 +241,28 @@ async function rallyOverVillagerRun() {
     check('the map has a berry bush and a villager to put on it', !s.fail, s.fail || '');
     if (s.fail) return;
 
-    await step(page, 300);
-    const posted = await page.evaluate((st) => {
-      const w = window.__game.world;
-      const v = w.entities.get(st.vill);
-      const b = w.entities.get(st.bush.id);
-      return { state: v.state, d: Math.hypot(v.x - b.x, v.y - b.y) };
-    }, s);
-    check('the villager is standing on the bush, working it',
-      posted.state === 'gather' && posted.d <= 1.6,
-      `state=${posted.state}, ${posted.d.toFixed(2)} tiles from the bush`);
+    // Wait for it to actually be at the bush, then freeze the simulation. The
+    // taps below cost ~350ms of real time each and the game keeps running
+    // between them: a villager that wanders off to drop its food mid-sequence
+    // would move the very thing under test. (A gatherer is only at the bush for
+    // part of its cycle, so this waits for the right part rather than assuming.)
+    let posted = null;
+    for (let i = 0; i < 60 && !posted; i++) {
+      await step(page, 10);
+      posted = await page.evaluate((st) => {
+        const w = window.__game.world;
+        const v = w.entities.get(st.vill);
+        const b = w.entities.get(st.bush.id);
+        const d = Math.hypot(v.x - b.x, v.y - b.y);
+        if (!v.task || v.task.type !== 'gather' || d > 1.6) return null;
+        window.__game.scene.simStep = () => {}; // hold everything still
+        return { d, state: v.state };
+      }, s);
+    }
+    check('the villager is standing on the bush, working it', !!posted,
+      posted ? `state=${posted.state}, ${posted.d.toFixed(2)} tiles from the bush`
+        : 'it never settled on the bush');
+    if (!posted) return;
 
     // Select the Town Center with a real touch.
     const tcAt = await page.evaluate((st) => {
@@ -466,7 +478,8 @@ async function toastCoverageRun() {
       g.hud.toast('12 soldiers selected', 'info');
     });
     await page.waitForTimeout(TOAST_EXIT_MS);
-    const before = await page.evaluate(() => document.querySelectorAll('#toasts .toast').length);
+    const before = await page.evaluate(
+      () => document.querySelectorAll('#toasts .toast:not(.out)').length);
 
     await page.evaluate(() => {
       const g = window.__game;
@@ -477,7 +490,7 @@ async function toastCoverageRun() {
     await page.waitForTimeout(TOAST_EXIT_MS);
 
     const shape = await page.evaluate((beforeCount) => {
-      const nodes = [...document.querySelectorAll('#toasts .toast')];
+      const nodes = [...document.querySelectorAll('#toasts .toast:not(.out)')];
       const box = document.getElementById('toasts').getBoundingClientRect();
       const alert = document.querySelector('#toasts .toast.alert');
       const ab = alert.getBoundingClientRect();
@@ -554,8 +567,8 @@ async function toastCoverageRun() {
         // Real chatter competing with the alarm, exactly as in the playtest.
         g.hud.toast('Training Villager', 'info');
         g.hud.toast('Not enough wood', 'warn');
-        const box = document.getElementById('toasts').getBoundingClientRect();
-        const nodes = document.querySelectorAll('#toasts .toast');
+        const nodes = document.querySelectorAll('#toasts .toast:not(.out)');
+        const box = nodes.length ? nodes[0].getBoundingClientRect() : { width: 0, height: 0 };
         return { n: nodes.length, w: Math.round(box.width), h: Math.round(box.height) };
       }, live.alerts);
     }
@@ -573,7 +586,79 @@ async function toastCoverageRun() {
   }
 }
 
-// --- Run 4: arm an attack-move and spend it ----------------------------------
+// --- Run 4: what a double-tap actually grabs ---------------------------------
+//
+// The playtest read the boot card's "every unit of that type on screen" as a
+// lie, having watched 24 of 24 villagers get selected — so this pins the real
+// rule down rather than arguing about it: with villagers parked in a far
+// corner, a double-tap takes the ones you can see and leaves the ones you
+// cannot. That is AoE2's rule (the menu sheet's "Select all villagers" is the
+// select-everything door), and the 24-of-24 reading is what you get when every
+// villager you own happens to be in frame, which at the opening zoom is most of
+// them. The boot card wording is the thing that has to match this test.
+//
+// The CDP touch pipeline cannot express a double-tap (~350ms per event, and the
+// window is 400ms), so this dispatches real PointerEvents in the page.
+
+async function doubleTapRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    const out = await page.evaluate(async () => {
+      const { spawnUnit } = await import('/src/core/world.js');
+      const g = window.__game;
+      const w = g.world;
+      // Two villagers in the far corner of the map, well outside any view.
+      spawnUnit(w, 'villager', 0, 40.5, 40.5);
+      spawnUnit(w, 'villager', 0, 42.5, 41.5);
+
+      const v = w.units.find((u) => u.player === 0 && u.type === 'villager');
+      g.input.centerOnGrid(v.x, v.y);
+
+      const canvas = g.scene.game.canvas;
+      const r = canvas.getBoundingClientRect();
+      const size = g.scene.game.scale.gameSize;
+      const p = g.input._toScreen(v.x, v.y);
+      const cx = r.left + (p.x * r.width) / size.width;
+      const cy = r.top + (p.y * r.height) / size.height;
+      const opts = { pointerId: 1, pointerType: 'touch', clientX: cx, clientY: cy, bubbles: true, cancelable: true };
+      const tap = () => {
+        canvas.dispatchEvent(new PointerEvent('pointerdown', opts));
+        window.dispatchEvent(new PointerEvent('pointerup', opts));
+      };
+      tap();
+      tap(); // inside DOUBLE_TAP_MS by construction
+
+      const all = w.units.filter((u) => u.player === 0 && u.type === 'villager');
+      const visible = all.filter((u) => {
+        const q = g.input._toScreen(u.x, u.y);
+        return q.x >= -24 && q.y >= -24 &&
+               q.x <= g.input.camera.width + 24 && q.y <= g.input.camera.height + 24;
+      });
+      return {
+        total: all.length,
+        visible: visible.length,
+        selected: w.selection.size,
+        allVisibleSelected: visible.every((u) => w.selection.has(u.id)),
+        anyOffScreen: all.some((u) => !visible.includes(u) && w.selection.has(u.id)),
+      };
+    });
+
+    check('the corner villagers really are off screen', out.visible < out.total,
+      `${out.visible} of ${out.total} villagers visible`);
+    check('a double-tap grabs every villager on screen',
+      out.allVisibleSelected && out.selected === out.visible,
+      `${out.selected} selected, ${out.visible} on screen`);
+    check('and none of the ones off screen',
+      !out.anyOffScreen, `${out.total - out.visible} parked in the corner, none selected`);
+
+    check('no console errors (double-tap run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 5: arm an attack-move and spend it ----------------------------------
 
 async function attackMoveRun() {
   const h = await boot();
@@ -782,6 +867,7 @@ const run = async () => {
     ['rally onto a resource', rallyRun],
     ['rally onto the bush a villager is already working', rallyOverVillagerRun],
     ['how much map the toast stack covers', toastCoverageRun],
+    ['what a double-tap grabs', doubleTapRun],
     ['attack-move', attackMoveRun],
   ];
   for (const [name, fn] of runs) {
