@@ -271,8 +271,18 @@ test('unlock lists skip building types that do not exist yet', () => {
     assert.ok(BUILDING_STATS[t], `unlockedTypes returned "${t}", which is not a building`);
   }
   // The forward-declared names in the table must not leak out as real types.
-  assert.equal(types.includes('castle'), !!BUILDING_STATS.castle);
-  assert.equal(types.includes('stonewall'), !!BUILDING_STATS.stonewall);
+  // 'keep' and 'market' are still only names; nothing may report them buildable.
+  for (const ghost of ['keep', 'market', 'siegeworkshop', 'palisadewall']) {
+    assert.equal(types.includes(ghost), false, `${ghost} is not a building yet`);
+  }
+  // The Castle and the stone wall are real buildings now, and they are gated by
+  // age rather than by existence — a Dark Age player has neither, and that is
+  // the age table doing its job rather than the type being missing.
+  assert.ok(BUILDING_STATS.castle && BUILDING_STATS.stonewall);
+  assert.equal(types.includes('castle'), false);
+  assert.equal(types.includes('stonewall'), false);
+  // The palisade is Dark Age, so it *is* in the list from the first second.
+  assert.equal(types.includes('palisade'), true);
 });
 
 test('an unknown building type is never permanently locked out', () => {

@@ -59,14 +59,15 @@ const SMOOTH_LOOKAHEAD = 12;
 // a *pocket*. Below it, a unit standing in the region has nowhere to work, no
 // drop-off to reach and no way home — it is entombed.
 //
-// The number is deliberately generous. There is no wall building in this game
-// (BUILDABLE is house / farm / barracks / mill / lumber camp / mining camp /
-// towncenter), so the smallest enclosure a player can build on purpose is far
-// larger than this — and on a 9216-tile map 96 tiles is about 1% of the ground,
-// so it stays a pocket limit rather than a cap on legitimate walling — while every
-// accidental seal seen in play has been one to a few tiles. Anything at or above
-// the limit is treated as honest ground and never restricts placement — walling
-// off a quarter of the map stays legal.
+// The number is deliberately generous, and it has to stay that way now that
+// walls exist. On a 9216-tile map 96 tiles is about 1% of the ground: the
+// smallest enclosure anyone builds on purpose — a ring of palisade round a
+// Town Center and its farms — is several times that, while every accidental
+// seal seen in play has been one to a few tiles. Anything at or above the limit
+// is treated as honest ground and never restricts placement, so walling off a
+// quarter of the map stays legal; and a gate is never counted as a wall by the
+// fills below (see solidAt), so a wall line with a door in it can always be
+// finished.
 export const POCKET_LIMIT = 96;
 
 /** Counters for tests and debugging. Reset whenever you like. */

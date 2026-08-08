@@ -12,6 +12,8 @@
 
 import {
   PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
+  MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
+  FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js';
@@ -19,6 +21,10 @@ import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js'
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
 import * as tech from '../systems/tech.js';
+import {
+  stanceOf, garrisonCapacity, garrisonCount, isGarrisoned, nearestShelter,
+  ungarrisonAll,
+} from '../systems/combat.js';
 
 import { createMinimap, miniToGrid } from './minimap.js';
 import {
@@ -55,6 +61,7 @@ const RALLY_SNAP = 1.5;
 
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
+  spearman: 'SPR', scout: 'CAV', ram: 'RAM',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
   lumbercamp: 'LMB', miningcamp: 'MIN',
   berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
@@ -75,7 +82,10 @@ const NODE_NAME = {
   berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein', stone: 'Stone Mine',
 };
 
-const MILITARY = new Set(['militia', 'archer']);
+// Derived from UNIT_STATS rather than written out, so a unit added to the roster
+// is a soldier here — selectable by "select all military", eligible for
+// attack-move, counted in the stance panel — the moment it declares itself one.
+const MILITARY = new Set(MILITARY_TYPES);
 export function isMilitary(u) { return u.kind === 'unit' && MILITARY.has(u.type); }
 
 function statsOf(e) {
@@ -261,6 +271,7 @@ export function createHud(scene, world) {
     buildMenuOpen: false,
     menuOpen: false,
     liveJob: null,           // { list, node } — the "where is this going" line
+    liveGarrison: null,      // { list, node } — the "how many are inside" line
     selSig: '',
     cmdSig: '',
     resSig: '',
@@ -532,6 +543,7 @@ export function createHud(scene, world) {
     panel.textContent = '';
     state.liveBars = [];
     state.liveJob = null;
+    state.liveGarrison = null;
 
     const sel = selectedEntities(world);
     if (sel.length === 0) {
@@ -598,6 +610,16 @@ export function createHud(scene, world) {
       const note = el('div', 'job-note');
       panel.appendChild(note);
       state.liveJob = { list: workers, node: note };
+    }
+
+    // How many bodies are inside, and how many more will fit. This is the only
+    // way the player can see a garrison at all — the units are off the map by
+    // design — so it is a live row rather than a line drawn once.
+    const shelters = sel.filter((e) => e.player === PLAYER && garrisonCapacity(e) > 0);
+    if (shelters.length) {
+      const note = el('div', 'garrison-note');
+      panel.appendChild(note);
+      state.liveGarrison = { list: shelters, node: note };
     }
 
     refreshBars();
@@ -701,6 +723,21 @@ export function createHud(scene, world) {
       if (state.liveJob.node.textContent !== text) state.liveJob.node.textContent = text;
       state.liveJob.node.hidden = text === '';
     }
+
+    if (state.liveGarrison) {
+      let inside = 0;
+      let cap = 0;
+      for (const b of state.liveGarrison.list) {
+        if (b.dead) continue;
+        inside += garrisonCount(b);
+        cap += garrisonCapacity(b);
+      }
+      const text = `Garrison ${inside} / ${cap}`;
+      const node = state.liveGarrison.node;
+      if (node.textContent !== text) node.textContent = text;
+      node.classList.toggle('manned', inside > 0);
+      node.classList.toggle('full', cap > 0 && inside >= cap);
+    }
   }
 
   // --- Command panel --------------------------------------------------------
@@ -799,6 +836,51 @@ export function createHud(scene, world) {
       }));
     }
 
+    // Garrison. AoE2 gives this to a right-click on a building; a phone has no
+    // right-click and no modifier, so it is a button that means "go inside the
+    // nearest shelter of yours that has room". That is the order a player
+    // actually wants under fire — they are not choosing *which* Town Center,
+    // they are getting their villagers off the field before the scouts arrive.
+    if (units.length) {
+      const shelter = units.map((u) => nearestShelter(world, u)).find(Boolean);
+      if (shelter) {
+        panel.appendChild(cmdButton('Garrison', {
+          cls: 'garrison',
+          sub: `${units.length} in`,
+          aria: `Send ${units.length} units into the nearest ${displayName(shelter)}.`,
+          onTap: () => {
+            command(units, { type: 'garrison' });
+            toast(`Garrisoning ${units.length}`, 'info');
+          },
+        }));
+      }
+    }
+
+    // ...and the way back out, on the building. One tap empties it: picking
+    // individuals out of a building you cannot see inside is a menu nobody
+    // wants on a 390px screen, and "everybody out" is what an alarm calls for.
+    const shelters = buildings.filter((b) => garrisonCount(b) > 0);
+    if (shelters.length) {
+      const inside = shelters.reduce((n, b) => n + garrisonCount(b), 0);
+      panel.appendChild(cmdButton('Ungarrison', {
+        cls: 'garrison out',
+        sub: `${inside} out`,
+        aria: `Turn out all ${inside} units garrisoned here.`,
+        onTap: () => {
+          let n = 0;
+          for (const b of shelters) n += ungarrisonAll(world, b);
+          toast(n ? `${n} came out` : 'Nowhere to stand', n ? 'info' : 'warn');
+          state.cmdSig = '';
+        },
+      }));
+    }
+
+    // Stance and formation. Both are unit *settings* rather than orders, which
+    // is why they sit below the verbs: you set them once and every order after
+    // that obeys them.
+    if (units.length) renderStances(panel, units);
+    if (military.length > 1) renderFormations(panel, military);
+
     // Stop always available to units.
     if (units.length) {
       panel.appendChild(cmdButton('Stop', {
@@ -829,6 +911,78 @@ export function createHud(scene, world) {
     if (buildings.length) renderDemolish(panel, buildings);
 
     refreshAffordability();
+  }
+
+  // --- Stance and formation --------------------------------------------------
+  //
+  // Two rows of segmented buttons, the live one lit. They are rows rather than a
+  // single cycling button on purpose: a cycler hides three of the four choices
+  // and makes "put these on Stand Ground" a game of tap-and-check, which is
+  // exactly the interaction a player is trying to avoid in the second before a
+  // raid lands. Every segment is a full 44px tall (see .segrow in hud.css), so
+  // four of them still fit across a 390px phone.
+  //
+  // Mixed selections show nothing lit and set all of them on the first tap,
+  // which is the only unambiguous answer to "what is this group's stance".
+
+  function segRow(panel, { title, options, current, onPick }) {
+    const wrap = el('div', 'segrow');
+    wrap.setAttribute('role', 'group');
+    wrap.setAttribute('aria-label', title);
+    for (const o of options) {
+      const on = o.id === current;
+      const b = el('button', `seg ${on ? 'on' : ''}`);
+      b.type = 'button';
+      b.appendChild(el('span', 'label', o.label));
+      b.appendChild(el('span', 'blurb', o.blurb || ''));
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.setAttribute('aria-label', `${title}: ${o.label}. ${o.blurb || ''}`.trim());
+      b.title = o.blurb || o.label;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); onPick(o.id); });
+      wrap.appendChild(b);
+    }
+    panel.appendChild(wrap);
+  }
+
+  /** The one value shared by every unit in the list, or null when they differ. */
+  function shared(list, read) {
+    let v = null;
+    for (const u of list) {
+      const x = read(u);
+      if (v === null) v = x;
+      else if (v !== x) return null;
+    }
+    return v;
+  }
+
+  function renderStances(panel, units) {
+    segRow(panel, {
+      title: 'Stance',
+      current: shared(units, stanceOf),
+      options: STANCE_ORDER.map((id) => ({
+        id, label: STANCE_LABEL[id], blurb: STANCE_BLURB[id],
+      })),
+      onPick: (id) => {
+        command(units, { type: 'stance', stance: id });
+        toast(`${STANCE_LABEL[id]}: ${STANCE_BLURB[id].toLowerCase()}`, 'info');
+        state.cmdSig = '';
+      },
+    });
+  }
+
+  function renderFormations(panel, units) {
+    segRow(panel, {
+      title: 'Formation',
+      current: shared(units, (u) => u.formation || DEFAULT_FORMATION),
+      options: FORMATION_ORDER.map((id) => ({
+        id, label: FORMATION_LABEL[id], blurb: FORMATION_BLURB[id],
+      })),
+      onPick: (id) => {
+        command(units, { type: 'formation', formation: id });
+        toast(`${FORMATION_LABEL[id]} formation`, 'info');
+        state.cmdSig = '';
+      },
+    });
   }
 
   // --- Cancel a foundation ---------------------------------------------------
@@ -1384,13 +1538,16 @@ export function createHud(scene, world) {
       if (tc) { centerOnGrid(tc.x, tc.y); setSelection(world, [tc]); }
       else toast('No Town Center left', 'warn');
     });
+    // ownedBy() still returns garrisoned units — they are yours and they still
+    // cost population — but they are not on the map, so selecting them would
+    // put a panel full of units the player cannot see or order in front of them.
     add('Select all villagers', () => {
-      const v = ownedBy(world, PLAYER, 'unit', 'villager');
+      const v = ownedBy(world, PLAYER, 'unit', 'villager').filter((u) => !isGarrisoned(u));
       if (v.length) { setSelection(world, v); toast(`${v.length} villagers`, 'info'); }
       else toast('No villagers', 'warn');
     });
     add('Select all military', () => {
-      const m = ownedBy(world, PLAYER, 'unit').filter(isMilitary);
+      const m = ownedBy(world, PLAYER, 'unit').filter((u) => isMilitary(u) && !isGarrisoned(u));
       if (m.length) { setSelection(world, m); toast(`${m.length} soldiers`, 'info'); }
       else toast('No soldiers yet', 'warn');
     });
@@ -1608,6 +1765,11 @@ export function createHud(scene, world) {
       if (e.player !== PLAYER) { types.add(`x${e.kind}`); continue; }
       types.add(`${e.kind}:${e.type}:${e.complete === false ? 'f' : 'c'}`);
       n++;
+      // Stance and formation decide which segment is lit, and both change
+      // without the selection changing — a unit dropped to No Attack by an
+      // order, a group whose formation was just set. Cheap: two string reads
+      // per selected unit, and the panel only re-renders when they differ.
+      if (e.kind === 'unit') q += `|${stanceOf(e)}${e.formation || ''}`;
       // The rally is in here so the note that names what it will do refreshes
       // the moment the player moves it.
       if (e.kind === 'building') {
@@ -1617,6 +1779,8 @@ export function createHud(scene, world) {
         // must draw, and there is no event for "the queue got shorter".
         q += `r${(e.research || []).length}`;
         q += e.rally ? `@${e.rally.x.toFixed(1)},${e.rally.y.toFixed(1)}` : '@-';
+        // The Ungarrison button appears and disappears with the garrison.
+        q += `g${garrisonCount(e)}`;
       }
     }
     // The age and the number of finished techs both change what the research

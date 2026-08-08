@@ -67,6 +67,25 @@ export function unitFrame(type, player, back) {
 export function buildingFrame(type, player) {
   return `b_${type}_${player}`;
 }
+/**
+ * A wall segment, keyed by the four-bit neighbour mask from core/world.js
+ * (1 = north, 2 = east, 4 = south, 8 = west). Sixteen frames per wall type per
+ * player: a lone post, two straight runs, four corners, four tees, one cross,
+ * and the four stubs that have exactly one neighbour.
+ *
+ * Every case is drawn rather than derived, because a wall's whole job is to look
+ * like one continuous structure. Rotating a single sprite cannot do it — in this
+ * projection the two grid axes run in different screen directions and are lit
+ * differently, so an east-west run and a north-south run are not the same
+ * picture turned round.
+ */
+export function wallFrame(type, player, mask) {
+  return `w_${type}_${player}_${mask & 15}`;
+}
+/** A gate, by the axis it stands across (0 = along +x, 1 = along +y) and state. */
+export function gateFrame(type, player, axis, open) {
+  return `g_${type}_${player}_${axis ? 'y' : 'x'}${open ? 'o' : 'c'}`;
+}
 /** Farms have three harvest stages; stage 0 shares the generic building name. */
 export function farmFrame(player, stage) {
   return stage ? `b_farm${stage}_${player}` : `b_farm_${player}`;
@@ -119,7 +138,15 @@ export const OCEAN_DEEP = 0x0d2740;
  * Returns { atlas, origins: Map<frame, {w,h,ox,oy}> }.
  */
 export function buildTextures(scene) {
-  const SIZE = 1024;
+  // 2048, up from 1024. The walls are what pushed it over: sixteen connected
+  // variants per wall type per player is sixty-four extra frames, and with the
+  // Castle's 4x4 body and the gates the atlas needs about 1.4M pixels of the
+  // 4.2M a 2048 sheet holds — against the 1.05M a 1024 sheet has in total.
+  // Splitting into two atlases was the alternative and it is the worse one: a
+  // second texture breaks the sprite batch every time the renderer alternates
+  // between a wall and anything else, which on a walled base is every few
+  // sprites. 16MB of texture memory buys back the single draw call.
+  const SIZE = 2048;
   if (scene.textures.exists(ATLAS)) scene.textures.remove(ATLAS);
   const canvasTex = scene.textures.createCanvas(ATLAS, SIZE, SIZE);
   const ctx = canvasTex.getContext();
@@ -143,6 +170,7 @@ export function buildTextures(scene) {
   }
 
   buildBuildings(put);
+  buildWalls(put);
   buildFoundations(put);
   buildResources(put, rng);
   buildUnits(put);
@@ -857,6 +885,11 @@ const BSPEC = {
   // with the buildings that matter for attention.
   lumbercamp: { fw: 2, fh: 2, wallH: 24, roofH: 17, logs: true, w: 140, h: 106 },
   miningcamp: { fw: 2, fh: 2, wallH: 24, roofH: 17, ore: true, w: 140, h: 106 },
+  // The two stone buildings that shoot. Both are drawn tall on purpose: a
+  // defensive building whose silhouette does not clear the houses around it is a
+  // defensive building the player forgets they own.
+  watchtower: { fw: 1, fh: 1, tower: true, w: 80, h: 110 },
+  castle: { fw: 4, fh: 4, castle: true, w: 280, h: 250 },
 };
 
 // The Town Center's roof is deliberately neither team colour. Packed bases put
@@ -928,6 +961,14 @@ function drawBuilding(g, type, s, cx, cy, col, colDark) {
   }
   if (type === 'house') {
     drawHouse(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.tower) {
+    drawWatchTower(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.castle) {
+    drawCastle(g, s, cx, cy, col, colDark);
     return;
   }
 
@@ -1645,11 +1686,472 @@ function banner(g, x, y, col, colDark, h) {
   g.fillRect(x + 1, y - h + 2, 5, 3);
 }
 
+// ---------------------------------------------------------------------------
+// Walls, gates, and the two stone buildings that shoot
+// ---------------------------------------------------------------------------
+//
+// WHY SIXTEEN FRAMES. A wall only reads as a wall if its segments join. Drawing
+// each one as an independent block gives a dotted line of huts, which is the
+// single most obvious way this feature could fail, so the connection is baked
+// into the art: a segment's frame is chosen by which of its four axis
+// neighbours are also walls (core/world.js owns the mask), and each of the
+// sixteen cases is drawn — post alone, four stubs, two straight runs, four
+// corners, four tees, one cross.
+//
+// The pieces are assembled from one primitive: an isometric prism running from
+// the tile centre out to the middle of one tile edge. A segment is a stack of
+// those, one per connected direction, plus a post at the junction. Because every
+// limb ends exactly on the shared edge between two tiles, the limb of one
+// segment meets the limb of its neighbour with no gap and no overlap — at any
+// zoom, on any of the sixteen cases, without a single hand-placed pixel.
+
+/**
+ * Half-edge vectors: tile centre to the middle of each of the four tile edges,
+ * in screen pixels. Index order matches the wall mask in core/world.js
+ * (0 = north/-y, 1 = east/+x, 2 = south/+y, 3 = west/-x); the two must not
+ * drift apart or a wall will grow limbs in the wrong directions.
+ */
+const WALL_DIR = [
+  { x: HALF_W / 2, y: -HALF_H / 2 },
+  { x: HALF_W / 2, y: HALF_H / 2 },
+  { x: -HALF_W / 2, y: HALF_H / 2 },
+  { x: -HALF_W / 2, y: -HALF_H / 2 },
+];
+
+// Wall texture boxes. `ay` is the pixel the tile centre sits on; it has to leave
+// room above for the tallest thing drawn (a gate tower and its finial), or the
+// health bar the renderer hangs off the sprite's top edge floats in the sky.
+const WALL_TEX = { w: 80, h: 76, ay: 54 };
+const GATE_TEX = { w: 80, h: 92, ay: 70 };
+
+const PAL_WOOD = { left: 0x7c5326, right: 0x9a6b38, top: 0xb2854c };
+const PAL_STONE = { left: 0x7c766a, right: 0x9c9689, top: 0xbcb6a6 };
+
+/**
+ * An isometric prism: a parallelogram base swept up by `H`.
+ *
+ * The four side faces are painted back-to-front by the screen y of their base
+ * edge, then the top. That is a painter's sort over a convex box, which is
+ * exact — no face can partly occlude another — and it costs a four-element sort
+ * that runs once at bake time and never again.
+ */
+function prism(g, cx, cy, vx, vy, px, py, H, pal, outline = 1.6) {
+  const base = [
+    { x: cx + px, y: cy + py },
+    { x: cx + vx + px, y: cy + vy + py },
+    { x: cx + vx - px, y: cy + vy - py },
+    { x: cx - px, y: cy - py },
+  ];
+  const top = base.map((b) => ({ x: b.x, y: b.y - H }));
+  const faces = [];
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) % 4;
+    faces.push({
+      my: (base[i].y + base[j].y) / 2,
+      mx: (base[i].x + base[j].x) / 2,
+      quad: [base[i], base[j], top[j], top[i]],
+    });
+  }
+  faces.sort((a, b) => a.my - b.my);
+  for (const f of faces) {
+    g.fillStyle(f.mx >= cx + vx / 2 ? pal.right : pal.left, 1);
+    g.fillPoints(f.quad, true, true);
+    g.lineStyle(outline, OUT, 1);
+    g.strokePoints(f.quad, true, true);
+  }
+  g.fillStyle(pal.top, 1);
+  g.fillPoints(top, true, true);
+  g.lineStyle(outline + 0.2, OUT, 1);
+  g.strokePoints(top, true, true);
+  return { base, top };
+}
+
+/** A prism centred on a point, given its two in-plane half-extents. */
+function box(g, x, y, a, b, H, pal, outline) {
+  return prism(g, x - a.x, y - a.y, a.x * 2, a.y * 2, b.x, b.y, H, pal, outline);
+}
+
+/** The base edge of a limb that faces the camera, for surface detail. */
+function nearEdge(cx, cy, vx, vy, px, py) {
+  const s = py >= 0 ? 1 : -1;
+  return [
+    { x: cx + px * s, y: cy + py * s },
+    { x: cx + vx + px * s, y: cy + vy + py * s },
+  ];
+}
+
+const WALL_SPEC = {
+  palisade: {
+    pal: PAL_WOOD, height: 22, postH: 28, thick: 0.30, post: 0.48,
+    // Sharpened stakes: the palisade's silhouette is what tells it apart from a
+    // stone wall at the zoom a phone actually plays at, long before the colour
+    // does.
+    stakes: true,
+  },
+  stonewall: {
+    pal: PAL_STONE, height: 27, postH: 33, thick: 0.42, post: 0.60,
+    courses: true,
+  },
+};
+
+function drawWallSegment(g, cx, cy, mask, spec, col, colDark) {
+  const t = spec.thick;
+  // Limbs first, post second: the post then sits proud of the joins, which is
+  // what makes a corner read as a corner and not as two planks crossing.
+  for (let d = 0; d < 4; d++) {
+    if (!(mask & (1 << d))) continue;
+    const v = WALL_DIR[d];
+    const per = WALL_DIR[(d + 1) % 4];
+    const px = per.x * t;
+    const py = per.y * t;
+    prism(g, cx, cy, v.x, v.y, px, py, spec.height, spec.pal);
+    const [e0, e1] = nearEdge(cx, cy, v.x, v.y, px, py);
+    if (spec.courses) {
+      // Two mortar courses along the face.
+      g.lineStyle(1.1, shade(spec.pal.left, -0.3), 0.55);
+      for (const f of [0.34, 0.68]) {
+        g.beginPath();
+        g.moveTo(e0.x, e0.y - spec.height * f);
+        g.lineTo(e1.x, e1.y - spec.height * f);
+        g.strokePath();
+      }
+    } else {
+      // Log seams.
+      g.lineStyle(1.1, shade(spec.pal.left, -0.32), 0.7);
+      for (let k = 1; k <= 3; k++) {
+        const u = k / 4;
+        const x = e0.x + (e1.x - e0.x) * u;
+        const y = e0.y + (e1.y - e0.y) * u;
+        g.beginPath();
+        g.moveTo(x, y);
+        g.lineTo(x, y - spec.height);
+        g.strokePath();
+      }
+    }
+  }
+
+  // The post, with a band of team colour under its cap. The band is the same
+  // idea as the Town Center's eave fascia and it exists for the same reason: a
+  // wall has no roof to colour, and a contested border where you cannot tell
+  // whose wall is whose is unreadable. It is a band rather than a flag on every
+  // segment because a flag on every segment is a picket fence — a thirty-tile
+  // run drew thirty pennants and the eye could not find the ends.
+  const a = { x: WALL_DIR[1].x * spec.post, y: WALL_DIR[1].y * spec.post };
+  const b = { x: WALL_DIR[2].x * spec.post * 0.5, y: WALL_DIR[2].y * spec.post * 0.5 };
+  const bandH = 5;
+  box(g, cx, cy, a, b, spec.postH - bandH, spec.pal);
+  box(g, cx, cy - (spec.postH - bandH), a, b, bandH,
+    { left: colDark, right: col, top: shade(col, 0.28) });
+
+  const topY = cy - spec.postH;
+  if (spec.stakes) {
+    // Three points along the post cap.
+    g.fillStyle(shade(spec.pal.top, 0.18), 1);
+    for (const dx of [-6, 0, 6]) {
+      g.fillTriangle(cx + dx - 3, topY + 1, cx + dx + 3, topY + 1, cx + dx, topY - 6);
+      g.lineStyle(1.3, OUT, 1);
+      g.strokeTriangle(cx + dx - 3, topY + 1, cx + dx + 3, topY + 1, cx + dx, topY - 6);
+    }
+  } else {
+    // Crenellations.
+    g.fillStyle(shade(spec.pal.top, 0.1), 1);
+    for (const dx of [-7, 0, 7]) {
+      g.fillRect(cx + dx - 2.6, topY - 5, 5.2, 6);
+      g.lineStyle(1.3, OUT, 1);
+      g.strokeRect(cx + dx - 2.6, topY - 5, 5.2, 6);
+    }
+  }
+
+  // A pennant marks the places worth marking: the ends of a run, a lone post,
+  // and the tees and crosses where two walls meet. Exactly two neighbours means
+  // "middle of a run or a plain corner", which is most of a wall and gets none.
+  const neighbours = ((mask >> 0) & 1) + ((mask >> 1) & 1) + ((mask >> 2) & 1) + ((mask >> 3) & 1);
+  if (neighbours !== 2) {
+    g.lineStyle(2.2, OUT, 1);
+    g.beginPath();
+    g.moveTo(cx + 9, topY - 4);
+    g.lineTo(cx + 9, topY - 16);
+    g.strokePath();
+    g.fillStyle(col, 1);
+    g.fillTriangle(cx + 9, topY - 16, cx + 18, topY - 13, cx + 9, topY - 9);
+    g.lineStyle(1.2, OUT, 1);
+    g.strokeTriangle(cx + 9, topY - 16, cx + 18, topY - 13, cx + 9, topY - 9);
+  }
+}
+
+/**
+ * A gate: two towers straddling the wall line with a doorway between them.
+ *
+ * `axis` is the direction the *wall* runs (0 = along +x, 1 = along +y), so the
+ * towers stand at the two tile edges the wall continues through and the opening
+ * faces the other way — which is the way a unit crosses. Open swings the leaves
+ * back against the towers; shut brings them together across the gap. That
+ * boolean is the same one the block grid reads, so what the player sees is
+ * literally whether the tile is passable.
+ */
+function drawGate(g, cx, cy, axis, open, spec, col, colDark) {
+  const along = axis === 0 ? [1, 3] : [0, 2];
+  const across = axis === 0 ? [0, 2] : [1, 3];
+  const towerH = spec.postH + 12;
+  const A = WALL_DIR[along[0]];
+  const B = WALL_DIR[across[0]];
+  const half = { x: A.x * 0.34, y: A.y * 0.34 };
+  const wide = { x: B.x * 0.5, y: B.y * 0.5 };
+
+  // The doorway, drawn first so the towers overlap its ends.
+  //
+  // Open and shut have to be told apart at a glance from across a base, so the
+  // difference is a whole shape and not a tint: shut is a slab of oak filling
+  // the arch to above wall height, open is an empty threshold with the two
+  // leaves folded flat against the towers and a shadow on the ground where the
+  // slab was. A player glancing at their wall must be able to see which of
+  // their gates is standing open.
+  const gap = spec.height + 8;
+  const p0 = { x: cx + WALL_DIR[along[0]].x * 0.66, y: cy + WALL_DIR[along[0]].y * 0.66 };
+  const p1 = { x: cx + WALL_DIR[along[1]].x * 0.66, y: cy + WALL_DIR[along[1]].y * 0.66 };
+  const across0 = { x: WALL_DIR[across[0]].x * 0.16, y: WALL_DIR[across[0]].y * 0.16 };
+
+  if (open) {
+    // The threshold: a dark strip of packed earth between the towers, so the
+    // gap reads as ground you can walk on rather than as a missing sprite.
+    g.fillStyle(0x2a2118, 0.55);
+    g.fillPoints([
+      { x: p0.x + across0.x, y: p0.y + across0.y },
+      { x: p1.x + across0.x, y: p1.y + across0.y },
+      { x: p1.x - across0.x, y: p1.y - across0.y },
+      { x: p0.x - across0.x, y: p0.y - across0.y },
+    ], true, true);
+    // Leaves folded back against the towers.
+    for (const p of [p0, p1]) {
+      const q = { x: cx + (p.x - cx) * 0.55, y: cy + (p.y - cy) * 0.55 };
+      const leaf = [
+        { x: p.x, y: p.y }, { x: q.x, y: q.y },
+        { x: q.x, y: q.y - gap * 0.8 }, { x: p.x, y: p.y - gap * 0.8 },
+      ];
+      g.fillStyle(WOOD_D, 1);
+      g.fillPoints(leaf, true, true);
+      g.lineStyle(1.6, OUT, 1);
+      g.strokePoints(leaf, true, true);
+    }
+  } else {
+    // A slab with thickness: the front face, a lit top edge, and iron banding.
+    const door = [
+      { x: p0.x, y: p0.y }, { x: p1.x, y: p1.y },
+      { x: p1.x, y: p1.y - gap }, { x: p0.x, y: p0.y - gap },
+    ];
+    g.fillStyle(WOOD, 1);
+    g.fillPoints(door, true, true);
+    g.fillStyle(shade(WOOD, 0.22), 1);
+    g.fillPoints([
+      { x: p0.x, y: p0.y - gap }, { x: p1.x, y: p1.y - gap },
+      { x: p1.x, y: p1.y - gap + 4 }, { x: p0.x, y: p0.y - gap + 4 },
+    ], true, true);
+    g.lineStyle(2.2, OUT, 1);
+    g.strokePoints(door, true, true);
+    // Plank seams down the leaf, then two iron straps across it.
+    g.lineStyle(1.1, WOOD_D, 0.85);
+    for (const f of [0.25, 0.5, 0.75]) {
+      const x = p0.x + (p1.x - p0.x) * f;
+      const y = p0.y + (p1.y - p0.y) * f;
+      g.beginPath();
+      g.moveTo(x, y);
+      g.lineTo(x, y - gap);
+      g.strokePath();
+    }
+    g.lineStyle(2.4, STEEL_D, 0.95);
+    for (const f of [0.28, 0.68]) {
+      g.beginPath();
+      g.moveTo(p0.x, p0.y - gap * f);
+      g.lineTo(p1.x, p1.y - gap * f);
+      g.strokePath();
+    }
+    g.fillStyle(0xdcc36a, 1);
+    g.fillCircle((p0.x + p1.x) / 2, (p0.y + p1.y) / 2 - gap * 0.48, 2.4);
+    g.lineStyle(1, OUT, 1);
+    g.strokeCircle((p0.x + p1.x) / 2, (p0.y + p1.y) / 2 - gap * 0.48, 2.4);
+  }
+
+  // Towers, far one first.
+  const posts = [
+    { x: cx + WALL_DIR[along[0]].x, y: cy + WALL_DIR[along[0]].y },
+    { x: cx + WALL_DIR[along[1]].x, y: cy + WALL_DIR[along[1]].y },
+  ].sort((a, b) => a.y - b.y);
+  for (const p of posts) {
+    box(g, p.x, p.y, half, wide, towerH, spec.pal);
+    const ty = p.y - towerH;
+    g.fillStyle(shade(spec.pal.top, 0.1), 1);
+    g.fillRect(p.x - 8, ty - 5, 16, 6);
+    g.lineStyle(1.4, OUT, 1);
+    g.strokeRect(p.x - 8, ty - 5, 16, 6);
+  }
+  // Banner on the nearer tower.
+  const near = posts[posts.length - 1];
+  banner(g, near.x + 6, near.y - towerH + 4, col, colDark, 18);
+}
+
+function buildWalls(put) {
+  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+    const col = PLAYER_COLORS[p];
+    const dark = PLAYER_COLORS_DARK[p];
+    for (const type of Object.keys(WALL_SPEC)) {
+      const spec = WALL_SPEC[type];
+      for (let mask = 0; mask < 16; mask++) {
+        put(wallFrame(type, p, mask), WALL_TEX.w, WALL_TEX.h, WALL_TEX.w / 2, WALL_TEX.ay,
+          (g) => drawWallSegment(g, WALL_TEX.w / 2, WALL_TEX.ay, mask, spec, col, dark));
+      }
+    }
+    // Each gate borrows the wall family it belongs to, so a stone gate in a
+    // stone wall is the same masonry with a door in it.
+    for (const [gateType, wallType] of [['palisadegate', 'palisade'], ['stonegate', 'stonewall']]) {
+      const spec = WALL_SPEC[wallType];
+      for (let axis = 0; axis < 2; axis++) {
+        for (const open of [false, true]) {
+          put(gateFrame(gateType, p, axis, open), GATE_TEX.w, GATE_TEX.h,
+            GATE_TEX.w / 2, GATE_TEX.ay,
+            (g) => drawGate(g, GATE_TEX.w / 2, GATE_TEX.ay, axis, open, spec, col, dark));
+        }
+      }
+    }
+  }
+}
+
+/**
+ * The Watch Tower: one tile of footprint and a great deal of height.
+ *
+ * Everything about it is vertical, because that is the only axis a 1x1 building
+ * has to work with. A battered stone base, a shaft with arrow slits, a
+ * corbelled parapet that overhangs it, and a shingled cap — read from bottom to
+ * top, that outline is unlike anything else on the map even when only the top
+ * third of it is showing over a treeline.
+ */
+function drawWatchTower(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  platform(g, cx, cy, hw, hh, false);
+
+  const baseA = { x: WALL_DIR[1].x * 0.82, y: WALL_DIR[1].y * 0.82 };
+  const baseB = { x: WALL_DIR[2].x * 0.82, y: WALL_DIR[2].y * 0.82 };
+  const shaftH = 46;
+  box(g, cx, cy, baseA, baseB, 10, PAL_STONE, 2);
+  const midA = { x: baseA.x * 0.82, y: baseA.y * 0.82 };
+  const midB = { x: baseB.x * 0.82, y: baseB.y * 0.82 };
+  box(g, cx, cy - 10, midA, midB, shaftH, PAL_STONE, 2);
+
+  const topY = cy - 10 - shaftH;
+  // Arrow slits.
+  g.fillStyle(OUT, 0.9);
+  g.fillRect(cx - 8, topY + 12, 3, 10);
+  g.fillRect(cx + 5, topY + 12, 3, 10);
+
+  // Overhanging parapet, wider than the shaft.
+  const capA = { x: baseA.x * 1.06, y: baseA.y * 1.06 };
+  const capB = { x: baseB.x * 1.06, y: baseB.y * 1.06 };
+  box(g, cx, topY, capA, capB, 12, PAL_STONE, 2);
+  const parY = topY - 12;
+  g.fillStyle(shade(PAL_STONE.top, 0.1), 1);
+  for (const dx of [-13, -4, 5, 14]) {
+    g.fillRect(cx + dx - 3, parY - 6, 6, 7);
+    g.lineStyle(1.4, OUT, 1);
+    g.strokeRect(cx + dx - 3, parY - 6, 6, 7);
+  }
+  // Shingled cap and a lookout's pennant.
+  isoRoof(g, cx, parY - 5, 17, 9, 16, col, colDark);
+  banner(g, cx + 13, cy + 2, col, colDark, 22);
+}
+
+/**
+ * The Castle: 4x4, and it has to look like 250 stone.
+ *
+ * Four corner towers, a curtain wall between them and a keep standing above the
+ * lot. The corner towers are what carry it — they give the silhouette four
+ * vertical spikes that nothing else in the game has, so a Castle is recognisable
+ * from the minimap-sized end of the zoom range and through a gap in a forest.
+ */
+function drawCastle(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  platform(g, cx, cy, hw, hh, true);
+
+  const iw = hw * 0.86;
+  const ih = hh * 0.86;
+  const wallH = 44;
+  isoBox(g, cx, cy, iw, ih, wallH, STONE, STONE_D, shade(STONE, 0.18));
+  // Courses across the curtain, so 44 pixels of flat grey reads as masonry.
+  g.lineStyle(1.2, STONE_D, 0.5);
+  for (let k = 1; k <= 4; k++) {
+    const y = cy - (wallH * k) / 5;
+    g.beginPath();
+    g.moveTo(cx - iw, y);
+    g.lineTo(cx, y + ih);
+    g.lineTo(cx + iw, y);
+    g.strokePath();
+  }
+  const topY = cy - wallH;
+  crenellations(g, cx, topY, iw, ih, col, colDark);
+
+  // Gatehouse on the south face.
+  const doorTop = cy + ih - wallH + 10;
+  g.fillStyle(WOOD_D, 1);
+  g.fillRoundedRect(cx - 12, doorTop, 24, wallH - 14, 3);
+  g.lineStyle(2.4, OUT, 1);
+  g.strokeRoundedRect(cx - 12, doorTop, 24, wallH - 14, 3);
+  g.lineStyle(1.8, STEEL_D, 0.85);
+  for (let k = 1; k <= 3; k++) {
+    g.beginPath();
+    g.moveTo(cx - 12, doorTop + (wallH - 14) * (k / 4));
+    g.lineTo(cx + 12, doorTop + (wallH - 14) * (k / 4));
+    g.strokePath();
+  }
+
+  // Four corner towers, painted back to front.
+  const towerH = 74;
+  const corners = [
+    { x: cx, y: cy - hh * 0.92 },
+    { x: cx - hw * 0.92, y: cy },
+    { x: cx + hw * 0.92, y: cy },
+    { x: cx, y: cy + hh * 0.92 },
+  ].sort((a, b) => a.y - b.y);
+  const tA = { x: WALL_DIR[1].x * 0.9, y: WALL_DIR[1].y * 0.9 };
+  const tB = { x: WALL_DIR[2].x * 0.9, y: WALL_DIR[2].y * 0.9 };
+  for (const c of corners) {
+    box(g, c.x, c.y, tA, tB, towerH, PAL_STONE, 2.2);
+    const ty = c.y - towerH;
+    g.fillStyle(OUT, 0.85);
+    g.fillRect(c.x - 2, ty + 16, 3.4, 11);
+    for (const dx of [-11, -2, 7]) {
+      g.fillStyle(shade(PAL_STONE.top, 0.12), 1);
+      g.fillRect(c.x + dx, ty - 6, 6, 7);
+      g.lineStyle(1.4, OUT, 1);
+      g.strokeRect(c.x + dx, ty - 6, 6, 7);
+    }
+    isoRoof(g, c.x, ty - 6, 15, 8, 15, col, colDark);
+  }
+
+  // The keep, standing above the curtain, with the standard on top of it.
+  const kw = iw * 0.4;
+  const kh = ih * 0.4;
+  const keepH = 40;
+  isoBox(g, cx, topY - 2, kw, kh, keepH, STONE, STONE_D, shade(STONE, 0.2));
+  const kTop = topY - 2 - keepH;
+  g.fillStyle(OUT, 0.85);
+  g.fillRect(cx - 10, kTop + 12, 3.4, 12);
+  g.fillRect(cx + 7, kTop + 12, 3.4, 12);
+  isoRoof(g, cx, kTop, kw * 1.3, kh * 1.3, 24, TILE_ROOF, TILE_ROOF_D, col, colDark, 6);
+  mast(g, cx, kTop - kh * 1.3 - 18, col, colDark, 44);
+
+  banner(g, cx - hw * 0.5, cy + hh * 0.42, col, colDark, 30);
+  banner(g, cx + hw * 0.5, cy + hh * 0.42, col, colDark, 30);
+}
+
 // --- foundations ------------------------------------------------------------
 
 function buildFoundations(put) {
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
-    for (const fw of [2, 3]) {
+    // 1 for a wall segment, 4 for the Castle. Before these existed the renderer
+    // clamped every footprint into the 2-wide frame, which drew a wall under
+    // construction as a site four times its own size and a Castle site as
+    // something smaller than a Barracks.
+    for (const fw of [1, 2, 3, 4]) {
       const hw = fw * HALF_W;
       const hh = fw * HALF_H;
       const w = hw * 2 + 12;

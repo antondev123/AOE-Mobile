@@ -72,6 +72,13 @@ export const EV = {
   // { building, unitType } — training finished, unit spawned
   TRAINED: 'trained',
 
+  // { building, unit, player } — a unit stepped inside a building. It is gone
+  // from world.units at this point but still in world.entities and still counts
+  // for population; see the garrison notes in systems/combat.js.
+  GARRISON: 'garrison',
+  // { building, unit, player } — a unit stepped back out and is on the map again
+  UNGARRISON: 'ungarrison',
+
   // { player, building, tech, name } — a research was paid for and queued
   RESEARCH_START: 'researchStart',
   // { player, building, tech, name } — a research finished. The effect is

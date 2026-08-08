@@ -33,6 +33,7 @@
 
 import {
   UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES, PLAYER,
+  MILITARY_TYPES as ROSTER, BONUS_DAMAGE, ARMOR_CLASS,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
@@ -44,6 +45,7 @@ import {
 } from './economy.js';
 import { findPath } from './pathfinding.js';
 import { commandUnits, isIdle } from './unitAI.js';
+import { armorClassOf, isGarrisoned, garrisonCapacity, garrisonCount, ungarrisonAll } from './combat.js';
 import {
   AGE, TECHS, currentAge, hasTech, techsAt, queueResearch, researchRefusal,
   nextAgeTech,
@@ -146,7 +148,59 @@ const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
 const BUILD_RETRY_DELAY = 6;   // no infinite placement retries
 const FOUNDATION_STALL = 60;   // abandon a foundation nobody is finishing
 
-const MILITARY_TYPES = ['militia', 'archer'];
+// Every soldier in the game, read off UNIT_STATS rather than written out, so a
+// unit added to the roster is one this AI trains, counts, waves and defends
+// with, with no edit here. (It was a literal two-element list; that list is
+// exactly how an AI ends up still massing militia three units after the game
+// grew a counter system.)
+const MILITARY_TYPES = ROSTER.slice();
+
+// --- Composition -------------------------------------------------------------
+//
+// The AI has to answer what the player fielded, not just build "some army".
+// Two knobs do the whole job:
+//
+//   COUNTER_WEIGHT   how hard the observed enemy mix pulls the next unit choice.
+//                    High enough that massing one unit is punished, low enough
+//                    that the AI never chases a composition it has already been
+//                    beaten by — a bot that perfectly counters last minute's
+//                    army is a bot that always fights the last battle.
+//   MIX_CEILING      no single type may exceed this share of the army, however
+//                    good the counter maths says it is. This is the important
+//                    one: a pure-spearman army loses to anything that is not
+//                    cavalry, and an AI that reasons only from counters walks
+//                    into that every time the player shows it two knights.
+const COUNTER_WEIGHT = 2.2;
+const MIX_CEILING = 0.55;
+// What the AI builds when it has seen nothing of the player at all — the fog
+// means that is the normal state early on. AoE2's own default opening mix:
+// mostly infantry, a third archers, a scout out front.
+const DEFAULT_MIX = { militia: 0.45, archer: 0.35, scout: 0.2 };
+// Wood the army is never allowed to spend.
+//
+// Two of the five units cost wood, where the old two-unit roster had one, and
+// that turned out to matter more than it sounds. The wood line is what pays for
+// Houses — and the AI stalls harder on being housed than on anything else — so
+// a mix that quietly drinks 25 wood a soldier has to be held back from the last
+// of it. Sixty is two Houses and change.
+const MILITARY_WOOD_RESERVE = 60;
+// ...and more than that while the Town Center is the only building that can
+// bank wood at all. A decapitated base with 91 wood is a base that can afford
+// neither a Town Center (275) nor the Lumber Camp (100) that would let it earn
+// one: every villager sent to the trees fills its pack, finds nowhere to put it
+// and stands there, and the AI holds a thousand food for the rest of the match
+// while it starves for timber. chooseBuilding already knows how to climb out of
+// that hole; this is what stops it falling in.
+const REBUILD_WOOD_FLOAT = 100;
+
+// A raid this close to the Town Center puts villagers inside it rather than
+// running them in circles around it. Generous — by the time a scout is eight
+// tiles from the TC the villagers on that side are already dead if they walk.
+const GARRISON_PANIC_RADIUS = 11;
+// Villagers stay inside for at least this long after the last sign of trouble.
+// Shorter and the AI empties the Town Center into the raid that is still
+// standing there; much longer and it is idling its economy for free.
+const GARRISON_HOLD = 8;
 
 // --- Tech (ages and upgrades) -----------------------------------------------
 //
@@ -352,6 +406,7 @@ class EnemyAI {
     if (doRebalance) this.rebalanceAcc = 0;
 
     this.watchStuck();
+    this.ungarrisonWhenClear();
     this.manageConstruction();
     this.manageVillagers(doRebalance);
     this.manageTraining();
@@ -1189,7 +1244,10 @@ class EnemyAI {
 
   manageVillagers(doRebalance) {
     const w = this.world;
-    const villagers = this.myUnits('villager');
+    // A garrisoned villager is not on the map: it cannot be given a job, and
+    // handing it one would leave a phantom worker booked onto a bush nobody is
+    // standing at, which is how the rebalance starves a real resource.
+    const villagers = this.myUnits('villager').filter((v) => !isGarrisoned(v));
     if (!villagers.length) {
       this.jobs.clear();
       return;
@@ -1308,14 +1366,64 @@ class EnemyAI {
     return this.byNeed(free)[0] || RES.WOOD;
   }
 
+  /**
+   * The town is being raided: get the villagers off the field.
+   *
+   * Running them to the Town Center — which is what this used to do — is only
+   * half of what AoE2 players actually do, and it is the half that does not
+   * work: a villager standing *beside* a Town Center is still a villager a
+   * scout can kill, and a crowd of them milling on the doorstep is the single
+   * easiest thing in the game to farm. AoE2's answer is the bell: everybody
+   * inside, where they are untouchable, healing, and — because a garrisoned
+   * body is an extra arrow (see combat.js) — where they turn the Town Center
+   * into the thing that kills the raider.
+   *
+   * A villager already inside stays inside; ungarrisonWhenClear() lets them out
+   * again the moment the raid has been quiet for GARRISON_HOLD seconds, which
+   * is the other half of getting this right. An AI that garrisons and forgets
+   * has simply deleted its own economy.
+   */
   evacuate(villagers) {
     const safe = this.home;
+    const shelters = this.myBuildings().filter(
+      (b) => b.complete && !b.dead && garrisonCapacity(b) > garrisonCount(b),
+    );
+    this.garrisonUntil = this.world.time + GARRISON_HOLD;
+
     for (const v of villagers) {
-      if (dist(v.x, v.y, safe.x, safe.y) < 3) continue;
+      if (isGarrisoned(v)) continue;
       // Only re-order villagers actually near the fighting.
       if (this.threat && dist(v.x, v.y, this.threat.x, this.threat.y) > DEFEND_RADIUS) continue;
+
+      // Close enough to the shelter to reach it before the raider reaches them.
+      const shelter = shelters.length
+        ? shelters.reduce((a, b) =>
+          (dist(b.x, b.y, v.x, v.y) < dist(a.x, a.y, v.x, v.y) ? b : a))
+        : null;
+      if (shelter && dist(v.x, v.y, shelter.x, shelter.y) <= GARRISON_PANIC_RADIUS) {
+        this.jobs.delete(v.id);
+        this.command([v], { type: 'garrison', target: shelter });
+        continue;
+      }
+      // Too far to shelter, or nowhere with room left: the old behaviour, which
+      // is still the right one for a villager out at the far gold.
+      if (dist(v.x, v.y, safe.x, safe.y) < 3) continue;
       this.jobs.delete(v.id);
       this.command([v], { type: 'move', gx: safe.x, gy: safe.y });
+    }
+  }
+
+  /**
+   * Ring the all-clear. Called every think, not only while defending, because
+   * the state that has to end is "villagers are inside" — and that outlives the
+   * raid that caused it by exactly GARRISON_HOLD seconds.
+   */
+  ungarrisonWhenClear() {
+    if (!this.garrisonUntil) return;
+    if (this.defending || this.world.time < this.garrisonUntil) return;
+    this.garrisonUntil = 0;
+    for (const b of this.myBuildings()) {
+      if (garrisonCount(b) > 0) ungarrisonAll(this.world, b);
     }
   }
 
@@ -1380,48 +1488,157 @@ class EnemyAI {
       }
     }
 
-    // Barracks: militia and archers, roughly 2:1 melee:ranged.
-    const barracks = this.myBuildings('barracks').filter((b) => b.complete && !b.dead);
+    // Military buildings: whatever the counter maths says, at whichever of them
+    // can make it. The list is every building we own that trains a soldier, so
+    // an Archery Range or a Stable landing from another pass is picked up with
+    // no edit — see trainersFor().
+    const barracks = this.myBuildings().filter(
+      (b) => b.complete && !b.dead && (b.trains || []).some((t) => MILITARY_TYPES.includes(t)),
+    );
     if (!barracks.length) return;
 
-    const army = this.myUnits().filter(isMilitary);
-    let militia = 0;
-    let archers = 0;
-    for (const u of army) {
-      if (u.type === 'militia') militia++;
-      else archers++;
-    }
-    for (const b of barracks) {
-      for (const q of b.queue || []) {
-        if (q && q.type === 'militia') militia++;
-        else if (q && q.type === 'archer') archers++;
-      }
-    }
-
+    const have = this.armyCensus();
     for (const b of barracks) {
       const state = this.popState();
       if (state.room <= 0) break;
       if ((b.queue ? b.queue.length : 0) >= 2) continue;
 
-      // Aim for 2:1 melee:ranged. When food dries up the ratio drifts toward
-      // archers by necessity — they are the only unit that costs no food.
-      const foodTight = (r.food || 0) < 120 && this.foodInGround() < 150;
-      let type = foodTight ? 'archer' : (militia < archers * 2 ? 'militia' : 'archer');
-      if (!this.affordUnit(type, r)) {
-        const other = type === 'militia' ? 'archer' : 'militia';
-        if (!this.affordUnit(other, r)) break;
-        type = other;
-      }
-      // Leave the TC enough food to keep making villagers while still growing.
-      if (type === 'militia' && villagers < villTarget &&
-          r.food < UNIT_STATS.militia.cost.food + UNIT_STATS.villager.cost.food) {
-        continue;
-      }
-      if (this.train(b, type)) {
-        if (type === 'militia') militia++;
-        else archers++;
+      const type = this.chooseUnit(b, have, r, villagers < villTarget);
+      if (!type) continue;
+      if (this.train(b, type)) have[type] = (have[type] || 0) + 1;
+    }
+  }
+
+  /** Everything we have or have queued, by type. The AI's own order of battle. */
+  armyCensus() {
+    const out = {};
+    for (const t of MILITARY_TYPES) out[t] = 0;
+    for (const u of this.myUnits()) {
+      if (isMilitary(u)) out[u.type] = (out[u.type] || 0) + 1;
+    }
+    for (const b of this.myBuildings()) {
+      for (const q of b.queue || []) {
+        if (q && out[q.type] !== undefined) out[q.type]++;
       }
     }
+    return out;
+  }
+
+  /**
+   * What the *player* has on the field, by armour class, as far as we know.
+   *
+   * "As far as we know" is doing real work here: the AI reads the world
+   * directly, so this is still perfect information (HANDOFF-vision.md item 2
+   * remains open). What it is not is *stale* — the mix is recomputed every time
+   * a unit is queued, so a player who switches to knights is answered within a
+   * couple of production cycles rather than at the next wave.
+   */
+  foeArmorMix() {
+    const mix = {};
+    let total = 0;
+    for (const u of ownedBy(this.world, this.foeId, 'unit')) {
+      if (!isMilitary(u) || isGarrisoned(u)) continue;
+      const cls = armorClassOf(u);
+      mix[cls] = (mix[cls] || 0) + 1;
+      total++;
+    }
+    return { mix, total };
+  }
+
+  /**
+   * Score a unit type against what the enemy is fielding.
+   *
+   * The score is the average bonus damage this type would land across the
+   * enemy's actual army, normalised — so a spearman scores highly against a
+   * cavalry mass and zero against archers, which is precisely the judgement the
+   * bonus table already encodes. Nothing is hardcoded about which unit counters
+   * which; adding a unit to BONUS_DAMAGE is all it takes to be reasoned about.
+   */
+  counterScore(type, foe) {
+    if (!foe.total) return 0;
+    const table = BONUS_DAMAGE[type];
+    if (!table) return 0;
+    let sum = 0;
+    for (const cls of Object.keys(foe.mix)) sum += (table[cls] || 0) * foe.mix[cls];
+    return sum / foe.total;
+  }
+
+  /**
+   * The next soldier out of this building.
+   *
+   * Three filters, in the order they matter:
+   *   1. it has to be something this building trains and we can pay for;
+   *   2. no type may pass MIX_CEILING of the army — the guard against building
+   *      a perfect counter to one thing and losing to everything else;
+   *   3. among what is left, the best answer to what the player has, with the
+   *      default opening mix as the tiebreaker so a blind AI (which, with fog,
+   *      is the normal early state) still builds a sensible spread.
+   */
+  chooseUnit(building, have, r, wantMoreVillagers) {
+    const foe = this.foeArmorMix();
+    const total = Object.values(have).reduce((a, b) => a + b, 0);
+    // When food dries up the mix has to drift toward whatever does not eat —
+    // the archer is the only soldier that costs no food at all.
+    const foodTight = (r.food || 0) < 120 && this.foodInGround() < 150;
+
+    let best = null;
+    let bestScore = -Infinity;
+    for (const type of building.trains || []) {
+      if (!MILITARY_TYPES.includes(type)) continue;
+      const cost = UNIT_STATS[type] && UNIT_STATS[type].cost;
+      if (!cost) continue;
+      if (!this.affordUnit(type, r)) continue;
+      // Never spend the food the Town Center is queued on while we are still
+      // growing the economy that pays for all of this.
+      if (wantMoreVillagers && (cost.food || 0) > 0 &&
+          r.food < (cost.food || 0) + UNIT_STATS.villager.cost.food) continue;
+      if (foodTight && (cost.food || 0) > 0) continue;
+      // The same rule for the other resource a soldier can drink. See
+      // MILITARY_WOOD_RESERVE: an army is worth nothing if it costs the base
+      // the House it was about to build, or the ability to stand back up.
+      if ((cost.wood || 0) > 0 && r.wood < (cost.wood || 0) + this.woodReserve()) continue;
+      // The ceiling. Only bites once there is an army to be lopsided about.
+      if (total >= 4 && (have[type] || 0) / total >= MIX_CEILING) continue;
+
+      const score = (DEFAULT_MIX[type] || 0.1)
+        + COUNTER_WEIGHT * this.counterScore(type, foe)
+        // Spread: a type we already have plenty of is worth a little less, which
+        // is what keeps the mix a mix on a map where we have seen no enemy.
+        - (total > 0 ? (have[type] || 0) / total : 0);
+      if (score > bestScore) {
+        bestScore = score;
+        best = type;
+      }
+    }
+    // Everything was priced out by the food guard — take whatever we can pay
+    // for rather than leaving the building idle, which is how an AI ends up
+    // with 900 wood and no army.
+    if (!best) {
+      for (const type of building.trains || []) {
+        if (!MILITARY_TYPES.includes(type)) continue;
+        if (!this.affordUnit(type, r)) continue;
+        const cost = UNIT_STATS[type].cost;
+        if (foodTight && (cost.food || 0) > 0) continue;
+        if ((cost.wood || 0) > 0 && r.wood < (cost.wood || 0) + this.woodReserve()) continue;
+        return type;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * Wood that must survive whatever we are about to buy.
+   *
+   * Larger while the Town Center is the only thing that can bank a load of
+   * timber, because losing it in that state is unrecoverable rather than merely
+   * expensive — see REBUILD_WOOD_FLOAT.
+   */
+  woodReserve() {
+    const banked = this.myBuildings().some(
+      (b) => b.complete && !b.dead && b.type !== 'towncenter' &&
+        b.dropoff && b.dropoff.includes(RES.WOOD),
+    );
+    return banked ? MILITARY_WOOD_RESERVE : Math.max(MILITARY_WOOD_RESERVE, REBUILD_WOOD_FLOAT);
   }
 
   // --- tech ----------------------------------------------------------------
@@ -1599,7 +1816,9 @@ class EnemyAI {
 
   manageArmy() {
     const w = this.world;
-    const army = this.myUnits().filter(isMilitary);
+    // Soldiers sheltering inside a tower are still ours and still count for
+    // population, but they are not on the field and cannot be waved anywhere.
+    const army = this.myUnits().filter((u) => isMilitary(u) && !isGarrisoned(u));
 
     if (this.defending) {
       // Everything comes home, including whatever is mid-attack.

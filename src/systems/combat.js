@@ -20,6 +20,12 @@
 //               for hp-bar flash and retaliation
 //   postLeash   how far this particular engagement may be chased (see engage)
 //   attackMove  true while the unit is under an attack-move order — see below
+//   stance      'aggressive' | 'defensive' | 'standGround' | 'noAttack'. Absent
+//               on a unit nobody has set one on; read it through stanceOf(),
+//               never directly, so the default is applied in one place
+//   garrisonedIn the building this unit is sheltering inside, or null. A
+//               garrisoned unit is not in world.units at all — see the garrison
+//               section — so nothing in this file's main loop ever sees one
 //
 // world.projectiles is owned here and only read by the renderer.
 //
@@ -407,6 +413,14 @@ function callForHelp(world, attacker, victim) {
     if (e.target) return;                        // already in a fight
     if (e.task && e.state !== 'idle') return;    // under orders — do not hijack
     if (!canAttack(e, attacker)) return;
+    // Answering a cry for help is still auto-acquisition: the same two gates
+    // apply. A Stand Ground unit holds its spot however loudly its neighbour
+    // shouts, a No Attack unit never joins, and nobody charges something their
+    // side cannot see.
+    const stance = stanceOf(e);
+    if (stance === STANCE.NO_ATTACK) return;
+    if (stance === STANCE.STAND_GROUND && !inRange(e, attacker)) return;
+    if (!canSee(world, e, attacker)) return;
     engage(e, attacker, true);
   });
 }
@@ -437,8 +451,16 @@ function reactToDamage(world, attacker, target) {
     return;
   }
   // A soldier shot from out of aggro range charges whoever shot it, unless it
-  // is already busy with an order.
+  // is already busy with an order. Retaliation is auto-acquisition too, so it
+  // obeys the stance and the fog: a Stand Ground unit shot from six tiles away
+  // takes it rather than abandoning its post, and nothing charges an attacker
+  // hidden in the dark — which is precisely the tower or the archer you have
+  // not scouted yet.
   if (!target.target && !target.task && canAttack(target, attacker)) {
+    const stance = stanceOf(target);
+    if (stance === STANCE.NO_ATTACK) return;
+    if (stance === STANCE.STAND_GROUND && !inRange(target, attacker)) return;
+    if (!canSee(world, target, attacker)) return;
     engage(target, attacker, true);
   }
 }
@@ -485,11 +507,21 @@ function engage(u, target, auto) {
   if (auto) {
     u.postX = u.x;
     u.postY = u.y;
-    // The leash has to be able to reach what was picked. CHASE_LEASH is the
-    // floor, not the rule: a unit that deliberately chose a target at the edge
-    // of ENGAGE_RANGE must be allowed to walk to it and swing, or it would
+    const stance = stanceOf(u);
+    // Stand Ground is a leash of zero and means it: leashSnapped never drops a
+    // target the unit can hit from where it stands, so the unit fights whatever
+    // walks in and abandons it the step it walks out. No special case anywhere
+    // else in the file.
+    if (stance === STANCE.STAND_GROUND) {
+      u.postLeash = 0;
+      return;
+    }
+    // The leash has to be able to reach what was picked. The stance's figure is
+    // the floor, not the rule: a unit that deliberately chose a target at the
+    // edge of its scan must be allowed to walk to it and swing, or it would
     // oscillate between acquiring and trudging home.
-    u.postLeash = Math.max(CHASE_LEASH, edgeDist(target, u.x, u.y) + LEASH_MARGIN);
+    const leash = STANCE_LEASH[stance] ?? CHASE_LEASH;
+    u.postLeash = Math.max(leash, edgeDist(target, u.x, u.y) + LEASH_MARGIN);
   }
 }
 
@@ -536,7 +568,10 @@ export function updateCombat(world, dt) {
     }
 
     if (u.target && !canAttack(u, u.target)) dropTarget(u, false);
-    if (u.target && u.autoTarget && leashSnapped(u)) dropTarget(u, true);
+    // Whether a snapped leash walks the unit home is the difference between
+    // Aggressive and Defensive: an aggressive unit holds the ground it took, a
+    // defensive one goes back to the post it was covering. See returnsToPost.
+    if (u.target && u.autoTarget && leashSnapped(u)) dropTarget(u, returnsToPost(u));
     if (!u.target) acquire(world, u, dt);
     if (!u.target) continue;
 
@@ -554,6 +589,10 @@ export function updateCombat(world, dt) {
     fire(world, u, u.target);
   }
 
+  // Buildings heal what is sheltering in them and throw their volley. After the
+  // units, deliberately: a garrison arrow is loosed at the world the soldiers
+  // have already finished moving through.
+  updateBuildings(world, dt);
   updateProjectiles(world, dt);
 }
 
@@ -663,20 +702,102 @@ export function isAttackMoving(u) {
 }
 
 /**
+ * MAY THIS UNIT'S OWNER SEE THAT?
+ *
+ * The one rule auto-acquisition has to obey once there is a fog: a unit only
+ * ever picks a fight with something its side can actually see. Before this, a
+ * militia (line of sight 4) auto-acquired at ENGAGE_RANGE — 7.5 tiles — so it
+ * opened fire on enemies that were invisible to the player, and what the player
+ * saw was a target ring and a stream of arrows aimed at empty black ground.
+ * An archer, seeing 6 and engaging at 7.5, did the same. See HANDOFF-vision.md.
+ *
+ * This is deliberately *not* applied to a target the player picked by hand:
+ * `orderAttack` sets `target` directly, and an explicit order on something the
+ * player selected while it was visible keeps working as it walks into the dark.
+ * That is AoE2's rule too — you may chase what you saw, you may not shoot at
+ * what you never saw.
+ *
+ * A world with no vision system (an isolated unit test) sees everything, so
+ * nothing here depends on the fog having been built.
+ */
+export function canSee(world, u, e) {
+  const v = world && world.vision;
+  if (!v || typeof v.entityVisible !== 'function') return true;
+  if (u.player === null || u.player === undefined) return true;
+  return v.entityVisible(u.player, e);
+}
+
+/**
+ * The stance this unit is playing, defaulted rather than stored.
+ *
+ * world.js stamps no `stance` field at spawn (it is not this pass's file), so
+ * every read goes through here and an un-stanced unit gets the right default:
+ * soldiers hold ground aggressively, villagers never fight at all. Setting a
+ * stance is what writes the field, so an untouched army behaves exactly as it
+ * always did.
+ */
+export function stanceOf(u) {
+  if (!u || u.kind !== 'unit') return DEFAULT_STANCE;
+  if (u.stance && STANCE_LEASH[u.stance] !== undefined) return u.stance;
+  return isVillager(u) ? VILLAGER_STANCE : DEFAULT_STANCE;
+}
+
+/**
+ * Put a unit on a stance. Anything the new stance forbids is dropped at once —
+ * switching to No Attack while mid-swing has to stop the swing, or the control
+ * is a label rather than an order.
+ */
+export function setStance(u, stance) {
+  if (!u || u.kind !== 'unit') return false;
+  if (STANCE_LEASH[stance] === undefined) return false;
+  u.stance = stance;
+  if (stance === STANCE.NO_ATTACK && u.autoTarget) dropTarget(u, false);
+  // Stand Ground keeps a fight it can reach from where it stands and abandons
+  // one it would have to walk to; leashSnapped does exactly that with a leash
+  // of zero, so re-anchoring the post here is the whole implementation.
+  if (stance === STANCE.STAND_GROUND && u.autoTarget) {
+    u.postX = u.x;
+    u.postY = u.y;
+    u.postLeash = 0;
+  }
+  return true;
+}
+
+/** Does a snapped leash send this unit back to where the fight started? */
+function returnsToPost(u) {
+  const s = stanceOf(u);
+  return s === STANCE.DEFENSIVE || s === STANCE.STAND_GROUND;
+}
+
+/**
  * How far this unit looks for a fight right now.
  *
  * A unit with no job, and a unit deliberately attack-moving, both hold ground
  * actively (ENGAGE_RANGE). A unit parked mid-order only spares AGGRO_RANGE for
  * its surroundings, so ordinary traffic near a border does not start wars.
+ *
+ * The two passive stances cut it down to something they can honour: a Stand
+ * Ground unit that acquired at seven tiles would either have to walk (which it
+ * must not) or immediately drop the target (which looks broken), and a
+ * Defensive unit that acquired past its own leash would chase and turn round in
+ * the same breath. Both scan roughly as far as they are willing to act.
  */
-function acquireRange(u) {
+function acquireRange(u, stance) {
+  if (stance === STANCE.NO_ATTACK) return 0;
+  const reach = (u.range || 0) + (u.radius || 0);
+  if (stance === STANCE.STAND_GROUND) return reach + 1.0;
   if (isAttackMoving(u)) return ENGAGE_RANGE;
+  if (stance === STANCE.DEFENSIVE) {
+    return Math.max(reach + 1.0, STANCE_LEASH[STANCE.DEFENSIVE]);
+  }
   return u.task ? AGGRO_RANGE : ENGAGE_RANGE;
 }
 
 function acquire(world, u, dt) {
   // Villagers never pick fights.
   if (isVillager(u) || !(u.attack > 0) || u.fleeing) return;
+  const stance = stanceOf(u);
+  if (stance === STANCE.NO_ATTACK) return;
   // Busy under an order — leave it alone. (A unit unitAI has parked as 'idle'
   // is fair game even if it still carries a spent task object.) An attack-move
   // is the exception: engaging what it passes is the entire point of the order.
@@ -686,11 +807,18 @@ function acquire(world, u, dt) {
   if (u._acqTimer > 0) return;
   u._acqTimer = ACQUIRE_INTERVAL + phaseOf(u) * ACQUIRE_INTERVAL;
 
-  const range = acquireRange(u);
+  const range = acquireRange(u, stance);
+  if (range <= 0) return;
+  const standing = stance === STANCE.STAND_GROUND;
   let best = null;
   let bestScore = Infinity;
   forEachNear(world, u.x, u.y, range, (e) => {
     if (!canAttack(u, e)) return;
+    // The fog gate. Never auto-acquire what your side cannot see.
+    if (!canSee(world, u, e)) return;
+    // Stand Ground fights only what has walked into its reach — it may not take
+    // a single step, so a target it cannot hit from here is not a target.
+    if (standing && !inRange(u, e)) return;
     // Prefer live threats over masonry: buildings are pushed to the back.
     const bias = e.kind === 'building' ? range * range : 0;
     const score = edgeDist2(e, u.x, u.y) + bias;
@@ -701,4 +829,270 @@ function acquire(world, u, dt) {
   });
 
   if (best) engage(u, best, true);
+}
+
+// --- Garrison ---------------------------------------------------------------
+//
+// A garrisoned unit is lifted out of `world.units` but left in `world.entities`
+// and in its owner's `owned` set. That one asymmetry is the whole feature:
+//
+//   * every per-step loop in the game — movement, combat, separation, the
+//     spatial index, the renderer, the fog's viewer sweep — walks world.units,
+//     so the unit stops moving, stops being drawn, stops being shot at and
+//     stops lighting the map, with no per-system opt-out to remember;
+//   * recomputePop() in world.js walks `owned`, so it keeps costing population,
+//     which is exactly AoE2's rule and the reason garrisoning is a real choice
+//     rather than free storage.
+//
+// The building side is `building.garrison`, an array of live unit entities.
+// Capacity comes from BUILDING_STATS.garrisonCapacity where the building
+// declares one (the Watch Tower and the Castle do), and from the fallback table
+// in constants.js where it does not (the Town Center).
+
+/** Per-world garrison bookkeeping: one EV.REMOVED subscription, made lazily. */
+const GARRISON_CTX = new WeakMap();
+
+function garrisonCtx(world) {
+  let ctx = GARRISON_CTX.get(world);
+  if (ctx) return ctx;
+  ctx = { hooked: true };
+  GARRISON_CTX.set(world, ctx);
+  world.events.on(EV.REMOVED, (p) => {
+    const b = p && p.entity;
+    if (!b || b.kind !== 'building') return;
+    if (!b.garrison || !b.garrison.length) return;
+    // The building is gone. AoE2 kills what was inside it; this ejects it
+    // instead, wounded and standing in the rubble. Losing a Town Center is
+    // already the worst thing that can happen to a player on a phone, and
+    // silently deleting the eight villagers they sheltered in it turns a
+    // setback into an unrecoverable one with no visible cause.
+    ungarrisonAll(world, b, { force: true });
+  });
+  return ctx;
+}
+
+/** How many bodies this building can hold. 0 means it is not a shelter. */
+export function garrisonCapacity(building) {
+  if (!building || building.kind !== 'building') return 0;
+  const s = BUILDING_STATS[building.type];
+  const declared = s && s.garrisonCapacity;
+  const cap = declared === undefined
+    ? GARRISON_CAPACITY_FALLBACK[building.type]
+    : declared;
+  return cap > 0 ? cap | 0 : 0;
+}
+
+/** Bodies currently inside. */
+export function garrisonCount(building) {
+  return building && building.garrison ? building.garrison.length : 0;
+}
+
+/** Is this unit currently inside something? */
+export function isGarrisoned(u) {
+  return !!(u && u.garrisonedIn && !u.garrisonedIn.dead);
+}
+
+/** Why `unit` may not enter `building` right now, or null when it may. */
+export function garrisonRefusal(world, unit, building) {
+  if (!unit || unit.dead || unit.kind !== 'unit') return 'No such unit';
+  if (isGarrisoned(unit)) return 'Already garrisoned';
+  if (!building || building.dead || building.kind !== 'building') return 'No such building';
+  if (!building.complete) return 'Still under construction';
+  if (building.player !== unit.player) return 'Not your building';
+  const cap = garrisonCapacity(building);
+  if (cap <= 0) return `The ${(BUILDING_STATS[building.type] || {}).name || building.type} holds nobody`;
+  if (garrisonCount(building) >= cap) return 'Full';
+  return null;
+}
+
+export function canGarrison(world, unit, building) {
+  return garrisonRefusal(world, unit, building) === null;
+}
+
+/**
+ * Put a unit inside a building. Returns true when it went in.
+ *
+ * Everything the unit was doing is dropped: a garrisoned unit with a live task
+ * would resume walking the instant it came out somewhere else entirely.
+ */
+export function garrisonUnit(world, unit, building) {
+  if (garrisonRefusal(world, unit, building)) return false;
+  garrisonCtx(world);
+
+  if (!building.garrison) building.garrison = [];
+  building.garrison.push(unit);
+  unit.garrisonedIn = building;
+  unit.task = null;
+  unit.target = null;
+  unit.autoTarget = false;
+  unit._autoFor = null;
+  unit.path = null;
+  unit.pathIndex = 0;
+  unit.dest = null;
+  unit.vx = 0;
+  unit.vy = 0;
+  unit.returnTo = null;
+  unit.fleeing = false;
+  unit.state = 'garrisoned';
+  // Off the map: out of world.units, out of the selection, out of every loop.
+  const i = world.units.indexOf(unit);
+  if (i >= 0) world.units.splice(i, 1);
+  world.selection.delete(unit.id);
+
+  world.events.emit(EV.GARRISON, { building, unit, player: unit.player });
+  return true;
+}
+
+/**
+ * A free tile to step out onto. Rings outward from the footprint, so a full
+ * Town Center empties into the ground around it rather than stacking everybody
+ * on one square.
+ */
+function exitTile(world, building, ring) {
+  const ox = Math.floor(building.x - building.fw / 2);
+  const oy = Math.floor(building.y - building.fh / 2);
+  for (let y = oy - ring; y < oy + building.fh + ring; y++) {
+    for (let x = ox - ring; x < ox + building.fw + ring; x++) {
+      const onRing =
+        x === ox - ring || x === ox + building.fw + ring - 1 ||
+        y === oy - ring || y === oy + building.fh + ring - 1;
+      if (!onRing) continue;
+      if (!inBounds(world, x, y)) continue;
+      if (isBlocked(world, x, y)) continue;
+      if (world.terrain[y * world.width + x] === TERRAIN.WATER) continue;
+      return { x: x + 0.5, y: y + 0.5 };
+    }
+  }
+  return null;
+}
+
+/**
+ * Take a unit back out. `force` puts it out even with nowhere to stand (a
+ * building being destroyed under it), because the alternative is deleting it.
+ */
+export function ungarrisonUnit(world, unit, { force = false } = {}) {
+  const b = unit && unit.garrisonedIn;
+  if (!b) return false;
+
+  let spot = null;
+  for (let ring = 1; ring <= 6 && !spot; ring++) spot = exitTile(world, b, ring);
+  if (!spot && !force) return false;
+
+  const list = b.garrison || [];
+  const i = list.indexOf(unit);
+  if (i >= 0) list.splice(i, 1);
+  unit.garrisonedIn = null;
+
+  if (spot) {
+    unit.x = spot.x;
+    unit.y = spot.y;
+  }
+  unit.px = unit.x;
+  unit.py = unit.y;
+  unit.state = 'idle';
+  if (!world.units.includes(unit)) world.units.push(unit);
+
+  world.events.emit(EV.UNGARRISON, { building: b, unit, player: unit.player });
+  return true;
+}
+
+/** Empty a building. The HUD's one-tap control, and what a demolition does. */
+export function ungarrisonAll(world, building, opts = {}) {
+  if (!building || !building.garrison) return 0;
+  let n = 0;
+  for (const u of building.garrison.slice()) {
+    if (ungarrisonUnit(world, u, opts)) n++;
+  }
+  return n;
+}
+
+/**
+ * The building a unit should walk into, given a point the player tapped or a
+ * unit that wants shelter: the nearest of its owner's shelters with room.
+ */
+export function nearestShelter(world, unit, x = unit.x, y = unit.y) {
+  return findNearestGlobal(world, x, y, world.buildings, (b) =>
+    b.player === unit.player && b.complete && !b.dead &&
+    garrisonCapacity(b) > garrisonCount(b));
+}
+
+// --- Buildings that shoot ---------------------------------------------------
+//
+// Two sources of arrows, added together, exactly as AoE2 does it:
+//
+//   the building's own — a Watch Tower or a Castle declares `attack`,
+//   `attackRange` and `attackCooldown` in BUILDING_STATS (that half of the
+//   table belongs to the walls pass; this reads it and does nothing if it is
+//   absent, so a tower shoots the day its stats land with no edit here);
+//
+//   one per garrisoned body — which is what makes a Town Center full of
+//   villagers a real answer to a raid, and the reason garrisoning is the most
+//   AoE2-authentic defensive move in the game.
+//
+// A garrison arrow is worth GARRISON_ARROW_DAMAGE whoever threw it: an archer
+// inside a Town Center is firing through an arrow slit, not standing in a
+// field, and making the volley depend on *which* units are inside would be a
+// stat nobody can see from outside the building.
+
+function buildingWeapon(b) {
+  const s = BUILDING_STATS[b.type] || {};
+  const own = s.attack > 0 ? 1 : 0;
+  const garrison = garrisonCount(b);
+  const arrows = own + garrison;
+  if (arrows <= 0) return null;
+  return {
+    arrows,
+    ownDamage: s.attack || 0,
+    range: s.attackRange || GARRISON_DEFAULT_RANGE,
+    cooldown: s.attackCooldown || GARRISON_VOLLEY_COOLDOWN,
+    own,
+  };
+}
+
+/**
+ * Heal what is sheltering, and throw whatever the building has at whatever it
+ * can see. Called once per step from updateCombat.
+ */
+function updateBuildings(world, dt) {
+  for (const b of world.buildings) {
+    if (b.dead || !b.complete) continue;
+    const inside = b.garrison;
+    if (inside && inside.length) {
+      for (const u of inside) {
+        if (u.dead || u.hp >= u.maxHp) continue;
+        u.hp = Math.min(u.maxHp, u.hp + GARRISON_HEAL_PER_SEC * dt);
+      }
+    }
+
+    const w = buildingWeapon(b);
+    if (!w) continue;
+    b.cooldown = Math.max(0, (b.cooldown || 0) - dt);
+    if (b.cooldown > 0) continue;
+
+    // Nearest hostiles first, capped at the number of arrows we have. Units
+    // only: a building shooting at another building is a siege, not a volley.
+    const seen = [];
+    forEachNear(world, b.x, b.y, w.range + Math.max(b.fw, b.fh) / 2, (e) => {
+      if (e.kind !== 'unit' || e.dead || !(e.hp > 0)) return;
+      if (!isHostile(b, e)) return;
+      if (edgeDist2(e, b.x, b.y) > w.range * w.range) return;
+      // The same fog rule the units obey: a building does not shoot what its
+      // owner cannot see.
+      if (!canSee(world, b, e)) return;
+      seen.push(e);
+    });
+    if (!seen.length) continue;
+    seen.sort((p, q) => edgeDist2(p, b.x, b.y) - edgeDist2(q, b.x, b.y));
+
+    b.cooldown = w.cooldown;
+    b.attackAnim = Math.min(0.4, w.cooldown * 0.45);
+    for (let i = 0; i < w.arrows; i++) {
+      // Spread over what is there and then double up on the nearest, which is
+      // both what a defender wants and what stops eleven arrows chasing one
+      // scout that is already dead.
+      const target = seen[i < seen.length ? i : 0];
+      const damage = i < w.own ? w.ownDamage : GARRISON_ARROW_DAMAGE;
+      launchProjectile(world, b, target, damage);
+    }
+  }
 }

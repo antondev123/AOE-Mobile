@@ -50,6 +50,11 @@ function step(world, n = 1) {
     updateUnits(world, SIM_DT);
     updateCombat(world, SIM_DT);
     updateEconomy(world, SIM_DT);
+    // Vision last, exactly as GameScene does. It is not optional any more:
+    // auto-acquisition refuses to target anything its owner cannot see, so a
+    // harness that never lights the map is a harness in which nothing ever
+    // picks a fight.
+    world.vision.update();
     world.time += SIM_DT;
     world.tick++;
   }

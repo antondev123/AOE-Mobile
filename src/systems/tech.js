@@ -62,13 +62,15 @@ export function ageName(age) {
 // first barracks (105s) and its first wave (170s) out past the age-up, which is
 // the pacing the whole game is tuned and tested around. So: Dark.
 //
-// FORWARD-DECLARED KEYS. Several types below do not exist in BUILDING_STATS
-// yet — the Castle, the walls, the tower, the Market and the military buildings
-// are landing from another pass. They are named here anyway, and every list is
-// filtered against the keys that actually exist (see unlockedTypes), so a name
-// that is not a building yet is simply skipped and slots in by itself the
-// moment it appears. Nothing here throws on an unknown key, and nothing here
-// needs editing when one arrives.
+// FORWARD-DECLARED KEYS. Several types below still do not exist in
+// BUILDING_STATS — the Market, the military buildings, the university. They are
+// named here anyway, and every list is filtered against the keys that actually
+// exist (see unlockedTypes), so a name that is not a building yet is simply
+// skipped and slots in by itself the moment it appears. Nothing here throws on
+// an unknown key, and nothing here needs editing when one arrives. That is not
+// a hypothetical: the palisade, the stone wall, the tower and the Castle all
+// arrived exactly this way, and the only edit any of them needed here was
+// adding their gates beside them.
 export const AGE_UNLOCKS = {
   [AGE.DARK]: [
     'towncenter', 'house', 'mill', 'lumbercamp', 'miningcamp', 'farm',
@@ -396,6 +398,50 @@ export const TECHS = {
     cost: { food: 150, gold: 150 },
     time: 32,
     armor: { ranged: 1 },
+  },
+
+  // --- Third tiers ---------------------------------------------------------
+  //
+  // AoE2 puts these in the Imperial Age, which does not exist here. They sit in
+  // the Castle Age behind their own predecessors instead, and that is the right
+  // place for them now that the roster is five units wide rather than two: a
+  // player who has committed to an army needs somewhere to keep spending gold
+  // on it in the last three minutes of a match, and the alternative — more
+  // bodies — is capped by population and by how fast a barracks can train.
+  //
+  // They are deliberately expensive enough to be a real choice against two more
+  // knights, and each is folded out of sight in the HUD until its prerequisite
+  // is done (see the note on `gate` below), so the Barracks panel does not grow
+  // three buttons nobody can press yet.
+  blastfurnace: {
+    name: 'Blast Furnace',
+    blurb: '+1 melee attack',
+    at: ['blacksmith', 'barracks'],
+    age: AGE.CASTLE,
+    requires: 'ironcasting',
+    cost: { food: 275, gold: 225 },
+    time: 36,
+    attack: { melee: 1 },
+  },
+  ringarcherarmor: {
+    name: 'Ring Archer Armour',
+    blurb: '+1 ranged armour',
+    at: ['blacksmith', 'archeryrange', 'barracks'],
+    age: AGE.CASTLE,
+    requires: 'leatherarcher',
+    cost: { food: 250, gold: 250 },
+    time: 36,
+    armor: { ranged: 1 },
+  },
+  platemail: {
+    name: 'Plate Mail Armour',
+    blurb: '+1 melee armour',
+    at: ['blacksmith', 'barracks'],
+    age: AGE.CASTLE,
+    requires: 'chainmail',
+    cost: { food: 300, gold: 150 },
+    time: 36,
+    armor: { melee: 1 },
   },
 };
 

@@ -8,7 +8,7 @@ import {
 } from '../src/core/world.js';
 import {
   SIM_DT, PLAYER, ENEMY, MIN_DAMAGE, CHASE_LEASH, AGGRO_RANGE, UNIT_STATS,
-  PROJECTILE_SPEED,
+  PROJECTILE_SPEED, BONUS_DAMAGE,
 } from '../src/core/constants.js';
 import { EV } from '../src/core/events.js';
 import {
@@ -41,6 +41,15 @@ function eq(a, b, msg) {
 function step(world, n = 1) {
   for (let i = 0; i < n; i++) {
     reindex(world);
+    // Vision *before* combat here, where GameScene runs it after everything
+    // else. It is not optional any more: auto-acquisition refuses to target
+    // anything its owner cannot see, so a harness that never lights the map is
+    // a harness in which no unit ever picks a fight. Running it first only
+    // means the masks describe the world this step is about to act on rather
+    // than the one it just left — which for a file that spawns units and then
+    // immediately asserts about them is the difference between testing the
+    // rule and testing the one-step warm-up.
+    world.vision.update();
     updateCombat(world, SIM_DT);
     world.time += SIM_DT;
     world.tick++;
@@ -240,7 +249,14 @@ test("an archer's projectile spawns, travels and lands damage", () => {
   assert(p.x <= m.x + 0.001, 'and does not overshoot');
 
   stepUntil(w, () => m.hp < m.maxHp, 60);
-  eq(m.hp, m.maxHp - (UNIT_STATS.archer.attack - UNIT_STATS.militia.armor), 'arrow damage landed');
+  // attack + counter bonus - armour. The archer's +4 against the infantry
+  // armour class is part of the swing, applied by the same rule and at the same
+  // moment as a blacksmith upgrade — see BONUS_DAMAGE in constants.js.
+  eq(
+    m.hp,
+    m.maxHp - (UNIT_STATS.archer.attack + BONUS_DAMAGE.archer.infantry - UNIT_STATS.militia.armor),
+    'arrow damage landed',
+  );
   eq(w.projectiles.length, 0, 'arrow consumed on impact');
 });
 
@@ -345,8 +361,14 @@ test('villagers never auto-attack and flee when struck', () => {
 test('a soldier shot from out of aggro range charges the shooter', () => {
   const w = fresh();
   const a = spawnUnit(w, 'archer', ENEMY, 10, 10);
-  a.range = AGGRO_RANGE + 4; // a sniper, well outside what the militia can notice
-  const m = spawnUnit(w, 'militia', PLAYER, 10 + AGGRO_RANGE + 2, 10);
+  a.range = AGGRO_RANGE + 4; // a sniper, well outside what the victim can notice
+  // A scout rather than a militia, because of the fog: retaliation is
+  // auto-acquisition, so a unit only charges a shooter its side can actually
+  // see, and a militia (line of sight 4) cannot see anything seven tiles away.
+  // A scout sees 7 — shot from outside its vigilance but in plain view, which
+  // is the case this test is about. The other case, being shot out of the dark,
+  // is covered in tests/military.test.mjs.
+  const m = spawnUnit(w, 'scout', PLAYER, 10 + AGGRO_RANGE + 2, 10);
   a.target = m;
   assert(!inRange(m, a), 'militia cannot see or reach the archer');
   assert(inRange(a, m), 'but the archer can hit it');
@@ -369,7 +391,10 @@ test('leashing drops an auto-acquired target beyond CHASE_LEASH', () => {
   step(w, 2);
   eq(m.target, null, 'target dropped past the leash');
   eq(m.autoTarget, false, 'auto flag cleared');
-  assert(m.returnTo && m.returnTo.x === 10 && m.returnTo.y === 10, 'told to return to its post');
+  // It keeps the ground it took. Walking back to the post is what the
+  // *Defensive* stance does, and telling the two apart is the whole point of
+  // having stances — see tests/military.test.mjs.
+  eq(m.returnTo, undefined, 'an aggressive unit holds where the chase ended');
 
   // It must not re-acquire the same runaway from its post.
   step(w, 5);
@@ -776,7 +801,20 @@ test('a fight abroad never spends the alert budget owed to home', () => {
 
 test('two idle armies do not stand in lines staring at each other', () => {
   // The critic swept the gap: engaged at 4.5 tiles, frozen at 5.5. Sweep it.
-  for (let gap = 4.0; gap <= 7.0 + 1e-9; gap += 0.25) {
+  //
+  // Each line now travels with a scout, and that is not scaffolding — it is the
+  // rule the fog imposes. ENGAGE_RANGE is 7.5 and a militia's line of sight is
+  // 4, so a militia can only start a fight at seven tiles if something on its
+  // *side* is lighting that ground. A scout sees 7 and shares what it sees with
+  // the whole army, exactly as in AoE2. Without one, two melee lines six tiles
+  // apart genuinely cannot see each other — and neither can the player, which
+  // is why standing there is the correct behaviour rather than the old bug.
+  //
+  // The sweep therefore stops at 6.5 rather than at ENGAGE_RANGE: a pair of
+  // scouts lights a disc, not a corridor, and the far corner of a four-deep
+  // line seven tiles away falls outside it. What is being swept is the band the
+  // standoff actually lived in (4.5 to 5.5), with room either side.
+  for (let gap = 4.0; gap <= 6.5 + 1e-9; gap += 0.25) {
     const w = fresh();
     const mine = [];
     const foes = [];
@@ -784,6 +822,10 @@ test('two idle armies do not stand in lines staring at each other', () => {
       mine.push(spawnUnit(w, 'militia', PLAYER, 10, 8 + i));
       foes.push(spawnUnit(w, 'militia', ENEMY, 10 + gap, 8 + i));
     }
+    mine.push(spawnUnit(w, 'scout', PLAYER, 10, 9));
+    mine.push(spawnUnit(w, 'scout', PLAYER, 10, 10));
+    foes.push(spawnUnit(w, 'scout', ENEMY, 10 + gap, 9));
+    foes.push(spawnUnit(w, 'scout', ENEMY, 10 + gap, 10));
     step(w, 20); // one second of looking at each other
     const idle = [...mine, ...foes].filter((u) => !u.target).length;
     eq(idle, 0, `${gap.toFixed(2)} tiles apart: ${idle} soldiers did nothing`);
@@ -820,7 +862,9 @@ test('villagers are never dragged into a fight by any of this', () => {
 
 test('a target spotted at the edge of vigilance can actually be reached', () => {
   const w = fresh();
-  const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  // A scout: ENGAGE_RANGE is 7.5 and only a unit that can see that far (or an
+  // army with something that can) may legally acquire out there at all.
+  const m = spawnUnit(w, 'scout', PLAYER, 10, 10);
   const v = spawnUnit(w, 'villager', ENEMY, 10 + ENGAGE_RANGE - 0.2, 10);
   v.hp = v.maxHp = 100000;
   step(w);
@@ -869,7 +913,10 @@ test('an attack-moving soldier engages what it passes', () => {
 
 test('an attack-move reaches further than a unit parked mid-order', () => {
   const w = fresh();
-  const parked = spawnUnit(w, 'militia', PLAYER, 10, 10);
+  // A scout again: the point is the difference between AGGRO_RANGE (5) and
+  // ENGAGE_RANGE (7.5), and a unit that sees only 4 tiles can never demonstrate
+  // it — the fog would be the thing stopping it, not the order.
+  const parked = spawnUnit(w, 'scout', PLAYER, 10, 10);
   parked.task = { type: 'move', gx: 30, gy: 10 };
   parked.state = 'idle'; // unitAI parks units mid-order with a spent task
   spawnUnit(w, 'villager', ENEMY, 10 + AGGRO_RANGE + 1, 10);

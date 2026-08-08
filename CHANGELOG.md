@@ -227,3 +227,146 @@ when it finished; researching twice is checked for both no-op and no-double-
 charge; the age-up bill is compared against the table; and a synthetic Castle is
 injected into `BUILDING_STATS` mid-test to prove a building added by another pass
 gets age-gated with no edit to the unlock tables.
+
+## Castles and walls
+
+The last release shipped a resource with no sink. Across two ten-minute
+simulations both players' stone counters read exactly 150 — the starting figure,
+untouched, for the entire match — because nothing in the game cost any. This is
+the pass that gives stone a job.
+
+### The five buildings stone pays for
+
+| building | cost | hp | size | build | age |
+| --- | --- | --- | --- | --- | --- |
+| Palisade | 2 wood | 90 | 1x1 | 4s | Dark |
+| Palisade Gate | 20 wood | 130 | 1x1 | 8s | Dark |
+| Stone Wall | 5 stone | 420 | 1x1 | 8s | Feudal |
+| Stone Gate | 30 stone | 520 | 1x1 | 16s | Feudal |
+| Watch Tower | 100 stone + 25 wood | 380 | 1x1 | 22s | Feudal |
+| Castle | 250 stone | 1500 | 4x4 | 90s | Castle |
+
+Costs are AoE2's wherever the economy can carry them — a palisade really is 2
+wood, a stone wall really is 5 stone, a stone gate really is 30 — and cut where
+it cannot. The two cuts are the Watch Tower (AoE2: 125 stone) and the Castle
+(AoE2: 650). A villager on stone banks about 0.7 a second including its walk, so
+650 is fifteen villager-minutes, longer than the whole match; 250 is about four
+minutes of two villagers on a mine, which is a project you commit to rather than
+a number you read once and dismiss. The opening 150 stone now buys a tower, or
+thirty wall segments, or most of a Castle's first instalment — so the first stone
+mine is finally the decision `STARTING_RESOURCES` always claimed it was.
+
+The Castle is 4x4, trains militia and archers, banks all four resources like a
+Town Center (deliberately unlike AoE2 — 250 stone should buy a forward base that
+can hold the gold it was planted on), sees twelve tiles, and garrisons ten.
+
+### Walls that look like walls
+
+A wall segment's sprite is chosen by a four-bit mask of which of its four axis
+neighbours are also walls: post, four stubs, two straight runs, four corners,
+four tees, one cross. All sixteen are drawn per wall family per player — 64
+frames — rather than derived by rotation, because in this projection the two grid
+axes run in different screen directions and are lit differently, so an east-west
+run is not a north-south run turned round.
+
+Each case is assembled from one primitive: an isometric prism from the tile
+centre to the middle of one tile edge, one per connected direction, plus a post
+at the junction. Every limb ends exactly on the edge shared with its neighbour,
+so two segments meet with no gap and no overlap at any zoom without a single
+hand-placed pixel. Masks are recomputed only when a neighbour appears or
+disappears (`refreshWallsAround` in `world.js`) — four tile reads, never
+per-frame.
+
+Team colour is a band under each post's crenellations rather than a pennant per
+segment: the first cut drew a flag on every tile and a thirty-tile run came out
+as a picket fence with no findable ends. Pennants now mark only ends, lone posts
+and junctions.
+
+The atlas moved from 1024 to 2048 to hold all of this. A second atlas was the
+alternative and is worse — it would break the sprite batch every time the
+renderer alternates between a wall and anything else, which on a walled base is
+every few sprites.
+
+### Gates, and per-player passability
+
+`world.blocked` is one byte per tile and is read by A*'s inner loop, the
+line-of-sight sampler and every flood fill, so it could not become a map lookup.
+It gained a fourth value, `BLOCK_GATE`, plus a parallel `world.gateOwner` byte
+array read *only* when that value appears. A free tile therefore costs exactly
+the compare it always did, a blocked tile costs one more, and only a real gate
+tile — of which there are a handful on 9216 — touches the second array. Nothing
+allocates and nothing hashes.
+
+Every walkability API (`isWalkable`, `nearestWalkable`, `hasLineOfSight`,
+`findPath`, `findAdjacentStandTile`) now takes an optional player: pass it and
+that player's own gates are ground, omit it and every gate is a wall. The default
+is the conservative one, because a unit walking the long way round its own gate
+is an annoyance and an enemy strolling through it is the feature not existing.
+The path memo is keyed on the player for the same reason.
+
+A gate also physically opens — `BLOCK_FREE` — when its owner's units are within
+about two tiles and no hostile is within three and a half, and it never shuts on
+somebody standing in the doorway. That is both the visible animation and what
+makes gates work today, before the unit AI starts naming who is walking. Open and
+shut differ by a whole shape (an oak slab filling the arch, versus an empty
+threshold with the leaves folded back), not by a tint, so a player can see which
+of their gates is standing open from across the base.
+
+The enclosure fills treat a gate as *not* solid, so a wall line with a door in it
+can always be finished — which is the play the whole feature exists for.
+
+### Drawing a wall: the drag
+
+Arm a wall type and a one-finger drag draws the whole run under your finger. The
+run is an L along the two grid axes, longer leg first. Two other shapes were
+tried: a straight Bresenham line between the endpoints renders in isometric as a
+column of tiles touching only at their corners — the segments never share an
+edge, every mask comes out 0, and the "wall" is a stack of loose posts units walk
+straight through. A free-form path following the drag is unreadable under a
+thumb. The L is what AoE2 does and the only shape that is always four-connected.
+
+While dragging, the real connected sprites are previewed (not abstract markers —
+the question you are asking is "will this join up", and a row of highlights
+cannot answer it), refused segments stay in shape and turn red, and a label above
+the finger reads the live count and bill: *12 Stone Walls — 60 stone*.
+Affordability is evaluated cumulatively along the run, so with 12 stone in hand a
+five-tile line shows two green and three red.
+
+`wallDraw` is its own pointer mode. It never consults `effectiveDragMode()`, so
+it cannot be turned into a box-select by having units in hand or into a pan by
+not having any; two fingers still pan and pinch exactly as before, and putting a
+second finger down is also how you abandon a half-drawn run. There is no drag
+threshold — a press and release without moving is a one-tile run — so tapping and
+dragging are one code path rather than two rules that have to agree.
+
+Releasing charges for exactly the segments actually placed. A run drawn across a
+tree becomes a wall with a gap in it, not a wall that silently did nothing. The
+enclosure test runs once over the finished run rather than once per segment:
+forty bounded flood fills inside a drag handler is a visible stutter, and "does
+*this* brick trap anyone" was never the question the player was asking.
+
+### What is waiting on other files
+
+`HANDOFF-walls.md` has the details. In short: `combat.js` has to grow a
+buildings-that-shoot loop (the Castle and the Watch Tower already carry `attack`,
+`range`, `attackCooldown`, `cooldown`, `target` and `garrison` under the same
+field names a unit uses, and `volleySize()` returns AoE2's one-arrow-per-body),
+and `unitAI.js` should start passing `u.player` to the pathfinder and gain a
+garrison order. The building side of garrisoning is done: a unit inside is
+spliced out of `world.units` — so no loop anywhere has to learn the word — while
+staying in `world.entities` and on the population.
+
+### Tests
+
+`tests/walls.test.mjs`, 27 checks: all sixteen mask cases swept exhaustively,
+straight runs, corners, tees, removal re-opening its neighbours, and walls
+refusing to join to an enemy's wall or to a house. Gate passability is checked
+*through the real A\** with a wall spanning the whole map and one gate in it —
+the owner crosses, the enemy does not. Plus: a run charges for exactly what it
+places, runs out exactly when the purse does, refuses entirely when it would seal
+the player in but not when the enclosure is base-sized, the Castle is refused
+before the Castle Age and deducts exactly its listed stone after it, and a
+garrisoned unit leaves the map, keeps its population and adds an arrow.
+
+Screenshots in `screenshots/walls-*.png` are the other half of that: the sixteen
+variants meeting up is not a thing a headless test can see.

@@ -19,13 +19,14 @@
 import {
   MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
   ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT, PLAYER,
-  BUILDING_STATS,
+  BUILDING_STATS, isWallType, isGateType,
 } from '../core/constants.js';
+import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
 import {
   buildTextures, ATLAS, TILE_TEX_W, TILE_TEX_H, TILE_TEX_OFF_X, TILE_TEX_OFF_Y,
   terrainFrame, unitFrame, buildingFrame, foundationFrame, resourceFrame,
-  markerFrame, farmFrame, farmFoundationFrame,
+  markerFrame, farmFrame, farmFoundationFrame, wallFrame, gateFrame,
   oceanFrame, edgeBlendFrame, shoreFrame, BLOB_FRAME,
   TERRAIN_VARIANTS, RESOURCE_VARIANTS,
   TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
@@ -185,7 +186,25 @@ export function createRenderer(scene, world) {
   // --- state ---------------------------------------------------------------
   let ghost = null;      // { type, gx, gy, valid }
   let dragBox = null;    // screen-space { x, y, w, h }
+  let wallRun = null;    // { type, segments: [{ tx, ty, mask, valid }] }
   let t = 0;
+
+  // The live "12 segments — 60 stone" readout that follows the finger while a
+  // wall is being drawn. A Phaser text pinned to the screen rather than a HUD
+  // element, for one reason: it has to sit *next to the finger*, which is a
+  // position only the gesture knows, and reaching into the DOM HUD to move a
+  // node every pointermove is both slower and somebody else's file.
+  const runLabel = scene.add.text(0, 0, '', {
+    fontFamily: 'system-ui, -apple-system, Segoe UI, sans-serif',
+    fontSize: '15px',
+    color: '#f4ecd8',
+    backgroundColor: 'rgba(12,10,7,0.82)',
+    padding: { x: 8, y: 4 },
+  });
+  runLabel.setScrollFactor(0);
+  runLabel.setDepth(960000);
+  runLabel.setOrigin(0.5, 1);
+  runLabel.setVisible(false);
 
   const viewRect = { x: 0, y: 0, r: 0, b: 0 };
   const _wp0 = new Phaser.Math.Vector2();
@@ -204,8 +223,30 @@ export function createRenderer(scene, world) {
   }
   function buildingFrameFor(type, player, b) {
     if (type === 'farm') return farmFrame(player, farmStage(b));
+    if (isWallType(type)) return wallPieceFrame(type, player, b);
     const f = buildingFrame(type, player);
     return has(f) ? f : buildingFrame('house', player);
+  }
+
+  /**
+   * Which of a wall piece's sixteen connected variants to draw.
+   *
+   * The mask itself is the simulation's (core/world.js recomputes it whenever a
+   * neighbour appears or disappears, never per frame), so this is a lookup and a
+   * string join. A gate has only two orientations, taken from the same mask: a
+   * gate with an east or west neighbour stands across a wall running along +x.
+   * A gate with no neighbours at all has to guess, and guesses +x — placed on
+   * its own it is a door in a wall that does not exist yet.
+   */
+  function wallPieceFrame(type, player, b) {
+    const mask = (b && b.wallMask) | 0;
+    if (isGateType(type)) {
+      const axis = (mask & (WALL_E | WALL_W)) ? 0 : mask ? 1 : 0;
+      const f = gateFrame(type, player, axis, !!(b && b.gateOpen));
+      return has(f) ? f : gateFrame('palisadegate', player, axis, false);
+    }
+    const f = wallFrame(type, player, mask);
+    return has(f) ? f : wallFrame('palisade', player, mask);
   }
   function resourceFrameFor(type, variant) {
     const n = RESOURCE_VARIANTS[type];
@@ -293,6 +334,32 @@ export function createRenderer(scene, world) {
     dragBox = rect || null;
   }
 
+  /**
+   * Preview a whole run of wall foundations under the finger.
+   *
+   * `segments` is [{ tx, ty, mask, valid }] — the mask already resolved by the
+   * caller against the run itself, so the preview joins up exactly the way the
+   * built wall will. Pass null to clear.
+   */
+  function setWallPreview(type, segments) {
+    wallRun = (type && segments && segments.length) ? { type, segments } : null;
+  }
+
+  /** The floating cost/count label. Screen coordinates; null text hides it. */
+  function setWallReadout(text, sx, sy) {
+    if (!text) {
+      runLabel.setVisible(false);
+      return;
+    }
+    runLabel.setText(text);
+    const halfW = runLabel.width / 2 + 6;
+    runLabel.setPosition(
+      Math.max(halfW, Math.min(camera.width - halfW, sx)),
+      Math.max(runLabel.height + 6, sy),
+    );
+    runLabel.setVisible(true);
+  }
+
   // --- frame ---------------------------------------------------------------
 
   function update(alpha, dt) {
@@ -341,6 +408,7 @@ export function createRenderer(scene, world) {
     drawUnits(alpha, invZ);
     drawMemory();
     drawGhost();
+    drawWallRun();
 
     markerPool.trim();
     unitPool.trim();
@@ -449,7 +517,7 @@ export function createRenderer(scene, world) {
       if (!b.complete) {
         const fFrame = b.type === 'farm'
           ? farmFoundationFrame(player)
-          : foundationFrame(b.fw >= 3 ? 3 : 2, player);
+          : foundationFrame(footprintFrameWidth(b.fw), player);
         fo = origins.get(fFrame);
         const fs = bldPool.get();
         setFrame(fs, fFrame, origins);
@@ -662,7 +730,7 @@ export function createRenderer(scene, world) {
       if (!m.complete) {
         const fFrame = m.type === 'farm'
           ? farmFoundationFrame(player)
-          : foundationFrame(m.fw >= 3 ? 3 : 2, player);
+          : foundationFrame(footprintFrameWidth(m.fw), player);
         const fs = bldPool.get();
         setFrame(fs, fFrame, origins);
         fs.setPosition(wx, wy);
@@ -742,6 +810,51 @@ export function createRenderer(scene, world) {
     strokeDiamond(overlay, wx, wy, ohw, ohh);
   }
 
+  /**
+   * The wall run being dragged out.
+   *
+   * Drawn as the real connected sprites rather than as a row of highlight
+   * diamonds, because the whole question the player is asking while they drag is
+   * "will this line join up" — and a preview made of abstract markers cannot
+   * answer it. A refused segment keeps its shape and turns red, so a gap in the
+   * run is visible as a gap rather than as a missing sprite.
+   */
+  function drawWallRun() {
+    if (!wallRun) return;
+    const segs = wallRun.segments;
+    for (let i = 0; i < segs.length; i++) {
+      const seg = segs[i];
+      const cx = seg.tx + 0.5;
+      const cy = seg.ty + 0.5;
+      const wx = (cx - cy) * HALF_W;
+      const wy = (cx + cy) * HALF_H;
+      if (!visible(wx, wy)) continue;
+      const tint = seg.valid ? 0x5ce08d : 0xff5a5a;
+
+      const h = ghostPool.get();
+      setFrame(h, 'tile_hi', origins);
+      h.setOrigin(0.5, 0.5);
+      h.setPosition((seg.tx - seg.ty) * HALF_W, (seg.tx + seg.ty + 1) * HALF_H);
+      h.setDepth(depthFor(seg.tx, seg.ty, 0.5));
+      h.setTint(tint);
+      h.setAlpha(0.85);
+
+      const frame = buildingFrameFor(wallRun.type, PLAYER, {
+        wallMask: seg.mask, gateOpen: false,
+      });
+      const s = ghostPool.get();
+      setFrame(s, frame, origins);
+      s.setPosition(wx, wy);
+      s.setDepth(depthFor(cx, cy, 400));
+      if (seg.valid) {
+        s.setAlpha(0.8);
+      } else {
+        s.setTint(0xff8080);
+        s.setAlpha(0.55);
+      }
+    }
+  }
+
   function drawDragBox() {
     screenG.clear();
     if (!dragBox) return;
@@ -775,6 +888,7 @@ export function createRenderer(scene, world) {
     ghostPool.destroy();
     overlay.destroy();
     screenG.destroy();
+    runLabel.destroy();
     terrain.destroy();
     if (fog) fog.destroy();
   }
@@ -788,6 +902,8 @@ export function createRenderer(scene, world) {
     gridToScreen,
     setPlacementGhost,
     setDragBox,
+    setWallPreview,
+    setWallReadout,
     // Extras other systems may find useful; not part of the required contract.
     fx,
     atlas: ATLAS,
@@ -838,6 +954,17 @@ function farmStage(b) {
 
 function num(v) {
   return typeof v === 'number' && isFinite(v) ? v : undefined;
+}
+
+/**
+ * Which foundation art a footprint gets. There is one frame per whole-tile width
+ * from 1 (a wall segment) to 4 (the Castle); anything wider clamps to 4 rather
+ * than falling back to a frame that would draw the site smaller than the
+ * building going up on it.
+ */
+function footprintFrameWidth(fw) {
+  const w = Math.round(fw || 2);
+  return w < 1 ? 1 : w > 4 ? 4 : w;
 }
 
 /** Set a pooled sprite's frame and re-apply that frame's origin. */
