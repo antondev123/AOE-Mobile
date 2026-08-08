@@ -57,6 +57,9 @@ const GHOST_LIFT = 62;
 // A second pick probe this far below the touch compensates for sprites being
 // drawn above their tile: you tap a unit's chest, its feet own the tile.
 const PICK_PROBE_DOWN = 15;
+// How much closer a lower-ranked entity must be before it beats the preference
+// order (own units > own buildings > enemies > resources). Screen px.
+const TIER_SLACK = 14;
 const INERTIA_DAMP = 5.5;      // e-folds per second
 const INERTIA_MIN = 12;        // world px/s below which we stop
 const VELOCITY_WINDOW_MS = 90;
@@ -176,24 +179,29 @@ export function createInput(scene, world, renderer, hud) {
 
   /**
    * Best entity within TAP_PICK_RADIUS *screen* pixels of the touch.
-   * Fat-finger friendly: two probe points, footprint-aware distances and a
-   * strict preference order (own units > own buildings > enemies > resources).
+   *
+   * Fat-finger friendly: two probe points, footprint-aware distances, and the
+   * preference order own units > own buildings > enemies > resources.
+   *
+   * The preference is applied within a tolerance rather than absolutely: a
+   * better-ranked entity wins only if it is roughly as close to the finger as
+   * the nearest thing. Strict ranking would make an enemy standing in a melee
+   * with your own troops impossible to tap, which is exactly when you most want
+   * to attack it. Within TIER_SLACK the ranking decides; beyond it, aim wins.
    */
   function pickAt(sx, sy) {
     const z = camera.zoom || 1;
     const radius = TAP_PICK_RADIUS / z; // compare in unzoomed screen px
+    const slack = TIER_SLACK / z;
     const probes = [toGrid(sx, sy), toGrid(sx, sy + PICK_PROBE_DOWN)];
     // Cheap grid-space reject box around both probes.
     const gridPad = radius / HALF_H + 2;
 
-    let best = null;
-    let bestTier = 99;
-    let bestGap = Infinity;
+    const bestOf = [null, null, null, null, null]; // one candidate per tier
+    let minGap = Infinity;
 
     const consider = (e) => {
       if (!e || e.dead) return;
-      const tier = tierOf(e);
-      if (tier > bestTier) return;
       let gap = Infinity;
       for (const g of probes) {
         if (Math.abs(e.x - g.x) > gridPad + (e.fw || 1) || Math.abs(e.y - g.y) > gridPad + (e.fh || 1)) continue;
@@ -201,17 +209,19 @@ export function createInput(scene, world, renderer, hud) {
         if (d < gap) gap = d;
       }
       if (gap > radius) return;
-      if (tier < bestTier || gap < bestGap) {
-        best = e;
-        bestTier = tier;
-        bestGap = gap;
-      }
+      const tier = tierOf(e);
+      if (!bestOf[tier] || gap < bestOf[tier].gap) bestOf[tier] = { e, gap };
+      if (gap < minGap) minGap = gap;
     };
 
     for (const e of world.units) consider(e);
     for (const e of world.buildings) consider(e);
     for (const e of world.resources) consider(e);
-    return best;
+
+    for (const c of bestOf) {
+      if (c && c.gap <= minGap + slack) return c.e;
+    }
+    return null;
   }
 
   function onScreen(gx, gy, margin = 24) {

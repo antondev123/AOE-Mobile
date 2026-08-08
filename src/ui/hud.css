@@ -540,7 +540,11 @@ body {
 /* --- Landscape --------------------------------------------------------------- */
 
 @media (orientation: landscape) and (max-height: 500px) {
-  .sel-panel, .cmd-panel { min-height: 62px; padding: 4px 5px; }
+  .sel-panel, .cmd-panel { min-height: 58px; padding: 3px 5px; }
+  .hud-bottom { padding: 4px calc(var(--safe-r) + 6px) calc(var(--safe-b) + 4px) calc(var(--safe-l) + 6px); }
+  .sel-head { margin-bottom: 2px; }
+  .hpbar { margin-top: 3px; }
+  .mode-chip { min-height: 32px; font-size: 11px; }
   .sel-panel { flex: 0 0 156px; }
   .chip { min-width: 34px; min-height: 34px; }
   .chip .badge { width: 18px; height: 18px; font-size: 9px; }

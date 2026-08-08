@@ -29,10 +29,13 @@ const { updateCombat } = await import('../src/systems/combat.js');
 const { updateEconomy } = await import('../src/systems/economy.js');
 const { createEnemyAI } = await import('../src/systems/enemyAI.js');
 
+// Which modules the run actually used. ENEMYAI_STUBS=1 forces the stubs even
+// when the real files are present (see enemyai.loader.mjs).
+const FORCED = !!process.env.ENEMYAI_STUBS;
 const REAL = {
-  economy: realModule('systems/economy.js'),
-  unitAI: realModule('systems/unitAI.js'),
-  combat: realModule('systems/combat.js'),
+  economy: !FORCED && realModule('systems/economy.js'),
+  unitAI: !FORCED && realModule('systems/unitAI.js'),
+  combat: !FORCED && realModule('systems/combat.js'),
 };
 
 const STEPS = 12000; // 12000 * (1/20)s = 600s = 10 minutes of sim time

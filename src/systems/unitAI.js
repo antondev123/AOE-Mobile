@@ -81,10 +81,32 @@ const MAX_PATH_FAILS = 6;
 const MAX_APPROACH_TRIES = 4;
 
 // Separation steering.
+//
+// The cardinal rule: separation may never cancel movement. It is a steering
+// *bias*, not a competing force. A unit under orders keeps at least
+// (1 - SEP_MAX_BRAKE) of its step no matter how many neighbours lean on it,
+// which is what makes a head-on meeting resolve instead of settling into a
+// zero-velocity equilibrium.
 const SEP_RADIUS = 1.0;
-const SEP_GAIN_MOVING = 1.0;
-const SEP_GAIN_WORKING = 0.3;
+// Most of the correction goes sideways — that is the direction that actually
+// unpicks a jam — and only a little into slowing down.
+const SEP_CROSS_GAIN = 0.9;
+const SEP_MAX_BRAKE = 0.3;
+const SEP_MAX_YIELD = 0.5;
+// Units that are not going anywhere absorb the shove instead: idle ones step
+// aside readily, working ones only a little (they must stay in reach of the
+// tree they are chopping).
+const SEP_GAIN_IDLE = 0.7;
+const SEP_GAIN_WORKING = 0.35;
+// A neighbour standing still is a softer obstacle than one under orders, so
+// traffic flows around parked villagers rather than being stopped by them.
+const STATIONARY_WEIGHT = 0.55;
+// Below this the push is noise; ignoring it is what lets crowds settle.
 const SEP_DEADBAND = 0.02;
+// A push this close to head-on has no sideways component to exploit, so a side
+// is chosen deliberately (see sidestep below).
+const HEAD_ON_DOT = -0.5;
+const SIDESTEP_MIN = 0.35;
 
 // Formation spacing for group orders, in tiles.
 const FORMATION_SPACING = 1.0;
@@ -1152,9 +1174,27 @@ function checkStuck(world, u, dt, ctx) {
 // --- Local avoidance --------------------------------------------------------
 
 /**
- * Cheap separation steering. Units are points to the planner, so this is what
- * stops a group from occupying one spot; it is repulsion only (never attraction)
- * and dies out at contact distance, so crowds settle instead of vibrating.
+ * Local avoidance.
+ *
+ * Separation is applied as a *steering bias on top of movement*, never as an
+ * opposing force. The original version added a displacement of up to a full
+ * movement step against the direction of travel, which gave two units walking
+ * into each other a stable equilibrium at zero velocity: each cancelled the
+ * other's step exactly, and neither ever arrived. Villagers hauling gold across
+ * a shared route met head-on and froze there.
+ *
+ * Three things prevent that now:
+ *   1. The component that opposes travel is clamped to SEP_MAX_BRAKE, so a unit
+ *      under orders always retains most of its speed however deep the crowd.
+ *   2. A head-on push (nothing to slide along) is turned into a sidestep, taken
+ *      relative to the unit's *own* heading — so two units meeting nose to nose
+ *      peel off to opposite sides of the road, like traffic keeping right.
+ *      Deterministic, and it uses no randomness at all.
+ *   3. Units that are not going anywhere yield instead, and count for less as
+ *      obstacles, so moving traffic pushes through parked villagers.
+ *
+ * Stuck detection still exists, but as a genuine last resort for walls and
+ * impossible orders — not as the thing that unpicks crowds.
  */
 function separate(world, u, dt) {
   let px = 0;
@@ -1165,19 +1205,21 @@ function separate(world, u, dt) {
     if (e === u || e.dead || e.kind !== 'unit') return;
     let dx = u.x - e.x;
     let dy = u.y - e.y;
-    let d2 = dx * dx + dy * dy;
+    const d2 = dx * dx + dy * dy;
     const min = (u.radius + e.radius) * 1.15;
     if (d2 > min * min) return;
     let d = Math.sqrt(d2);
     if (d < 1e-4) {
-      // Exactly stacked (spawned on the same spot): break the tie by id so the
-      // result is deterministic and the two never chase each other.
+      // Exactly stacked (two units spawned on one spot): break the tie by id so
+      // the result is deterministic and the pair never chases itself. Uses the
+      // id rather than world.rng, which belongs to the seeded simulation.
       const a = u.id * 2.3999632;
       dx = Math.cos(a);
       dy = Math.sin(a);
       d = 1;
     }
-    const push = (min - d) / min;
+    const weight = e.dest ? 1 : STATIONARY_WEIGHT;
+    const push = ((min - d) / min) * weight;
     px += (dx / d) * push;
     py += (dy / d) * push;
     n++;
@@ -1187,11 +1229,56 @@ function separate(world, u, dt) {
   const mag = Math.hypot(px, py);
   if (mag < SEP_DEADBAND) return;
 
-  const gain = u.state === 'move' ? SEP_GAIN_MOVING : SEP_GAIN_WORKING;
-  const maxStep = u.speed * dt * gain;
-  const scale = Math.min(maxStep, mag * 0.5) / mag;
-  let nx = u.x + px * scale;
-  let ny = u.y + py * scale;
+  const step = u.speed * dt;
+  // How badly we are overlapping, 0..1 — scales the whole correction.
+  const strength = Math.min(1, mag);
+  px /= mag;
+  py /= mag;
+
+  let ox;
+  let oy;
+  const wp = u.dest ? currentWaypoint(u) : null;
+
+  if (wp) {
+    // --- Under orders: steer, do not stop. ---
+    let hx = wp.x - u.x;
+    let hy = wp.y - u.y;
+    const hl = Math.hypot(hx, hy);
+    if (hl < 1e-6) return;
+    hx /= hl;
+    hy /= hl;
+
+    const along = px * hx + py * hy;      // -1 head-on, +1 from behind
+    let cx = px - along * hx;             // the part that is pure sideways
+    let cy = py - along * hy;
+    let cl = Math.hypot(cx, cy);
+
+    if (cl < SIDESTEP_MIN && along < HEAD_ON_DOT) {
+      // Dead ahead: no sideways component exists to grow, so pick a side.
+      // Rotating our own heading by +90 degrees means two units approaching
+      // each other choose opposite sides of the road and slide past.
+      cx = -hy;
+      cy = hx;
+      cl = 1;
+    }
+    if (cl > 1e-6) { cx /= cl; cy /= cl; }
+    else { cx = 0; cy = 0; }
+
+    const brake = clamp(along, -SEP_MAX_BRAKE, SEP_MAX_YIELD) * step * strength;
+    const slide = SEP_CROSS_GAIN * step * strength;
+    ox = cx * slide + hx * brake;
+    oy = cy * slide + hy * brake;
+  } else {
+    // --- Not going anywhere: absorb the shove and get out of the way. ---
+    const working = u.state === 'gather' || u.state === 'build' ||
+      u.state === 'deposit' || u.state === 'attack';
+    const gain = working ? SEP_GAIN_WORKING : SEP_GAIN_IDLE;
+    ox = px * step * gain * strength;
+    oy = py * step * gain * strength;
+  }
+
+  let nx = u.x + ox;
+  let ny = u.y + oy;
 
   // Never let a shove push a unit inside a wall: slide along it instead.
   if (!isWalkable(world, nx, ny)) {

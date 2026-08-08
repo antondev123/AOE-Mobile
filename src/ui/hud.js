@@ -284,7 +284,10 @@ export function createHud(scene, world) {
       const own = g.player === PLAYER;
       const chip = el('button', `chip ${own ? '' : g.player == null ? 'neutral' : 'foe'}`);
       chip.appendChild(el('span', 'badge', ABBR[g.type] || g.type.slice(0, 3).toUpperCase()));
-      chip.appendChild(el('span', 'n', g.list.length > 1 ? `×${g.list.length}` : displayName(g.list[0]).slice(0, 8)));
+      // The header already names a lone selection — do not say it twice.
+      if (groups.size > 1 || g.list.length > 1) {
+        chip.appendChild(el('span', 'n', `×${g.list.length}`));
+      }
       chip.title = `${displayName(g.list[0])} ×${g.list.length}`;
       // Tapping a group narrows the selection to just that type (AoE2 habit).
       chip.addEventListener('click', () => {

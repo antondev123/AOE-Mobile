@@ -479,6 +479,81 @@ test('a new building across a path makes units re-plan, not freeze', () => {
   assert(arrived > 0, 'the unit should have re-planned around the new wall');
 });
 
+// --- Crowd resolution -------------------------------------------------------
+
+/**
+ * Watch every unit's speed while it is under orders. A unit that is trying to
+ * go somewhere must keep making real headway: crawling along at a fraction of
+ * its speed for seconds on end is the shape of a deadlock, and it is what a
+ * player sees as "my villagers are stuck".
+ */
+function runWatchingSpeed(w, units, steps, minSpeed = 0.4, windowSteps = 30) {
+  const hist = new Map(units.map((u) => [u.id, []]));
+  let worst = Infinity;
+  let worstId = null;
+  for (let i = 0; i < steps; i++) {
+    const before = units.map((u) => ({ x: u.x, y: u.y, ordered: !!(u.task && u.dest) }));
+    step(w);
+    units.forEach((u, k) => {
+      const h = hist.get(u.id);
+      h.push(before[k].ordered ? dist(u, before[k]) : null);
+      if (h.length > windowSteps) h.shift();
+      if (h.length === windowSteps && h.every((v) => v !== null)) {
+        const speed = h.reduce((a, b) => a + b, 0) / (windowSteps * SIM_DT);
+        if (speed < worst) { worst = speed; worstId = u.id; }
+      }
+    });
+  }
+  assert(
+    worst >= minSpeed,
+    `unit ${worstId} crawled at ${worst.toFixed(2)} tiles/s for ${(windowSteps * SIM_DT).toFixed(1)}s while under orders`,
+  );
+  return worst;
+}
+
+test('columns meeting head-on slide past each other instead of deadlocking', () => {
+  const w = blankWorld();
+  const east = [];
+  const west = [];
+  for (let i = 0; i < 5; i++) {
+    east.push(spawnUnit(w, 'villager', PLAYER, 8.5, 19.7 + i * 0.35));
+    west.push(spawnUnit(w, 'villager', PLAYER, 34.5, 19.7 + i * 0.35));
+  }
+  const all = [...east, ...west];
+  reindex(w);
+  commandUnits(w, east, { type: 'move', gx: 36.5, gy: 20.5 });
+  commandUnits(w, west, { type: 'move', gx: 6.5, gy: 20.5 });
+
+  // 28 tiles at 1.5 tiles/s = ~19s. Give them three times that.
+  const worst = runWatchingSpeed(w, all, 1200);
+  for (const u of all) {
+    assert(isIdle(u), `unit ${u.id} never finished its walk (state ${u.state})`);
+  }
+  console.log(`       slowest 1.5s window while under orders: ${worst.toFixed(2)} tiles/s`);
+});
+
+test('a shared gold line keeps flowing with full carry loads', () => {
+  // The reported freeze: several villagers on one distant node, loaded ones
+  // walking home while empty ones walk out along the same route.
+  const w = blankWorld();
+  const tc = spawnBuilding(w, 'towncenter', PLAYER, 10, 20);
+  const gold = spawnResource(w, 'gold', 32, 20);
+  const vils = [];
+  for (let i = 0; i < 6; i++) {
+    vils.push(spawnUnit(w, 'villager', PLAYER, 13.5 + (i % 2) * 0.5, 19.5 + Math.floor(i / 2) * 0.5));
+  }
+  recomputePop(w, PLAYER);
+  reindex(w);
+  commandUnits(w, vils, { type: 'gather', target: gold });
+
+  const gold0 = w.players[PLAYER].resources.gold;
+  const worst = runWatchingSpeed(w, vils, 3600); // three minutes
+  const banked = w.players[PLAYER].resources.gold - gold0;
+  assert(banked >= 150, `the gold line should keep delivering (banked ${banked})`);
+  for (const v of vils) assert(!isIdle(v), `villager ${v.id} stopped working`);
+  console.log(`       gold banked in 3 min: ${banked}; slowest window ${worst.toFixed(2)} tiles/s`);
+});
+
 // --- Real map integration ---------------------------------------------------
 
 test('on a generated map the opening villagers work without getting stuck', () => {
