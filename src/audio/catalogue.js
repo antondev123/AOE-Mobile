@@ -45,7 +45,7 @@ export const SOUNDS = {
   // briefly: three partials at non-integer ratios (1 : 1.47 : 2.09) over a
   // dull rock thud. The ratios are what stop it sounding like a bell.
   mine: {
-    gain: 0.42, priority: 0, coalesce: 0.09, maxVoices: 3,
+    gain: 0.5, priority: 0, coalesce: 0.09, maxVoices: 3,
     render(k) {
       const f = k.rand(0.94, 1.08);
       k.hiss({ buf: 'white', hp: 3200 * f, peak: 0.3, attack: 0.001, decay: 0.02 });
@@ -60,7 +60,7 @@ export const SOUNDS = {
   // Berries: a hand going into a bush. Pink noise through a bandpass that
   // falls as the branch springs back, with a soft attack so there is no click.
   forage: {
-    gain: 0.34, priority: 0, coalesce: 0.11, maxVoices: 3,
+    gain: 1.0, priority: 0, coalesce: 0.11, maxVoices: 3,
     render(k) {
       const f = k.rand(0.9, 1.15);
       k.hiss({ buf: 'pink', bp: 2100 * f, toFreq: 900 * f, sweep: 0.2, q: 0.9,
@@ -73,7 +73,7 @@ export const SOUNDS = {
   // wheat rather than fingers in a bush. Kept separate so a farm-heavy economy
   // does not sound identical to a berry-heavy one.
   farm: {
-    gain: 0.32, priority: 0, coalesce: 0.11, maxVoices: 3,
+    gain: 0.85, priority: 0, coalesce: 0.11, maxVoices: 3,
     render(k) {
       const f = k.rand(0.88, 1.06);
       k.hiss({ buf: 'pink', bp: 1400 * f, toFreq: 620 * f, sweep: 0.24, q: 0.8,
@@ -86,7 +86,7 @@ export const SOUNDS = {
   // staggered by ~35 ms read as several coins; perfectly simultaneous ones
   // read as a single chime.
   deposit: {
-    gain: 0.45, priority: 1, coalesce: 0.12, maxVoices: 2,
+    gain: 0.5, priority: 1, coalesce: 0.12, maxVoices: 2,
     render(k) {
       const f = k.rand(0.96, 1.06);
       k.tone({ type: 'sine', freq: 120, to: 78, peak: 0.4, attack: 0.004, decay: 0.16, lp: 600 });
@@ -114,7 +114,7 @@ export const SOUNDS = {
   // construction, so it is short, cheap, and randomly pitched: a fixed pitch
   // repeated every 400 ms becomes a metronome within seconds.
   hammer: {
-    gain: 0.4, priority: 0, coalesce: 0.1, maxVoices: 3,
+    gain: 0.5, priority: 0, coalesce: 0.1, maxVoices: 3,
     render(k) {
       const f = k.rand(0.85, 1.2);
       k.hiss({ buf: 'white', bp: 2600 * f, q: 1.6, peak: 0.3, attack: 0.001, decay: 0.022 });
@@ -176,7 +176,7 @@ export const SOUNDS = {
   // tension), the air is a short noise sweep behind it (the fletching). Very
   // quiet on purpose: a dozen archers volleying should be texture, not a wall.
   arrowLoose: {
-    gain: 0.34, priority: 1, coalesce: 0.06, maxVoices: 4,
+    gain: 0.55, priority: 1, coalesce: 0.06, maxVoices: 4,
     render(k) {
       const f = k.rand(0.94, 1.1);
       k.tone({ type: 'sawtooth', freq: 360 * f, to: 150 * f, glide: 0.07,
@@ -189,7 +189,7 @@ export const SOUNDS = {
   // Arrow landing. Duller and shorter than a melee hit — there is no metal
   // ring, just the shaft stopping and a low thump.
   arrowHit: {
-    gain: 0.38, priority: 1, coalesce: 0.07, maxVoices: 4,
+    gain: 0.5, priority: 1, coalesce: 0.07, maxVoices: 4,
     render(k) {
       const f = k.rand(0.9, 1.12);
       k.hiss({ buf: 'white', bp: 1500 * f, q: 1.6, peak: 0.3, attack: 0.001, decay: 0.035 });
@@ -202,7 +202,7 @@ export const SOUNDS = {
   // sweeping down) over a falling sine. It reads as "gone" without being a
   // scream, which matters in a game a child might play on a phone.
   unitDeath: {
-    gain: 0.4, priority: 2, coalesce: 0.09, maxVoices: 3,
+    gain: 0.55, priority: 2, coalesce: 0.09, maxVoices: 3,
     render(k) {
       const f = k.rand(0.9, 1.14);
       k.hiss({ buf: 'pink', bp: 1000 * f, toFreq: 320 * f, sweep: 0.3, q: 1.6,
@@ -237,7 +237,7 @@ export const SOUNDS = {
   // Selecting a unit. Almost subliminal: this fires on every tap, so anything
   // with a tail becomes irritating inside a minute.
   select: {
-    gain: 0.3, priority: 1, coalesce: 0.04, maxVoices: 2, positional: false,
+    gain: 0.42, priority: 1, coalesce: 0.04, maxVoices: 2, positional: false,
     render(k) {
       k.tone({ type: 'sine', freq: 880, peak: 0.3, attack: 0.002, decay: 0.045, lp: 3000 });
       k.hiss({ buf: 'white', hp: 4000, peak: 0.1, attack: 0.001, decay: 0.012 });
@@ -247,7 +247,7 @@ export const SOUNDS = {
   // Order accepted. Brighter than select and rising, so "I heard you" and
   // "I selected something" are distinguishable without looking.
   commandAck: {
-    gain: 0.34, priority: 1, coalesce: 0.05, maxVoices: 2, positional: false,
+    gain: 0.42, priority: 1, coalesce: 0.05, maxVoices: 2, positional: false,
     render(k) {
       k.tone({ type: 'triangle', freq: 660, peak: 0.28, attack: 0.003, decay: 0.06, lp: 3500 });
       k.tone({ type: 'triangle', freq: 990, peak: 0.24, attack: 0.003, decay: 0.1,
@@ -269,7 +269,7 @@ export const SOUNDS = {
   // A HUD button. Quieter and drier than `select` so the chrome never competes
   // with the world.
   buttonTap: {
-    gain: 0.26, priority: 1, coalesce: 0.04, maxVoices: 2, positional: false,
+    gain: 0.36, priority: 1, coalesce: 0.04, maxVoices: 2, positional: false,
     render(k) {
       k.tone({ type: 'sine', freq: 1250, peak: 0.24, attack: 0.001, decay: 0.03 });
       k.hiss({ buf: 'white', hp: 5000, peak: 0.08, attack: 0.001, decay: 0.01 });
@@ -302,7 +302,7 @@ export const SOUNDS = {
   // A villager is ready. Soft, domestic, two notes up a fourth. Fires often,
   // so it must be pleasant at the twentieth repetition.
   villagerTrained: {
-    gain: 0.32, priority: 2, coalesce: 0.12, maxVoices: 2, positional: false,
+    gain: 0.42, priority: 2, coalesce: 0.12, maxVoices: 2, positional: false,
     render(k) {
       k.tone({ type: 'sine', freq: 587.3, peak: 0.26, attack: 0.008, decay: 0.14, lp: 3000 });
       k.tone({ type: 'sine', freq: 784, peak: 0.24, attack: 0.008, decay: 0.26, lp: 3000, delay: 0.08 });
