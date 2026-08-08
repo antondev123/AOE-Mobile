@@ -139,18 +139,39 @@ function growForest(world, cx, cy, count, bases, minBaseDist) {
   }
 }
 
+// How close a *neutral* cluster may sit to any base.
+//
+// This is the number that decides whether a big map is a big map. A review of
+// the 96x96 release counted what was reachable within fifteen tiles of a Town
+// Center: 2200 food, 12900 wood, 8640 gold, 2200 stone. A ten-minute match at
+// around twenty villagers consumes roughly nine thousand resources in total, so
+// everything a full game needed was already inside a seven-hundred-tile pocket
+// the player never had to leave. The other ninety-two percent of the map was
+// scenery, and the Lumber Camp — justified by woodlines fifteen tiles out —
+// was answering a problem the generator never created.
+//
+// Pushing neutral clusters past twenty tiles is what forces the second base,
+// the forward camp and the fight over the middle. The guaranteed starting
+// clusters below are deliberately left close: the opening should still be about
+// assigning villagers, not about exploring.
+const NEUTRAL_MIN_BASE_DIST = 22;
+
 function scatterGold(world, bases) {
   const { rng } = world;
   // Neutral gold in the contested middle — worth fighting over.
   for (let i = 0; i < scaled(7); i++) {
     const cx = rng.int(8, MAP_W - 9);
     const cy = rng.int(8, MAP_H - 9);
-    placeCluster(world, cx, cy, 'gold', rng.int(3, 5), bases, 9);
+    placeCluster(world, cx, cy, 'gold', rng.int(3, 5), bases, NEUTRAL_MIN_BASE_DIST);
   }
   // A starting gold vein per player, a short walk from the Town Center.
+  //
+  // Three nodes, not four. Four held 1280 gold, which is 28 archers off a vein
+  // you never have to defend — enough to reach the end of a skirmish without
+  // contesting the middle even once. Three leaves you needing the map.
   for (const b of bases) {
     const dir = b.player === PLAYER ? 1 : -1;
-    placeCluster(world, b.x + 7 * dir, b.y - 4 * dir, 'gold', 4, bases, 4.5);
+    placeCluster(world, b.x + 7 * dir, b.y - 4 * dir, 'gold', 3, bases, 4.5);
   }
 }
 
@@ -175,11 +196,14 @@ function scatterStone(world, bases) {
   for (let i = 0; i < scaled(6); i++) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
-    placeCluster(world, cx, cy, 'stone', rng.int(3, 4), bases, 11);
+    placeCluster(world, cx, cy, 'stone', rng.int(3, 4), bases, NEUTRAL_MIN_BASE_DIST + 2);
   }
+  // Three nodes at fourteen tiles rather than four at ten. Stone is the
+  // resource you go and get once the first raid has told you that you need
+  // walls, so the starting mine should be a decision with a walk attached.
   for (const b of bases) {
     const dir = b.player === PLAYER ? 1 : -1;
-    placeCluster(world, b.x - 4 * dir, b.y + 10 * dir, 'stone', 4, bases, 6.5);
+    placeCluster(world, b.x - 5 * dir, b.y + 14 * dir, 'stone', 3, bases, 6.5);
   }
 }
 
@@ -189,7 +213,7 @@ function scatterBerries(world, bases) {
   for (let i = 0; i < scaled(6); i++) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
-    placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, 10);
+    placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, NEUTRAL_MIN_BASE_DIST);
   }
 }
 
@@ -219,9 +243,14 @@ function buildBase(world, base) {
   // second patch a little further out. Food is finite — with only the opening
   // patch both economies run dry around the six minute mark and armies decay
   // into archers, which cost no food.
+  //
+  // Eleven bushes held 2200 food, which fed a whole match on its own and made
+  // the Farm — the renewable food source the wood economy is supposed to feed
+  // into — something you never had to build. Seven is enough to open on and
+  // run out with, which is the point at which farms become a decision.
   const dir = player === PLAYER ? 1 : -1;
-  placeCluster(world, x - 5 * dir, y + 3 * dir, 'berry', 6, [], 0);
-  placeCluster(world, x + 4 * dir, y + 7 * dir, 'berry', 5, [], 0);
+  placeCluster(world, x - 5 * dir, y + 3 * dir, 'berry', 4, [], 0);
+  placeCluster(world, x + 4 * dir, y + 7 * dir, 'berry', 3, [], 0);
 
   // Three starting villagers, fanned out in front of the Town Center.
   const spawned = [];
