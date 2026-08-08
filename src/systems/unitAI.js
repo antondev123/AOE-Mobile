@@ -203,7 +203,11 @@ function rallyOrder(world, unit, r) {
  * Issue an order to a group of units.
  *
  * `order` = { type, gx, gy, target } where type is
- * 'move' | 'gather' | 'attack' | 'build' | 'stop' | 'patrol'.
+ * 'move' | 'attackMove' | 'gather' | 'attack' | 'build' | 'stop' | 'patrol'.
+ *
+ * 'attackMove' is a 'move' whose task carries `attackMove: true`; combat.js
+ * reads that flag (isAttackMoving) to keep acquiring while the unit walks, and
+ * tickMove() stops for the fight and resumes the walk afterwards.
  *
  * Called by ui/input.js for the player and by systems/enemyAI.js for the AI.
  * `units` may be entities, ids, an array or any iterable — selections travel in
@@ -663,6 +667,53 @@ function tickFlee(world, u, ctx) {
 
 function tickMove(world, u, dt, ctx) {
   const t = u.task;
+
+  // Attack-move: stop for the fight, then carry on to where you were sent.
+  //
+  // combat.js acquires the target (it scans wider for an attack-moving unit and
+  // keeps scanning while the unit walks) and does the damage. Without this hook
+  // it would swing once and the unit would keep walking past the enemy, which is
+  // the whole reason a deliberate attack-move looked broken.
+  if (t.attackMove) {
+    const target = u.target;
+    if (target && canAttack(u, target)) {
+      if (inRange(u, target)) {
+        clearMovement(u);
+        u.state = 'attack';
+        u.facing = dirIndex(target.x - u.x, target.y - u.y);
+        t.engaging = true;
+        return;
+      }
+      // Close the gap. Repath only when the quarry has actually moved, exactly
+      // as an ordered attack does.
+      const moved = t.lastX === undefined
+        ? Infinity
+        : Math.hypot(target.x - t.lastX, target.y - t.lastY);
+      if (!t.engaging || !u.dest || (moved > 1.2 && u.repathTimer <= 0)) {
+        t.engaging = true;
+        t.lastX = target.x;
+        t.lastY = target.y;
+        u.repathTimer = REPATH_COOLDOWN;
+        const p = approachPoint(world, u, target);
+        requestPath(world, u, p.x, p.y, ctx, false);
+      }
+      u.state = 'move';
+      return;
+    }
+    if (t.engaging) {
+      // Nothing left to fight here — resume the advance from where we stand.
+      t.engaging = false;
+      t.lastX = undefined;
+      t.lastY = undefined;
+      u.aiFails = 0;
+      u.returnTo = null;   // the destination is the order, not where we stood
+      clearMovement(u);
+      requestPath(world, u, t.gx, t.gy, ctx, false);
+      u.state = 'move';
+      return;
+    }
+  }
+
   if (!u.dest) {
     // Arrived (or the path ran out). Close enough counts.
     const d = Math.hypot(u.x - t.gx, u.y - t.gy);

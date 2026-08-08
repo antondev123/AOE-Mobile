@@ -392,6 +392,42 @@ test('an archer stops at its own range instead of walking into the enemy', () =>
   assert(gap > 1.5, `archer walked too close (${gap.toFixed(2)} tiles from the wall)`);
 });
 
+test('an attack-moving unit stops to fight, then carries on to its destination', () => {
+  const w = blankWorld();
+  const me = spawnUnit(w, 'militia', PLAYER, 6.5, 20.5);
+  const foe = spawnUnit(w, 'villager', ENEMY, 18.5, 20.5);
+  reindex(w);
+  const goal = { x: 40.5, y: 20.5 };
+  commandUnits(w, [me], { type: 'attackMove', gx: goal.x, gy: goal.y });
+  assert(me.task && me.task.attackMove, 'the task must carry the attack-move flag');
+  eq(me.task.type, 'move', 'it is still a walk, just a fighting one');
+
+  const engaged = stepUntil(w, 1200, () => me.state === 'attack');
+  assert(engaged > 0, 'the attack-mover walked past the enemy without engaging');
+  assert(dist(me, foe) < 2.0, `it should have closed on the enemy (${dist(me, foe).toFixed(2)} tiles)`);
+
+  const dead = stepUntil(w, 1200, () => foe.dead);
+  assert(dead > 0, 'the fight never resolved');
+
+  const arrived = stepUntil(w, 2400, () => dist(me, goal) < 1.0);
+  assert(arrived > 0, `it never resumed the advance (stopped at ${me.x.toFixed(1)},${me.y.toFixed(1)})`);
+  stepUntil(w, 60, () => isIdle(me));
+  assert(isIdle(me), 'and it settles once the order is done');
+});
+
+test('a plain move order still walks past a fight', () => {
+  const w = blankWorld();
+  const me = spawnUnit(w, 'militia', PLAYER, 6.5, 20.5);
+  const foe = spawnUnit(w, 'villager', ENEMY, 18.5, 22.5);
+  reindex(w);
+  const goal = { x: 40.5, y: 20.5 };
+  commandUnits(w, [me], { type: 'move', gx: goal.x, gy: goal.y });
+  assert(!me.task.attackMove, 'an ordinary move is not an attack-move');
+  const arrived = stepUntil(w, 2400, () => dist(me, goal) < 1.0);
+  assert(arrived > 0, 'a plain move order should not be derailed by a passing enemy');
+  assert(!foe.dead, 'a unit under a move order does not go hunting');
+});
+
 test('a unit killed mid-order leaves no dangling task', () => {
   const w = blankWorld();
   const me = spawnUnit(w, 'militia', PLAYER, 6.5, 6.5);
