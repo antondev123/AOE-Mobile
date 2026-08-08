@@ -7,9 +7,11 @@
   "scripts": {
     "serve": "python3 -m http.server 8080",
     "test": "node --test tests/",
-    "smoke": "node tests/smoke.mjs"
+    "smoke": "node tests/smoke.mjs",
+    "standalone": "node tools/build-standalone.mjs"
   },
   "devDependencies": {
+    "esbuild": "^0.28.1",
     "playwright-core": "^1.49.0"
   }
 }
