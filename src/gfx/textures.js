@@ -104,7 +104,7 @@ export function shoreFrame(edge) {
 export const BLOB_FRAME = 'tr_blob';
 
 export const TERRAIN_VARIANTS = [4, 4, 3, 3]; // grass, dirt, water, sand
-export const RESOURCE_VARIANTS = { tree: 3, berry: 2, gold: 3 };
+export const RESOURCE_VARIANTS = { tree: 3, berry: 2, gold: 3, stone: 3 };
 
 // How many tiles of sea are actually tiled around the island before the flat
 // deep-water fill takes over. The last ramp colour equals the fill, so the
@@ -849,6 +849,14 @@ const BSPEC = {
   barracks: { fw: 3, fh: 3, wallH: 38, roofH: 24, crenels: true, w: 200, h: 175 },
   mill: { fw: 2, fh: 2, wallH: 30, roofH: 22, blades: true, w: 140, h: 118 },
   farm: { fw: 2, fh: 2, w: 140, h: 100, stages: 3 },
+  // The two forward drop-offs share a body — a low 2x2 timber shed — and are
+  // told apart by what is stacked outside them. That is deliberate: they do the
+  // same job, they are built for the same reason, and a player scanning their
+  // base needs to read "drop-off" first and "which one" second. Both sit lower
+  // than the Mill so a camp planted at the edge of a woodline does not compete
+  // with the buildings that matter for attention.
+  lumbercamp: { fw: 2, fh: 2, wallH: 24, roofH: 17, logs: true, w: 140, h: 106 },
+  miningcamp: { fw: 2, fh: 2, wallH: 24, roofH: 17, ore: true, w: 140, h: 106 },
 };
 
 // The Town Center's roof is deliberately neither team colour. Packed bases put
@@ -993,6 +1001,85 @@ function drawBuilding(g, type, s, cx, cy, col, colDark) {
     g.fillCircle(cx, hubY, 3.4);
     g.lineStyle(1.6, OUT, 1);
     g.strokeCircle(cx, hubY, 3.4);
+  }
+
+  // A stack of felled trunks against the near wall: the one prop that says
+  // "wood arrives here" without any text, and the reason a Lumber Camp is
+  // recognisable at a glance from the Mining Camp it otherwise duplicates.
+  if (s.logs) {
+    const bx = cx - iw * 0.55;
+    const by = cy + ih * 0.35;
+    const logRow = (ox, oy, n) => {
+      for (let i = 0; i < n; i++) {
+        const x = ox + i * 9;
+        g.fillStyle(WOOD_D, 1);
+        g.fillRoundedRect(x - 4.5, oy - 4.5, 9, 9, 3);
+        g.lineStyle(1.8, OUT, 1);
+        g.strokeRoundedRect(x - 4.5, oy - 4.5, 9, 9, 3);
+        // End grain, so the stack reads as cut trunks and not as barrels.
+        g.fillStyle(0xc59a5f, 1);
+        g.fillCircle(x, oy, 2.6);
+        g.lineStyle(1, shade(WOOD_D, -0.2), 1);
+        g.strokeCircle(x, oy, 1.4);
+      }
+    };
+    logRow(bx, by, 3);
+    logRow(bx + 4.5, by - 8, 2);
+    // A saw leaning against the pile, blade-out so its teeth catch the eye.
+    g.lineStyle(3.2, OUT, 1);
+    g.beginPath();
+    g.moveTo(bx - 8, by + 4);
+    g.lineTo(bx + 6, by - 18);
+    g.strokePath();
+    g.lineStyle(1.8, STEEL, 1);
+    g.beginPath();
+    g.moveTo(bx - 8, by + 4);
+    g.lineTo(bx + 6, by - 18);
+    g.strokePath();
+  }
+
+  // ...and for the Mining Camp, a heap of ore with a pick stood in it. Grey
+  // rock with both a gold and a pale-stone nugget on top, because this one
+  // building banks both of the things you dig out of the ground.
+  if (s.ore) {
+    const bx = cx - iw * 0.55;
+    const by = cy + ih * 0.35;
+    const heap = [
+      { x: bx - 7, y: by - 1 },
+      { x: bx + 6, y: by },
+      { x: bx, y: by - 8 },
+    ];
+    g.fillStyle(OUT, 1);
+    for (const h of heap) g.fillCircle(h.x, h.y, 7.4);
+    g.fillStyle(0x6a747f, 1);
+    for (const h of heap) g.fillCircle(h.x, h.y, 6);
+    g.fillStyle(0x8d99a6, 1);
+    for (const h of heap) g.fillCircle(h.x - 1.4, h.y - 1.8, 4);
+    g.fillStyle(0xf5c333, 1);
+    g.fillCircle(bx + 2, by - 11, 2.6);
+    g.fillStyle(0xd8e2ec, 1);
+    g.fillCircle(bx - 5, by - 9, 2.4);
+    // The pick: haft, then a steel head across the top.
+    g.lineStyle(3.2, OUT, 1);
+    g.beginPath();
+    g.moveTo(bx + 9, by + 3);
+    g.lineTo(bx + 3, by - 19);
+    g.strokePath();
+    g.lineStyle(1.8, WOOD, 1);
+    g.beginPath();
+    g.moveTo(bx + 9, by + 3);
+    g.lineTo(bx + 3, by - 19);
+    g.strokePath();
+    g.lineStyle(3.4, OUT, 1);
+    g.beginPath();
+    g.moveTo(bx - 4, by - 22);
+    g.lineTo(bx + 10, by - 17);
+    g.strokePath();
+    g.lineStyle(2, STEEL_D, 1);
+    g.beginPath();
+    g.moveTo(bx - 4, by - 22);
+    g.lineTo(bx + 10, by - 17);
+    g.strokePath();
   }
 
   banner(g, cx + iw * 0.72, cy + 3, col, colDark, 26);
@@ -1689,6 +1776,11 @@ const RES_TEX = {
   tree: { w: 52, h: 66, cx: 26, ft: 60 },
   berry: { w: 46, h: 40, cx: 23, ft: 34 },
   gold: { w: 48, h: 42, cx: 24, ft: 36 },
+  // Taller and wider than the gold vein on purpose. At 0.7 zoom on a 390px
+  // phone the two are four pixels apart in silhouette, so the difference has to
+  // be carried by more than colour: a stone mine is a stack of blocky boulders
+  // that stands proud of the ground, gold is a low scatter of rubble.
+  stone: { w: 50, h: 46, cx: 25, ft: 40 },
 };
 
 function buildResources(put, rng) {
@@ -1703,6 +1795,10 @@ function buildResources(put, rng) {
   const go = RES_TEX.gold;
   for (let v = 0; v < RESOURCE_VARIANTS.gold; v++) {
     put(resourceFrame('gold', v), go.w, go.h, go.cx, go.ft, (g) => drawGold(g, go, v, rng));
+  }
+  const st = RES_TEX.stone;
+  for (let v = 0; v < RESOURCE_VARIANTS.stone; v++) {
+    put(resourceFrame('stone', v), st.w, st.h, st.cx, st.ft, (g) => drawStone(g, st, v, rng));
   }
   // Stump left behind when a tree is chopped out.
   put('r_stump_0', 30, 22, 15, 17, (g) => {
@@ -1811,6 +1907,89 @@ function drawGold(g, go, v, rng) {
     g.fillCircle(cx + dx, ft + dy, 2.3);
     g.fillStyle(0xfff0a8, 1);
     g.fillCircle(cx + dx - 0.7, ft + dy - 0.8, 1);
+  }
+}
+
+/**
+ * A stone mine: a cluster of squared-off grey boulders with a chiselled face.
+ *
+ * The whole job of this drawing is to not be the gold vein. Gold reads warm —
+ * grey rubble carrying bright yellow spots of ore, lit like a scatter of
+ * pebbles. Stone reads cool and heavy: bluish slate, no warm hue anywhere in
+ * the palette, boulders drawn as isometric *blocks* with a flat top face rather
+ * than as lumps, and one exposed quarry face of pale rock instead of glinting
+ * specks. At a glance across a minimap-sized sprite the cue is the silhouette
+ * (stacked cubes against a low mound) before it is ever the colour.
+ */
+function drawStone(g, st, v, rng) {
+  const { cx, ft } = st;
+  groundShadow(g, cx, ft - 1, 30, 11);
+
+  // Cool slate, deliberately with no warm component: side by side with the gold
+  // vein's rocks (0x8b8b93, which carries a faint violet) this reads bluer and
+  // darker, and never picks up the yellow.
+  const FACE_L = 0x707d8a;
+  const FACE_R = 0x5b6774;
+  const TOP = 0x94a2af;
+  const CHIP = 0xc3cedb;
+
+  // Three blocks: two squat ones on the ground and one perched across them, so
+  // the cluster has a stepped profile rather than a single blob.
+  const blocks = [
+    { x: cx - 10, y: ft - 5, hw: 10, hh: 5, h: 11 },
+    { x: cx + 9, y: ft - 4, hw: 9, hh: 4.5, h: 9 },
+    { x: cx + (v === 1 ? -3 : 2), y: ft - 13, hw: 9, hh: 4.5, h: 12 },
+  ];
+  // v === 2 shoulders the top block over to the other side, so a cluster of
+  // three mines beside each other does not look like one sprite stamped thrice.
+  if (v === 2) blocks[2].x = cx - 6;
+
+  for (const b of blocks) {
+    const topY = b.y - b.h;
+    const top = [
+      { x: b.x, y: topY - b.hh },
+      { x: b.x + b.hw, y: topY },
+      { x: b.x, y: topY + b.hh },
+      { x: b.x - b.hw, y: topY },
+    ];
+    // Left and right walls, drawn as quads hanging off the top diamond.
+    g.fillStyle(FACE_L, 1);
+    g.fillPoints([
+      { x: b.x - b.hw, y: topY },
+      { x: b.x, y: topY + b.hh },
+      { x: b.x, y: topY + b.hh + b.h },
+      { x: b.x - b.hw, y: topY + b.h },
+    ], true, true);
+    g.fillStyle(FACE_R, 1);
+    g.fillPoints([
+      { x: b.x + b.hw, y: topY },
+      { x: b.x, y: topY + b.hh },
+      { x: b.x, y: topY + b.hh + b.h },
+      { x: b.x + b.hw, y: topY + b.h },
+    ], true, true);
+    g.fillStyle(TOP, 1);
+    g.fillPoints(top, true, true);
+    g.lineStyle(2, OUT, 1);
+    g.strokePoints(top, true, true);
+    g.beginPath();
+    g.moveTo(b.x - b.hw, topY);
+    g.lineTo(b.x - b.hw, topY + b.h);
+    g.lineTo(b.x, topY + b.hh + b.h);
+    g.lineTo(b.x + b.hw, topY + b.h);
+    g.lineTo(b.x + b.hw, topY);
+    g.strokePath();
+  }
+
+  // The quarried face: a few pale chips knocked off the rock, cool white rather
+  // than the gold vein's yellow, so the two never read as the same material.
+  const chips = [[-12, -12], [-7, -7], [8, -9], [12, -6], [0, -20], [-4, -16]];
+  for (const [dx, dy] of chips) {
+    g.fillStyle(CHIP, 0.9);
+    g.fillTriangle(
+      cx + dx, ft + dy,
+      cx + dx + 3.4, ft + dy + 1.2,
+      cx + dx + 0.8, ft + dy + 3.4,
+    );
   }
 }
 

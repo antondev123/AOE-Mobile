@@ -22,12 +22,24 @@ import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 // --- Tuning (local to this module; constants.js is read-only for me) --------
 //
 // GATHER_RATE in constants.js is AoE2's real-time pace (~0.5/sec), which makes
-// a 10-unit trip take ~20 seconds — far too slow to read as a *loop* on a phone
-// in a 10-minute skirmish. Scaling by GATHER_SPEED compresses the harvest leg
-// to ~3 seconds, so with a 3-4 tile walk each way a full round trip lands
-// around 8-10 seconds: long enough to see the villager work, short enough that
-// the food counter visibly ticks up.
-export const GATHER_SPEED = 6.0;
+// a 10-unit trip take ~20 seconds. GATHER_SPEED is the one dial that sets how
+// compressed this skirmish is against that.
+//
+// It used to be 6.0, which put the harvest leg at ~3 seconds. That was too fast
+// to be a strategy game: a villager finished a pack before you could finish
+// reading the HUD, the whole opening was over in ninety seconds, and there was
+// never a moment where nothing needed tapping. 2.5 is the AoE2 rhythm at
+// skirmish length — measured beside a Town Center, a full pack now takes 7.3s
+// on berries, 8.0s on wood, 8.9s on gold and 9.5s on stone, and with a 3-4 tile
+// walk each way (villagers move at 1.35 tiles/s) a round trip measures 12-14
+// seconds. That is roughly 0.75 resources/second per villager, so a villager
+// pays for the next villager in about a minute of its own work: slow enough to
+// have to choose what to build, fast enough that the counter never looks stuck.
+//
+// If you change this, change the train and build times in constants.js with it.
+// The two are a matched pair — halving income without lengthening production
+// does not slow the game down, it just makes the Town Center idle.
+export const GATHER_SPEED = 2.5;
 
 /** Effective units/second for a resource type, after tuning. */
 export function gatherRateFor(resourceType) {
@@ -126,7 +138,10 @@ function econState(world) {
   return world._economy;
 }
 
-const RES_KEYS = [RES.FOOD, RES.WOOD, RES.GOLD];
+// Every resource the stockpile knows about. canAfford, pay, refund and
+// addResource all iterate this, so a resource that is not listed here can be
+// gathered into a villager's pack and then silently vanish on deposit.
+const RES_KEYS = [RES.FOOD, RES.WOOD, RES.GOLD, RES.STONE];
 
 function playerOf(world, playerId) {
   return world.players[playerId] || null;
@@ -304,6 +319,20 @@ export function acceptsDropoff(building, resourceType) {
 
 /**
  * Nearest completed building of `playerId` that accepts `resourceType`.
+ *
+ * "Nearest" is by *edge* distance, not centre distance, because a 3x3 Town
+ * Center is reached a tile and a half before its middle and a 2x2 Lumber Camp
+ * is not — comparing centres would send villagers past a camp they were
+ * standing next to. Every building the player owns is considered, not just the
+ * Town Center: that is the whole reason a Lumber Camp is worth 100 wood.
+ *
+ * This is deliberately re-evaluated on every trip (unitAI's routeToDropoff calls
+ * it each time a villager fills its pack), so a camp planted mid-game shortens
+ * the round trip of every villager already working that woodline without the
+ * player re-tasking a single one. The scan is a linear pass over one player's
+ * buildings and happens once per full pack — around once every ten seconds per
+ * villager — which is nothing.
+ *
  * Exported because "where do I drop this off" is an economy rule, but the
  * walking to it is the unit AI's job.
  */

@@ -33,7 +33,7 @@ import { createFx } from './fx.js';
 const FACE_BACK = [false, false, false, true, true, true, false, false];
 const FACE_FLIP = [false, true, true, true, false, false, false, false];
 
-const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333 };
+const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa7b4 };
 
 // How far outside the camera an entity may be before we stop drawing it.
 const CULL_PAD = 140;
@@ -117,7 +117,7 @@ export function createRenderer(scene, world) {
   // --- terrain -------------------------------------------------------------
   // Baked once, over the whole map diamond rather than the boot-time view, so
   // no viewport change, zoom-out or pan can reach unpainted ground.
-  const chunks = bakeTerrain(scene, world, worldRect);
+  const terrain = bakeTerrain(scene, world, worldRect);
 
   // --- pools ---------------------------------------------------------------
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
@@ -272,6 +272,10 @@ export function createRenderer(scene, world) {
     viewRect.y = _tmpA.y - CULL_PAD;
     viewRect.r = _tmpB.x + CULL_PAD;
     viewRect.b = _tmpB.y + CULL_PAD;
+
+    // Ground the camera is about to reach has to exist before anything is drawn
+    // on top of it; see bakeTerrain for why this is not done up front.
+    terrain.ensure(viewRect);
 
     markerPool.reset();
     unitPool.reset();
@@ -609,8 +613,7 @@ export function createRenderer(scene, world) {
     ghostPool.destroy();
     overlay.destroy();
     screenG.destroy();
-    for (const c of chunks) c.destroy();
-    chunks.length = 0;
+    terrain.destroy();
   }
 
   return {
@@ -756,6 +759,15 @@ function strokeDiamond(g, cx, cy, hw, hh) {
  *      grass/dirt/sand meet
  *   4. surf along the coastline
  *   5. very faint map-scale mottling, so wide single-terrain regions vary
+ *
+ * LAZY. The chunks are *planned* here but only allocated and painted the first
+ * time the camera comes near them. On the old 48x48 map an eager bake was 8
+ * RenderTextures and about 30MB of GPU memory, which was free. A 96x96 map is
+ * 6272x3168 world pixels — 91 chunks and close to 100MB — and a mid-range phone
+ * does not have that to spare on ground the player may never look at. Baking on
+ * approach keeps the resident set to the handful of chunks around the viewport
+ * plus whatever has already been visited, and each bake is a single batched
+ * draw of a few thousand quads, which lands inside one frame.
  */
 function bakeTerrain(scene, world, rect) {
   const { minX, minY, maxX, maxY } = rect;
@@ -765,40 +777,71 @@ function bakeTerrain(scene, world, rect) {
   // Chunks overlap by CHUNK_PAD so neighbours cover each other's edge pixels;
   // without it, a hairline seam shows wherever two chunks meet.
   const CHUNK_PAD = 4;
-  const chunks = [];
+  // Bake this far outside the visible rect, so a chunk is always finished before
+  // it is on screen and a fast pan never shows bare ocean where land should be.
+  const PREBAKE_PAD = TERRAIN_CHUNK * 0.75;
+
+  const size = TERRAIN_CHUNK + CHUNK_PAD * 2;
+  const planned = [];
   for (let cy = 0; cy < rows; cy++) {
     for (let cx = 0; cx < cols; cx++) {
-      const ox = minX + cx * TERRAIN_CHUNK - CHUNK_PAD;
-      const oy = minY + cy * TERRAIN_CHUNK - CHUNK_PAD;
-      const size = TERRAIN_CHUNK + CHUNK_PAD * 2;
-      const rt = scene.add.renderTexture(ox, oy, size, size);
-      rt.setOrigin(0, 0);
-      rt.setDepth(-1000000);
-      rt._ox = ox;
-      rt._oy = oy;
-      rt._size = size;
-      chunks.push(rt);
+      planned.push({
+        ox: minX + cx * TERRAIN_CHUNK - CHUNK_PAD,
+        oy: minY + cy * TERRAIN_CHUNK - CHUNK_PAD,
+        rt: null,
+      });
     }
   }
 
+  // The draw list is shared by every chunk and built once; it is plain data, so
+  // holding it for the life of the renderer costs a few hundred kB and saves
+  // rebuilding the whole map's op list every time a new chunk is reached.
   const ops = buildTerrainOps(world);
 
-  for (const rt of chunks) {
-    const x0 = rt._ox - TILE_TEX_W - 90;
-    const y0 = rt._oy - TILE_TEX_H - 60;
-    const x1 = rt._ox + rt._size + 90;
-    const y1 = rt._oy + rt._size + 60;
+  function paint(chunk) {
+    const rt = scene.add.renderTexture(chunk.ox, chunk.oy, size, size);
+    rt.setOrigin(0, 0);
+    rt.setDepth(-1000000);
+    chunk.rt = rt;
+
+    const x0 = chunk.ox - TILE_TEX_W - 90;
+    const y0 = chunk.oy - TILE_TEX_H - 60;
+    const x1 = chunk.ox + size + 90;
+    const y1 = chunk.oy + size + 60;
     rt.fill(OCEAN_DEEP, 1);
     rt.beginDraw();
     for (let i = 0; i < ops.length; i++) {
       const o = ops[i];
       if (o.x < x0 || o.x > x1 || o.y < y0 || o.y > y1) continue;
-      rt.batchDrawFrame(ATLAS, o.f, o.x - rt._ox, o.y - rt._oy, o.a, o.t);
+      rt.batchDrawFrame(ATLAS, o.f, o.x - chunk.ox, o.y - chunk.oy, o.a, o.t);
     }
     rt.endDraw();
   }
 
-  return chunks;
+  /** Paint every planned chunk overlapping the view (plus a margin). */
+  function ensure(view) {
+    const x0 = view.x - PREBAKE_PAD;
+    const y0 = view.y - PREBAKE_PAD;
+    const x1 = view.r + PREBAKE_PAD;
+    const y1 = view.b + PREBAKE_PAD;
+    for (let i = 0; i < planned.length; i++) {
+      const c = planned[i];
+      if (c.rt) continue;
+      if (c.ox > x1 || c.ox + size < x0 || c.oy > y1 || c.oy + size < y0) continue;
+      paint(c);
+    }
+  }
+
+  function destroy() {
+    for (const c of planned) {
+      if (c.rt) c.rt.destroy();
+      c.rt = null;
+    }
+    planned.length = 0;
+    ops.length = 0;
+  }
+
+  return { ensure, destroy };
 }
 
 /** Screen position for a tile's terrain blit. */

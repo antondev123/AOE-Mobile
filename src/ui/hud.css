@@ -175,6 +175,16 @@ body {
 .ico-food { border-radius: 50%; background: radial-gradient(circle at 34% 30%, #ff9a8a, #9e2318); }
 .ico-wood { border-radius: 2px; background: linear-gradient(90deg, #6a3f1d, #b07c42 45%, #5d3717); }
 .ico-gold { border-radius: 50%; background: radial-gradient(circle at 34% 28%, #ffeaa0, #bd8c17); }
+/* Stone sits directly beside gold in the bar, so it has to differ in two ways at
+   once or a glance reads them as the same pip: cool slate against gold's warm
+   yellow, and a squared-off block with a chipped corner against gold's circle.
+   The clip-path is what carries it at 13px, where the hue difference alone
+   washes out on a phone in daylight. */
+.ico-stone {
+  border-radius: 2px;
+  background: linear-gradient(150deg, #b7c2ce 8%, #7b8896 52%, #4e5865);
+  clip-path: polygon(0 22%, 26% 0, 100% 0, 100% 78%, 74% 100%, 0 100%);
+}
 .ico-pop  { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #e2d4b4 45%, #8d7f63 46%); }
 .ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
 
@@ -392,6 +402,19 @@ body {
   padding: 6px 2px;
 }
 .sel-hint { display: block; margin-top: 5px; font-size: 11px; opacity: 0.75; }
+
+/* "Gathering wood -> Lumber Camp". Quiet: it is a status line, not a control,
+   and it sits directly under the bars it explains. */
+.job-note {
+  margin-top: 4px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #cbbf9a;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-note[hidden] { display: none; }
 
 .sel-head {
   display: flex;

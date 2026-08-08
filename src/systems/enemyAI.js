@@ -59,19 +59,25 @@ const REBALANCE_PERIOD = 2.0;  // seconds between villager re-assignment passes
 // And food is no longer finite at all: a Farm converts 60 wood into 300 food,
 // against 39000-44000 wood standing in trees.
 //
-// So food does not set the cap any more; population does. The hard cap is 50.
-// A wave tops out at MAX_WAVE_SIZE (16) and the AI wants a standing army of
-// roughly that plus replacements — call it 26 pop — to keep launching full-sized
-// waves while absorbing losses. 50 - 26 = 24 villagers, which is also about what
-// this economy can keep employed: ~10 on food (2-3 farms running), ~8 on wood
-// (farms and houses to pay for) and ~6 on gold.
+// So food does not set the cap any more; population does — but not the engine's
+// any more either. MAX_POP_CAP is now 200 (AoE2's default), and this AI does not
+// try to fill it: MAX_HOUSES below holds it to a 50-pop economy, which is the
+// shape of opening that is actually tested. A wave tops out at MAX_WAVE_SIZE
+// (16) and the AI wants a standing army of roughly that plus replacements — call
+// it 26 pop — to keep launching full-sized waves while absorbing losses. 50 - 26
+// = 24 villagers, which is also about what this economy can keep employed: ~10
+// on food (2-3 farms running), ~8 on wood (farms and houses to pay for) and ~6
+// on gold. Growing past that is the enemy AI upgrade's job, not this pass's.
 const MAX_VILLAGERS = 24;
 // ...but not before there is a Barracks. Villagers arrive faster than houses do,
 // and an economy booming to 24 keeps pushing "we are 2 off the cap, build a
 // house" in front of the Barracks, which pushed the first wave from ~4:15 out to
 // ~6:00. 16 is the old cap and the opening it produces is the tested one.
 const PRE_BARRACKS_VILLAGERS = 16;
-const MAX_HOUSES = 9;          // TC(5) + 9 x 5 = the 50-pop hard cap
+// TC(5) + 9 x 5 = 50 pop. This is the AI's own ceiling, not the engine's (see
+// MAX_VILLAGERS above): the pop cap is 200, and stopping here is a deliberate
+// choice about how large an economy this opening knows how to run.
+const MAX_HOUSES = 9;
 const FOOD_SCAN = 26;          // how far out we count food still in the ground
 
 // Farms. FARM_SCAN is the radius that counts as "berries we can actually work
@@ -87,6 +93,32 @@ const MAX_FARMS = 8;
 const BARRACKS_TIME = 105;     // earliest barracks (seconds)
 const BARRACKS2_TIME = 330;    // second barracks, for wave escalation
 const MILL_MIN_WALK = 5.0;     // build a Mill if berries are further than this
+
+// Forward drop-offs (Lumber Camp / Mining Camp).
+//
+// A villager's income is set by its round trip, not by its gather rate. A full
+// pack is 10 resources and a villager walks 1.35 tiles/second, so every tile of
+// haul costs about 1.5 seconds of every trip. At CAMP_MIN_WALK the round trip is
+// spending ~13 seconds walking against ~8 seconds working — the villager is more
+// than half idle — and a 100-wood camp beside the node pays that back inside two
+// minutes of one worker. Below it the camp is worse than the walk, which is why
+// this is a threshold and not "build one per woodline".
+//
+// Measured against the map generator: a base's starting woodline and gold are
+// both inside 8 tiles, so this never fires in the opening. It starts firing
+// around the four minute mark, when the near trees are stumps and the workforce
+// has drifted out to the second woodline — which is exactly the moment a human
+// player notices their wood has quietly stopped growing.
+const CAMP_MIN_WALK = 9.0;
+// Not before the economy can spare a builder, and never with the wood that the
+// next House or field is waiting on. A camp is an optimisation; being housed is
+// not.
+const CAMP_MIN_VILLAGERS = 6;
+const CAMP_WOOD_RESERVE = 120;
+// Enough to cover the woodlines a base actually works, and no more: past this
+// the AI is spending wood on buildings instead of on the army the wood is for.
+const MAX_LUMBER_CAMPS = 3;
+const MAX_MINING_CAMPS = 2;
 
 const FIRST_WAVE_TIME = 170;   // earliest first attack
 const FIRST_WAVE_SIZE = 5;
@@ -172,6 +204,10 @@ class EnemyAI {
     this.badSpots = [];        // sites that proved unreachable, never retried
     this.buildBlockedUntil = 0;
     this.placeCursor = 0;
+    // Where the next drop-off camp should go, decided by chooseBuilding at the
+    // same moment it decides it wants one — the node that justified the camp is
+    // the only sensible place to anchor it, and it is not worth finding twice.
+    this.campAnchor = null;
 
     this.wave = null;          // { ids, target, launchedAt, size }
     this.waveNumber = 0;
@@ -193,6 +229,8 @@ class EnemyAI {
       barracksStarted: 0,
       millsStarted: 0,
       farmsStarted: 0,
+      lumberCampsStarted: 0,
+      miningCampsStarted: 0,
       villagersQueued: 0,
       militaryQueued: 0,
       wavesLaunched: 0,
@@ -420,7 +458,12 @@ class EnemyAI {
 
   res() {
     const p = this.world.players[this.id];
-    return (p && p.resources) || { food: 0, wood: 0, gold: 0 };
+    // Stone is carried in the fallback so `r.stone` is a number everywhere,
+    // even before a Town Center exists. Nothing this AI can build spends it yet
+    // — its sinks (castle, towers, stone walls) belong to a later system — so it
+    // is bookkeeping only, and the villager split below stays three-way on
+    // purpose rather than quietly parking workers on a resource with no use.
+    return (p && p.resources) || { food: 0, wood: 0, gold: 0, stone: 0 };
   }
 
   afford(cost) {
@@ -499,7 +542,7 @@ class EnemyAI {
     const villagers = this.myUnits('villager');
     if (!villagers.length) return;
 
-    const anchor = want === 'mill' ? this.millAnchor() : this.home;
+    const anchor = this.anchorFor(want);
     const spot = this.findBuildSpot(want, anchor);
     if (!spot) {
       // No room right now — back off rather than hammering the search.
@@ -529,6 +572,8 @@ class EnemyAI {
     else if (want === 'barracks') this.stats.barracksStarted++;
     else if (want === 'mill') this.stats.millsStarted++;
     else if (want === 'farm') this.stats.farmsStarted++;
+    else if (want === 'lumbercamp') this.stats.lumberCampsStarted++;
+    else if (want === 'miningcamp') this.stats.miningCampsStarted++;
 
     this.pending = {
       type: want, entity: foundation, since: w.time,
@@ -563,6 +608,10 @@ class EnemyAI {
     }
 
     // 1. Houses, always ahead of the cap. Getting housed is the classic stall.
+    // Since MAX_POP_CAP went to 200 this test no longer stops anything on its
+    // own — MAX_HOUSES does — but it stays as the honest engine-level guard, so
+    // an AI that is ever allowed to build past nine houses still stops at 200
+    // instead of pouring wood into houses that raise nothing.
     const housed = pop.cap >= MAX_POP_CAP;
     if (!housed && anyOf('house') < MAX_HOUSES && pop.room <= 2) return 'house';
 
@@ -577,6 +626,16 @@ class EnemyAI {
 
     // 3. Mill, if the berries are a real walk from the drop-off.
     if (complete('barracks') && anyOf('mill') === 0 && this.millWorthIt()) return 'mill';
+
+    // 3a. Forward drop-offs. This sits ahead of farms because it is the cheaper
+    //     fix for the same complaint: a farm converts wood into food, a camp
+    //     converts a walk into everything. It is gated hard enough (see
+    //     campWanted) that it can never take the wood a House or a field needs.
+    const camp = this.campWanted();
+    if (camp) {
+      this.campAnchor = camp.anchor;
+      return camp.type;
+    }
 
     // 3b. Farms, from the moment the local berries thin out and for the rest of
     //     the match — a farm is consumed as fast as it is worked, so this is a
@@ -690,6 +749,94 @@ class EnemyAI {
     return {
       x: berry.x * 0.65 + this.home.x * 0.35,
       y: berry.y * 0.65 + this.home.y * 0.35,
+    };
+  }
+
+  /** Where the next building of this type should be anchored. */
+  anchorFor(type) {
+    if (type === 'mill') return this.millAnchor();
+    if (type === 'lumbercamp' || type === 'miningcamp') {
+      return this.campAnchor || this.home;
+    }
+    return this.home;
+  }
+
+  // --- forward drop-offs ---------------------------------------------------
+
+  /**
+   * How far a load taken from `node` has to be carried, given what we have
+   * standing. Zero when we own nothing that will take it — that is the "no
+   * drop-off at all" case, which is chooseBuilding's problem, not this one's.
+   */
+  haulFrom(node, resType) {
+    let best = Infinity;
+    for (const b of this.myBuildings()) {
+      if (!b.complete || b.dead || !b.dropoff || !b.dropoff.includes(resType)) continue;
+      const d = dist(b.x, b.y, node.x, node.y);
+      if (d < best) best = d;
+    }
+    return best === Infinity ? 0 : best;
+  }
+
+  /**
+   * The longest haul our own workforce is currently paying for `resType`.
+   *
+   * Deliberately measured from the nodes villagers are *actually assigned to*
+   * rather than from the map: "there is a tree 20 tiles away" is not a problem,
+   * "four of my villagers are walking to it" is. That also makes the camp land
+   * where the work is, because the node that justified it is the anchor.
+   */
+  worstHaul(resType) {
+    let worst = 0;
+    let node = null;
+    for (const j of this.jobs.values()) {
+      if (j.res !== resType) continue;
+      const n = this.world.entities.get(j.nodeId);
+      if (!n || n.dead || !(n.amount > 0)) continue;
+      const d = this.haulFrom(n, resType);
+      if (d > worst) { worst = d; node = n; }
+    }
+    return { dist: worst, node };
+  }
+
+  /**
+   * Should the next building be a forward drop-off, and beside what?
+   * Returns { type, anchor } or null.
+   */
+  campWanted() {
+    if (this.myUnits('villager').length < CAMP_MIN_VILLAGERS) return null;
+    const cost = BUILDING_STATS.lumbercamp.cost.wood;
+    if ((this.res().wood || 0) < cost + CAMP_WOOD_RESERVE) return null;
+
+    const wood = this.worstHaul(RES.WOOD);
+    if (wood.node && wood.dist >= CAMP_MIN_WALK &&
+        this.myBuildings('lumbercamp').length < MAX_LUMBER_CAMPS) {
+      return { type: 'lumbercamp', anchor: this.campAnchorFor(wood.node) };
+    }
+    // Gold and stone share the Mining Camp, so whichever line is walking further
+    // is the one that justifies it — and the camp then shortens both.
+    const gold = this.worstHaul(RES.GOLD);
+    const stone = this.worstHaul(RES.STONE);
+    const dig = stone.dist > gold.dist ? stone : gold;
+    if (dig.node && dig.dist >= CAMP_MIN_WALK &&
+        this.myBuildings('miningcamp').length < MAX_MINING_CAMPS) {
+      return { type: 'miningcamp', anchor: this.campAnchorFor(dig.node) };
+    }
+    return null;
+  }
+
+  /**
+   * Anchor a camp near the node it is for. findBuildSpot only considers ground
+   * 3.2 to 11 tiles from its anchor (PLACEMENT_RING, which exists so the AI
+   * never builds on top of itself), so anchoring exactly on the node would put
+   * the camp anywhere in a ring around it. Pulling the anchor a quarter of the
+   * way back toward home biases that ring onto the near side of the resource,
+   * which is the side the villagers are walking from anyway.
+   */
+  campAnchorFor(node) {
+    return {
+      x: node.x * 0.75 + this.home.x * 0.25,
+      y: node.y * 0.75 + this.home.y * 0.25,
     };
   }
 

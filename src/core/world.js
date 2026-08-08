@@ -12,6 +12,12 @@ import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
 import { dist2 } from './iso.js';
 
+// Side of one spatial bucket, in tiles. Four is what forEachNear's typical
+// query radius (1-5 tiles) wants: small enough that a lookup touches a handful
+// of cells, large enough that the bucket array stays small. It scales with the
+// map rather than being a fixed grid — see createWorld.
+const BUCKET_SIZE = 4;
+
 export function createWorld(seed = 12345) {
   const rng = makeRng(seed);
 
@@ -50,10 +56,13 @@ export function createWorld(seed = 12345) {
     // { x, y, tx, ty, target, damage, owner, speed, elapsed, duration }
     projectiles: [],
 
-    // Spatial buckets for proximity queries, rebuilt each sim step.
-    _cellSize: 4,
-    _cols: Math.ceil(MAP_W / 4),
-    _rows: Math.ceil(MAP_H / 4),
+    // Spatial buckets for proximity queries, rebuilt each sim step. The grid is
+    // derived from the map size rather than written out, so a 96x96 map gets
+    // 24x24 buckets instead of silently reusing a 12x12 grid sized for 48x48 and
+    // putting sixteen tiles of entities in every cell.
+    _cellSize: BUCKET_SIZE,
+    _cols: Math.ceil(MAP_W / BUCKET_SIZE),
+    _rows: Math.ceil(MAP_H / BUCKET_SIZE),
     _buckets: null,
   };
 
@@ -222,9 +231,20 @@ export function spawnBuilding(world, type, player, gx, gy, { complete = true } =
   return e;
 }
 
+// What a node type actually pays out. Kept as a table rather than a chain of
+// ternaries: with four resources the chain quietly turned every unrecognised
+// node into gold, which is exactly the kind of bug that only shows up as "why
+// is my stone mine giving me coins".
+const NODE_RESOURCE = {
+  tree: RES.WOOD,
+  berry: RES.FOOD,
+  gold: RES.GOLD,
+  stone: RES.STONE,
+};
+
 export function spawnResource(world, type, gx, gy) {
-  const resourceType =
-    type === 'tree' ? RES.WOOD : type === 'berry' ? RES.FOOD : RES.GOLD;
+  const resourceType = NODE_RESOURCE[type];
+  if (!resourceType) throw new Error(`unknown resource node type: ${type}`);
   const tx = Math.floor(gx);
   const ty = Math.floor(gy);
   const e = {

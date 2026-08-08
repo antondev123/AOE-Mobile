@@ -1,13 +1,27 @@
 // Skirmish map generation: terrain, resource nodes, and two mirrored bases.
 //
 // The layout follows AoE2's opening: a Town Center, a few villagers, berries
-// and wood close by, and gold a short walk away — so the first two minutes are
-// about assigning villagers rather than exploring.
+// and wood close by, gold a short walk away and stone a longer one — so the
+// first two minutes are about assigning villagers rather than exploring, and
+// the minutes after that are about deciding when to leave the base.
 
 import { MAP_W, MAP_H, TERRAIN, PLAYER, ENEMY } from './constants.js';
 import { spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop } from './world.js';
 
-const BASE_OFFSET = 9; // distance of each Town Center from its map corner
+// Distance of each Town Center from its map corner.
+//
+// 18 on a 96x96 map puts the two bases 60 tiles apart on each axis — about 85
+// tiles of walking — so a militia at 1.1 tiles/second needs a little over a
+// minute to cross, and the first raid is something you hear about from the
+// minimap rather than something that is already happening. It is the old figure
+// (9 on 48x48) scaled with the map, deliberately: the *local* layout around a
+// base is tuned and did not want moving, only the gap between the two.
+const BASE_OFFSET = 18;
+
+// Everything scattered across open ground scales with the map's area, so a map
+// four times the size is not four times emptier. The counts below are the old
+// 48x48 figures multiplied by this and rounded to something that reads well.
+const AREA_SCALE = (MAP_W * MAP_H) / (48 * 48);
 
 export function generateMap(world) {
   carveTerrain(world);
@@ -21,6 +35,7 @@ export function generateMap(world) {
   // then clear anything that would sit on top of a base.
   scatterForests(world, bases);
   scatterGold(world, bases);
+  scatterStone(world, bases);
   scatterBerries(world, bases);
 
   for (const b of bases) buildBase(world, b);
@@ -29,20 +44,26 @@ export function generateMap(world) {
   return { bases };
 }
 
+/** Counts that should grow with the map, never below the original figure. */
+function scaled(n) {
+  return Math.max(n, Math.round(n * AREA_SCALE));
+}
+
 function carveTerrain(world) {
   const { rng } = world;
   // Gentle patches of dirt and sand so the ground is not a flat green sheet.
-  for (let i = 0; i < 70; i++) {
+  for (let i = 0; i < scaled(70); i++) {
     const cx = rng.int(0, MAP_W - 1);
     const cy = rng.int(0, MAP_H - 1);
     const r = rng.range(1.5, 4);
     const kind = rng.chance(0.65) ? TERRAIN.DIRT : TERRAIN.SAND;
     stamp(world, cx, cy, r, kind);
   }
-  // A pond or two, away from the base corners.
-  for (let i = 0; i < 2; i++) {
-    const cx = rng.int(14, MAP_W - 14);
-    const cy = rng.int(14, MAP_H - 14);
+  // Ponds, away from the base corners. Kept small and few: water is impassable,
+  // and a lake across the middle of a 96-tile map is a wall, not scenery.
+  for (let i = 0; i < scaled(2); i++) {
+    const cx = rng.int(BASE_OFFSET + 6, MAP_W - BASE_OFFSET - 6);
+    const cy = rng.int(BASE_OFFSET + 6, MAP_H - BASE_OFFSET - 6);
     const r = rng.range(2.5, 4.5);
     stamp(world, cx, cy, r, TERRAIN.WATER);
   }
@@ -86,7 +107,7 @@ function freeSpot(world, x, y, bases, minBaseDist) {
 function scatterForests(world, bases) {
   const { rng } = world;
   // Big neutral woods in the middle of the map...
-  for (let i = 0; i < 22; i++) {
+  for (let i = 0; i < scaled(22); i++) {
     const cx = rng.int(3, MAP_W - 4);
     const cy = rng.int(3, MAP_H - 4);
     growForest(world, cx, cy, rng.int(8, 26), bases, 7);
@@ -121,7 +142,7 @@ function growForest(world, cx, cy, count, bases, minBaseDist) {
 function scatterGold(world, bases) {
   const { rng } = world;
   // Neutral gold in the contested middle — worth fighting over.
-  for (let i = 0; i < 7; i++) {
+  for (let i = 0; i < scaled(7); i++) {
     const cx = rng.int(8, MAP_W - 9);
     const cy = rng.int(8, MAP_H - 9);
     placeCluster(world, cx, cy, 'gold', rng.int(3, 5), bases, 9);
@@ -133,10 +154,39 @@ function scatterGold(world, bases) {
   }
 }
 
+/**
+ * Stone mines.
+ *
+ * Stone is the mid-game resource: nothing in the opening spends it, and its
+ * sinks are the defensive buildings you reach for once the first raid has
+ * landed. So it is placed to be *found*, not to be stumbled over. Each player
+ * gets one guaranteed cluster, but further out than their starting gold (11
+ * tiles against gold's 7) and on the far side of the base, so walking a villager
+ * to it is a small decision rather than something that happens by accident on
+ * the way to the berries.
+ *
+ * The rest sits in the contested middle in clusters of three or four. Counted in
+ * nodes the map ends up with slightly fewer stone than gold and a small fraction
+ * of the trees, which is the intended scarcity ordering: wood is everywhere,
+ * gold is worth a fight, stone is worth a walk and a fight.
+ */
+function scatterStone(world, bases) {
+  const { rng } = world;
+  for (let i = 0; i < scaled(6); i++) {
+    const cx = rng.int(10, MAP_W - 11);
+    const cy = rng.int(10, MAP_H - 11);
+    placeCluster(world, cx, cy, 'stone', rng.int(3, 4), bases, 11);
+  }
+  for (const b of bases) {
+    const dir = b.player === PLAYER ? 1 : -1;
+    placeCluster(world, b.x - 4 * dir, b.y + 10 * dir, 'stone', 4, bases, 6.5);
+  }
+}
+
 /** Neutral berry patches, so a long game has food worth walking out for. */
 function scatterBerries(world, bases) {
   const { rng } = world;
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < scaled(6); i++) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
     placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, 10);

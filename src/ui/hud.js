@@ -55,12 +55,19 @@ const RALLY_SNAP = 1.5;
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
-  berry: 'BSH', tree: 'TRE', gold: 'GLD',
+  lumbercamp: 'LMB', miningcamp: 'MIN',
+  berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
 };
-const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold' };
+const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold', stone: 'stone' };
+// Display order for costs, the resource bar and "not enough X" flashes. One
+// list, so the four resources can never appear in a different order in two
+// places on the same screen.
+const RES_ORDER = ['food', 'wood', 'gold', 'stone'];
 // Resource nodes have no stats block, so they need their own display names —
 // "berry" in the selection header reads like a bug, "Berry Bush" reads like AoE.
-const NODE_NAME = { berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein' };
+const NODE_NAME = {
+  berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein', stone: 'Stone Mine',
+};
 
 const MILITARY = new Set(['militia', 'archer']);
 export function isMilitary(u) { return u.kind === 'unit' && MILITARY.has(u.type); }
@@ -111,7 +118,9 @@ function affordable(world, playerId, cost) {
 /** Which resource is short, for a precise "Not enough wood" toast. */
 function missingResource(world, playerId, cost) {
   const r = world.players[playerId].resources;
-  for (const k of ['wood', 'food', 'gold']) {
+  // Wood first: it is the resource almost everything you can place costs, so
+  // naming it before food gives the right answer for the common case.
+  for (const k of ['wood', 'food', 'gold', 'stone']) {
     if ((cost && cost[k] || 0) > (r[k] || 0)) return k;
   }
   return null;
@@ -201,7 +210,7 @@ export function rallyText(world, producers, rally) {
 function costNode(cost) {
   const box = el('span', 'cost');
   let any = false;
-  for (const k of ['food', 'wood', 'gold']) {
+  for (const k of RES_ORDER) {
     const v = cost && cost[k];
     if (!v) continue;
     any = true;
@@ -224,6 +233,7 @@ export function createHud(scene, world) {
     food: doc.getElementById('res-food'),
     wood: doc.getElementById('res-wood'),
     gold: doc.getElementById('res-gold'),
+    stone: doc.getElementById('res-stone'),
     pop: doc.getElementById('res-pop'),
     toasts: doc.getElementById('toasts'),
     selPanel: doc.getElementById('sel-panel'),
@@ -243,6 +253,7 @@ export function createHud(scene, world) {
     demolishArm: null,       // { key, at } — demolish armed for exactly this set
     buildMenuOpen: false,
     menuOpen: false,
+    liveJob: null,           // { list, node } — the "where is this going" line
     selSig: '',
     cmdSig: '',
     resSig: '',
@@ -458,17 +469,20 @@ export function createHud(scene, world) {
 
   function updateResources() {
     const p = world.players[PLAYER];
-    const sig = `${p.resources.food | 0}/${p.resources.wood | 0}/${p.resources.gold | 0}/${p.pop}/${p.popCap}`;
+    let sig = '';
+    for (const k of RES_ORDER) sig += `${p.resources[k] | 0}/`;
+    sig += `${p.pop}/${p.popCap}`;
     if (sig === state.resSig) return;
     state.resSig = sig;
-    setRes(dom.food, String(Math.floor(p.resources.food)));
-    setRes(dom.wood, String(Math.floor(p.resources.wood)));
-    setRes(dom.gold, String(Math.floor(p.resources.gold)));
+    for (const k of RES_ORDER) setRes(dom[k], String(Math.floor(p.resources[k] || 0)));
     setRes(dom.pop, `${p.pop}/${p.popCap}`);
     if (dom.pop) dom.pop.classList.toggle('low', p.pop >= p.popCap);
   }
 
-  const RES_NODE = { food: () => dom.food, wood: () => dom.wood, gold: () => dom.gold };
+  const RES_NODE = {
+    food: () => dom.food, wood: () => dom.wood,
+    gold: () => dom.gold, stone: () => dom.stone,
+  };
 
   function flashRes(kinds) {
     for (const k of kinds) {
@@ -489,6 +503,7 @@ export function createHud(scene, world) {
     if (!panel) return;
     panel.textContent = '';
     state.liveBars = [];
+    state.liveJob = null;
 
     const sel = selectedEntities(world);
     if (sel.length === 0) {
@@ -547,7 +562,72 @@ export function createHud(scene, world) {
     const stocked = sel.filter((e) => stockOf(e));
     if (stocked.length) addBar(panel, 'stock', stocked);
 
+    // Where this villager's load is going. See jobNoteText: the drop-off is
+    // chosen for the player by the sim, so the panel has to say which one it
+    // picked or the Lumber Camp they just paid 100 wood for is invisible.
+    const workers = sel.filter((e) => e.player === PLAYER && e.type === 'villager');
+    if (workers.length) {
+      const note = el('div', 'job-note');
+      panel.appendChild(note);
+      state.liveJob = { list: workers, node: note };
+    }
+
     refreshBars();
+  }
+
+  /**
+   * One line naming what the selected villagers are doing and, crucially, where
+   * they are banking it.
+   *
+   * The drop-off is the one decision in the economy the game makes on the
+   * player's behalf every single trip (economy.nearestDropoff), and it is the
+   * decision a Lumber Camp or a Mining Camp exists to change. Without this line
+   * the only evidence that a new camp did anything is that the wood counter goes
+   * up slightly faster, which nobody can see. Returns '' when there is nothing
+   * worth saying, and the caller hides the row.
+   */
+  function jobNoteText(list) {
+    const live = list.filter((u) => !u.dead);
+    if (!live.length) return '';
+
+    // Every drop-off the group is currently routed to, named once each.
+    const drops = [];
+    for (const u of live) {
+      const t = u.task;
+      const b = t && t.type === 'gather' ? t.building : null;
+      if (!b || b.dead) continue;
+      const name = displayName(b);
+      if (!drops.includes(name)) drops.push(name);
+    }
+
+    if (live.length === 1) {
+      const u = live[0];
+      const t = u.task;
+      const carrying = u.carrying && u.carrying.amount > 0 ? u.carrying : null;
+      if (t && t.type === 'build' && t.building && !t.building.dead) {
+        return `Building the ${displayName(t.building)}`;
+      }
+      if (t && t.type === 'gather') {
+        if (t.stage === 'toDrop' && drops.length) {
+          const load = carrying
+            ? `${Math.floor(carrying.amount)} ${RES_LABEL[carrying.type] || carrying.type}`
+            : 'a load';
+          return `Hauling ${load} to the ${drops[0]}`;
+        }
+        const res = (t.node && t.node.resourceType) || (carrying && carrying.type);
+        const what = res ? RES_LABEL[res] || res : 'resources';
+        // Name the drop-off it *will* use, not the one it used last, by asking
+        // the same function the villager will ask when its pack fills.
+        const drop = res ? economy.nearestDropoff(world, PLAYER, u.x, u.y, res) : null;
+        return drop ? `Gathering ${what} → ${displayName(drop)}` : `Gathering ${what}`;
+      }
+      return carrying
+        ? `Carrying ${Math.floor(carrying.amount)} ${RES_LABEL[carrying.type] || carrying.type}`
+        : '';
+    }
+
+    if (!drops.length) return '';
+    return `Dropping off at: ${drops.join(', ')}`;
   }
 
   function addBar(panel, kind, list) {
@@ -586,6 +666,12 @@ export function createHud(scene, world) {
       h.text.textContent = h.kind === 'stock'
         ? `${Math.ceil(val)} / ${Math.ceil(max)} ${res && res !== 'mixed' ? RES_LABEL[res] || res : 'resources'} left`
         : `${Math.ceil(val)} / ${Math.ceil(max)} hp`;
+    }
+
+    if (state.liveJob) {
+      const text = jobNoteText(state.liveJob.list);
+      if (state.liveJob.node.textContent !== text) state.liveJob.node.textContent = text;
+      state.liveJob.node.hidden = text === '';
     }
   }
 
@@ -880,7 +966,7 @@ export function createHud(scene, world) {
     if (!affordable(world, PLAYER, s.cost)) {
       const miss = missingResource(world, PLAYER, s.cost);
       toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-      flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
+      flashRes(miss ? [miss] : RES_ORDER);
       return;
     }
     if (typeof economy.queueTrain !== 'function') return;
@@ -921,7 +1007,7 @@ export function createHud(scene, world) {
         if (!affordable(world, PLAYER, s.cost)) {
           const miss = missingResource(world, PLAYER, s.cost);
           toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-          flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
+          flashRes(miss ? [miss] : RES_ORDER);
           return;
         }
         setPlacementMode(type);
@@ -1105,7 +1191,7 @@ export function createHud(scene, world) {
     if (p && p.player !== undefined && p.player !== PLAYER) return;
     const miss = p && p.cost ? missingResource(world, PLAYER, p.cost) : null;
     toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-    flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
+    flashRes(miss ? [miss] : RES_ORDER);
   }));
 
   off.push(world.events.on(EV.POP_CAPPED, (p) => {

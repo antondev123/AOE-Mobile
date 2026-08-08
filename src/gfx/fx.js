@@ -10,7 +10,7 @@ import { EV } from '../core/events.js';
 import { HALF_W, HALF_H } from '../core/constants.js';
 import { ATLAS, unitFrame } from './textures.js';
 
-const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333 };
+const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa7b4 };
 const CMD_COLOR = { move: 0x4ade80, attack: 0xf05252, gather: 0xfacc15, rally: 0x60a5fa };
 
 const MAX_PARTICLES = 220;

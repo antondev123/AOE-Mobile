@@ -30,7 +30,12 @@ function hex(n) {
 // view. Baked into the terrain layer, so it costs nothing per redraw.
 const OCEAN_CSS = hex(OCEAN_DEEP);
 
-const RES_COLOR = { tree: '#2e5a24', berry: '#a8324a', gold: '#d8b33c' };
+// Node colours. Stone is deliberately the palest, coolest pip on the map: at
+// two pixels it has to separate from gold's warm yellow *and* from the blue-grey
+// of water underneath it, and a light slate is the only value that does both.
+const RES_COLOR = {
+  tree: '#2e5a24', berry: '#a8324a', gold: '#d8b33c', stone: '#b9c3ce',
+};
 const TEAM = ['#5aa2ff', '#ff5a5a'];
 const TEAM_DARK = ['#1c56ab', '#a01f1f'];
 

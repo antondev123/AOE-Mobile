@@ -23,10 +23,23 @@
 
 // --- Tuning -----------------------------------------------------------------
 
-// Expansions before A* gives up and returns its best effort. The whole map is
-// 48*48 = 2304 tiles, so this is "search everything, twice over" — it only ever
-// bites on pathological repeated re-expansion, not on honest long walks.
-const DEFAULT_BUDGET = 6000;
+// Expansions before A* gives up and returns its best effort.
+//
+// The map is 96*96 = 9216 tiles, so 12000 is "search every tile, with a third
+// again in hand for re-expansion". It has to be at least the tile count or a
+// genuinely long walk — corner to corner is 85 tiles and the two bases really
+// are in opposite corners — would come back as a partial path and the unit
+// would re-plan every few tiles for the whole journey.
+//
+// It is a *cap*, not a cost: measured over a four-minute smoke run on the 96x96
+// map (pathStats.expanded / pathStats.searches) an average search expands well
+// under two hundred nodes, because H_WEIGHT keeps A* in a narrow corridor toward
+// the goal. The budget only bites when the goal is unreachable, and that case is
+// exactly the one it exists to stop — an impossible destination fails in bounded
+// time with a partial path rather than stalling the frame. unitAI.js bounds the
+// other side of it: SEARCHES_PER_STEP caps how many of these can happen in one
+// sim step, so a hundred units all re-planning at once still cannot spike.
+const DEFAULT_BUDGET = 12000;
 const SQRT2 = Math.SQRT2;
 // Slight tie-breaker toward the goal: keeps A* from fanning out over the huge
 // open areas of an AoE2 map when a straight walk would do. Bounded so paths
@@ -47,8 +60,10 @@ const SMOOTH_LOOKAHEAD = 12;
 // drop-off to reach and no way home — it is entombed.
 //
 // The number is deliberately generous. There is no wall building in this game
-// (BUILDABLE is house / farm / barracks / mill / towncenter), so the smallest
-// enclosure a player can build on purpose is far larger than this, while every
+// (BUILDABLE is house / farm / barracks / mill / lumber camp / mining camp /
+// towncenter), so the smallest enclosure a player can build on purpose is far
+// larger than this — and on a 9216-tile map 96 tiles is about 1% of the ground,
+// so it stays a pocket limit rather than a cap on legitimate walling — while every
 // accidental seal seen in play has been one to a few tiles. Anything at or above
 // the limit is treated as honest ground and never restricts placement — walling
 // off a quarter of the map stays legal.

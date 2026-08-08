@@ -1395,6 +1395,39 @@ function onBuilt(world, building) {
     if (u.task.building !== building) continue;
     onJobFinished(world, u, ctx);
   }
+  adoptNewDropoff(world, building, ctx);
+}
+
+/**
+ * A drop-off just went up. Anyone already walking a load somewhere further away
+ * turns and uses it instead.
+ *
+ * Every trip picks its drop-off fresh (routeToDropoff calls nearestDropoff), so
+ * without this a new Lumber Camp still pays for itself — from the *next* trip.
+ * That is one full round trip of nothing happening, which on a fifteen-tile haul
+ * is half a minute, and the player who just spent 100 wood watching their
+ * villagers walk past the new building is entitled to think it is broken. So the
+ * moment the camp is finished, anyone whose current errand it shortens is
+ * re-routed mid-walk.
+ *
+ * Deliberately narrow: only villagers already heading for a drop-off are
+ * touched, and only when the new building is genuinely closer to where they are
+ * standing right now. Nobody working a node is interrupted, and nobody is sent
+ * backwards past a load they have almost delivered.
+ */
+function adoptNewDropoff(world, building, ctx) {
+  if (!building.complete || !building.dropoff || !building.dropoff.length) return;
+  for (const u of world.units) {
+    if (u.dead || u.player !== building.player) continue;
+    const t = u.task;
+    if (!t || t.type !== 'gather' || t.stage !== 'toDrop') continue;
+    const type = u.carrying ? u.carrying.type : null;
+    if (!type || !building.dropoff.includes(type)) continue;
+    const old = t.building;
+    if (old === building) continue;
+    if (old && !old.dead && edgeDist(old, u.x, u.y) <= edgeDist(building, u.x, u.y)) continue;
+    routeToDropoff(world, u, t, ctx, false);
+  }
 }
 
 /**
