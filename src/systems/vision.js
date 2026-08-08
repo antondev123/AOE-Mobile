@@ -318,7 +318,13 @@ export function createVision(world) {
     // from them so a nearly-worked-out tree still looks nearly worked out.
     s.amount = typeof e.amount === 'number' ? e.amount : undefined;
     s.maxAmount = typeof e.maxAmount === 'number' ? e.maxAmount : undefined;
-    s.depleted = !!e.depleted;
+    // A farm's remaining food is owned by economy.js and has gone by three
+    // different field names during this sprint. The renderer already copes with
+    // all of them (see farmStage in render.js); copy whichever one is there
+    // rather than have a remembered farm always look freshly sown.
+    s.remaining = typeof e.remaining === 'number' ? e.remaining : undefined;
+    s.resourceLeft = typeof e.resourceLeft === 'number' ? e.resourceLeft : undefined;
+    s.depleted = !!(e.depleted || e.exhausted || e.spent);
     return s;
   }
 

@@ -323,6 +323,20 @@ export function createHud(scene, world) {
     sizeObserver.observe(bottomBar);
   }
 
+  // The top bar is measured for the same reason: the resource bar wraps to a
+  // second line once the stockpiles get big enough (see .res-bar in hud.css),
+  // and the toast stack is positioned directly under it. A fixed offset would
+  // put a toast over the food counter for the second half of a long match.
+  let topObserver = null;
+  const topBar = root.querySelector('.hud-top');
+  if (topBar && typeof ResizeObserver === 'function') {
+    topObserver = new ResizeObserver((entries) => {
+      const h = Math.round(entries[0].contentRect.height + 14);
+      root.style.setProperty('--topbar-h', `${h}px`);
+    });
+    topObserver.observe(topBar);
+  }
+
   // --- Minimap --------------------------------------------------------------
 
   const minimap = dom.minimap ? createMinimap(dom.minimap, world) : null;
@@ -1601,7 +1615,9 @@ export function createHud(scene, world) {
   function destroy() {
     state.destroyed = true;
     if (sizeObserver) sizeObserver.disconnect();
+    if (topObserver) topObserver.disconnect();
     root.style.removeProperty('--hud-h');
+    root.style.removeProperty('--topbar-h');
     for (const fn of off) { try { fn(); } catch (_) { /* already gone */ } }
     if (dom.idleBtn) dom.idleBtn.removeEventListener('click', onIdle);
     if (dom.menuBtn) dom.menuBtn.removeEventListener('click', onMenu);

@@ -124,15 +124,22 @@ body {
   pointer-events: auto;
 }
 
-/* Six things now live in this bar — four resources, the population and the age
-   — and at 390px with four-digit stockpiles they add up to more than the row
-   is wide. The padding and gaps below are the ~50px that buys back: measured
-   at food/wood/gold all on 9999, stone on 999, pop on 48/50 and the longest
-   age name, the row comes in under the width with a few pixels to spare. Any
-   further and the counters start touching each other. */
+/* Six things live in this bar now — four resources, the population and the age.
+   At 390px that is more than fits once the stockpiles reach four digits: the
+   six measure ~384px against 326 of row. Two things answer it, in this order.
+   First the padding, gaps and pip size below, trimmed to buy back ~55px, which
+   is enough for everything up to four-digit food and wood on one line — the
+   state a match is in for most of its length. Then, for the late-game bank that
+   still does not fit, the bar WRAPS rather than clipping: the old behaviour
+   shoved the last counter out under the menu button where it could not be read,
+   and the last counter is now the age. The toasts move down to match, because
+   the HUD measures this bar into --topbar-h. The alternative — shrinking the
+   numbers to 11px so it never wraps — trades a rare second line for a
+   permanently harder-to-read counter, which is the wrong way round. */
 .res-bar {
   pointer-events: auto;
   display: flex;
+  flex-wrap: wrap;
   gap: 0;
   flex: 0 1 auto;
   min-width: 0;
@@ -149,7 +156,7 @@ body {
   display: flex;
   align-items: center;
   gap: 3px;
-  padding: 2px 4px;
+  padding: 2px 2px;
   flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
@@ -159,6 +166,11 @@ body {
   transition: background-color 140ms linear, color 140ms linear;
 }
 .res span { min-width: 1.6em; }
+/* One pixel smaller than everywhere else the pips are used. It is not a style
+   choice: five of them sit in a row that is 14px short of fitting a late-game
+   stockpile, and 5px of icon is 5px the numbers do not have to give up. The
+   numbers stay at 13px, because they are the thing being read. */
+.res .ico { width: 12px; height: 12px; }
 
 .res.flash {
   background: var(--danger);
@@ -194,24 +206,21 @@ body {
   clip-path: polygon(0 22%, 26% 0, 100% 0, 100% 78%, 74% 100%, 0 100%);
 }
 .ico-pop  { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #e2d4b4 45%, #8d7f63 46%); }
-/* The age pip is a shield, because it is the only thing in the bar that is not
-   a quantity and it must not be mistaken for one at a glance. */
-.ico-age {
-  border-radius: 3px 3px 50% 50%;
-  background: linear-gradient(180deg, #f0d38a 0%, #b3861f 55%, #6b4c14 100%);
-}
-
-/* The age itself. It carries a word rather than a number, so it opts out of
-   the tabular-numeric sizing the counters use, and it is set apart with a
-   hairline rule — a glance down the bar should read "four resources, a
-   population, and then something else". It brightens with each age so the
-   Castle Age looks like an achievement rather than a fifth counter. */
+.ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
+/* The age. Deliberately the one entry in this bar with no pip: it is not a
+   quantity, and giving it a little coloured icon like the others would file it
+   as a sixth counter — which is exactly what a glance must not read. What sets
+   it apart instead is a hairline rule, its own colour, and the fact that it
+   says a word. Dropping the pip also bought the 16px that keeps the whole row
+   on one line at ordinary stockpile sizes, which is the difference between the
+   bar wrapping most of a match and wrapping almost never. It brightens with
+   each age so the Castle Age looks like an achievement. */
 .res.age {
   font-variant-numeric: normal;
   letter-spacing: 0.2px;
   font-size: 12px;
   border-left: 1px solid var(--edge-soft);
-  margin-left: 2px;
+  margin-left: 3px;
   padding-left: 6px;
   color: var(--parch-dim);
 }
@@ -219,7 +228,6 @@ body {
 .res.age[data-age="1"] { color: var(--parch); }
 .res.age[data-age="2"] { color: var(--gold); }
 .res.age[data-age="2"] .ico-age { box-shadow: 0 0 6px rgba(217, 171, 79, 0.7); }
-.ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
 
 .icon-btn {
   min-width: var(--tap);
@@ -270,7 +278,7 @@ body {
    hid the Town Center an alert was telling the player to look at. */
 .hud-toasts {
   position: absolute;
-  top: calc(var(--safe-t) + 48px);
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
   left: calc(var(--safe-l) + 8px);
   width: min(46vw, 182px);
   display: flex;
@@ -851,7 +859,7 @@ body {
   .place-bar { flex-wrap: nowrap; }
   .hud-minimap { top: calc(var(--safe-t) + 6px); right: calc(var(--safe-r) + 56px); }
   #minimap { width: 92px; height: 92px; }
-  .hud-toasts { top: calc(var(--safe-t) + 44px); width: min(34vw, 182px); }
+  .hud-toasts { top: calc(var(--safe-t) + var(--topbar-h, 44px)); width: min(34vw, 182px); }
   .cbtn { font-size: 10.5px; }
   .cbtn .cost { font-size: 9.5px; }
 }
