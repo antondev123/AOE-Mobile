@@ -7,6 +7,7 @@
 import {
   MAP_W, MAP_H, TERRAIN, RES, STARTING_RESOURCES, MAX_POP_CAP,
   UNIT_STATS, BUILDING_STATS, NODE_AMOUNT, PLAYER, ENEMY,
+  isWallType, isGateType,
 } from './constants.js';
 import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
@@ -39,10 +40,14 @@ export function createWorld(seed = 12345) {
     width: MAP_W,
     height: MAP_H,
     terrain: new Uint8Array(MAP_W * MAP_H),
-    // 0 = walkable, 1 = blocked by a static object, 2 = blocked by terrain
+    // See BLOCK_* below: 0 walkable, 1 static object, 2 terrain, 3 closed gate.
     blocked: new Uint8Array(MAP_W * MAP_H),
     // Entity id occupying each tile (0 = none). Lets units find what blocks them.
     occupant: new Int32Array(MAP_W * MAP_H),
+    // Who owns the gate on each tile, as playerId + 1 (0 = no gate here). This
+    // is the whole of the per-player passability model — see the note on
+    // BLOCK_GATE below and isWalkable() in systems/pathfinding.js.
+    gateOwner: new Uint8Array(MAP_W * MAP_H),
 
     entities: new Map(),
     units: [],       // live unit entities (dense array, rebuilt on removal)
@@ -93,6 +98,48 @@ function makePlayer(id) {
   };
 }
 
+// --- The block grid ---------------------------------------------------------
+//
+// `world.blocked` is one byte per tile and every system reads it directly — A*'s
+// inner loop, the line-of-sight sampler, the flood fills. It is the hottest data
+// structure in the game, so what it can say has to stay cheap to ask.
+//
+//   0 BLOCK_FREE     nothing here
+//   1 BLOCK_SOLID    a building, a resource node
+//   2 BLOCK_TERRAIN  water
+//   3 BLOCK_GATE     a closed gate belonging to world.gateOwner[i] - 1
+//
+// GATES AND PER-PLAYER PASSABILITY. A gate is walkable by its owner and solid
+// to everyone else, which the old grid — one global byte, no notion of who is
+// asking — could not express. Three approaches were on the table:
+//
+//   * a Map from tile to owner, consulted per walkability test. Rejected
+//     outright: isWalkable is called five times per line-of-sight *sample*, and
+//     a hash lookup on that path is not affordable.
+//   * one blocked grid per player, so the reader picks an array and the inner
+//     loop is unchanged. Correct and fast, but every setBlocked then writes N
+//     arrays and the two grids can drift apart, which is a bug class nobody
+//     would ever see coming.
+//   * this one: keep the single grid, spend a *distinct value* on the case, and
+//     put the owner in a parallel byte array read only when that value appears.
+//
+// The third wins on the only measurement that matters. A free tile costs the
+// same single compare it always did (`blocked[i] !== 0` short-circuits), a
+// blocked tile costs one more compare, and only an actual gate tile — of which
+// there are a handful on a 9216-tile map — reaches the gateOwner read. No
+// allocation, no lookup, no second grid to keep honest.
+//
+// Callers that know who is walking pass the player through (`opts.player` on
+// findPath, a trailing argument on isWalkable); callers that do not get the safe
+// answer, which is that a gate is a wall. Safe, because the worst case is a unit
+// walking the long way round its own gate, whereas the other default would let
+// an enemy stroll through it. See HANDOFF-walls.md for the call sites that
+// should start passing a player.
+export const BLOCK_FREE = 0;
+export const BLOCK_SOLID = 1;
+export const BLOCK_TERRAIN = 2;
+export const BLOCK_GATE = 3;
+
 // --- Tile helpers -----------------------------------------------------------
 
 export function inBounds(world, tx, ty) {
@@ -136,10 +183,114 @@ export function footprintTiles(gx, gy, fw, fh) {
 export function canPlace(world, gx, gy, fw, fh) {
   for (const [tx, ty] of footprintTiles(gx, gy, fw, fh)) {
     if (!inBounds(world, tx, ty)) return false;
-    if (world.blocked[ty * world.width + tx] !== 0) return false;
-    if (world.terrain[ty * world.width + tx] === TERRAIN.WATER) return false;
+    const i = ty * world.width + tx;
+    if (world.blocked[i] !== 0) return false;
+    // An *open* gate reads as free ground in the block grid — that is the whole
+    // trick that lets its owner walk through it — so the occupancy test is what
+    // stops a player dropping a house on top of their own open gate. Every other
+    // occupied tile is already blocked, so this costs one array read and only
+    // ever changes the answer for gates.
+    if (world.occupant[i] !== 0) return false;
+    if (world.terrain[i] === TERRAIN.WATER) return false;
   }
   return true;
+}
+
+// --- Walls ------------------------------------------------------------------
+//
+// A wall segment is a 1x1 building whose *sprite* depends on its neighbours: a
+// lone post, a straight run along either grid axis, one of four corners, one of
+// four tees, or a cross. That is sixteen cases, and they are addressed by a
+// four-bit mask of which axis neighbours are also walls — which is exactly the
+// shape of the question, so there is no lookup table and no special-casing.
+//
+// Bit order is the same one the terrain edge-blends use (see gfx/textures.js):
+// 0 = north (-y), 1 = east (+x), 2 = south (+y), 3 = west (-x). Keep it, or a
+// wall and the ground under it will disagree about which way north is.
+export const WALL_N = 1;
+export const WALL_E = 2;
+export const WALL_S = 4;
+export const WALL_W = 8;
+
+/** Does the wall at (tx,ty) owned by `player` join up with a piece here? */
+function wallNeighbour(world, tx, ty, player) {
+  if (!inBounds(world, tx, ty)) return false;
+  const id = world.occupant[ty * world.width + tx];
+  if (!id) return false;
+  const e = world.entities.get(id);
+  // Foundations count. A run that only joins up once the last segment is
+  // finished spends the whole build looking like a row of loose posts, which is
+  // precisely the reading this system exists to prevent.
+  return !!(e && !e.dead && e.kind === 'building' && e.player === player && isWallType(e.type));
+}
+
+/**
+ * The neighbour mask for a wall at (tx,ty) belonging to `player`.
+ *
+ * `extra` is an optional Set of "tx,ty" keys to treat as walls that are not
+ * there yet — the drag-to-draw preview passes the run it is about to place, so
+ * the ghost joins up exactly the way the finished wall will.
+ */
+export function wallMaskAt(world, tx, ty, player, extra = null) {
+  const at = (x, y) =>
+    (extra && extra.has(`${x},${y}`)) || wallNeighbour(world, x, y, player);
+  let m = 0;
+  if (at(tx, ty - 1)) m |= WALL_N;
+  if (at(tx + 1, ty)) m |= WALL_E;
+  if (at(tx, ty + 1)) m |= WALL_S;
+  if (at(tx - 1, ty)) m |= WALL_W;
+  return m;
+}
+
+/** Recompute one wall's own mask. Cheap: four tile reads. */
+export function refreshWallMask(world, b) {
+  if (!b || b.dead || !isWallType(b.type)) return;
+  const tx = Math.floor(b.x);
+  const ty = Math.floor(b.y);
+  b.wallMask = wallMaskAt(world, tx, ty, b.player);
+}
+
+/**
+ * Recompute the masks of the four walls around a tile, and of the wall on it.
+ * Called whenever a wall piece appears or disappears — which is the only time
+ * any of these answers can change, so nothing recomputes per frame.
+ */
+export function refreshWallsAround(world, tx, ty) {
+  const spots = [[tx, ty], [tx, ty - 1], [tx + 1, ty], [tx, ty + 1], [tx - 1, ty]];
+  for (const [x, y] of spots) {
+    if (!inBounds(world, x, y)) continue;
+    const id = world.occupant[y * world.width + x];
+    if (!id) continue;
+    const e = world.entities.get(id);
+    if (e && !e.dead && e.kind === 'building' && isWallType(e.type)) refreshWallMask(world, e);
+  }
+}
+
+/**
+ * Open or shut a completed gate.
+ *
+ * Open is BLOCK_FREE, which is what lets the owner's units walk through it under
+ * today's pathfinding calls, none of which say who is asking. Shut is BLOCK_GATE
+ * plus the owner in `gateOwner`, which the player-aware calls read. The occupant
+ * is left alone in both states so the gate stays tappable, targetable and
+ * findable while it is standing open.
+ */
+export function setGateOpen(world, b, open) {
+  if (!b || b.dead || !isGateType(b.type)) return;
+  const tx = Math.floor(b.x);
+  const ty = Math.floor(b.y);
+  if (!inBounds(world, tx, ty)) return;
+  const i = ty * world.width + tx;
+  b.gateOpen = !!open;
+  if (!b.complete) {
+    // A gate under construction is a building site: solid to everybody,
+    // including the villager who is standing next to it hammering.
+    world.blocked[i] = BLOCK_SOLID;
+    world.gateOwner[i] = 0;
+    return;
+  }
+  world.gateOwner[i] = b.player + 1;
+  world.blocked[i] = open ? BLOCK_FREE : BLOCK_GATE;
 }
 
 // --- Entity creation --------------------------------------------------------
@@ -232,12 +383,57 @@ export function spawnBuilding(world, type, player, gx, gy, { complete = true } =
     rally: null,
     state: complete ? 'idle' : 'foundation',
     dead: false,
+
+    // --- The shooting half ---------------------------------------------------
+    // Stamped from the stats block so a Castle or a tower carries everything a
+    // combat pass needs on the entity itself — the same field names a unit
+    // carries, so the code that swings for a unit can swing for a building
+    // without learning a second vocabulary. Zero for everything else, which is
+    // the same "does not fight" answer buildings have always given.
+    attack: s.attack || 0,
+    range: s.attackRange || 0,
+    attackCooldown: s.attackCooldown || 0,
+    cooldown: 0,
+    target: null,
+    attackAnim: 0,
+    armor: s.armor || 0,
+    // Units sheltering inside. Each one adds an arrow to the volley (AoE2's
+    // rule); they are off the map but still on the population. See
+    // garrisonUnit() in systems/economy.js.
+    garrison: [],
+    garrisonCapacity: s.garrisonCapacity || 0,
+
+    // Wall pieces: which neighbours to draw a join to, and whether a gate is
+    // standing open. Filled in below for the pieces that have them.
+    wallMask: 0,
+    gateOpen: false,
   };
 
   for (const [tx, ty] of e.tiles) setBlocked(world, tx, ty, 1, e.id);
   register(world, e);
+  if (isWallType(type)) {
+    refreshWallsAround(world, Math.floor(e.x), Math.floor(e.y));
+    if (isGateType(type)) setGateOpen(world, e, false);
+  }
   if (complete) applyPopBonus(world, player);
   return e;
+}
+
+/**
+ * Everything that has to happen the instant a building finishes.
+ *
+ * economy.js calls this from buildTick. It lives here because both of the things
+ * it does are facts about the tile grid, which is this module's to own: a gate
+ * only becomes passable when it is a gate rather than a building site, and a
+ * finished wall joins up with what is already standing.
+ */
+export function onBuildingComplete(world, b) {
+  if (!b || b.dead || b.kind !== 'building') return b;
+  if (isWallType(b.type)) {
+    refreshWallsAround(world, Math.floor(b.x), Math.floor(b.y));
+    if (isGateType(b.type)) setGateOpen(world, b, false);
+  }
+  return b;
 }
 
 // What a node type actually pays out. Kept as a table rather than a chain of
@@ -288,7 +484,15 @@ export function removeEntity(world, e) {
   } else if (e.kind === 'building') {
     const i = world.buildings.indexOf(e);
     if (i >= 0) world.buildings.splice(i, 1);
-    for (const [tx, ty] of e.tiles) setBlocked(world, tx, ty, 0);
+    for (const [tx, ty] of e.tiles) {
+      setBlocked(world, tx, ty, 0);
+      if (inBounds(world, tx, ty)) world.gateOwner[ty * world.width + tx] = 0;
+    }
+    // Anyone sheltering inside a building that has just been razed comes out
+    // where it stood. Leaving them in the entity map but off the unit list would
+    // be an invisible population leak that nothing on screen could explain.
+    if (e.garrison && e.garrison.length) evictGarrison(world, e);
+    if (isWallType(e.type)) refreshWallsAround(world, Math.floor(e.x), Math.floor(e.y));
   } else if (e.kind === 'resource') {
     const i = world.resources.indexOf(e);
     if (i >= 0) world.resources.splice(i, 1);
@@ -310,6 +514,128 @@ export function removeEntity(world, e) {
     }
   }
   world.events.emit(EV.REMOVED, { entity: e });
+}
+
+// --- Garrison ---------------------------------------------------------------
+//
+// A garrisoned unit is *off the map but still in the game*: it keeps its entity
+// id, it stays in `world.entities` and in its owner's `owned` set — so
+// recomputePop still counts it, which is AoE2's rule and the thing that stops
+// garrisoning being a free way to duck the population cap — and it is spliced
+// out of `world.units`.
+//
+// That one splice is what does all the work. Every system that could see the
+// unit walks `world.units`: the renderer, the spatial index, unit AI, combat's
+// acquisition sweep. None of them needs to learn the word "garrison"; the unit
+// is simply not in the list any more. The alternative — a `garrisoned` flag that
+// eleven loops have to remember to test — is the same feature with eleven places
+// to forget it.
+//
+// The *order* to enter or leave is the unit AI's (a garrison order is a walk
+// followed by a disappearance, and walking is not this module's business). What
+// is here is the disappearance itself. See HANDOFF-walls.md.
+
+/** Room for one more body inside this building? */
+export function canGarrison(world, b, unit) {
+  if (!b || b.dead || b.kind !== 'building' || !b.complete) return false;
+  if (!unit || unit.dead || unit.kind !== 'unit') return false;
+  if (unit.player !== b.player) return false;
+  if (!b.garrisonCapacity) return false;
+  return (b.garrison ? b.garrison.length : 0) < b.garrisonCapacity;
+}
+
+/** Take a unit off the map and into `b`. Returns true when it went in. */
+export function garrisonUnit(world, b, unit) {
+  if (!canGarrison(world, b, unit)) return false;
+  const i = world.units.indexOf(unit);
+  if (i < 0) return false;                 // already inside something
+  world.units.splice(i, 1);
+  unit.garrisonedIn = b;
+  unit.task = null;
+  unit.path = null;
+  unit.target = null;
+  unit.state = 'garrison';
+  world.selection.delete(unit.id);
+  if (!b.garrison) b.garrison = [];
+  b.garrison.push(unit);
+  return true;
+}
+
+/**
+ * Put one unit (the last one in, or `unit` if named) back on the map beside the
+ * building. Returns the unit, or null when there was nobody to let out or
+ * nowhere to put them.
+ */
+export function ungarrisonUnit(world, b, unit = null) {
+  const list = b && b.garrison;
+  if (!list || !list.length) return null;
+  const idx = unit ? list.indexOf(unit) : list.length - 1;
+  if (idx < 0) return null;
+  const spot = freeTileAround(world, b);
+  if (!spot) return null;
+  const u = list[idx];
+  list.splice(idx, 1);
+  u.garrisonedIn = null;
+  u.x = spot.x;
+  u.y = spot.y;
+  u.px = spot.x;
+  u.py = spot.y;
+  u.state = 'idle';
+  if (!world.units.includes(u)) world.units.push(u);
+  return u;
+}
+
+/** Empty a building out. Used when it is destroyed, and by "unload". */
+export function evictGarrison(world, b) {
+  const out = [];
+  let guard = 64;
+  while (b.garrison && b.garrison.length && guard-- > 0) {
+    const u = ungarrisonUnit(world, b);
+    if (!u) break;
+    out.push(u);
+  }
+  // Nowhere at all to stand — the building is walled in and being razed. The
+  // bodies inside die with it rather than leaking out of every list at once.
+  if (b.garrison && b.garrison.length) {
+    for (const u of b.garrison.slice()) {
+      u.garrisonedIn = null;
+      u.hp = 0;
+      removeEntity(world, u);
+    }
+    b.garrison.length = 0;
+  }
+  return out;
+}
+
+/** First free tile on a widening ring around a building, or null. */
+function freeTileAround(world, b) {
+  const ox = Math.floor(b.x - b.fw / 2);
+  const oy = Math.floor(b.y - b.fh / 2);
+  for (let r = 1; r <= 4; r++) {
+    for (let y = oy - r; y < oy + b.fh + r; y++) {
+      for (let x = ox - r; x < ox + b.fw + r; x++) {
+        const onRing =
+          x === ox - r || x === ox + b.fw + r - 1 ||
+          y === oy - r || y === oy + b.fh + r - 1;
+        if (!onRing || !inBounds(world, x, y)) continue;
+        const i = y * world.width + x;
+        if (world.blocked[i] !== 0) continue;
+        if (world.terrain[i] === TERRAIN.WATER) continue;
+        return { x: x + 0.5, y: y + 0.5 };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * How many arrows this building looses in one volley: its own, plus one per
+ * body sheltering inside, exactly as an AoE2 Castle works. A building that
+ * cannot shoot fires nothing however full it is.
+ */
+export function volleySize(b) {
+  if (!b || !(b.attack > 0)) return 0;
+  return 1 + (b.garrison ? b.garrison.length : 0);
 }
 
 // --- Population -------------------------------------------------------------

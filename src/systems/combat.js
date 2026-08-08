@@ -40,11 +40,17 @@
 // is taking damage, as you intended". See alertRelevant().
 
 import {
-  UNIT_STATS, AGGRO_RANGE, CHASE_LEASH, PROJECTILE_SPEED, MIN_DAMAGE,
+  UNIT_STATS, BUILDING_STATS, TERRAIN, AGGRO_RANGE, CHASE_LEASH,
+  PROJECTILE_SPEED, MIN_DAMAGE,
+  BONUS_DAMAGE, DEFAULT_ARMOR_CLASS, BUILDING_ARMOR_CLASS,
+  STANCE, DEFAULT_STANCE, VILLAGER_STANCE, STANCE_LEASH,
+  GARRISON_CAPACITY_FALLBACK, GARRISON_HEAL_PER_SEC, GARRISON_ARROW_DAMAGE,
+  GARRISON_VOLLEY_COOLDOWN, GARRISON_DEFAULT_RANGE,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
   edgeDist, edgeDist2, forEachNear, isHostile, removeEntity, findNearestGlobal,
+  inBounds, isBlocked,
 } from '../core/world.js';
 import { dist, dirIndex } from '../core/iso.js';
 import { attackBonus, armorBonus } from './tech.js';
@@ -164,10 +170,43 @@ export function canAttack(attacker, target) {
 // every swing costs nothing measurable next to the target search that preceded
 // it.
 
-/** What this unit actually swings with: base attack plus its class's line. */
-export function effectiveAttack(world, unit) {
+/**
+ * What `e` counts as when it is being hit. Units declare it in UNIT_STATS;
+ * masonry is all one class, decided here rather than per building so that
+ * BUILDING_STATS — which belongs to another pass — needs no field for it.
+ */
+export function armorClassOf(e) {
+  if (!e) return DEFAULT_ARMOR_CLASS;
+  if (e.kind === 'building') return BUILDING_ARMOR_CLASS;
+  const s = UNIT_STATS[e.type];
+  return (s && s.armorClass) || DEFAULT_ARMOR_CLASS;
+}
+
+/**
+ * The counter system, in one lookup: what `attacker` adds against what
+ * `target` is. Two object reads, no allocation — it runs on every swing and
+ * on every arrow.
+ */
+export function bonusDamage(attacker, target) {
+  if (!attacker || !target) return 0;
+  const table = BONUS_DAMAGE[attacker.type];
+  if (!table) return 0;
+  return table[armorClassOf(target)] || 0;
+}
+
+/**
+ * What this unit actually swings with: base attack, plus its class's blacksmith
+ * line, plus whatever the counter table says about the thing in front of it.
+ *
+ * `target` is optional. Called without one this is the unit's *sheet* attack —
+ * which is what the HUD and the tech tests want — and called with one it is the
+ * number that actually lands. Every real swing passes the target, so a
+ * spearman's +12 against cavalry is applied at exactly the same moment, and by
+ * exactly the same rule, as Forging's +1.
+ */
+export function effectiveAttack(world, unit, target = null) {
   if (!unit) return 0;
-  return (unit.attack || 0) + attackBonus(world, unit);
+  return (unit.attack || 0) + attackBonus(world, unit) + bonusDamage(unit, target);
 }
 
 /** What this entity actually soaks with: base armour plus its class's line. */
@@ -542,7 +581,7 @@ function fire(world, u, target) {
   if (isRanged(u)) {
     launchProjectile(world, u, target);
   } else {
-    applyDamage(world, u, target, effectiveAttack(world, u));
+    applyDamage(world, u, target, effectiveAttack(world, u, target));
   }
 }
 
@@ -552,7 +591,7 @@ function isRanged(u) {
   return !!(s && s.projectile);
 }
 
-function launchProjectile(world, u, target) {
+function launchProjectile(world, u, target, damage) {
   const d = dist(u.x, u.y, target.x, target.y);
   const p = {
     x: u.x,
@@ -565,8 +604,9 @@ function launchProjectile(world, u, target) {
     // so the difference is invisible — but "the arrow carries its damage" is
     // the rule the projectile struct already implied, and changing it here
     // would make a Fletching finishing mid-volley retroactively strengthen
-    // arrows that had already left.
-    damage: effectiveAttack(world, u),
+    // arrows that had already left. The counter bonus is snapshotted with it and
+    // for the same reason: the arrow was aimed at *this* target.
+    damage: damage === undefined ? effectiveAttack(world, u, target) : damage,
     owner: u,
     speed: PROJECTILE_SPEED,
     elapsed: 0,

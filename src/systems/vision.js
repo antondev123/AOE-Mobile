@@ -50,33 +50,18 @@
 
 import {
   MAP_W, MAP_H, UNIT_STATS, BUILDING_STATS,
+  DEFAULT_UNIT_LOS, DEFAULT_BUILDING_LOS,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 
 // --- Tuning ----------------------------------------------------------------
-// These belong in core/constants.js beside UNIT_STATS once someone is editing
-// that file; they live here for now so this feature does not collide with the
-// balance pass happening in parallel. See HANDOFF-vision.md.
-
-// A unit's line of sight, in tiles. AoE2 gives infantry and villagers 4 and
-// archers 6, and those two numbers are what the derivation below reproduces
-// from stats we already have — UNIT_STATS carries no lineOfSight field and this
-// file may not add one.
-//
-// The rule: everybody sees at least DEFAULT_UNIT_LOS, and a unit that shoots
-// sees two tiles past the end of its bow. The second half is not decoration —
-// a unit that could out-range its own vision would auto-acquire and fire at
-// something the player cannot see, which is the single ugliest thing an RTS
-// fog can do. floor() rather than round() on the range keeps the archer at
-// AoE2's 6 (range 4.5 -> 4 + 2) instead of an over-generous 7.
-const DEFAULT_UNIT_LOS = 4;
-const LOS_RANGE_MARGIN = 2;
-
-// Buildings carry their own lineOfSight in BUILDING_STATS. A building is not a
-// point, though: a Town Center is 3x3, so measuring from the centre tile would
-// have its stated 8 tiles of sight cover only 6.5 tiles of ground past its own
-// wall. Half the footprint is added back.
-const DEFAULT_BUILDING_LOS = 3;
+// The three numbers that used to live here now live in core/constants.js beside
+// UNIT_STATS, which is where HANDOFF-vision.md said they belonged: every unit
+// states its own `lineOfSight`, every building states one, and the two
+// constants imported above are only the fallbacks for an entry that forgets.
+// The derivation from attack range is gone with them — the invariant it existed
+// to guarantee (sight strictly greater than reach) is now checked per entry and
+// asserted over the whole table in tests/military.test.mjs.
 
 /** Counters for tests and debugging. Reset whenever you like. */
 export const visionStats = {
@@ -110,10 +95,16 @@ const nowMs = () =>
 export function unitLineOfSight(type) {
   const s = UNIT_STATS[type];
   if (!s) return DEFAULT_UNIT_LOS;
-  return Math.max(DEFAULT_UNIT_LOS, Math.floor(s.range || 0) + LOS_RANGE_MARGIN);
+  return s.lineOfSight || DEFAULT_UNIT_LOS;
 }
 
-/** Vision radius in whole tiles for a building type, footprint included. */
+/**
+ * Vision radius in whole tiles for a building type, footprint included.
+ *
+ * A building is not a point: a Town Center is 3x3, so measuring from the centre
+ * tile would have its stated 8 tiles of sight cover only 6.5 tiles of ground
+ * past its own wall. Half the footprint is added back.
+ */
 export function buildingLineOfSight(type) {
   const s = BUILDING_STATS[type];
   if (!s) return DEFAULT_BUILDING_LOS;

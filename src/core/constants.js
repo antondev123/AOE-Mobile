@@ -97,6 +97,31 @@ export const MAX_POP_CAP = 200;
 // Movement is only ~10% slower. It is the one number that must not be halved:
 // walking is dead time, and doubling it would have paid for the extra thinking
 // room with boredom instead of with decisions.
+// --- Armour classes ---------------------------------------------------------
+//
+// AoE2's counter system is not "cavalry is strong": it is a table of *bonuses*
+// keyed by what you are and what you are hitting. Every unit carries an
+// `armorClass` — the thing it counts as when it is being hit — and BONUS_DAMAGE
+// below says what each attacker adds against each class. That indirection is
+// what lets a new unit slot into the triangle by declaring one string, instead
+// of every existing unit growing a clause about it.
+export const ARMOR_CLASS = {
+  VILLAGER: 'villager',
+  INFANTRY: 'infantry',
+  ARCHER: 'archer',
+  CAVALRY: 'cavalry',
+  SIEGE: 'siege',
+  BUILDING: 'building',
+};
+// A unit whose stats block forgets to say. Infantry is the safe default: it is
+// the class the most bonuses point at, so a missing declaration makes a unit
+// slightly *weaker* than intended rather than accidentally immune to the whole
+// counter table.
+export const DEFAULT_ARMOR_CLASS = ARMOR_CLASS.INFANTRY;
+// Buildings do not live in UNIT_STATS and BUILDING_STATS belongs to another
+// pass, so masonry is classified here rather than per building.
+export const BUILDING_ARMOR_CLASS = ARMOR_CLASS.BUILDING;
+
 export const UNIT_STATS = {
   villager: {
     name: 'Villager',
@@ -108,6 +133,11 @@ export const UNIT_STATS = {
     // 80 seconds, which is the same shape of opening, an age compressed.
     buildTime: 16,
     pop: 1,
+    // Its own class, deliberately, so that "archers beat infantry" does not
+    // quietly also mean "archers massacre villagers". A raid on a wood line is
+    // already one-sided; it does not need a damage bonus on top.
+    armorClass: ARMOR_CLASS.VILLAGER,
+    lineOfSight: 4,
   },
   militia: {
     name: 'Militia',
@@ -116,6 +146,25 @@ export const UNIT_STATS = {
     cost: { food: 60, wood: 0, gold: 20 },
     buildTime: 22,
     pop: 1,
+    armorClass: ARMOR_CLASS.INFANTRY,
+    lineOfSight: 4,
+    military: true,
+  },
+  // The anti-cavalry pike. Cheap, slow, and almost useless on its own: 4 attack
+  // against a militia's 6 is a losing trade in every fight except the one it is
+  // for. That is the point — a counter unit that is also fine in a straight
+  // brawl is not a counter, it is just a better unit, and the player never has
+  // to look at what the enemy fielded.
+  spearman: {
+    name: 'Spearman',
+    hp: 45, speed: 1.0, radius: 0.34,
+    attack: 4, range: 0.9, attackCooldown: 1.4, armor: 0,
+    cost: { food: 35, wood: 25, gold: 0 },
+    buildTime: 20,
+    pop: 1,
+    armorClass: ARMOR_CLASS.INFANTRY,
+    lineOfSight: 4,
+    military: true,
   },
   archer: {
     name: 'Archer',
@@ -125,8 +174,94 @@ export const UNIT_STATS = {
     buildTime: 24,
     pop: 1,
     projectile: true,
+    armorClass: ARMOR_CLASS.ARCHER,
+    // Six, not five: the one hard rule the fog imposes is that a unit must see
+    // further than it shoots (range 4.5), or it auto-acquires targets its owner
+    // cannot see. See the invariant test in tests/military.test.mjs.
+    lineOfSight: 6,
+    military: true,
+  },
+  // The scout/knight line. Fast and tough rather than hard-hitting: 1.7 tiles a
+  // second is half again a militia's pace, which is what makes cavalry the unit
+  // that reaches an archer line before it has fired four volleys, and the unit
+  // that arrives at a raid on the far gold while it is still happening.
+  scout: {
+    name: 'Scout Cavalry',
+    hp: 60, speed: 1.7, radius: 0.4,
+    attack: 5, range: 0.8, attackCooldown: 1.3, armor: 1,
+    cost: { food: 80, wood: 0, gold: 0 },
+    buildTime: 26,
+    pop: 1,
+    armorClass: ARMOR_CLASS.CAVALRY,
+    // Seven. A scout that cannot see further than everything else is not a
+    // scout, and with fog of war this is the unit a player actually opens the
+    // map with.
+    lineOfSight: 7,
+    military: true,
+  },
+  // Siege. A battering ram is not a soldier: 3 attack means it cannot kill
+  // anything that moves, and 200 hitpoints behind 4 armour means very little
+  // that moves can kill it quickly either. Its whole existence is the +40
+  // against masonry below, which turns a Town Center from a two-minute chore
+  // into a thirty-second one.
+  ram: {
+    name: 'Battering Ram',
+    hp: 200, speed: 0.65, radius: 0.5,
+    attack: 3, range: 1.2, attackCooldown: 3.0, armor: 4,
+    cost: { food: 0, wood: 160, gold: 75 },
+    buildTime: 36,
+    // Two, not one. A ram is a siege engine crewed by several men and it should
+    // cost more of the army it travels with than a spearman does.
+    pop: 2,
+    armorClass: ARMOR_CLASS.SIEGE,
+    // Three, as in AoE2. A ram is blind and slow and is meant to be escorted;
+    // still comfortably past its own 1.2 reach.
+    lineOfSight: 3,
+    military: true,
   },
 };
+
+/**
+ * Damage bonuses, attacker unit type -> target armour class.
+ *
+ * Read at the moment of the swing and added to `attack` *before* armour is
+ * subtracted, so the formula stays the one number a player can do in their
+ * head: max(MIN_DAMAGE, attack + bonus - armor).
+ *
+ * The three numbers that carry the counter triangle are the spearman's +12
+ * against cavalry, the scout's +5 against archers and the archer's +4 against
+ * infantry. Two of those three are not AoE2's — AoE2's archers and cavalry beat
+ * infantry and archers respectively through *movement*: kiting, and closing
+ * distance faster than a bow can fire. Neither of those exists on a phone. There
+ * is no kiting AI, there is no per-unit micro, and a player giving a group order
+ * with one thumb is never going to pull five archers back a tile at a time. So
+ * the counters that AoE2 gets for free out of its control scheme are paid for
+ * here in the bonus table, where they are legible: tap a unit, read the number,
+ * know what it is for. The spearman's +12 *is* AoE2's (+15 vs cavalry, trimmed
+ * because a scout here has 60 hitpoints rather than a knight's 100).
+ *
+ * The +2..+4 against siege is the other half of "siege is not a soldier": a ram
+ * left unescorted is meant to die to whatever finds it.
+ */
+export const BONUS_DAMAGE = {
+  spearman: { cavalry: 12, siege: 4 },
+  scout: { archer: 5, siege: 2 },
+  archer: { infantry: 4, siege: 2 },
+  militia: { siege: 3 },
+  // 3 + 40 against a 900-hitpoint Town Center is 21 swings, a minute of work
+  // for one ram — long enough that the defender gets to answer it, short enough
+  // that bringing two is a plan.
+  ram: { building: 40 },
+};
+
+/** Every unit type that counts as an army, in table order. */
+export const MILITARY_TYPES = Object.keys(UNIT_STATS).filter((t) => UNIT_STATS[t].military);
+
+/** Is this unit type a soldier rather than a worker? */
+export function isMilitaryType(type) {
+  const s = UNIT_STATS[type];
+  return !!(s && s.military);
+}
 
 export const BUILDING_STATS = {
   towncenter: {
@@ -155,7 +290,22 @@ export const BUILDING_STATS = {
     hp: 700, fw: 3, fh: 3,
     cost: { food: 0, wood: 175, gold: 0 },
     buildTime: 38,
-    trains: ['militia', 'archer'],
+    // Four units at one building, and two of them do not belong here.
+    //
+    // The Archery Range, the Stable and the Siege Workshop are named in
+    // tech.js's age tables and in BUILDABLE, but they are landing from another
+    // pass. Until they do, a roster that only the barracks can reach is a
+    // roster nobody can play with: the counter triangle needs cavalry on the
+    // map for spearmen to mean anything, and an enemy AI that cannot train a
+    // scout cannot be made to respond to an archer mass. The archer was already
+    // here as exactly this stopgap; the scout joins it on the same terms. Both
+    // move to their proper buildings the day those exist — see
+    // HANDOFF-military.md, which lists the one-line change.
+    //
+    // The ram is deliberately *not* here. A barracks building a siege engine is
+    // a step too far, and unlike cavalry the ram's absence costs the counter
+    // triangle nothing.
+    trains: ['militia', 'spearman', 'archer', 'scout'],
     lineOfSight: 5,
   },
   farm: {
@@ -220,7 +370,157 @@ export const BUILDING_STATS = {
     dropoff: ['gold', 'stone'],
     lineOfSight: 4,
   },
+
+  // --- Defences: what stone is actually for -----------------------------------
+  //
+  // Until this pass stone was a resource with no sink. Two ten-minute
+  // simulations both ended with 150 stone in the bank — the exact figure both
+  // players started with, untouched, because nothing in the game cost any. The
+  // five buildings below are the sink, and they are AoE2's five: the wooden
+  // fence you throw up in the Dark Age, the stone wall and the tower that follow
+  // it, the gates that make either wall a wall you can live behind, and the
+  // Castle at the end of the line.
+  //
+  // COSTS. AoE2's own numbers wherever the economy can carry them (a palisade is
+  // 2 wood, a stone wall is 5 stone, a stone gate is 30 stone — those are exact),
+  // and cut where it cannot. The two that are cut are the Watch Tower (125 stone
+  // + 25 wood in AoE2) and the Castle (650 stone). Measured against the shipped
+  // economy: a villager on stone banks roughly 0.7 stone a second including its
+  // walk, so AoE2's 650 is fifteen villager-minutes — longer than the whole
+  // match. 250 is about four minutes of two villagers on a mine, which is a
+  // project you commit to in the Castle Age and not a number you look at once
+  // and dismiss. The opening 150 stone buys a tower, or thirty wall segments, or
+  // most of a Castle's first instalment: enough that the first stone mine is a
+  // decision rather than a formality, which is exactly what the comment on
+  // STARTING_RESOURCES has always promised and could not previously deliver.
+  //
+  // FOOTPRINTS. Every wall piece is 1x1, so a run of them tiles the grid with no
+  // gaps; the Castle is AoE2's 4x4. Nothing here is 2x2, because a 2x2 "wall"
+  // cannot turn a corner without leaving a hole.
+  //
+  // `wall: true` marks a piece that joins up with its neighbours — see
+  // wallMaskAt() in core/world.js, which picks the connected sprite from which
+  // of the four axis neighbours are also walls. `gate: true` additionally marks
+  // a piece that is passable for its owner; see the block-grid note in world.js.
+  palisade: {
+    name: 'Palisade',
+    // 250 hp in AoE2 against a 900-hp house; here a house is 320, so the same
+    // ratio lands at 90. Five militia chew through a segment in about three
+    // seconds, which is the point of a palisade: it buys you the time to react
+    // to a drush, it does not stop one.
+    hp: 90, fw: 1, fh: 1,
+    cost: { food: 0, wood: 2, gold: 0, stone: 0 },
+    // AoE2 builds a palisade in 6 seconds and that is nearly the compressed
+    // figure already, so it barely moves: what matters is that a long run is
+    // paid for in villager-seconds, and 4s x 20 segments is 80 of them.
+    buildTime: 4,
+    trains: [],
+    lineOfSight: 2,
+    wall: true,
+  },
+  palisadegate: {
+    name: 'Palisade Gate',
+    hp: 130, fw: 1, fh: 1,
+    cost: { food: 0, wood: 20, gold: 0, stone: 0 },
+    buildTime: 8,
+    trains: [],
+    lineOfSight: 3,
+    wall: true,
+    gate: true,
+  },
+  stonewall: {
+    name: 'Stone Wall',
+    // AoE2's stone wall has 1800 hp against its 1800-hp house — an even trade
+    // that does not survive being compressed here, where a house is 320. 420 is
+    // the number that makes the wall do its job: five militia need fifteen
+    // seconds a segment, so a raiding party has to commit to breaking in and you
+    // have that long to answer it. Much less and the wall is decoration; much
+    // more and there is no way through it in a ten-minute match.
+    hp: 420, fw: 1, fh: 1,
+    cost: { food: 0, wood: 0, gold: 0, stone: 5 },
+    buildTime: 8,
+    trains: [],
+    lineOfSight: 2,
+    wall: true,
+  },
+  stonegate: {
+    name: 'Stone Gate',
+    // Deliberately the toughest thing on the wall line: a gate is the hole in
+    // your defences and the tile every attacker walks to first.
+    hp: 520, fw: 1, fh: 1,
+    cost: { food: 0, wood: 0, gold: 0, stone: 30 },
+    buildTime: 16,
+    trains: [],
+    lineOfSight: 3,
+    wall: true,
+    gate: true,
+  },
+  watchtower: {
+    name: 'Watch Tower',
+    hp: 380, fw: 1, fh: 1,
+    cost: { food: 0, wood: 25, gold: 0, stone: 100 },
+    buildTime: 22,
+    trains: [],
+    // Nine tiles of sight from a one-tile footprint is the whole reason to plant
+    // one on a hill or beside a forward gold: an archer sees 6, so a tower is
+    // half again as far and it never has to be told to look.
+    lineOfSight: 9,
+    // --- The shooting half (see HANDOFF-walls.md) ---------------------------
+    // A tower out-ranges an archer by half a tile and hits harder than one, but
+    // swings at less than half the rate, so it beats a scout and loses to a
+    // committed push — which is what a tower is for.
+    attack: 6,
+    attackRange: 7,
+    attackCooldown: 2.0,
+    projectile: true,
+    garrisonCapacity: 5,
+  },
+  castle: {
+    name: 'Castle',
+    // AoE2's Castle is 4800 hp and 4x4. The footprint is exact; the hitpoints
+    // are the same 0.3 compression every other building here carries, which
+    // leaves it at five Town Centers' worth of masonry — the one building on the
+    // map an early army simply cannot remove.
+    hp: 1500, fw: 4, fh: 4,
+    cost: { food: 0, wood: 0, gold: 0, stone: 250 },
+    // Ninety seconds with one villager, twenty-two with four. AoE2 spends 200s
+    // on it; the compression factor everything else uses would give 80, and the
+    // extra ten are deliberate — a Castle should be a thing you see going up
+    // from across the map with time to do something about it.
+    buildTime: 90,
+    trains: ['militia', 'archer'],
+    // A Castle is a drop-off for everything, like a Town Center. That is not
+    // AoE2 (which reserves the honour for the Town Center), and it is here on
+    // purpose: 250 stone is a forward base, and a forward base that cannot bank
+    // the gold it was planted on is an ornament.
+    dropoff: ['food', 'wood', 'gold', 'stone'],
+    // Twelve tiles from a 4x4 footprint sees about a fifth of the way across the
+    // map. On its own that is worth the stone: a Castle on the middle gold is a
+    // permanent answer to "where is his army".
+    lineOfSight: 12,
+    attack: 12,
+    attackRange: 9,
+    attackCooldown: 2.0,
+    projectile: true,
+    // AoE2 garrisons 20 in a Castle and adds an arrow per body. Ten is the
+    // figure for an army this size: filling it is a real decision about where
+    // ten soldiers are, and it triples the Castle's volley rather than making it
+    // unanswerable.
+    garrisonCapacity: 10,
+  },
 };
+
+/** Is this building type a wall piece that joins up with its neighbours? */
+export function isWallType(type) {
+  const s = BUILDING_STATS[type];
+  return !!(s && s.wall);
+}
+
+/** Is this building type a gate — a wall piece its owner may walk through? */
+export function isGateType(type) {
+  const s = BUILDING_STATS[type];
+  return !!(s && s.gate);
+}
 
 // Buildings a villager may place, in the order the build menu lists them.
 //
@@ -242,13 +542,16 @@ export const BUILDING_STATS = {
 export const BUILDABLE = [
   // Standing today.
   'house', 'farm', 'mill', 'lumbercamp', 'miningcamp', 'barracks', 'towncenter',
-  // Dark Age, expected.
-  'palisade', 'palisadewall',
-  // Feudal Age, expected.
+  // Dark Age.
+  'palisade', 'palisadegate', 'palisadewall',
+  // Feudal Age. The wall and its gate sit next to each other because they are
+  // placed in the same breath: you draw a run and then put the door in it.
+  'stonewall', 'stonegate', 'watchtower',
   'archeryrange', 'stable', 'blacksmith', 'market',
-  'watchtower', 'tower', 'stonewall', 'wall', 'gate',
-  // Castle Age, expected.
-  'castle', 'siegeworkshop', 'university', 'monastery', 'keep',
+  'tower', 'wall', 'gate',
+  // Castle Age.
+  'castle',
+  'siegeworkshop', 'university', 'monastery', 'keep',
 ];
 
 // Villagers contribute this much build progress per second (per builder).
@@ -261,6 +564,123 @@ export const AGGRO_RANGE = 5.0;
 export const CHASE_LEASH = 7.0;
 export const PROJECTILE_SPEED = 9.0; // tiles/sec
 export const MIN_DAMAGE = 1;
+
+// --- Line of sight ----------------------------------------------------------
+// Moved here from the top of systems/vision.js, where they lived only because
+// this file was owned by a parallel pass at the time (see HANDOFF-vision.md).
+// Every unit now states its own `lineOfSight` in UNIT_STATS and every building
+// states one in BUILDING_STATS; these two are the fallbacks for an entry that
+// forgets, and vision.js does no derivation of its own any more.
+//
+// THE INVARIANT, which was the whole reason the derivation existed: a unit's
+// line of sight must be strictly greater than its attack range. A unit that
+// out-ranges its own vision auto-acquires and fires at things its owner cannot
+// see — arrows leaving a bow aimed at empty black ground. It is now checked by
+// hand per entry and asserted for the whole table in tests/military.test.mjs.
+export const DEFAULT_UNIT_LOS = 4;
+export const DEFAULT_BUILDING_LOS = 3;
+
+// --- Stances ----------------------------------------------------------------
+//
+// AoE2's four, and they mean here exactly what they mean there:
+//
+//   aggressive   attack anything you see, chase it, stay where the chase ends
+//   defensive    attack anything you see, chase it a little, then walk back to
+//                where you were standing when it started
+//   standGround  attack only what walks into your reach; never take a step
+//   noAttack     never acquire a target at all
+//
+// A stance is a property of the *unit*, not of the order, so it survives every
+// move, attack and attack-move the player gives — which is what makes it worth
+// setting on a phone, where re-issuing it per order would be unusable.
+export const STANCE = {
+  AGGRESSIVE: 'aggressive',
+  DEFENSIVE: 'defensive',
+  STAND_GROUND: 'standGround',
+  NO_ATTACK: 'noAttack',
+};
+/** Order the HUD lists them in — least passive first, as AoE2 does. */
+export const STANCE_ORDER = [
+  STANCE.AGGRESSIVE, STANCE.DEFENSIVE, STANCE.STAND_GROUND, STANCE.NO_ATTACK,
+];
+export const STANCE_LABEL = {
+  [STANCE.AGGRESSIVE]: 'Aggressive',
+  [STANCE.DEFENSIVE]: 'Defensive',
+  [STANCE.STAND_GROUND]: 'Stand Ground',
+  [STANCE.NO_ATTACK]: 'No Attack',
+};
+/** One line of what each stance actually does, for the button's sub-label. */
+export const STANCE_BLURB = {
+  [STANCE.AGGRESSIVE]: 'Chase what you see',
+  [STANCE.DEFENSIVE]: 'Chase, then return',
+  [STANCE.STAND_GROUND]: 'Hold the spot',
+  [STANCE.NO_ATTACK]: 'Never fight back',
+};
+export const DEFAULT_STANCE = STANCE.AGGRESSIVE;
+// A villager that defends itself is a villager that dies. AoE2 puts them on
+// No Attack for the same reason, and the panic-and-run behaviour in combat.js is
+// the behaviour that keeps them alive.
+export const VILLAGER_STANCE = STANCE.NO_ATTACK;
+// How far each stance will chase, measured from where the engagement started.
+// Aggressive keeps the leash the game has always used; Defensive is deliberately
+// short — a defensive line that chases seven tiles is not holding anything, it
+// is being pulled apart one unit at a time, which is the oldest trick in RTS.
+export const STANCE_LEASH = {
+  [STANCE.AGGRESSIVE]: CHASE_LEASH,
+  [STANCE.DEFENSIVE]: 4.0,
+  [STANCE.STAND_GROUND]: 0,
+  [STANCE.NO_ATTACK]: 0,
+};
+
+// --- Formations -------------------------------------------------------------
+//
+// A formation is only ever applied when a *group* is given a destination: it
+// decides which unit walks to which slot, and nothing else. There is no
+// per-frame formation keeping, no rotation, no lock-step — those cost a pass
+// over every unit every step and buy a look, not a behaviour.
+export const FORMATION = { LINE: 'line', BOX: 'box', SPREAD: 'spread' };
+export const FORMATION_ORDER = [FORMATION.LINE, FORMATION.BOX, FORMATION.SPREAD];
+export const FORMATION_LABEL = {
+  [FORMATION.LINE]: 'Line',
+  [FORMATION.BOX]: 'Box',
+  [FORMATION.SPREAD]: 'Spread',
+};
+export const FORMATION_BLURB = {
+  [FORMATION.LINE]: 'Ranks facing the way you sent them',
+  [FORMATION.BOX]: 'Tough units outside, ranged inside',
+  [FORMATION.SPREAD]: 'Loose, against area damage',
+};
+export const DEFAULT_FORMATION = FORMATION.LINE;
+// Tile spacing between neighbouring slots. One tile is shoulder to shoulder for
+// units with a 0.32-0.4 radius; the spread figure is a little over two, which is
+// far enough that one mangonel shot cannot reach two bodies.
+export const FORMATION_SPACING = 1.0;
+export const SPREAD_SPACING = 2.2;
+
+// --- Garrison ---------------------------------------------------------------
+//
+// A garrisoned unit is off the map and out of every system's loop, but it is
+// still yours: it still costs population, it still heals, and — as in AoE2 — it
+// still adds an arrow to whatever it is standing inside.
+//
+// Capacity comes from BUILDING_STATS.garrisonCapacity where the building
+// declares one (the tower and the Castle do). This table is the fallback for
+// buildings that do not, which today means the Town Center.
+export const GARRISON_CAPACITY_FALLBACK = { towncenter: 10 };
+// Hit points a garrisoned unit regains per second. Deliberately slow: 1.5/s
+// takes a militia from one hitpoint to full in half a minute, so pulling a
+// wounded army into the Town Center is a decision that costs you the army for
+// long enough to matter, not a free heal between waves.
+export const GARRISON_HEAL_PER_SEC = 1.5;
+// What one garrisoned body adds to the building's volley. A Town Center with
+// five villagers inside throws five arrows at 4 damage: enough to make raiding
+// a defended town expensive, nowhere near enough to replace an army.
+export const GARRISON_ARROW_DAMAGE = 4;
+// A building with a garrison but no `attack` of its own — the Town Center —
+// shoots on this beat and at this reach. AoE2's Town Center fires every ~2s at
+// 6 tiles.
+export const GARRISON_VOLLEY_COOLDOWN = 2.0;
+export const GARRISON_DEFAULT_RANGE = 6.0;
 
 // --- Simulation -------------------------------------------------------------
 // Fixed logic step. Rendering interpolates between steps.

@@ -73,14 +73,16 @@ export const AGE_UNLOCKS = {
   [AGE.DARK]: [
     'towncenter', 'house', 'mill', 'lumbercamp', 'miningcamp', 'farm',
     // The palisade is Dark Age in AoE2: it is a wooden fence, the thing you
-    // throw up in the opening to slow a drush down. Two spellings because the
-    // pass adding it has not named its key yet.
-    'palisade', 'palisadewall',
+    // throw up in the opening to slow a drush down. Its gate comes with it —
+    // a fence you cannot walk through is a fence you have built around your own
+    // villagers, and making the player wait an age for the door would teach
+    // them not to build the fence.
+    'palisade', 'palisadegate', 'palisadewall',
     'barracks',
   ],
   [AGE.FEUDAL]: [
     'archeryrange', 'stable', 'market', 'blacksmith',
-    'watchtower', 'tower', 'stonewall', 'wall', 'gate',
+    'watchtower', 'tower', 'stonewall', 'stonegate', 'wall', 'gate',
   ],
   [AGE.CASTLE]: [
     'castle', 'siegeworkshop', 'university', 'monastery', 'keep',

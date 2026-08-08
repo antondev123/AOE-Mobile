@@ -164,25 +164,58 @@ function heapPop(s) {
 
 // --- Tile queries -----------------------------------------------------------
 
+// --- Gates ------------------------------------------------------------------
+//
+// The block grid carries one extra value, BLOCK_GATE, and a parallel byte per
+// tile saying whose gate it is (core/world.js has the full rationale). Every
+// walkability test in this file therefore takes an optional `player`:
+//
+//   player given   a gate belonging to that player is ground, anyone else's is
+//                  a wall
+//   player omitted every gate is a wall
+//
+// The default is the conservative one on purpose. A unit that walks the long way
+// round its own gate is a small annoyance; an enemy army strolling through it
+// because a call site forgot to say who was asking is the feature not existing.
+//
+// COST. The common case is a free tile, and `blocked[i] !== 0` still short
+// circuits on it before anything else is read — so ordinary ground costs exactly
+// what it always did. A blocked tile costs one more integer compare, and only a
+// real gate tile ever touches gateOwner. Nothing here allocates and nothing here
+// hashes, which is the requirement: isWalkable runs five times per line-of-sight
+// sample and hasLineOfSight runs four times per smoothing step.
+
+/** The gateOwner byte that means "mine". 0 matches no gate, which is what we want. */
+function gateKeyFor(player) {
+  return player === null || player === undefined ? 0 : player + 1;
+}
+
 /**
  * Can a unit stand on this tile? Accepts either integer tile coordinates or
  * float grid positions (it floors them), so callers never have to remember.
+ *
+ * `player` is optional; pass it and the player's own gates become walkable.
  */
-export function isWalkable(world, tx, ty) {
+export function isWalkable(world, tx, ty, player) {
   const x = Math.floor(tx);
   const y = Math.floor(ty);
   if (x < 0 || y < 0 || x >= world.width || y >= world.height) return false;
-  return world.blocked[y * world.width + x] === 0;
+  const i = y * world.width + x;
+  const b = world.blocked[i];
+  if (b === 0) return true;
+  if (b !== 3) return false;                       // 3 === BLOCK_GATE
+  const key = gateKeyFor(player);
+  return key !== 0 && world.gateOwner[i] === key;
 }
 
 /**
  * Nearest walkable tile to (tx,ty), searched outward in rings up to `maxR`.
  * Returns { x, y, tx, ty } (x,y = tile centre) or null.
  */
-export function nearestWalkable(world, tx, ty, maxR = 6) {
+export function nearestWalkable(world, tx, ty, maxR = 6, player) {
   const cx = Math.floor(tx);
   const cy = Math.floor(ty);
-  if (isWalkable(world, cx, cy)) return tile(cx, cy);
+  if (isWalkable(world, cx, cy, player)) return tile(cx, cy);
 
   let best = null;
   let bestD = Infinity;
@@ -193,7 +226,7 @@ export function nearestWalkable(world, tx, ty, maxR = 6) {
         if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
         const x = cx + dx;
         const y = cy + dy;
-        if (!isWalkable(world, x, y)) continue;
+        if (!isWalkable(world, x, y, player)) continue;
         // Compare against the true (possibly fractional) request point.
         const ex = x + 0.5 - tx;
         const ey = y + 0.5 - ty;
@@ -241,6 +274,7 @@ export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
   const avoid = opts.avoid || null;
   const maxRing = Math.max(1, opts.maxRing || 1);
   const checkReach = opts.reachable !== false;
+  const player = opts.player;
   const own = occupiedTiles(target);
   const ownKeys = new Set(own.map(([x, y]) => `${x},${y}`));
 
@@ -256,7 +290,7 @@ export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
           const key = `${x},${y}`;
           if (seen.has(key) || ownKeys.has(key)) continue;
           seen.add(key);
-          if (!isWalkable(world, x, y)) continue;
+          if (!isWalkable(world, x, y, player)) continue;
           if (avoid && avoid.has(key)) continue;
 
           const cxp = x + 0.5;
@@ -269,7 +303,7 @@ export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
           if (dx !== 0 && dy !== 0) score += 0.45;
           // Prefer tiles that are not themselves cramped, so the unit can get
           // out again without a second search.
-          const open = openness(world, x, y);
+          const open = openness(world, x, y, player);
           if (open <= 2) score += 1.5;
           cands.push({ x, y, score, open });
         }
@@ -287,12 +321,12 @@ export function findAdjacentStandTile(world, target, fromX, fromY, opts = {}) {
   return null;
 }
 
-function openness(world, x, y) {
+function openness(world, x, y, player) {
   let n = 0;
-  if (isWalkable(world, x + 1, y)) n++;
-  if (isWalkable(world, x - 1, y)) n++;
-  if (isWalkable(world, x, y + 1)) n++;
-  if (isWalkable(world, x, y - 1)) n++;
+  if (isWalkable(world, x + 1, y, player)) n++;
+  if (isWalkable(world, x - 1, y, player)) n++;
+  if (isWalkable(world, x, y + 1, player)) n++;
+  if (isWalkable(world, x, y - 1, player)) n++;
   return n;
 }
 
@@ -322,8 +356,19 @@ function getRegionScratch(world) {
   return r;
 }
 
+/**
+ * Solid *for the enclosure question*, which is not quite the same question A*
+ * asks. A gate is deliberately not solid here, whoever owns it: these fills
+ * exist to answer "is this patch of ground a place a unit can never get out of",
+ * and a gate is a way out. Counting a closed gate as a wall would make the
+ * placement rules refuse the last segment of a wall the player is deliberately
+ * building around their own base *with a door in it* — the exact play the whole
+ * feature exists for. Being permissive here can only ever allow a placement;
+ * the pocket limit is what stops anything genuinely small being sealed.
+ */
 function solidAt(world, i, extra) {
-  return world.blocked[i] !== 0 || (extra !== null && extra.has(i));
+  const b = world.blocked[i];
+  return (b !== 0 && b !== 3) || (extra !== null && extra.has(i));
 }
 
 /**
@@ -528,11 +573,11 @@ export function hasOpenPerimeter(world, tiles, opts = {}) {
  * without clipping a blocked tile. Used to smooth A* output; also useful to
  * skip planning entirely when the goal is in plain sight.
  */
-export function hasLineOfSight(world, ax, ay, bx, by) {
+export function hasLineOfSight(world, ax, ay, bx, by, player) {
   const dx = bx - ax;
   const dy = by - ay;
   const len = Math.sqrt(dx * dx + dy * dy);
-  if (len < 1e-6) return isWalkable(world, ax, ay);
+  if (len < 1e-6) return isWalkable(world, ax, ay, player);
   const steps = Math.max(1, Math.ceil(len / LOS_STEP));
   const sx = dx / steps;
   const sy = dy / steps;
@@ -540,11 +585,11 @@ export function hasLineOfSight(world, ax, ay, bx, by) {
   for (let i = 0; i <= steps; i++) {
     const x = ax + sx * i;
     const y = ay + sy * i;
-    if (!isWalkable(world, x, y)) return false;
-    if (!isWalkable(world, x + CLEARANCE, y)) return false;
-    if (!isWalkable(world, x - CLEARANCE, y)) return false;
-    if (!isWalkable(world, x, y + CLEARANCE)) return false;
-    if (!isWalkable(world, x, y - CLEARANCE)) return false;
+    if (!isWalkable(world, x, y, player)) return false;
+    if (!isWalkable(world, x + CLEARANCE, y, player)) return false;
+    if (!isWalkable(world, x - CLEARANCE, y, player)) return false;
+    if (!isWalkable(world, x, y + CLEARANCE, player)) return false;
+    if (!isWalkable(world, x, y - CLEARANCE, player)) return false;
   }
   return true;
 }
@@ -573,7 +618,11 @@ function octile(dx, dy) {
  * a blocked goal slides to the nearest free tile near it, and an unreachable
  * goal returns the partial path that gets closest.
  *
- * opts: { budget, smooth, allowPartial, goalSearchR, cache }
+ * opts: { budget, smooth, allowPartial, goalSearchR, cache, player }
+ *
+ * `player` is who is walking. Pass it and this player's own gates are open
+ * ground to the search; leave it out and every gate is a wall. See the gate note
+ * above isWalkable().
  */
 export function findPath(world, sx, sy, tx, ty, opts = {}) {
   const W = world.width;
@@ -581,17 +630,26 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
   const budget = opts.budget || DEFAULT_BUDGET;
   const smooth = opts.smooth !== false;
   const allowPartial = opts.allowPartial !== false;
+  const player = opts.player;
+  // Hoisted once per search: the inner loop must not re-derive this per node.
+  const gateKey = gateKeyFor(player);
+  const blockedGrid = world.blocked;
+  const gateGrid = world.gateOwner;
+  const passable = (i) => {
+    const b = blockedGrid[i];
+    return b === 0 || (b === 3 && gateKey !== 0 && gateGrid[i] === gateKey);
+  };
 
   let stx = Math.floor(sx);
   let sty = Math.floor(sy);
   if (stx < 0 || sty < 0 || stx >= W || sty >= H) {
-    const esc = nearestWalkable(world, clamp(stx, 0, W - 1), clamp(sty, 0, H - 1), 6);
+    const esc = nearestWalkable(world, clamp(stx, 0, W - 1), clamp(sty, 0, H - 1), 6, player);
     if (!esc) { pathStats.failures++; return null; }
     stx = esc.tx; sty = esc.ty;
   }
   // Standing inside a wall (a building went up on top of the unit): walk out.
-  if (!isWalkable(world, stx, sty)) {
-    const esc = nearestWalkable(world, stx, sty, 4);
+  if (!isWalkable(world, stx, sty, player)) {
+    const esc = nearestWalkable(world, stx, sty, 4, player);
     if (!esc) { pathStats.failures++; return null; }
     stx = esc.tx; sty = esc.ty;
   }
@@ -601,8 +659,10 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
   let gtx = Math.floor(tx);
   let gty = Math.floor(ty);
   let goalMoved = false;
-  if (!isWalkable(world, gtx, gty)) {
-    const alt = nearestWalkable(world, gtx, gty, opts.goalSearchR == null ? 4 : opts.goalSearchR);
+  if (!isWalkable(world, gtx, gty, player)) {
+    const alt = nearestWalkable(
+      world, gtx, gty, opts.goalSearchR == null ? 4 : opts.goalSearchR, player,
+    );
     if (!alt) { pathStats.failures++; return null; }
     gtx = alt.tx; gty = alt.ty;
     gx = alt.x; gy = alt.y;
@@ -622,8 +682,12 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
   // Same-tick memo: a group ordered together produces many near-identical
   // searches in one step. Keyed on tiles, so the answer is at most one tile
   // stale, and the caller gets a copy it may freely own.
+  // The player is part of the key: two players asking the same question about
+  // the same two tiles can get different answers now that gates exist, and
+  // handing one of them the other's path is the subtlest possible way for an
+  // enemy to walk through your gate.
   const useCache = opts.cache !== false;
-  const key = useCache ? `${stx},${sty},${gtx},${gty},${smooth ? 1 : 0}` : null;
+  const key = useCache ? `${stx},${sty},${gtx},${gty},${smooth ? 1 : 0},${gateKey}` : null;
   if (useCache) {
     if (s.memoTick !== world.tick) {
       s.memo.clear();
@@ -632,13 +696,13 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
     const hit = s.memo.get(key);
     if (hit) {
       pathStats.cacheHits++;
-      return reheadPath(world, hit, sx, sy, smooth);
+      return reheadPath(world, hit, sx, sy, smooth, player);
     }
   }
 
   // Plain sight? Skip the search entirely — most orders in an open base are
   // this case, and it keeps A* for the walks that actually need it.
-  if (!goalMoved && hasLineOfSight(world, sx, sy, gx, gy)) {
+  if (!goalMoved && hasLineOfSight(world, sx, sy, gx, gy, player)) {
     const out = [{ x: gx, y: gy }];
     out.partial = false;
     out.goal = { x: gx, y: gy };
@@ -682,13 +746,13 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
       const ny = cy + dy;
       if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
       const ni = ny * W + nx;
-      if (world.blocked[ni] !== 0) continue;
+      if (!passable(ni)) continue;
       if (stamp[ni] === gen && closed[ni]) continue;
       if (dx !== 0 && dy !== 0) {
         // No corner cutting: both orthogonal neighbours must be free, or the
         // unit would clip the corner of a building it cannot walk through.
-        if (world.blocked[cy * W + nx] !== 0) continue;
-        if (world.blocked[ny * W + cx] !== 0) continue;
+        if (!passable(cy * W + nx)) continue;
+        if (!passable(ny * W + cx)) continue;
       }
       const ng = cg + (dx !== 0 && dy !== 0 ? SQRT2 : 1);
       if (stamp[ni] === gen && ng >= g[ni]) continue;
@@ -732,14 +796,14 @@ export function findPath(world, sx, sy, tx, ty, opts = {}) {
     pts[pts.length - 1] = { x: gx, y: gy };
   }
 
-  const out = smooth ? smoothPath(world, sx, sy, pts) : pts;
+  const out = smooth ? smoothPath(world, sx, sy, pts, player) : pts;
   out.partial = partial;
   out.goal = { x: gx, y: gy };
 
   if (useCache && s.memo.size < 512) {
     s.memo.set(key, out);
     // Hand back a copy: the caller owns its path and may splice it.
-    return reheadPath(world, out, sx, sy, false);
+    return reheadPath(world, out, sx, sy, false, player);
   }
   return out;
 }
@@ -772,7 +836,7 @@ function reconstruct(s, endIdx, startIdx, W) {
  * legs a player expects, and drops the first waypoint when the unit is already
  * past it (so a command never starts with a step backwards).
  */
-function smoothPath(world, sx, sy, pts) {
+function smoothPath(world, sx, sy, pts, player) {
   if (pts.length <= 1) return pts;
   const out = [];
   let ax = sx;
@@ -783,7 +847,7 @@ function smoothPath(world, sx, sy, pts) {
     let best = i;
     const limit = Math.min(last, i + SMOOTH_LOOKAHEAD);
     for (let k = i; k <= limit; k++) {
-      if (hasLineOfSight(world, ax, ay, pts[k].x, pts[k].y)) best = k;
+      if (hasLineOfSight(world, ax, ay, pts[k].x, pts[k].y, player)) best = k;
       else break;
     }
     out.push(pts[best]);
@@ -798,8 +862,8 @@ function smoothPath(world, sx, sy, pts) {
  * Reuse a cached path from a slightly different start: re-run the smoothing
  * head so the unit does not walk back to the cached start's tile centre.
  */
-function reheadPath(world, cached, sx, sy, smooth) {
-  const out = smooth ? smoothPath(world, sx, sy, cached.slice()) : cached.slice();
+function reheadPath(world, cached, sx, sy, smooth, player) {
+  const out = smooth ? smoothPath(world, sx, sy, cached.slice(), player) : cached.slice();
   out.partial = cached.partial;
   out.goal = cached.goal;
   return out;
