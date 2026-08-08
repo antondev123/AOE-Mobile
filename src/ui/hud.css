@@ -246,6 +246,58 @@ body {
 @keyframes toastin  { from { opacity: 0; transform: translateX(-14px); } }
 @keyframes toastout { to   { opacity: 0; transform: translateY(-8px); } }
 
+/* The under-attack alert. Nothing about it reads like a routine toast: the
+   others are parchment on dark wood and sit still, this one is red, bigger,
+   pulsing, and — uniquely in the stack — tappable, because its whole value is
+   that it takes you to the fight. */
+.toast.alert {
+  pointer-events: auto;
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  text-align: left;
+  font-family: inherit;
+  font-size: 13.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: #fff2ec;
+  background: linear-gradient(180deg, rgba(176, 38, 22, 0.97), rgba(104, 17, 9, 0.97));
+  border: 1px solid #ff7a5e;
+  border-left: 4px solid #ff2f18;
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(255, 47, 24, 0.42);
+  animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
+  cursor: pointer;
+}
+.toast.alert .siren { margin-right: 5px; }
+.toast.alert .sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 10.5px;
+  font-weight: 700;
+  opacity: 0.85;
+  letter-spacing: 0.2px;
+}
+.toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
+/* The shared exit animation must still win when the toast is retired. */
+.toast.alert.out { animation: toastout 260ms ease-in forwards; }
+@keyframes alertin { from { opacity: 0; transform: translateX(-14px) scale(0.96); } }
+@keyframes alertpulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(255, 47, 24, 0.35); }
+  50%      { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 22px rgba(255, 47, 24, 0.95); }
+}
+/* The minimap frame flashes too: the ping is small, and this is what makes the
+   eye go and look for it. */
+.hud-minimap.alarm { animation: minialarm 700ms ease-in-out infinite; }
+@keyframes minialarm {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(255, 47, 24, 0.35); }
+  50%      { box-shadow: 0 0 0 2px rgba(255, 47, 24, 0.95), 0 0 14px rgba(255, 47, 24, 0.7); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .toast.alert { animation: alertin 170ms ease-out; }
+  .hud-minimap.alarm { box-shadow: 0 0 0 2px rgba(255, 47, 24, 0.9); animation: none; }
+}
+
 /* --- Gesture mode chip ------------------------------------------------------
    Removes all doubt about what a one-finger drag will do right now. */
 
@@ -432,6 +484,38 @@ body {
 
 .cmd-note { font-size: 11px; color: var(--parch-dim); padding: 4px 2px; }
 
+/* Attack-move. Red-edged so it never reads as "one more thing to train", and
+   unmistakably lit while it is armed and owns your next tap. */
+.cbtn.attack { border-color: #8c3b26; }
+.cbtn.attack .label { color: #f0b9ac; }
+.cbtn.attack.armed {
+  border-color: var(--danger);
+  background: linear-gradient(180deg, #7a3020 0%, #3d1a10 100%);
+  animation: armpulse 1.1s ease-in-out infinite;
+}
+.cbtn.attack.armed .label { color: #ffe3db; }
+.cbtn.attack.armed .cost { color: #ffb9a9; }
+@keyframes armpulse {
+  0%, 100% { box-shadow: var(--shadow); }
+  50%      { box-shadow: 0 0 0 3px rgba(209, 69, 47, 0.45), var(--shadow); }
+}
+
+/* Rally line under a production building: what the next unit out of it will do.
+   Full width so it never squeezes a train button below 44px. */
+.rally-note {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+.rally-note .flag { font-style: normal; color: #9ad8ff; font-size: 12px; }
+.rally-note.is-gather { color: #f0d98a; }
+.rally-note.is-gather .flag { color: var(--gold); }
+.rally-note.is-build { color: #cbd9a8; }
+.rally-note.is-hint { opacity: 0.85; }
+
 /* Training queue */
 .queue { flex: 1 1 100%; display: flex; align-items: center; gap: 5px; }
 .qprog {
@@ -509,6 +593,15 @@ body {
 .place-bar .txt { flex: 1 1 auto; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
 .place-bar .txt small { display: block; font-weight: 600; color: var(--parch-dim); font-size: 10.5px; }
 .place-bar button { min-height: var(--tap); min-width: var(--tap); padding: 0 10px; font-weight: 800; font-size: 12px; }
+
+/* Same bar, armed for a fight: red edge and a pulse, so "my next tap is an
+   attack-move" is readable at a glance from across the room. */
+.place-bar.attack {
+  border-color: var(--danger);
+  animation: sheetin 140ms ease-out, armpulse 1.1s ease-in-out infinite;
+}
+.place-bar.attack .txt { color: #ffd9d1; }
+.place-bar.attack .txt small { color: #e0a99d; }
 
 /* --- Menu sheet -------------------------------------------------------------- */
 

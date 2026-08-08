@@ -23,6 +23,17 @@
 //   something of yours selected -> BOX (you are picking troops; pan with two
 //                                       fingers, exactly as the brief asks)
 //
+// WHAT A TAP MEANS depends only on what is selected, which is always on screen:
+//
+//   units selected      -> ground = move, resource = gather, enemy = attack
+//   a producer selected -> ground = rally, resource / your farm / your
+//                          foundation = rally onto it (a standing work order)
+//   nothing in hand     -> select what you tapped
+//
+// Two HUD buttons can arm the next tap instead — building placement and
+// attack-move. Both say so with a bar across the bottom of the screen, both
+// are cancellable, and neither survives being used.
+//
 // The player can lock either mode from the chip, and a long press always gets
 // a box even when the rule says pan — so no situation is unreachable. Adding a
 // second finger mid-gesture always cancels a box and becomes a pinch, which
@@ -42,6 +53,7 @@ import * as unitAI from '../systems/unitAI.js';
 import * as economy from '../systems/economy.js';
 
 import { setSelection, clearSelection, selectedEntities } from './selection.js';
+import { rallyText } from './hud.js';
 
 // --- Tuning that is local to gesture handling (the shared feel numbers live
 // in core/constants.js and must not be duplicated there). --------------------
@@ -252,6 +264,86 @@ export function createInput(scene, world, renderer, hud) {
     return selectedEntities(world).filter((e) => e.player === PLAYER);
   }
 
+  function clampG(g) {
+    return {
+      x: Math.max(0, Math.min(MAP_W, g.x)),
+      y: Math.max(0, Math.min(MAP_H, g.y)),
+    };
+  }
+
+  // ------------------------------------------------------------------- rally
+
+  /** A finished building of ours that can actually produce something. */
+  function isProducer(e) {
+    return e.kind === 'building' && e.complete && e.trains && e.trains.length > 0;
+  }
+
+  /**
+   * What a tap means while a production building is in hand:
+   *
+   *   null      -> bare ground: rally there
+   *   entity    -> a resource node, one of our farms, or one of our foundations:
+   *                rally *onto it*, which unitAI turns into a standing gather or
+   *                build order for everything trained from then on
+   *   undefined -> not a rally at all (your own barracks, an enemy, a unit) —
+   *                the tap falls through and selects, as it always did
+   *
+   * The rule is "things a villager could work become rally targets, everything
+   * else stays a selection target", which is also why tapping your own Town
+   * Center still selects it rather than rallying it onto itself.
+   */
+  function rallyTargetAt(pick) {
+    if (!pick) return null;
+    if (pick.kind === 'resource') return pick;
+    if (pick.kind === 'building' && pick.player === PLAYER) {
+      if (!pick.complete) return pick;
+      if (typeof economy.isGatherableBuilding === 'function' &&
+          economy.isGatherableBuilding(pick)) return pick;
+    }
+    return undefined;
+  }
+
+  /**
+   * Point every selected producer at `target` (or at the tapped ground).
+   *
+   * Three things say what happened, and none of them can be confused with a
+   * unit order: the ping is blue (CMD_COLOR.rally — a gather *order* pings
+   * yellow), the renderer draws the flag line from the building to the point,
+   * and the toast names the outcome in words ("Villagers will gather food
+   * here"). hud.toast() throttles repeats, so leaning on a bush cannot spam.
+   */
+  function setRally(producers, target, g) {
+    const p = target ? { x: target.x, y: target.y } : clampG(g);
+    for (const b of producers) b.rally = { x: p.x, y: p.y };
+    fx(p.x, p.y, 'rally');
+    hud.toast(rallyText(world, producers, p).text, 'info');
+  }
+
+  // ------------------------------------------------------------- attack-move
+
+  function attackArmed() {
+    return !!(hud && typeof hud.isAttackArmed === 'function' && hud.isAttackArmed());
+  }
+
+  function disarmAttack() {
+    if (hud && typeof hud.setAttackArmed === 'function') hud.setAttackArmed(false);
+  }
+
+  /**
+   * Spend an armed attack-move on this tap. Returns false when there is nothing
+   * to send, in which case the tap is handled normally rather than swallowed.
+   */
+  function fireAttackMove(g) {
+    const troops = ownSelection().filter((e) => e.kind === 'unit' && MILITARY.has(e.type));
+    disarmAttack();
+    if (!troops.length) return false;
+    const p = clampG(g);
+    command(troops, { type: 'attackMove', gx: p.x, gy: p.y });
+    fx(p.x, p.y, 'attack');
+    hud.toast(`${troops.length} advancing — they will fight on the way`, 'info');
+    return true;
+  }
+
   function issueOrder(units, pick, g) {
     const villagers = units.filter((u) => u.type === 'villager');
 
@@ -311,6 +403,14 @@ export function createInput(scene, world, renderer, hud) {
     const pick = pickAt(sx, sy);
     const g = toGrid(sx, sy);
 
+    // An armed attack-move owns this tap outright — including a tap that landed
+    // on a unit or a bush. Anything else would make "advance here" gamble on
+    // what happened to be under your thumb.
+    if (attackArmed()) {
+      st.lastTap = null;
+      if (fireAttackMove(g)) return;
+    }
+
     const isDouble = st.lastTap &&
       now - st.lastTap.t < DOUBLE_TAP_MS &&
       Math.hypot(sx - st.lastTap.x, sy - st.lastTap.y) < DOUBLE_TAP_SLOP;
@@ -330,7 +430,22 @@ export function createInput(scene, world, renderer, hud) {
     const own = ownSelection();
     const units = own.filter((e) => e.kind === 'unit');
     const villagers = units.filter((u) => u.type === 'villager');
-    const buildings = own.filter((e) => e.kind === 'building');
+    const producers = own.filter(isProducer);
+
+    // A tap on a resource is "gather that" when units are in hand and "rally
+    // there" when a production building is — the two can never collide, because
+    // the selection decides, and the selection is on screen the whole time.
+    //
+    // This is the macro that matters on a phone: a Town Center hands you a body
+    // every 8 seconds, and a rally sitting on the berries is the difference
+    // between those villagers working and those villagers standing still.
+    if (!units.length && producers.length) {
+      const target = rallyTargetAt(pick);
+      if (target !== undefined) {
+        setRally(producers, target, g);
+        return;
+      }
+    }
 
     // Tapping something of yours selects it — unless it is a foundation and you
     // have villagers in hand, in which case it is obviously a build order.
@@ -346,16 +461,7 @@ export function createInput(scene, world, renderer, hud) {
     }
 
     if (units.length === 0) {
-      // No units in hand: buildings get a rally point, otherwise this is a
-      // plain selection (or a deselect on empty ground).
-      if (!pick && buildings.length) {
-        const gx = Math.max(0, Math.min(MAP_W, g.x));
-        const gy = Math.max(0, Math.min(MAP_H, g.y));
-        for (const b of buildings) b.rally = { x: gx, y: gy };
-        fx(gx, gy, 'move');
-        hud.toast('Rally point set', 'info');
-        return;
-      }
+      // No units and nothing that produces: a plain selection, or a deselect.
       if (pick) setSelection(world, [pick]);
       else clearSelection(world);
       return;
@@ -753,6 +859,7 @@ export function createInput(scene, world, renderer, hud) {
   function onKey(ev) {
     if (ev.key === 'Escape') {
       if (st.placeType) { hud.setPlacementMode(null); syncPlacement(); }
+      else if (attackArmed()) disarmAttack();
       else clearSelection(world);
     }
   }

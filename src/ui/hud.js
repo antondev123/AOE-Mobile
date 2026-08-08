@@ -14,7 +14,7 @@ import {
   PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
-import { ownedBy } from '../core/world.js';
+import { ownedBy, forEachNear, edgeDist2 } from '../core/world.js';
 
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
@@ -36,6 +36,12 @@ const ALERT_MS = 5200;
 const ALERT_MIN_MS = 1200;
 // How long the minimap frame keeps flashing after an alert.
 const ALERT_GLOW_MS = 5000;
+
+// A rally point this close to something workable *is* an order to work it.
+// Must match unitAI's RALLY_SNAP: the HUD's job below is to say out loud what
+// the unit AI has already decided, and a HUD that disagrees with the sim is
+// worse than no HUD at all.
+const RALLY_SNAP = 1.5;
 
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
@@ -91,71 +97,66 @@ export function underAttackText(e) {
   return `Your ${displayName(e)} is under attack!`;
 }
 
-// --- Alert styling ----------------------------------------------------------
-// Owned here rather than in hud.css: this is the one piece of chrome that has to
-// look nothing like the rest of the HUD, and keeping it beside the code that
-// raises it means the two can never drift apart.
-//
-// The routine toasts are parchment on dark wood with a gold edge and they do not
-// move. An alert is the opposite of routine: red, brighter, larger, pulsing,
-// and — uniquely in the toast stack — tappable.
-const ALERT_CSS = `
-.toast.alert {
-  pointer-events: auto;
-  display: block;
-  width: 100%;
-  padding: 8px 10px;
-  text-align: left;
-  font-family: inherit;
-  font-size: 13.5px;
-  font-weight: 800;
-  letter-spacing: 0.2px;
-  color: #fff2ec;
-  background: linear-gradient(180deg, rgba(176,38,22,0.97), rgba(104,17,9,0.97));
-  border: 1px solid #ff7a5e;
-  border-left: 4px solid #ff2f18;
-  border-radius: 7px;
-  box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 16px rgba(255,47,24,0.42);
-  animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
-  cursor: pointer;
+/**
+ * What a rally point will actually make a newly trained unit do.
+ *
+ * This mirrors unitAI.rallyOrder() deliberately: a rally that lands on (or
+ * within RALLY_SNAP of) a resource node, one of your finished farms, or one of
+ * your foundations is a *work* order, not a walk. The HUD has to be able to
+ * name that outcome — "rally set" alone tells the player nothing about the one
+ * thing that makes rallies worth using on a phone.
+ *
+ * Returns { kind: 'gather' | 'build' | 'move', target } — never null for a
+ * well-formed rally.
+ */
+export function rallyIntent(world, playerId, rally) {
+  if (!rally || typeof rally.x !== 'number') return null;
+  let best = null;
+  let bestD = Infinity;
+  const consider = (e, kind) => {
+    const d = edgeDist2(e, rally.x, rally.y);
+    if (d > RALLY_SNAP * RALLY_SNAP || d >= bestD) return;
+    bestD = d;
+    best = { kind, target: e };
+  };
+  forEachNear(world, rally.x, rally.y, RALLY_SNAP, (e) => {
+    if (e.dead) return;
+    if (e.kind === 'resource') {
+      if (e.amount > 0) consider(e, 'gather');
+      return;
+    }
+    if (e.kind !== 'building' || e.player !== playerId) return;
+    if (!e.complete) consider(e, 'build');
+    else if (typeof economy.isGatherableBuilding === 'function' && economy.isGatherableBuilding(e)) {
+      consider(e, 'gather');
+    }
+  });
+  return best || { kind: 'move', target: null };
 }
-.toast.alert .siren { margin-right: 5px; }
-.toast.alert .sub {
-  display: block;
-  margin-top: 2px;
-  font-size: 10.5px;
-  font-weight: 700;
-  opacity: 0.85;
-  letter-spacing: 0.2px;
-}
-.toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
-/* The shared exit animation must still win when the toast is retired. */
-.toast.alert.out { animation: toastout 260ms ease-in forwards; }
-@keyframes alertin { from { opacity: 0; transform: translateX(-14px) scale(0.96); } }
-@keyframes alertpulse {
-  0%, 100% { box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 16px rgba(255,47,24,0.35); }
-  50%      { box-shadow: 0 0 0 1px rgba(0,0,0,0.55), 0 5px 22px rgba(255,47,24,0.95); }
-}
-/* The minimap frame flashes too: the ping is small, and this is what makes the
-   eye go and look for it. */
-.hud-minimap.alarm { animation: minialarm 700ms ease-in-out infinite; }
-@keyframes minialarm {
-  0%, 100% { box-shadow: 0 0 0 1px rgba(255,47,24,0.35); }
-  50%      { box-shadow: 0 0 0 2px rgba(255,47,24,0.95), 0 0 14px rgba(255,47,24,0.7); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .toast.alert { animation: alertin 170ms ease-out; }
-  .hud-minimap.alarm { box-shadow: 0 0 0 2px rgba(255,47,24,0.9); animation: none; }
-}
-`;
 
-let alertCssNode = null;
-function ensureAlertCss(doc) {
-  if (alertCssNode && alertCssNode.isConnected) return;
-  alertCssNode = doc.createElement('style');
-  alertCssNode.id = 'hud-alert-css';
-  alertCssNode.textContent = ALERT_CSS;
-  (doc.head || doc.documentElement).appendChild(alertCssNode);
+/**
+ * One sentence naming what a rally will do, for the buildings that will produce
+ * into it. Used both by the confirmation toast when the rally is set and by the
+ * note under a selected production building, so the tap and the panel can never
+ * tell the player two different stories.
+ *
+ * Only villagers get work orders out of a rally (unitAI's rule), so a barracks
+ * rallied onto a bush honestly says its soldiers will muster there.
+ */
+export function rallyText(world, producers, rally) {
+  const list = Array.isArray(producers) ? producers : [producers];
+  const intent = rallyIntent(world, PLAYER, rally) || { kind: 'move', target: null };
+  const trainsVillagers = list.some((b) => (b.trains || []).includes('villager'));
+
+  if (trainsVillagers && intent.kind === 'gather') {
+    const res = intent.target.resourceType || 'food';
+    return { kind: 'gather', text: `Villagers will gather ${RES_LABEL[res] || res} here` };
+  }
+  if (trainsVillagers && intent.kind === 'build') {
+    return { kind: 'build', text: `Villagers will help build the ${displayName(intent.target)}` };
+  }
+  if (trainsVillagers) return { kind: 'move', text: 'New villagers will wait here' };
+  return { kind: 'move', text: 'New soldiers will muster here' };
 }
 
 /** Cost markup: "25 wood" with the matching pip. */
@@ -196,11 +197,11 @@ export function createHud(scene, world) {
     minimap: doc.getElementById('minimap'),
     minimapWrap: doc.getElementById('minimap-wrap'),
   };
-  ensureAlertCss(doc);
 
   const state = {
     input: null,             // set by createInput via attachInput()
     placement: null,         // building type currently being placed
+    attackArmed: false,      // next map tap is an attack-move
     buildMenuOpen: false,
     menuOpen: false,
     selSig: '',
@@ -238,6 +239,13 @@ export function createHud(scene, world) {
   placeBar.id = 'place-bar';
   placeBar.hidden = true;
   root.appendChild(placeBar);
+
+  // Same shape as the placement bar on purpose: the game already teaches "a bar
+  // across the bottom means the next tap on the map is spoken for".
+  const attackBar = el('div', 'place-bar attack');
+  attackBar.id = 'attack-bar';
+  attackBar.hidden = true;
+  root.appendChild(attackBar);
 
   const menuSheet = el('div', 'menu-sheet');
   menuSheet.id = 'menu-sheet';
@@ -505,7 +513,12 @@ export function createHud(scene, world) {
     const own = sel.filter((e) => e.player === PLAYER);
     const units = own.filter((e) => e.kind === 'unit');
     const villagers = units.filter((u) => u.type === 'villager');
+    const military = units.filter(isMilitary);
     const buildings = own.filter((e) => e.kind === 'building' && e.complete);
+
+    // An armed attack-move belongs to the troops that were in hand when it was
+    // armed. Lose them and the armed tap would fire into the void, so drop it.
+    if (state.attackArmed && !military.length) setAttackArmed(false, { quiet: true });
 
     if (own.length === 0) {
       if (sel.length) {
@@ -541,6 +554,17 @@ export function createHud(scene, world) {
         }));
       }
       renderQueue(panel, trainer);
+      renderRallyNote(panel, trainer);
+    }
+
+    // Attack-move: the one order a phone had no way to give. It arms the next
+    // tap on the map rather than asking for a second gesture nobody would find.
+    if (military.length) {
+      panel.appendChild(cmdButton(state.attackArmed ? 'Cancel' : 'Attack-move', {
+        cls: `attack ${state.attackArmed ? 'armed' : ''}`,
+        sub: state.attackArmed ? 'tap a spot' : `${military.length} ready`,
+        onTap: () => setAttackArmed(!state.attackArmed),
+      }));
     }
 
     // Stop always available to units.
@@ -563,6 +587,28 @@ export function createHud(scene, world) {
     }
 
     refreshAffordability();
+  }
+
+  /**
+   * The line under a production building that says what its rally will do —
+   * and, when it has none, that tapping a resource is how you set one.
+   *
+   * This is the discoverability half of rally-to-resource: the behaviour is
+   * worth nothing if the player never learns the tap exists.
+   */
+  function renderRallyNote(panel, b) {
+    const note = el('div', 'cmd-note rally-note');
+    if (b.rally) {
+      const r = rallyText(world, [b], b.rally);
+      note.classList.add(`is-${r.kind}`);
+      note.appendChild(el('i', 'flag', '⚑'));
+      note.appendChild(doc.createTextNode(r.text));
+    } else {
+      note.classList.add('is-hint');
+      note.appendChild(el('i', 'flag', '⚑'));
+      note.appendChild(doc.createTextNode('Tap a resource to rally onto it'));
+    }
+    panel.appendChild(note);
   }
 
   function progressOf(b) {
@@ -687,6 +733,9 @@ export function createHud(scene, world) {
   function setPlacementMode(typeOrNull) {
     state.placement = typeOrNull || null;
     toggleBuildMenu(false);
+    // Placement also claims the next tap, so it cannot coexist with an armed
+    // attack-move. (Only when arming: setPlacementMode(null) must not recurse.)
+    if (state.placement) setAttackArmed(false, { quiet: true });
     if (!state.placement) {
       placeBar.hidden = true;
       placeBar.textContent = '';
@@ -705,6 +754,44 @@ export function createHud(scene, world) {
   }
 
   function getPlacementType() { return state.placement; }
+
+  // --- Attack-move arming ---------------------------------------------------
+  // "Advance to here and fight what you meet" is a two-part order: a verb and a
+  // place. On a phone the verb has to be a button and the place has to be the
+  // next tap — exactly how placing a building already works — because there is
+  // no modifier key to hold and no second mouse button to press.
+  //
+  // It is one-shot: the order goes out and the mode disarms, so an ordinary
+  // move order is never one tap further away than it was before.
+
+  function setAttackArmed(on, opts = {}) {
+    const want = !!on;
+    if (want === state.attackArmed) return;
+    state.attackArmed = want;
+    state.cmdSig = ''; // the button has to redraw as armed/idle immediately
+
+    if (!want) {
+      attackBar.hidden = true;
+      attackBar.textContent = '';
+      return;
+    }
+
+    // The two armed modes both claim the next tap; only one may be live.
+    setPlacementMode(null);
+    toggleBuildMenu(false);
+
+    attackBar.textContent = '';
+    const txt = el('div', 'txt', 'Attack-move armed');
+    txt.appendChild(el('small', null, 'Tap where to advance — they fight what they meet'));
+    attackBar.appendChild(txt);
+    const cancel = el('button', 'danger', 'Cancel');
+    cancel.addEventListener('click', (ev) => { ev.stopPropagation(); setAttackArmed(false); });
+    attackBar.appendChild(cancel);
+    attackBar.hidden = false;
+    if (!opts.quiet) toast('Attack-move: tap where to advance', 'info');
+  }
+
+  function isAttackArmed() { return state.attackArmed; }
 
   // --- Idle villagers -------------------------------------------------------
 
@@ -953,9 +1040,14 @@ export function createHud(scene, world) {
       if (e.player !== PLAYER) { types.add(`x${e.kind}`); continue; }
       types.add(`${e.kind}:${e.type}:${e.complete === false ? 'f' : 'c'}`);
       n++;
-      if (e.kind === 'building') q += `|${e.id}:${(e.queue || []).length}`;
+      // The rally is in here so the note that names what it will do refreshes
+      // the moment the player moves it.
+      if (e.kind === 'building') {
+        q += `|${e.id}:${(e.queue || []).length}`;
+        q += e.rally ? `@${e.rally.x.toFixed(1)},${e.rally.y.toFixed(1)}` : '@-';
+      }
     }
-    return `${n}/${Array.from(types).sort().join(',')}${q}`;
+    return `${n}/${Array.from(types).sort().join(',')}${q}${state.attackArmed ? '+am' : ''}`;
   }
 
   function destroy() {
@@ -974,7 +1066,7 @@ export function createHud(scene, world) {
     }
     document.removeEventListener('pointerdown', onDocDown, true);
     if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
-    for (const n of [modeChip, buildMenu, placeBar, menuSheet]) n.remove();
+    for (const n of [modeChip, buildMenu, placeBar, attackBar, menuSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
     for (const rec of state.toasts.slice()) rec.node.remove();
@@ -988,6 +1080,8 @@ export function createHud(scene, world) {
     setPlacementMode,
     // Extras the input layer and tests use.
     getPlacementType,
+    setAttackArmed,
+    isAttackArmed,
     cycleIdle,
     flashRes,
     underAttackAlert,
