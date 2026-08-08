@@ -26,7 +26,10 @@ export async function resolve(specifier, context, nextResolve) {
       continue;
     }
     if (!target.includes('/src/systems/')) continue;
-    if (existsSync(target)) continue; // the real module landed — use it
+    // ENEMYAI_STUBS=1 forces the stubs even when the real modules exist, so
+    // they stay exercised (and so the AI can be bisected against a known-good
+    // simulation when another system regresses).
+    if (!process.env.ENEMYAI_STUBS && existsSync(target)) continue;
     return { url: stub, shortCircuit: true, format: 'module' };
   }
   return nextResolve(specifier, context);

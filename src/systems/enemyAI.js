@@ -16,9 +16,15 @@
 //   0:00  first House the moment wood allows (the TC alone only gives 5 pop)
 //   ~1:30 gold assignment opens up so military is affordable
 //   ~1:45 Barracks; Mill if the berries are a long walk
-//   ~2:00 militia + archers train continuously, ~2:1 melee:ranged
-//   ~3:00 first wave: 5 units, sent as one group at a soft edge of your base
-//   then  a wave every 100-130 s, +2 units each time, capped at 16
+//   ~2:00 militia + archers train continuously, aiming at 2:1 melee:ranged
+//   ~2:55 first wave: 5 units, sent as one group at a soft edge of your base
+//         (it lands on your town around 3:45)
+//   then  a wave every 90-125 s, +2 units each wave, capped at 16
+//
+// Measured over eight seeds: 4-5 waves in ten minutes, gaps 95-120 s, every
+// wave reaching the player's town. A wave that gets wiped costs it ~135 s of
+// rebuilding before the next one, which is the intended punishment for the
+// player fighting back.
 //
 // It never busy-waits: every "I want X" has a cooldown and a bounded search,
 // and a wiped-out wave puts it back into an economy-rebuilding posture.
@@ -28,7 +34,7 @@ import {
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
-  ownedBy, findNearestGlobal, forEachNear, canPlace, edgeDist,
+  ownedBy, findNearestGlobal, forEachNear, canPlace,
 } from '../core/world.js';
 import { canAfford, queueTrain, placeFoundation } from './economy.js';
 import { commandUnits, isIdle } from './unitAI.js';
@@ -137,6 +143,7 @@ class EnemyAI {
     this.wave = null;          // { ids, target, launchedAt, size }
     this.waveNumber = 0;
     this.nextWaveTime = FIRST_WAVE_TIME;
+    this.lostLastWave = false;
 
     // Stuck-watchdog bookkeeping: unitId -> { x, y, t, strikes }
     this.motion = new Map();
@@ -159,7 +166,8 @@ class EnemyAI {
       wavesReachedBase: 0,
       minDistToFoeBase: Infinity,
       lastWaveSize: 0,
-      waveLog: [],   // [{ t, size }] — one entry per launch
+      // One entry per launch: { t, size, militia, archers, afterLoss }
+      waveLog: [],
     };
 
     // Cheap "am I being attacked" signal. Combat emits DAMAGE synchronously.
@@ -201,8 +209,6 @@ class EnemyAI {
   }
 
   tick(step) {
-    const w = this.world;
-
     this.refreshHome();
     this.refreshAvailability();
     this.trackWaveProgress();
@@ -217,8 +223,6 @@ class EnemyAI {
     this.manageVillagers(doRebalance);
     this.manageTraining();
     this.manageArmy();
-
-    void w;
   }
 
   /**
@@ -501,8 +505,18 @@ class EnemyAI {
     const villagers = this.myUnits('villager').length;
 
     // 0. No Town Center? Rebuilding it is everything, if we still have a builder.
-    if (!buildings.some((b) => b.type === 'towncenter') && villagers > 0) {
-      return 'towncenter';
+    const noTC = !buildings.some((b) => b.type === 'towncenter');
+    if (noTC && villagers > 0) {
+      if (this.afford(BUILDING_STATS.towncenter.cost)) return 'towncenter';
+      // Cannot afford one, and with no drop-off at all nothing can be banked —
+      // that is a dead end. A Mill is cheaper and restores a food drop-off, so
+      // the economy can restart and pay for the Town Center later.
+      const hasDropoff = buildings.some((b) => b.complete && b.dropoff);
+      if (!hasDropoff && anyOf('mill') === 0 && this.hasNodeFor(RES.FOOD) &&
+          this.afford(BUILDING_STATS.mill.cost)) {
+        return 'mill';
+      }
+      return 'towncenter'; // keep saving for it; manageConstruction just waits
     }
 
     // 1. Houses, always ahead of the cap. Getting housed is the classic stall.
@@ -1160,7 +1174,16 @@ class EnemyAI {
     this.waveNumber++;
     this.stats.wavesLaunched++;
     this.stats.lastWaveSize = units.length;
-    this.stats.waveLog.push({ t: Math.round(w.time), size: units.length });
+    let mel = 0;
+    for (const u of units) if (u.type === 'militia') mel++;
+    this.stats.waveLog.push({
+      t: Math.round(w.time), size: units.length,
+      militia: mel, archers: units.length - mel,
+      // True when the previous wave died out there, so this one waited for a
+      // full rebuild rather than keeping the normal beat.
+      afterLoss: this.lostLastWave,
+    });
+    this.lostLastWave = false;
     // Schedule the next beat from this launch, so the cadence is steady.
     this.nextWaveTime = w.time + this.waveInterval();
     this.command(units, { type: 'attack', target, gx: target.x, gy: target.y });
@@ -1178,6 +1201,7 @@ class EnemyAI {
       // Wiped. Back to building economy and army before trying again, harder.
       this.wave = null;
       this.stats.wavesWiped++;
+      this.lostLastWave = true;
       this.nextWaveTime = w.time + WAVE_REGROUP_AFTER_LOSS;
       return;
     }
@@ -1187,6 +1211,7 @@ class EnemyAI {
       const s = this.staging || this.home;
       this.command(alive, { type: 'move', gx: s.x, gy: s.y });
       this.wave = null;
+      this.lostLastWave = true;
       this.nextWaveTime = w.time + WAVE_REGROUP_AFTER_LOSS;
       return;
     }
@@ -1250,8 +1275,6 @@ class EnemyAI {
       this.wave.arrived = true;
       this.stats.wavesReachedBase++;
     }
-    void w;
-    void edgeDist; // kept for callers that need footprint-aware distance
   }
 }
 

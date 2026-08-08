@@ -150,6 +150,19 @@ export function createHud(scene, world) {
   menuSheet.hidden = true;
   root.appendChild(menuSheet);
 
+  // The floating controls (mode chip, idle button, build menu, placement bar)
+  // sit just above the bottom bar. Its height depends on what is selected, so
+  // measure it rather than guessing with a magic number.
+  const bottomBar = root.querySelector('.hud-bottom');
+  let sizeObserver = null;
+  if (bottomBar && typeof ResizeObserver === 'function') {
+    sizeObserver = new ResizeObserver((entries) => {
+      const h = Math.round(entries[0].contentRect.height + 12);
+      root.style.setProperty('--hud-h', `${h}px`);
+    });
+    sizeObserver.observe(bottomBar);
+  }
+
   // --- Minimap --------------------------------------------------------------
 
   const minimap = dom.minimap ? createMinimap(dom.minimap, world) : null;
@@ -779,6 +792,8 @@ export function createHud(scene, world) {
 
   function destroy() {
     state.destroyed = true;
+    if (sizeObserver) sizeObserver.disconnect();
+    root.style.removeProperty('--hud-h');
     for (const fn of off) { try { fn(); } catch (_) { /* already gone */ } }
     if (dom.idleBtn) dom.idleBtn.removeEventListener('click', onIdle);
     if (dom.menuBtn) dom.menuBtn.removeEventListener('click', onMenu);

@@ -563,7 +563,7 @@ function setFrame(s, frame, origins) {
     s._frameKey = frame;
   }
   if (s.isCropped) s.setCrop();
-  if (s.tintFill || s.isTinted) s.clearTint();
+  s.clearTint();
   s.setFlipX(false);
   s.setRotation(0);
   s.setAlpha(1);

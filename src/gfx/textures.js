@@ -9,7 +9,9 @@
 // Everything here runs once, during scene create.
 
 import { makeRng } from '../core/rng.js';
-import { TILE_W, TILE_H, PLAYER_COLORS, PLAYER_COLORS_DARK } from '../core/constants.js';
+import {
+  TILE_W, TILE_H, HALF_W, HALF_H, PLAYER_COLORS, PLAYER_COLORS_DARK,
+} from '../core/constants.js';
 
 export const ATLAS = 'aoe-gfx';
 
@@ -285,8 +287,6 @@ const UNIT_BOX = {
   archer: { w: 38, h: 52, cx: 19, ft: 46 },
 };
 
-export const UNIT_TEX = UNIT_BOX;
-
 function buildUnits(put) {
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     const col = PLAYER_COLORS[p];
@@ -557,13 +557,11 @@ const BSPEC = {
   mill: { fw: 2, fh: 2, wallH: 30, roofH: 22, blades: true, w: 140, h: 118 },
 };
 
-export const BUILDING_TEX = BSPEC;
-
 function buildBuildings(put) {
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     for (const type of Object.keys(BSPEC)) {
       const s = BSPEC[type];
-      const baseHH = (s.fw + s.fh) * 8;
+      const baseHH = (s.fw + s.fh) * (HALF_H / 2);
       const ax = s.w / 2;
       const ay = s.h - 6 - baseHH;
       put(buildingFrame(type, p), s.w, s.h, ax, ay, (g) =>
@@ -573,8 +571,9 @@ function buildBuildings(put) {
 }
 
 function drawBuilding(g, type, s, cx, cy, col, colDark) {
-  const hw = (s.fw + s.fh) * 16;
-  const hh = (s.fw + s.fh) * 8;
+  // Footprint diamond: an fw x fh block spans (fw+fh) half-tiles each way.
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
 
   // Ground platform (the footprint the building actually occupies).
   const base = [
@@ -805,8 +804,8 @@ function banner(g, x, y, col, colDark, h) {
 function buildFoundations(put) {
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     for (const fw of [2, 3]) {
-      const hw = (fw + fw) * 16;
-      const hh = (fw + fw) * 8;
+      const hw = fw * HALF_W;
+      const hh = fw * HALF_H;
       const w = hw * 2 + 12;
       const h = hh * 2 + 30;
       const ax = w / 2;
@@ -875,8 +874,6 @@ const RES_TEX = {
   berry: { w: 46, h: 40, cx: 23, ft: 34 },
   gold: { w: 48, h: 42, cx: 24, ft: 36 },
 };
-
-export const RESOURCE_TEX = RES_TEX;
 
 function buildResources(put, rng) {
   const t = RES_TEX.tree;
