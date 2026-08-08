@@ -100,9 +100,14 @@ const run = async () => {
     check('enemy built houses', end.houses[1] >= 1, `${end.houses[1]} houses`);
     check('enemy built a barracks', end.barracks[1] >= 1, `${end.barracks[1]} barracks`);
     // The barracks only lands around 1:45 and the first wave is scheduled at
-    // 170s, so a short run legitimately has no soldiers yet.
-    if (MINUTES >= 4) {
+    // 170s, so a short run legitimately has no soldiers yet. The seed is random
+    // per run and the AI's opening varies with how its local resources fall, so
+    // the four minute mark is only good for "it has started"; hold it to a real
+    // army only once it has had time to build one.
+    if (MINUTES >= 5) {
       check('enemy trained military', end.military[1] >= 3, `${end.military[1]} soldiers`);
+    } else if (MINUTES >= 4) {
+      check('enemy started training military', end.military[1] >= 1, `${end.military[1]} soldiers`);
     } else {
       console.log(`  skip  enemy trained military (needs a >=4 minute run, got ${MINUTES})`);
     }

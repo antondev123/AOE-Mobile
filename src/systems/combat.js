@@ -35,6 +35,9 @@
 // Any damage landing on an owned entity may raise EV.UNDER_ATTACK. That is an
 // alert, not a damage log: it is throttled per player *and* per locality here,
 // so a sustained beating produces a handful of events, never one per hit.
+// It is also *filtered for relevance* — the alarm means "something you are not
+// looking after is being attacked at home", not "a unit you sent into a fight
+// is taking damage, as you intended". See alertRelevant().
 
 import {
   UNIT_STATS, AGGRO_RANGE, CHASE_LEASH, PROJECTILE_SPEED, MIN_DAMAGE,
@@ -100,6 +103,12 @@ const ALERT_LOCAL_WINDOW = 18.0;
 const ALERT_MIN_GAP = 4.0;
 // Bounded memory: only the most recent localities are remembered.
 const ALERT_SITES_MAX = 8;
+// How close to one of your own buildings counts as "at home". Measured to the
+// nearest owned building's footprint, not to the Town Center: a lumber camp on
+// the far treeline is your territory too, which is the whole reason this is not
+// a radius around the TC. Generous, because the signal it has to separate is
+// "a few tiles from a house" versus "inside the enemy base 35 tiles away".
+const ALERT_HOME_RADIUS = 14.0;
 
 // --- Pure predicates (imported by unitAI — keep cheap and side-effect free) --
 
@@ -182,16 +191,102 @@ function alertState(world, playerId) {
 }
 
 /**
- * Raise EV.UNDER_ATTACK for the owner of `target`, if the throttle allows it.
+ * Is this unit carrying out an offensive order the player gave it?
  *
- * Two gates, both required:
- *   locality — a site that has already alerted stays quiet for
- *              ALERT_LOCAL_WINDOW, so a Town Center being ground down for a
- *              minute produces ~3 alerts rather than ~60. The window is not
- *              refreshed by further hits: a genuinely sustained siege *should*
- *              re-warn you every so often.
- *   rate     — no player hears two alerts within ALERT_MIN_GAP, so a wave
- *              hitting three things at once is one warning, not three.
+ * Three shapes, because an ordered fight looks slightly different depending on
+ * where in it the unit is:
+ *   - attack-move (isAttackMoving): the order *is* "go and fight".
+ *   - a target the player set: unitAI's orderAttack assigns `target` directly,
+ *     which is precisely what leaves `autoTarget` false. An auto-acquired
+ *     target always has `autoTarget` true, so this separates the two.
+ *   - an 'attack' task whose target has just died: unitAI flags its
+ *     auto-acquired attack tasks `auto: true`, so an unflagged one is a player
+ *     order still in progress even for the frame where `target` is null.
+ */
+function isOnOffensive(u) {
+  if (!u || u.kind !== 'unit') return false;
+  if (isAttackMoving(u)) return true;
+  if (u.target && !u.autoTarget) return true;
+  const t = u.task;
+  return !!(t && t.type === 'attack' && !t.auto);
+}
+
+/**
+ * Is `e` standing in the part of the map its owner is actually looking after?
+ *
+ * "Home" is the neighbourhood of any building you own — main base, forward
+ * tower, or a mining camp out at the far gold. A player with no buildings left
+ * has no home to be away from, so nothing is ever filtered out for them.
+ */
+function nearOwnTerritory(world, e) {
+  const player = e.player;
+  let any = false;
+  for (const b of world.buildings) {
+    if (b.dead || b.player !== player) continue;
+    any = true;
+    if (edgeDist2(b, e.x, e.y) <= ALERT_HOME_RADIUS * ALERT_HOME_RADIUS) return true;
+  }
+  return !any;
+}
+
+/**
+ * Is this hit worth interrupting the player for?
+ *
+ * The alarm means "something you are *not* looking after is being attacked at
+ * home". Without this filter it meant "damage happened", and a playtest found
+ * 8 of 9 alerts in a won match were the player's own archers taking hits inside
+ * the enemy base they had been ordered to assault — each one a siren whose
+ * "tap to jump there" flew the camera to the enemy's Town Center. An alarm that
+ * cries wolf eight times out of nine is worse than none, because the ninth one
+ * (the real raid) gets ignored with the rest.
+ *
+ * Two signals, combined rather than used alone:
+ *   offensive — did the player deliberately send this unit into this fight? A
+ *               unit taking damage where you ordered it to fight is the plan
+ *               working, not news.
+ *   home      — is it near something of yours? Distance from the Town Center
+ *               alone would be wrong: it would silence a villager being picked
+ *               off at a far gold vein, which is exactly the raid you must hear
+ *               about. Proximity to *any* owned building keeps that loud.
+ *
+ * The rule, by what is being hit:
+ *   - buildings: always. A building is never anywhere by accident and cannot
+ *     be sent to fight, so nothing about it is ever "the plan working".
+ *   - villagers: always, unless you ordered this one to attack something away
+ *     from your territory. A villager picked off at a far gold vein is exactly
+ *     the raid you must hear about, which is why the test is proximity to any
+ *     building of yours and not a radius around the Town Center.
+ *   - soldiers: only when standing in your territory with no offensive order.
+ *     An idle guard jumped by a raider warns you; an army trading blows where
+ *     you sent it does not, because you are already looking at it.
+ */
+function alertRelevant(world, target) {
+  if (target.kind !== 'unit') return true;
+  const offensive = isOnOffensive(target);
+  // Note the cheap paths: the storm of hits an assault generates is answered by
+  // `offensive` alone, with no territory scan at all.
+  if (isVillager(target)) return !offensive || nearOwnTerritory(world, target);
+  return !offensive && nearOwnTerritory(world, target);
+}
+
+/**
+ * Raise EV.UNDER_ATTACK for the owner of `target`, if the throttles and the
+ * relevance filter allow it.
+ *
+ * Three gates, all required:
+ *   locality  — a site that has already alerted stays quiet for
+ *               ALERT_LOCAL_WINDOW, so a Town Center being ground down for a
+ *               minute produces ~3 alerts rather than ~60. The window is not
+ *               refreshed by further hits: a genuinely sustained siege *should*
+ *               re-warn you every so often.
+ *   rate      — no player hears two alerts within ALERT_MIN_GAP, so a wave
+ *               hitting three things at once is one warning, not three.
+ *   relevance — see alertRelevant(): the hit has to be something the player is
+ *               not already doing on purpose.
+ *
+ * Relevance is checked last, and an irrelevant hit records nothing. Failing it
+ * must not spend the locality window or the rate budget, or an assault on the
+ * enemy base would go on silencing the raid back home.
  */
 function raiseAlert(world, attacker, target) {
   const player = target.player;
@@ -211,6 +306,7 @@ function raiseAlert(world, attacker, target) {
     if (dx * dx + dy * dy <= ALERT_LOCAL_RADIUS * ALERT_LOCAL_RADIUS) return false;
   }
   if (now - st.last < ALERT_MIN_GAP) return false;
+  if (!alertRelevant(world, target)) return false;
 
   st.last = now;
   sites.push({ x: target.x, y: target.y, at: now });

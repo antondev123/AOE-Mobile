@@ -581,6 +581,197 @@ test('the alert names the thing, the way AoE2 does', () => {
   eq(underAttackText(m), 'Your Militia is under attack!', 'soldiers by name');
 });
 
+// --- alert relevance --------------------------------------------------------
+//
+// Second playtest: a won match delivered 9 alerts, of which 8 were the player's
+// own archers taking hits inside the enemy base they had been ordered to storm,
+// each one a siren whose "tap to jump there" flew the camera to the *enemy*
+// Town Center. That trains a player to ignore the alarm, so the one real
+// warning is lost too. The alarm means "something you are not looking after is
+// being attacked at home". These tests pin the rule down from both sides.
+
+/** Only the human player's alerts — the AI raises its own and the HUD filters. */
+function watchAlerts(w) {
+  const seen = [];
+  w.events.on(EV.UNDER_ATTACK, (p) => { if (p.player === PLAYER) seen.push(p); });
+  return seen;
+}
+/** A home base far from where the fighting in these tests happens. */
+function homeBase(w) {
+  return spawnBuilding(w, 'towncenter', PLAYER, 6, 6);
+}
+
+test('an army you ordered into the enemy base never raises the alarm', () => {
+  const w = fresh();
+  homeBase(w);
+  const foeTc = spawnBuilding(w, 'towncenter', ENEMY, 40, 40);
+  foeTc.hp = foeTc.maxHp = 1000000;
+  const seen = watchAlerts(w);
+
+  const archers = [];
+  for (let i = 0; i < 4; i++) {
+    const a = spawnUnit(w, 'archer', PLAYER, 36, 38 + i * 0.6);
+    a.hp = a.maxHp = 100000;
+    // Exactly what unitAI.orderAttack does for a player-ordered attack: the
+    // task carries no `auto` flag and `target` is set directly, which is what
+    // leaves autoTarget false.
+    a.task = { type: 'attack', target: foeTc };
+    a.target = foeTc;
+    archers.push(a);
+  }
+  const defenders = [];
+  for (let i = 0; i < 3; i++) defenders.push(spawnUnit(w, 'militia', ENEMY, 41, 38 + i));
+
+  // ~40 seconds of the assault going as planned, well past every throttle.
+  let hits = 0;
+  for (let t = 0; t < 40; t++) {
+    for (const a of archers) { applyDamage(w, defenders[t % 3], a, 3); hits++; }
+    step(w, 20);
+  }
+  assert(hits > 100, `the army really was being shot at (${hits} hits)`);
+  eq(seen.length, 0, `an assault you ordered is not news (${seen.length} alerts)`);
+});
+
+test('an attack-moving army taking fire in the field stays silent', () => {
+  const w = fresh();
+  homeBase(w);
+  const seen = watchAlerts(w);
+  const m = spawnUnit(w, 'militia', PLAYER, 30, 30);
+  m.hp = m.maxHp = 100000;
+  m.task = { type: 'move', gx: 40, gy: 40, attackMove: true };
+  m.state = 'move';
+  assert(isAttackMoving(m), 'flag recognised');
+  const foe = spawnUnit(w, 'militia', ENEMY, 30.9, 30);
+
+  applyDamage(w, foe, m, 3);
+  eq(seen.length, 0, 'you sent it out to fight and it is fighting');
+
+  // The same army marching out through the edge of your own territory: still
+  // your order, still silent. Distance is not what makes an ordered fight
+  // expected — the order is. A first cut that let "offensive but near home"
+  // through put four midfield battles back on the HUD in a real match.
+  const w2 = fresh();
+  spawnBuilding(w2, 'towncenter', PLAYER, 20, 20);
+  const seen2 = watchAlerts(w2);
+  const out = spawnUnit(w2, 'militia', PLAYER, 26, 20);
+  out.hp = out.maxHp = 100000;
+  out.task = { type: 'move', gx: 40, gy: 20, attackMove: true };
+  out.state = 'move';
+  applyDamage(w2, spawnUnit(w2, 'militia', ENEMY, 26.9, 20), out, 3);
+  eq(seen2.length, 0, 'an ordered fight is expected wherever it happens');
+});
+
+test('the silence survives the ordered target dying mid-assault', () => {
+  const w = fresh();
+  homeBase(w);
+  const seen = watchAlerts(w);
+  const a = spawnUnit(w, 'archer', PLAYER, 38, 38);
+  a.hp = a.maxHp = 100000;
+  const foe = spawnUnit(w, 'militia', ENEMY, 39, 38);
+  // The building it was sent to kill is gone; combat auto-acquired the next
+  // defender, so nothing on the unit says "ordered" any more. Distance from
+  // everything the player owns is what has to carry this case.
+  a.task = { type: 'attack', target: foe, auto: true };
+  a.target = foe;
+  a.autoTarget = true;
+  a._autoFor = foe;
+
+  applyDamage(w, foe, a, 3);
+  eq(seen.length, 0, 'still deep in the enemy base, still not a home emergency');
+});
+
+test('a soldier far from anything you own is not a home emergency', () => {
+  const w = fresh();
+  homeBase(w);
+  const seen = watchAlerts(w);
+  const m = spawnUnit(w, 'militia', PLAYER, 38, 38);
+  m.hp = m.maxHp = 100000;
+  const foe = spawnUnit(w, 'militia', ENEMY, 38.9, 38);
+  applyDamage(w, foe, m, 3);
+  eq(seen.length, 0, 'a skirmish out in the field is not the alarm’s job');
+});
+
+test('a villager picked off at a far gold vein is still an emergency', () => {
+  const w = fresh();
+  const tc = homeBase(w);
+  const seen = watchAlerts(w);
+  const v = spawnUnit(w, 'villager', PLAYER, 38, 38);
+  v.task = { type: 'gather', node: null, building: null, stage: 'toNode', stand: null };
+  v.state = 'gather';
+  assert(
+    Math.hypot(v.x - tc.x, v.y - tc.y) > 30,
+    'the vein really is miles from home — this is the case a TC radius would silence',
+  );
+  const foe = spawnUnit(w, 'militia', ENEMY, 38.9, 38);
+
+  applyDamage(w, foe, v, 3);
+  eq(seen.length, 1, 'losing villagers is how you lose games; distance is no excuse');
+  eq(seen[0].entity, v, 'and it names the villager, not the fight');
+});
+
+test('a building is loud wherever it stands', () => {
+  const w = fresh();
+  homeBase(w);
+  const seen = watchAlerts(w);
+  const outpost = spawnBuilding(w, 'house', PLAYER, 40, 40);
+  const foe = spawnUnit(w, 'militia', ENEMY, 41.6, 40);
+  applyDamage(w, foe, outpost, 3);
+  eq(seen.length, 1, 'a building of yours being hit is always news');
+  eq(seen[0].entity, outpost, 'and it is the building that is named');
+});
+
+test('an idle soldier jumped at home still raises the alarm', () => {
+  const w = fresh();
+  spawnBuilding(w, 'towncenter', PLAYER, 20, 20);
+  const seen = watchAlerts(w);
+  const guard = spawnUnit(w, 'militia', PLAYER, 22.5, 20);
+  guard.state = 'idle';
+  const raider = spawnUnit(w, 'militia', ENEMY, 23.4, 20);
+
+  applyDamage(w, raider, guard, 3);
+  eq(seen.length, 1, 'a raider jumping the guard at your TC is exactly the alarm');
+  eq(seen[0].entity, guard, 'the guard is named');
+});
+
+test('a soldier already auto-defending at home is still worth a warning', () => {
+  const w = fresh();
+  spawnBuilding(w, 'towncenter', PLAYER, 20, 20);
+  const seen = watchAlerts(w);
+  const guard = spawnUnit(w, 'militia', PLAYER, 22.5, 20);
+  const raider = spawnUnit(w, 'militia', ENEMY, 23.4, 20);
+  // What engage(auto) leaves behind: fighting back is not an order you gave.
+  guard.target = raider;
+  guard.autoTarget = true;
+  guard._autoFor = raider;
+
+  applyDamage(w, raider, guard, 3);
+  eq(seen.length, 1, 'auto-retaliation at home is defence, not an assault you chose');
+});
+
+test('a fight abroad never spends the alert budget owed to home', () => {
+  const w = fresh();
+  homeBase(w);
+  const seen = watchAlerts(w);
+  const v = spawnUnit(w, 'villager', PLAYER, 8, 6);
+  v.hp = v.maxHp = 100000;
+  const foeTc = spawnBuilding(w, 'towncenter', ENEMY, 40, 40);
+  foeTc.hp = foeTc.maxHp = 1000000;
+  const army = spawnUnit(w, 'archer', PLAYER, 37, 40);
+  army.hp = army.maxHp = 100000;
+  army.task = { type: 'attack', target: foeTc };
+  army.target = foeTc;
+  const defender = spawnUnit(w, 'militia', ENEMY, 38, 40);
+  const raider = spawnUnit(w, 'militia', ENEMY, 8.9, 6);
+
+  // A storm abroad, then a single blow at home in the very same instant.
+  for (let i = 0; i < 30; i++) applyDamage(w, defender, army, 2);
+  eq(seen.length, 0, 'the storm abroad said nothing');
+  applyDamage(w, raider, v, 2);
+  eq(seen.length, 1, 'and the raid at home is heard at once, not four seconds later');
+  eq(seen[0].entity, v, 'pointing at the villager, not the assault');
+  assert(Math.hypot(seen[0].gx - 8, seen[0].gy - 6) < 0.001, 'tap-to-jump goes home');
+});
+
 // --- the standoff (finding #2) ----------------------------------------------
 
 test('two idle armies do not stand in lines staring at each other', () => {
