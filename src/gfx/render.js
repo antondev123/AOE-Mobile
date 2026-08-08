@@ -11,6 +11,10 @@
 //
 // Terrain is baked into a handful of RenderTextures at startup and never
 // touched again, so 2304 tiles cost nothing per frame.
+//
+// Fog of war rides on top of that shape rather than fighting it: the masks in
+// systems/vision.js decide which entities are drawn at all, and one overlay
+// quad — see makeFog — darkens the ground. Nothing per-tile happens per frame.
 
 import {
   MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
@@ -39,6 +43,39 @@ const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa
 const CULL_PAD = 140;
 
 const TERRAIN_CHUNK = 512;
+
+// --- Fog of war -------------------------------------------------------------
+//
+// The veil is a warm black rather than a neutral one. Neutral black over this
+// palette reads as a hole punched in the screen; a trace of red and green in it
+// (0x140e08) reads as unlit ground, which is what it is meant to be.
+const FOG_R = 0x14;
+const FOG_G = 0x0e;
+const FOG_B = 0x08;
+// Alpha over explored-but-not-visible ground. 0.52 is where the terrain type is
+// still legible — you can tell your woodline from the open field you have to
+// cross to reach it — while nothing on it competes for attention with the
+// brightly lit part of the map. Under 0.4 the fog stops reading as fog; over
+// 0.6 the map you have explored may as well be the map you have not.
+const FOG_EXPLORED_ALPHA = 0.52;
+// Remembered objects are drawn with this multiplied over them. It is a cool
+// slate, not a grey: multiplying by grey only darkens, and the ghost then looks
+// like the same building at night. Pulling the red down and leaving the blue
+// nearly intact drains the warmth out of roofs and foliage, which is the part
+// of "desaturated" that actually says *memory* at a glance.
+const FOG_MEMORY_TINT = 0x7c8698;
+const FOG_MEMORY_ALPHA = 0.85;
+// The fog texture is only redrawn this often. The mask changes on most sim
+// steps — somebody is always walking — but re-uploading the whole canvas at
+// 20Hz is bandwidth spent on a change nobody can see, since one tile of fog is
+// a 45x22 pixel blob on screen. At 12Hz the edge still slides smoothly under a
+// walking unit and the upload cost drops by half.
+const FOG_REFRESH_INTERVAL = 1 / 12;
+// Above every entity, every effect and the terrain; below the overlay Graphics
+// (800000), which draws selection rings and bars for things you can see.
+const FOG_DEPTH = 700000;
+
+let fogTextureSerial = 0;
 
 export function createRenderer(scene, world) {
   const tex = buildTextures(scene);
@@ -118,6 +155,15 @@ export function createRenderer(scene, world) {
   // Baked once, over the whole map diamond rather than the boot-time view, so
   // no viewport change, zoom-out or pan can reach unpainted ground.
   const terrain = bakeTerrain(scene, world, worldRect);
+
+  // --- fog of war ----------------------------------------------------------
+  const fog = makeFog(scene, world, worldRect);
+  // The masks the draw passes below consult. When there is no vision system at
+  // all (a stripped-down harness world), everything is permanently visible and
+  // nothing remembered, so the whole feature falls away without a branch in any
+  // inner loop.
+  const fogState = fog ? fog.state : null;
+  const visMask = fogState ? fogState.visible : null;
 
   // --- pools ---------------------------------------------------------------
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
@@ -293,6 +339,7 @@ export function createRenderer(scene, world) {
     drawResources();
     drawBuildings(invZ);
     drawUnits(alpha, invZ);
+    drawMemory();
     drawGhost();
 
     markerPool.trim();
@@ -304,6 +351,8 @@ export function createRenderer(scene, world) {
 
     drawDragBox();
 
+    if (fog) fog.update(dt);
+
     fx.update(dt);
   }
 
@@ -311,11 +360,49 @@ export function createRenderer(scene, world) {
     return wx > viewRect.x && wx < viewRect.r && wy > viewRect.y && wy < viewRect.b;
   }
 
+  // --- fog gates -----------------------------------------------------------
+  // One typed-array read per entity. Deliberately not a call into vision.js:
+  // this runs a few hundred times a frame and the bounds test there is dead
+  // weight for coordinates that came out of the simulation.
+
+  /** Is the tile under a point lit for the human player? */
+  function litAt(gx, gy) {
+    if (!visMask) return true;
+    const tx = gx | 0;
+    const ty = gy | 0;
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
+    return visMask[ty * MAP_W + tx] === 1;
+  }
+
+  /** A building counts as seen if any tile of its footprint is lit. */
+  function litBuilding(b) {
+    if (!visMask) return true;
+    const tiles = b.tiles;
+    if (!tiles) return litAt(b.x, b.y);
+    for (let i = 0; i < tiles.length; i++) {
+      const tx = tiles[i][0];
+      const ty = tiles[i][1];
+      if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
+      if (visMask[ty * MAP_W + tx]) return true;
+    }
+    return false;
+  }
+
+  /** Same question for a remembered snapshot, whose tiles are flat indices. */
+  function litTiles(indices) {
+    if (!visMask) return true;
+    for (let i = 0; i < indices.length; i++) {
+      if (visMask[indices[i]]) return true;
+    }
+    return false;
+  }
+
   function drawResources() {
     const list = world.resources;
     for (let i = 0; i < list.length; i++) {
       const e = list[i];
       if (e.dead) continue;
+      if (!litAt(e.x, e.y)) continue;
       const wx = (e.x - e.y) * HALF_W;
       const wy = (e.x + e.y) * HALF_H;
       if (!visible(wx, wy)) continue;
@@ -346,6 +433,8 @@ export function createRenderer(scene, world) {
     for (let i = 0; i < list.length; i++) {
       const b = list[i];
       if (b.dead) continue;
+      // Out of sight the building is drawn from memory instead, by drawMemory.
+      if (!litBuilding(b)) continue;
       const wx = (b.x - b.y) * HALF_W;
       const wy = (b.x + b.y) * HALF_H;
       if (!visible(wx, wy)) continue;
@@ -435,6 +524,10 @@ export function createRenderer(scene, world) {
     for (let i = 0; i < list.length; i++) {
       const u = list[i];
       if (u.dead) continue;
+      // Units are never remembered. Where they were a moment ago is exactly the
+      // information fog exists to withhold, and an enemy left standing at his
+      // last known position is worse than no information at all.
+      if (!litAt(u.x, u.y)) continue;
       // Interpolate between sim steps: the sim runs at 20Hz, we draw at 60.
       const gx = u.px + (u.x - u.px) * alpha;
       const gy = u.py + (u.y - u.py) * alpha;
@@ -522,6 +615,75 @@ export function createRenderer(scene, world) {
         overlay.fillCircle(cx, cy, r);
         overlay.fillStyle(0xffffff, 0.6);
         overlay.fillCircle(cx - r * 0.3, cy - r * 0.35, r * 0.36);
+      }
+    }
+  }
+
+  /**
+   * Everything the player remembers but cannot currently see.
+   *
+   * These are snapshots taken by vision.js at the instant the tile went dark —
+   * never the live entity — so a Town Center razed behind your back keeps
+   * standing here, at the hit points it had when you looked away, until you
+   * send something back to look. That is the whole point of the state, and it
+   * is why this pass reads a parallel list instead of dimming live entities.
+   *
+   * Cost is one pass over the memory list, which is bounded by the number of
+   * static objects on the map (~1900 trees on a full 96x96) and touches nothing
+   * but plain fields — the view cull throws almost all of it away before any
+   * sprite is pulled.
+   */
+  function drawMemory() {
+    if (!fogState) return;
+    const list = fogState.memory;
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      // Anything currently lit is drawn live by the passes above.
+      if (litTiles(m.tiles)) continue;
+      const wx = (m.x - m.y) * HALF_W;
+      const wy = (m.x + m.y) * HALF_H;
+      if (!visible(wx, wy)) continue;
+
+      if (m.kind === 'resource') {
+        const s = resPool.get();
+        setFrame(s, resourceFrameFor(m.type, m.variant || 0), origins);
+        s.setPosition(wx, wy);
+        s.setDepth(depthFor(m.x, m.y, 2));
+        const left = m.maxAmount ? m.amount / m.maxAmount : 1;
+        s.setScale(0.82 + 0.18 * Math.max(0, Math.min(1, left)));
+        s.setTint(FOG_MEMORY_TINT);
+        s.setAlpha(FOG_MEMORY_ALPHA);
+        continue;
+      }
+      if (m.kind !== 'building') continue;
+
+      const player = pi(m.player === undefined || m.player === null ? PLAYER : m.player);
+      const depth = depthFor(m.x, m.y, 1);
+      if (!m.complete) {
+        const fFrame = m.type === 'farm'
+          ? farmFoundationFrame(player)
+          : foundationFrame(m.fw >= 3 ? 3 : 2, player);
+        const fs = bldPool.get();
+        setFrame(fs, fFrame, origins);
+        fs.setPosition(wx, wy);
+        fs.setDepth(depth);
+        fs.setTint(FOG_MEMORY_TINT);
+        fs.setAlpha(FOG_MEMORY_ALPHA);
+      }
+      const bFrame = buildingFrameFor(m.type, player, m);
+      const s = bldPool.get();
+      setFrame(s, bFrame, origins);
+      s.setPosition(wx, wy);
+      s.setDepth(depth + 0.4);
+      s.setTint(FOG_MEMORY_TINT);
+      if (m.complete) {
+        s.setAlpha(FOG_MEMORY_ALPHA);
+      } else {
+        // Half-built when you last looked, half-built in your memory.
+        const progress = Math.max(0.02, Math.min(1, (m.buildProgress || 0) / (m.buildTime || 1)));
+        const o = origins.get(bFrame);
+        s.setCrop(0, o.h * (1 - progress), o.w, o.h * progress);
+        s.setAlpha(FOG_MEMORY_ALPHA * (0.55 + 0.45 * progress));
       }
     }
   }
@@ -614,6 +776,7 @@ export function createRenderer(scene, world) {
     overlay.destroy();
     screenG.destroy();
     terrain.destroy();
+    if (fog) fog.destroy();
   }
 
   return {
@@ -742,6 +905,129 @@ function strokeDiamond(g, cx, cy, hw, hh) {
   g.lineTo(cx - hw, cy);
   g.closePath();
   g.strokePath();
+}
+
+/**
+ * The fog overlay.
+ *
+ * WHY THIS SHAPE AND NOT A SCREEN-SPACE GRID
+ * ------------------------------------------
+ * The obvious cheap trick — a small canvas at one pixel per tile, stretched
+ * over the viewport with smoothing — is wrong here, and wrong in a way that is
+ * obvious the moment you look at it: this is an isometric projection, so a tile
+ * is a diamond and an axis-aligned pixel grid cuts across it at 45 degrees.
+ * Every fog edge would sit at a diagonal to the ground it is meant to be lying
+ * on, and the soft blur would smear along screen axes rather than along the
+ * furrows of the map.
+ *
+ * Per-tile diamond sprites are the other obvious answer, and they line up
+ * perfectly, but that is 9216 quads with alpha blending in the worst case and
+ * a hard-edged staircase of diamonds in the best.
+ *
+ * So the fog canvas is one pixel per tile in *grid* space, and the grid->screen
+ * transform is handed to the GPU. That transform,
+ *     wx = (gx - gy) * HALF_W
+ *     wy = (gx + gy) * HALF_H
+ * is a rotation by 45 degrees followed by a non-uniform scale. A Phaser
+ * GameObject applies its own scale *before* its rotation, which is the wrong
+ * order and cannot express this — hence the container: the image inside carries
+ * the 45 degree rotation, and the container carries the squash. The two
+ * matrices multiply out to exactly the projection above, so texture pixel
+ * (PAD+tx, PAD+ty) lands on tile (tx,ty), dead centre, at every zoom.
+ *
+ * The payoff is that bilinear filtering now interpolates *between tile centres
+ * along the grid axes*. A fog edge is a soft ramp that follows the diamonds
+ * instead of cutting across them, it costs one textured quad per frame, and the
+ * only work when the mask changes is 9216 alpha bytes and one texture upload.
+ *
+ * The canvas is padded out past the map because the camera can see well beyond
+ * the coastline — the four corners of its bounds rectangle are open sea. That
+ * ocean is ground you can never explore, so it is left permanently unexplored,
+ * which is both correct and what AoE2 looks like when you pan off the edge of
+ * the world.
+ */
+function makeFog(scene, world, rect) {
+  const vision = world.vision;
+  if (!vision) return null;
+
+  // Pad the texture until its diamond swallows the camera's bounds rectangle,
+  // corners included; otherwise the fog stops in a straight 45 degree line
+  // across open water.
+  let lo = 0;
+  let hi = 0;
+  for (const [cx, cy] of [
+    [rect.minX, rect.minY], [rect.maxX, rect.minY],
+    [rect.minX, rect.maxY], [rect.maxX, rect.maxY],
+  ]) {
+    const a = cx / HALF_W;
+    const b = cy / HALF_H;
+    const gx = (a + b) / 2;
+    const gy = (b - a) / 2;
+    lo = Math.min(lo, gx, gy);
+    hi = Math.max(hi, gx - MAP_W, gy - MAP_H);
+  }
+  const PAD = Math.ceil(Math.max(-lo, hi)) + 1;
+  const TW = MAP_W + PAD * 2;
+  const TH = MAP_H + PAD * 2;
+
+  const key = `fog-${++fogTextureSerial}`;
+  const tex = scene.textures.createCanvas(key, TW, TH);
+  if (!tex) return null;
+  const ctx = tex.getContext();
+  // Everything starts unexplored, including the permanently unexplorable sea in
+  // the padding, which is never written again.
+  ctx.fillStyle = `rgb(${FOG_R},${FOG_G},${FOG_B})`;
+  ctx.fillRect(0, 0, TW, TH);
+  tex.refresh();
+  if (Phaser.Textures && Phaser.Textures.FilterMode) {
+    tex.setFilter(Phaser.Textures.FilterMode.LINEAR);
+  }
+
+  // One scratch ImageData for the playable area. The colour bytes are written
+  // once here; a repaint only touches alpha.
+  const img = ctx.createImageData(MAP_W, MAP_H);
+  const bytes = img.data;
+  for (let p = 0; p < bytes.length; p += 4) {
+    bytes[p] = FOG_R;
+    bytes[p + 1] = FOG_G;
+    bytes[p + 2] = FOG_B;
+  }
+  const EXPLORED_BYTE = Math.round(FOG_EXPLORED_ALPHA * 255);
+
+  const root = scene.add.container(0, -2 * PAD * HALF_H);
+  root.setScale(HALF_W * Math.SQRT2, HALF_H * Math.SQRT2);
+  root.setDepth(FOG_DEPTH);
+  const quad = scene.add.image(0, 0, key);
+  quad.setOrigin(0, 0);
+  quad.setRotation(Math.PI / 4);
+  root.add(quad);
+
+  const st = vision.state(PLAYER);
+  let paintedRevision = -1;
+  let since = FOG_REFRESH_INTERVAL;
+
+  function repaint() {
+    vision.writeFogAlpha(PLAYER, bytes, EXPLORED_BYTE);
+    ctx.putImageData(img, PAD, PAD);
+    tex.refresh();
+    paintedRevision = st.revision;
+    since = 0;
+  }
+
+  function update(dt) {
+    since += dt;
+    if (st.revision === paintedRevision) return;
+    if (since < FOG_REFRESH_INTERVAL) return;
+    repaint();
+  }
+
+  function destroy() {
+    root.destroy(true);
+    scene.textures.remove(key);
+  }
+
+  repaint();
+  return { update, destroy, state: st, pad: PAD };
 }
 
 /**

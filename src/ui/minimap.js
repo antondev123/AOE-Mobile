@@ -7,11 +7,16 @@
 // Terrain never changes, so it is baked once into an offscreen canvas and
 // blitted; only entities and the viewport rectangle are drawn per redraw
 // (~10Hz, driven by hud.js).
+//
+// Fog of war is drawn the same way as in the main view (see makeFog in
+// render.js): a canvas at one pixel per tile in *grid* space, blitted through
+// the grid->minimap transform, which is linear, so one setTransform and one
+// drawImage put it exactly over the diamonds with a soft edge. It is rebuilt
+// only when the vision revision changes, which at 10Hz is most redraws but
+// costs 9216 byte writes — a rounding error next to the ~2000 node pips this
+// map already paints.
 
-import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
-// The same deep water the main view now ends in, imported rather than copied so
-// the two surfaces stay in step if it is ever retuned.
-import { OCEAN_DEEP } from '../gfx/textures.js';
+import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN, PLAYER } from '../core/constants.js';
 
 const SPAN = MAP_W + MAP_H;
 
@@ -22,14 +27,6 @@ const TERRAIN_COLOR = {
   [TERRAIN.SAND]:  '#9c8a5b',
 };
 
-/** '#rrggbb' for a 0xRRGGBB constant shared with the renderer. */
-function hex(n) {
-  return `#${n.toString(16).padStart(6, '0')}`;
-}
-// Everything outside the playable diamond is open sea, exactly as in the main
-// view. Baked into the terrain layer, so it costs nothing per redraw.
-const OCEAN_CSS = hex(OCEAN_DEEP);
-
 // Node colours. Stone is deliberately the palest, coolest pip on the map: at
 // two pixels it has to separate from gold's warm yellow *and* from the blue-grey
 // of water underneath it, and a light slate is the only value that does both.
@@ -38,6 +35,20 @@ const RES_COLOR = {
 };
 const TEAM = ['#5aa2ff', '#ff5a5a'];
 const TEAM_DARK = ['#1c56ab', '#a01f1f'];
+
+// --- Fog ---------------------------------------------------------------------
+// The same warm black and the same explored alpha as the main view, so the two
+// surfaces agree about what "you have been here" looks like. Kept as raw
+// components because the overlay is built as ImageData, one byte per tile.
+const FOG_R = 0x14;
+const FOG_G = 0x0e;
+const FOG_B = 0x08;
+const FOG_EXPLORED_BYTE = Math.round(0.52 * 255);
+const FOG_CSS = `rgb(${FOG_R},${FOG_G},${FOG_B})`;
+// One tile of opaque border around the mask, so the coastline gets the same
+// soft ramp into the unexplorable sea that every other fog edge gets instead of
+// stopping dead on the map boundary.
+const FOG_PAD = 1;
 
 // --- Under-attack pings ------------------------------------------------------
 // A ping has to be findable on a 160px map in under a second, on grass, dirt,
@@ -89,6 +100,80 @@ export function createMinimap(canvas, world) {
   bg.width = size;
   bg.height = size;
   bake(bg.getContext('2d'), world, size);
+
+  // --- Fog layer ----------------------------------------------------------
+  const vision = world.vision || null;
+  const fogState = vision ? vision.state(PLAYER) : null;
+  const fogW = MAP_W + FOG_PAD * 2;
+  const fogH = MAP_H + FOG_PAD * 2;
+  let fogCanvas = null;
+  let fogCtx = null;
+  let fogImage = null;
+  let fogRevision = -1;
+
+  if (fogState) {
+    fogCanvas = document.createElement('canvas');
+    fogCanvas.width = fogW;
+    fogCanvas.height = fogH;
+    fogCtx = fogCanvas.getContext('2d');
+    fogCtx.fillStyle = `rgb(${FOG_R},${FOG_G},${FOG_B})`;
+    fogCtx.fillRect(0, 0, fogW, fogH);
+    fogImage = fogCtx.createImageData(MAP_W, MAP_H);
+    const d = fogImage.data;
+    for (let p = 0; p < d.length; p += 4) {
+      d[p] = FOG_R;
+      d[p + 1] = FOG_G;
+      d[p + 2] = FOG_B;
+    }
+  }
+
+  function refreshFog() {
+    if (!fogState || fogState.revision === fogRevision) return;
+    fogRevision = fogState.revision;
+    vision.writeFogAlpha(PLAYER, fogImage.data, FOG_EXPLORED_BYTE);
+    fogCtx.putImageData(fogImage, FOG_PAD, FOG_PAD);
+  }
+
+  function drawFog() {
+    if (!fogState) return;
+    refreshFog();
+    // grid -> minimap is x = k(gx - gy) + MAP_H*k, y = k(gx + gy). Handing that
+    // straight to the canvas transform means the fog pixels land on the tile
+    // diamonds rather than on a screen-aligned grid rotated across them.
+    const k = size / SPAN;
+    const smooth = ctx.imageSmoothingEnabled;
+    ctx.imageSmoothingEnabled = true;
+    ctx.setTransform(k, k, -k, k, MAP_H * k, 0);
+    ctx.drawImage(fogCanvas, -FOG_PAD, -FOG_PAD, fogW, fogH);
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.imageSmoothingEnabled = smooth;
+  }
+
+  /** Is this grid point lit for the human player right now? */
+  function lit(gx, gy) {
+    if (!fogState) return true;
+    const tx = gx | 0;
+    const ty = gy | 0;
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
+    return fogState.visible[ty * MAP_W + tx] === 1;
+  }
+
+  function litTiles(indices) {
+    if (!fogState) return true;
+    for (let i = 0; i < indices.length; i++) {
+      if (fogState.visible[indices[i]]) return true;
+    }
+    return false;
+  }
+
+  function litBuilding(b) {
+    if (!fogState || !b.tiles) return lit(b.x, b.y);
+    for (const [tx, ty] of b.tiles) {
+      if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
+      if (fogState.visible[ty * MAP_W + tx]) return true;
+    }
+    return false;
+  }
 
   // Live "something of yours is being hit here" markers. Wall-clock timed, not
   // sim-timed: this is a UI effect, and it must decay at the same rate whether
@@ -146,37 +231,69 @@ export function createMinimap(canvas, world) {
     ctx.globalAlpha = 1;
   }
 
+  /** One resource pip. Shared by the live pass and the memory pass. */
+  function node(type, gx, gy) {
+    const p = gridToMini(gx, gy, size);
+    ctx.fillStyle = RES_COLOR[type] || '#888';
+    ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+  }
+
+  /** One building block. Shared by the live pass and the memory pass. */
+  function building(type, player, fw, complete, gx, gy) {
+    const p = gridToMini(gx, gy, size);
+    const s = Math.max(3, Math.round((fw / SPAN) * size * 2));
+    ctx.fillStyle = complete ? TEAM[player] : TEAM_DARK[player];
+    ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+    ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(p.x - s / 2 + 0.5, p.y - s / 2 + 0.5, s - 1, s - 1);
+  }
+
   function draw(camera) {
     // The baked layer is opaque edge to edge (sea, then map), so blitting it is
     // also the clear — no need to pay for both at 10Hz.
     ctx.drawImage(bg, 0, 0);
 
-    // Resource nodes: small, dim, but enough to read the map's shape.
+    // Resource nodes: small, dim, but enough to read the map's shape. Only the
+    // ones you can see right now; the rest come from memory below, at the same
+    // colour, and the fog veil is what makes them read as remembered.
     for (const r of world.resources) {
-      if (r.dead) continue;
-      const p = gridToMini(r.x, r.y, size);
-      ctx.fillStyle = RES_COLOR[r.type] || '#888';
-      ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
+      if (r.dead || !lit(r.x, r.y)) continue;
+      node(r.type, r.x, r.y);
     }
 
     // Buildings first so units sit on top of them.
     for (const b of world.buildings) {
-      if (b.dead) continue;
-      const p = gridToMini(b.x, b.y, size);
-      const s = Math.max(3, Math.round((b.fw / SPAN) * size * 2));
-      ctx.fillStyle = b.complete ? TEAM[b.player] : TEAM_DARK[b.player];
-      ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
-      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(p.x - s / 2 + 0.5, p.y - s / 2 + 0.5, s - 1, s - 1);
+      if (b.dead || !litBuilding(b)) continue;
+      building(b.type, b.player, b.fw, b.complete, b.x, b.y);
     }
 
+    // Everything the player remembers but cannot see. This is the half of the
+    // minimap that makes it a *navigation* tool rather than a live radar: the
+    // enemy town you scouted at four minutes stays on the map afterwards, which
+    // is how you find your way back to it.
+    if (fogState) {
+      const mem = fogState.memory;
+      for (let i = 0; i < mem.length; i++) {
+        const m = mem[i];
+        if (litTiles(m.tiles)) continue;
+        if (m.kind === 'resource') node(m.type, m.x, m.y);
+        else if (m.kind === 'building') building(m.type, m.player, m.fw, m.complete, m.x, m.y);
+      }
+    }
+
+    // Units are never remembered — see drawUnits in render.js.
     for (const u of world.units) {
-      if (u.dead) continue;
+      if (u.dead || !lit(u.x, u.y)) continue;
       const p = gridToMini(u.x, u.y, size);
       ctx.fillStyle = TEAM[u.player];
       ctx.fillRect(p.x - 1.5, p.y - 1.5, 3, 3);
     }
+
+    // The veil, over the entities so explored ones dim with the ground they
+    // stand on, but under the selection pips and the viewport rectangle, which
+    // are chrome and have to stay readable wherever they land.
+    drawFog();
 
     // Selected things get a bright pip so you can find your army at a glance.
     if (world.selection.size) {
@@ -184,6 +301,7 @@ export function createMinimap(canvas, world) {
       for (const id of world.selection) {
         const e = world.entities.get(id);
         if (!e || e.dead) continue;
+        if (e.kind === 'building' ? !litBuilding(e) : !lit(e.x, e.y)) continue;
         const p = gridToMini(e.x, e.y, size);
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
       }
@@ -212,10 +330,13 @@ export function createMinimap(canvas, world) {
 }
 
 function bake(g, world, size) {
-  // Open sea everywhere the map is not. The main view ends in the same water,
-  // and a minimap floating on black was the last surface still saying "the
-  // world stops here" instead of "the world is an island".
-  g.fillStyle = OCEAN_CSS;
+  // Everything outside the playable diamond is open sea you can never set foot
+  // on, so under fog of war it is permanently unexplored and it is painted in
+  // the fog's own black rather than in water. The main view does exactly the
+  // same thing with the padding around its fog texture (see makeFog), and the
+  // two surfaces have to agree or the minimap says "island in a sea" while the
+  // world says "edge of the known world".
+  g.fillStyle = FOG_CSS;
   g.fillRect(0, 0, size, size);
 
   // The playable area is a diamond; fill it with grass, then paint the tiles

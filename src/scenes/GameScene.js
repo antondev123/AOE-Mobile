@@ -20,6 +20,7 @@ import { updateEconomy } from '../systems/economy.js';
 import { updateUnits, commandUnits } from '../systems/unitAI.js';
 import { updateCombat } from '../systems/combat.js';
 import { createEnemyAI } from '../systems/enemyAI.js';
+import { visionStats } from '../systems/vision.js';
 import { createInput } from '../ui/input.js';
 import { createHud } from '../ui/hud.js';
 import { reindex } from '../core/world.js';
@@ -39,6 +40,10 @@ export class GameScene extends Phaser.Scene {
     generateMap(world);
     recomputePop(world, PLAYER);
     recomputePop(world, ENEMY);
+    // Seed the fog before anything is drawn. Without this the first frame or
+    // two render against an all-unexplored mask, which reads as the game
+    // booting to a black screen and then blinking your base into existence.
+    world.vision.update();
 
     this.renderer = createRenderer(this, world);
     this.hud = createHud(this, world);
@@ -58,6 +63,10 @@ export class GameScene extends Phaser.Scene {
       },
       // Issue orders from the console or from the test harness.
       command: (units, order) => commandUnits(world, units, order),
+      // Fog of war, for the console: masks, remembered objects and the timing
+      // counters (see visionStats in systems/vision.js).
+      vision: world.vision,
+      visionStats,
     };
 
     this.accumulator = 0;
@@ -89,6 +98,10 @@ export class GameScene extends Phaser.Scene {
     updateCombat(world, dt);
     updateEconomy(world, dt);
     this.enemyAI.update(dt);
+    // Vision last, after everything has finished moving, dying and being built,
+    // so the masks the renderer reads this frame describe the world the player
+    // is about to be shown rather than the one at the top of the step.
+    world.vision.update();
 
     world.time += dt;
     world.tick++;
@@ -157,6 +170,9 @@ export class GameScene extends Phaser.Scene {
     if (this.input2) this.input2.destroy();
     if (this.renderer) this.renderer.destroy();
     if (this.hud) this.hud.destroy();
-    if (this.world) this.world.events.clear();
+    if (this.world) {
+      if (this.world.vision) this.world.vision.destroy();
+      this.world.events.clear();
+    }
   }
 }

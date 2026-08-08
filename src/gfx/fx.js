@@ -7,7 +7,7 @@
 // emitted the event.
 
 import { EV } from '../core/events.js';
-import { HALF_W, HALF_H } from '../core/constants.js';
+import { HALF_W, HALF_H, MAP_W, MAP_H, PLAYER } from '../core/constants.js';
 import { ATLAS, unitFrame } from './textures.js';
 
 const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa7b4 };
@@ -134,6 +134,40 @@ export function createFx(scene, world, opts) {
 
   function wx(gx, gy) { return (gx - gy) * HALF_W; }
   function wy(gx, gy) { return (gx + gy) * HALF_H; }
+
+  // --- fog gate ------------------------------------------------------------
+  //
+  // Effects are information. Sparks where two enemy armies are grinding each
+  // other down, a dust ring where a building finished, a floating -12: all of
+  // it tells you exactly what is happening in a corner of the map you cannot
+  // see, and it is the classic way a fog of war ends up leaking. Every recipe
+  // below that fires from a *world position* asks this first.
+  //
+  // The mask is read straight off the vision system each time rather than
+  // cached, because effects are spawned from events and the events arrive
+  // between frames.
+  const visMask = world.vision ? world.vision.state(PLAYER).visible : null;
+
+  function lit(gx, gy) {
+    if (!visMask) return true;
+    const tx = gx | 0;
+    const ty = gy | 0;
+    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
+    return visMask[ty * MAP_W + tx] === 1;
+  }
+
+  /** A building is lit if any tile of its footprint is. */
+  function litEntity(e) {
+    if (!visMask || !e) return true;
+    if (e.kind === 'building' && e.tiles) {
+      for (const [tx, ty] of e.tiles) {
+        if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
+        if (visMask[ty * MAP_W + tx]) return true;
+      }
+      return false;
+    }
+    return lit(e.x, e.y);
+  }
 
   /** Where a floating label should sit relative to an entity's ground point. */
   function entityAnchorY(e) {
@@ -271,6 +305,7 @@ export function createFx(scene, world, opts) {
   on(EV.DAMAGE, (p) => {
     const t = p && p.target;
     if (!t || t.dead) return;
+    if (!litEntity(t)) return;
     sparks(t.x, t.y, t.kind === 'building' ? 3 : 4, t.kind === 'building' ? 0xd8c9a0 : 0xffd27a);
     if (p.amount >= 1 && texts.length < MAX_TEXTS - 6) {
       floatText(`-${Math.round(p.amount)}`, wx(t.x, t.y), wy(t.x, t.y) + entityAnchorY(t), 0xff8f8f);
@@ -281,6 +316,7 @@ export function createFx(scene, world, opts) {
     const n = p && p.node;
     const u = p && p.unit;
     if (!n) return;
+    if (!lit(n.x, n.y)) return;
     if (Math.random() < 0.55) {
       chips(n.x, n.y, u ? u.x : n.x, u ? u.y : n.y - 1, p.type);
     }
@@ -289,6 +325,7 @@ export function createFx(scene, world, opts) {
   on(EV.DEPOSIT, (p) => {
     const b = p && p.building;
     if (!b) return;
+    if (!litEntity(b)) return;
     const amt = Math.round(p.amount || 0);
     if (amt <= 0) return;
     floatText(`+${amt}`, wx(b.x, b.y), wy(b.x, b.y) + entityAnchorY(b),
@@ -306,6 +343,7 @@ export function createFx(scene, world, opts) {
 
   on(EV.FLOAT_TEXT, (p) => {
     if (!p) return;
+    if (!lit(p.gx, p.gy)) return;
     floatText(String(p.text), wx(p.gx, p.gy), wy(p.gx, p.gy) - 22, p.color || 0xffffff, true);
   });
 
@@ -315,18 +353,20 @@ export function createFx(scene, world, opts) {
   });
 
   on(EV.BUILT, (p) => {
-    if (p && p.building) builtPulse(p.building);
+    if (p && p.building && litEntity(p.building)) builtPulse(p.building);
   });
 
   on(EV.PROJECTILE, (p) => {
     const f = p && p.from;
     if (!f) return;
+    if (!lit(f.x, f.y)) return;
     sparks(f.x, f.y, 1, 0xfff0c0);
   });
 
   on(EV.DEATH, (p) => {
     const e = p && p.entity;
     if (!e) return;
+    if (!litEntity(e)) return;
     const x = wx(e.x, e.y);
     const y = wy(e.x, e.y);
     if (e.kind === 'unit') {
@@ -364,9 +404,15 @@ export function createFx(scene, world, opts) {
 
   function syncProjectiles() {
     const list = world.projectiles || [];
+    let n = 0;
     for (let i = 0; i < list.length; i++) {
       const pr = list[i];
-      let s = projSprites[i];
+      // An arrow arcing out of the dark would draw a line straight back to an
+      // archer you are not supposed to know about, so an arrow in fog simply is
+      // not drawn. Sprites are packed down rather than skipped in place, or the
+      // hidden ones would leave gaps in the pool that the tail loop re-shows.
+      if (!lit(pr.x, pr.y)) continue;
+      let s = projSprites[n];
       if (!s) {
         s = scene.add.image(0, 0, ATLAS, 'fx_arrow');
         s.setOrigin(0.5, 0.5);
@@ -396,8 +442,9 @@ export function createFx(scene, world, opts) {
       s.setPosition(px, py);
       s.setRotation(Math.atan2(sdy, sdx));
       s.setDepth(depthOf(gx, gy, 800));
+      n++;
     }
-    for (let i = list.length; i < projSprites.length; i++) {
+    for (let i = n; i < projSprites.length; i++) {
       if (projSprites[i].visible) projSprites[i].setVisible(false);
     }
   }
@@ -456,6 +503,7 @@ export function createFx(scene, world, opts) {
       for (let i = 0; i < units.length && emitted < 3; i++) {
         const u = units[(i + (world.tick || 0)) % units.length];
         if (!u || u.state !== 'move') continue;
+        if (!lit(u.x, u.y)) continue;
         const px = (u.x - u.y) * HALF_W;
         const py = (u.x + u.y) * HALF_H;
         if (view && (px < view.x || px > view.r || py < view.y || py > view.b)) continue;

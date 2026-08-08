@@ -124,12 +124,19 @@ body {
   pointer-events: auto;
 }
 
+/* Six things now live in this bar — four resources, the population and the age
+   — and at 390px with four-digit stockpiles they add up to more than the row
+   is wide. The padding and gaps below are the ~50px that buys back: measured
+   at food/wood/gold all on 9999, stone on 999, pop on 48/50 and the longest
+   age name, the row comes in under the width with a few pixels to spare. Any
+   further and the counters start touching each other. */
 .res-bar {
   pointer-events: auto;
   display: flex;
-  gap: 2px;
+  gap: 0;
   flex: 0 1 auto;
-  padding: 4px 6px;
+  min-width: 0;
+  padding: 4px 5px;
   min-height: 34px;
   align-items: center;
   background: var(--panel);
@@ -141,8 +148,9 @@ body {
 .res {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
+  gap: 3px;
+  padding: 2px 4px;
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
   font-size: 13px;
@@ -200,10 +208,11 @@ body {
    Castle Age looks like an achievement rather than a fifth counter. */
 .res.age {
   font-variant-numeric: normal;
-  letter-spacing: 0.4px;
+  letter-spacing: 0.2px;
+  font-size: 12px;
   border-left: 1px solid var(--edge-soft);
   margin-left: 2px;
-  padding-left: 7px;
+  padding-left: 6px;
   color: var(--parch-dim);
 }
 .res.age span { min-width: 0; }
@@ -659,6 +668,16 @@ body {
 }
 .cbtn.research .cost { justify-content: flex-start; }
 
+/* The age-up. It is the most consequential button on the panel and it costs
+   more than everything around it, so it gets the gold edge the game already
+   uses for "this is the important one" and takes the full row. */
+.cbtn.research.is-age {
+  flex: 1 1 100%;
+  border-color: var(--gold);
+}
+.cbtn.research.is-age .label { color: var(--gold); }
+.cbtn.research.is-age .blurb { color: #e0c88a; }
+
 /* Already ours, permanently. Green and un-tappable-looking, but still tappable
    — it says so when you tap it. */
 .cbtn.research.is-done {
@@ -679,6 +698,11 @@ body {
 
 /* Wrong age, or a prerequisite missing. */
 .cbtn.research.is-locked .label::before { content: "🔒 "; font-size: 9px; }
+
+/* Every research button does something when tapped — the greyed ones say why
+   they are greyed — so none of them may sit dead under the global .off rule
+   that kills the press animation. A tap with no response reads as a missed tap. */
+.cbtn.research.off:active { transform: translateY(1px); filter: brightness(1.25); }
 
 .research-queue .qlabel {
   font-size: 10px;

@@ -1002,12 +1002,17 @@ export function createHud(scene, world) {
 
     for (const opt of options) {
       const usable = opt.status === 'ready' || opt.status === 'poor';
-      const btn = el('button', `cbtn research is-${opt.status}${opt.status === 'poor' ? ' off' : ''}`);
+      const isAge = opt.tech && opt.tech.advancesTo !== undefined;
+      const btn = el('button',
+        `cbtn research is-${opt.status}${isAge ? ' is-age' : ''}${opt.status === 'poor' ? ' off' : ''}`);
       btn.appendChild(el('span', 'label', opt.name));
-      // The effect line, always, for anything not already grey for a reason.
-      if (opt.status !== 'done' && opt.status !== 'active' && !opt.reason) {
-        btn.appendChild(el('span', 'blurb', opt.blurb || ''));
-      }
+      // The effect line goes on anything the player could actually buy — which
+      // includes the ones they cannot afford *yet*, because "+20% wood" is
+      // precisely the argument for saving up for it. A button that is grey for
+      // a structural reason (done, running, wrong age) prints that reason
+      // instead: there is only one question left about it and it is not "what
+      // does this do".
+      if (usable) btn.appendChild(el('span', 'blurb', opt.blurb || ''));
       if (usable) {
         btn.appendChild(costNode(opt.cost));
         // Only 'poor' entries join the live affordability refresh; 'ready' ones
@@ -1193,7 +1198,10 @@ export function createHud(scene, world) {
     if (locked) {
       // The age replaces the cost, not joins it: what a Castle costs is not the
       // question you have while you cannot build one.
-      b.appendChild(el('span', 'cost need', tech.AGE_SHORT[need] || 'later'));
+      // "Castle — CASTLE" reads like a stutter; "Castle — CASTLE AGE" reads as
+      // the tier it is waiting for, which is the question being answered.
+      b.appendChild(el('span', 'cost need',
+        tech.AGE_SHORT[need] ? `${tech.AGE_SHORT[need]} Age` : 'later'));
       b.setAttribute('aria-label', `${s.name}. Locked until the ${tech.ageName(need)}.`);
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();

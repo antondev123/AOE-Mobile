@@ -24,6 +24,23 @@ function spend(world, playerId, cost) {
   }
 }
 
+// systems/tech.js imports these three out of economy, and it lives in
+// src/systems/ too — so under ENEMYAI_STUBS=1 it resolves to this file. They
+// have to exist here or the enemy AI cannot even be imported in stub mode.
+export function pay(world, playerId, cost, _reason = 'spend') {
+  if (!canAfford(world, playerId, cost)) return false;
+  spend(world, playerId, cost || {});
+  return true;
+}
+
+export function refund(world, playerId, cost, _reason = 'refund') {
+  const p = world.players[playerId];
+  if (!p || !cost) return;
+  for (const k of ['food', 'wood', 'gold', 'stone']) {
+    p.resources[k] = (p.resources[k] || 0) + (cost[k] || 0);
+  }
+}
+
 export function queueTrain(world, building, unitType) {
   if (!building || building.dead || !building.complete) return false;
   if (!building.trains || !building.trains.includes(unitType)) return false;

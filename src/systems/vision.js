@@ -578,6 +578,64 @@ export function createVision(world) {
     viewers.clear();
   }
 
+  /**
+   * Write the fog alpha field for a player into the alpha bytes of an RGBA
+   * buffer sized MAP_W x MAP_H — one texel per tile, ready to be uploaded and
+   * stretched over the map.
+   *
+   * This lives here, in the sim file, rather than in the renderer for one
+   * reason: the main view and the minimap both draw fog, and if they compute it
+   * separately they will eventually disagree about where an edge is. It is pure
+   * arithmetic over the masks, no Phaser, no canvas.
+   *
+   * The blur is the part that earns its keep. Raw, one texel per tile, bilinear
+   * filtering gives the edge exactly one tile of ramp — 45 pixels across the
+   * screen but only 22 down it, which is short enough that the boundary reads
+   * as a staircase of diamonds rather than as fog. One separable 1-2-1 pass
+   * widens the ramp to roughly two and a half tiles in every direction, which is
+   * where it stops looking like geometry and starts looking like weather. Out
+   * of bounds counts as unexplored, so the coastline ramps into the black sea
+   * instead of ending on a hard line at the map edge.
+   */
+  function writeFogAlpha(playerId, rgba, exploredByte, blur = true) {
+    const st = states[playerId];
+    const { visible, explored } = st;
+    if (!fogRaw) {
+      fogRaw = new Uint8Array(N);
+      fogTmp = new Uint8Array(N);
+    }
+    const raw = fogRaw;
+    for (let i = 0; i < N; i++) {
+      raw[i] = visible[i] ? 0 : explored[i] ? exploredByte : 255;
+    }
+    if (!blur) {
+      for (let i = 0, p = 3; i < N; i++, p += 4) rgba[p] = raw[i];
+      return;
+    }
+    const tmp = fogTmp;
+    for (let y = 0; y < H; y++) {
+      const base = y * W;
+      for (let x = 0; x < W; x++) {
+        const i = base + x;
+        const l = x > 0 ? raw[i - 1] : 255;
+        const r = x < W - 1 ? raw[i + 1] : 255;
+        tmp[i] = (l + raw[i] * 2 + r + 2) >> 2;
+      }
+    }
+    for (let y = 0; y < H; y++) {
+      const base = y * W;
+      for (let x = 0; x < W; x++) {
+        const i = base + x;
+        const u = y > 0 ? tmp[i - W] : 255;
+        const d = y < H - 1 ? tmp[i + W] : 255;
+        rgba[i * 4 + 3] = (u + tmp[i] * 2 + d + 2) >> 2;
+      }
+    }
+  }
+
+  let fogRaw = null;
+  let fogTmp = null;
+
   return {
     width: W,
     height: H,
@@ -589,6 +647,7 @@ export function createVision(world) {
     entityVisible,
     rememberedAt,
     recomputeFromScratch,
+    writeFogAlpha,
     destroy,
     // Exposed for tests and for anyone who wants to reason about the cache.
     _viewers: viewers,

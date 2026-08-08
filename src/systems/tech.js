@@ -109,9 +109,15 @@ function inferredAge(type) {
   return AGE.DARK;
 }
 
-// Built once from AGE_UNLOCKS, then consulted per lookup. Rebuilt lazily if the
-// building table grows underneath us (another pass adding a Castle at import
-// time is fine; one adding it later is also fine).
+// Built once from AGE_UNLOCKS, then consulted per lookup — the build menu asks
+// for this once per button per render, so it must not be a table walk.
+//
+// It is rebuilt lazily whenever the building table changes underneath it. The
+// entry count alone is not a sufficient signal (an add and a remove in the same
+// session net to zero), so ageForBuilding also rebuilds on the one case the
+// count misses: a type that exists in BUILDING_STATS but is not in the map. A
+// stale *extra* entry, for a building that has gone away, is harmless — nobody
+// can place a building that does not exist.
 let unlockCache = null;
 let unlockCacheSize = -1;
 
@@ -135,7 +141,12 @@ function unlockTable() {
 
 /** The age `type` becomes buildable in. Dark for anything unrecognised. */
 export function ageForBuilding(type) {
-  return unlockTable().get(type) ?? AGE.DARK;
+  let map = unlockTable();
+  if (!map.has(type) && BUILDING_STATS[type]) {
+    unlockCache = null;                 // a building appeared that the map predates
+    map = unlockTable();
+  }
+  return map.get(type) ?? AGE.DARK;
 }
 
 /** Has `playerId` reached the age that unlocks `type`? */
@@ -159,7 +170,10 @@ export function unlockedTypes(world, playerId) {
   const age = currentAge(world, playerId);
   const out = [];
   for (const [type, need] of unlockTable()) {
-    if (need <= age) out.push(type);
+    // The BUILDING_STATS test is not redundant: the map may carry an entry for
+    // a type that has since gone away, and a type nobody can spawn must never
+    // be reported as unlocked.
+    if (need <= age && BUILDING_STATS[type]) out.push(type);
   }
   return out;
 }

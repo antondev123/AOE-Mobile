@@ -44,6 +44,10 @@ import {
 } from './economy.js';
 import { findPath } from './pathfinding.js';
 import { commandUnits, isIdle } from './unitAI.js';
+import {
+  AGE, TECHS, currentAge, hasTech, techsAt, queueResearch, researchRefusal,
+  nextAgeTech,
+} from './tech.js';
 
 // --- Tuning -----------------------------------------------------------------
 
@@ -144,6 +148,57 @@ const FOUNDATION_STALL = 60;   // abandon a foundation nobody is finishing
 
 const MILITARY_TYPES = ['militia', 'archer'];
 
+// --- Tech (ages and upgrades) -----------------------------------------------
+//
+// The AI has to age up, and it has to buy the gathering upgrades, for one
+// reason: a human who does both and an AI that does neither are not playing the
+// same game by minute six. Double-Bit Axe and Bow Saw together are +40% wood
+// forever; against an opponent who never buys them that is a second lumber camp
+// out of thin air, and the waves that wood pays for stop arriving.
+//
+// The schedule is deliberately behind what a good human manages, not level with
+// it. This AI is the opposition in a ten-minute skirmish, not a ladder bot: it
+// should punish a player who ignores the tech tree and lose to one who uses it
+// well.
+//
+// These two clocks are the *earliest* the AI will consider it, not when it
+// happens. Measured over five seeds of a full ten-minute match, the age-up
+// actually lands at 5:30-8:00 for the Feudal Age and 8:15-9:30 for the Castle,
+// because the money gate below binds long before the clock does — the Town
+// Center is training villagers non-stop and the barracks is training soldiers,
+// so 400 spare food takes a while to appear. That is the right shape: a human
+// who *chooses* to stop making villagers for forty seconds gets there first,
+// which is exactly the trade the age is supposed to be.
+const FEUDAL_AGE_TIME = 255;
+const CASTLE_AGE_TIME = 495;
+const AGE_UP_VILLAGERS = 10;
+const AGE_UP_VILLAGERS_CASTLE = 18;
+// A 400-food age-up is eight villagers the Town Center did not train. This
+// reserve is what stops it being taken out of the food the barracks is queued
+// on: the AI banks the cost *plus* a working float before it commits.
+const AGE_UP_RESERVE = { food: 90, wood: 0, gold: 40, stone: 0 };
+// 140 food of reserve and a twelve-villager gate were the first try, and they
+// pushed the Feudal Age past 5:40 on every seed and past 8:00 on one. 90 and 10
+// is the same idea with the brakes eased: the age lands around 5:30, the AI
+// still never goes broke for it, and the only measured cost was one wave in one
+// seed out of five — which is the trade the upgrades then pay back.
+// The same idea, smaller, for the upgrades themselves. An upgrade is always
+// worth having eventually and never worth going broke for this minute.
+const TECH_RESERVE = { food: 120, wood: 90, gold: 80, stone: 0 };
+
+// Which drop-off buildings get shopped, in the order their upgrades pay off.
+// Wood first because it compounds into every building the AI wants next; food
+// second because it feeds the villagers doing the chopping; gold and stone last
+// because only soldiers and (later) defences spend them.
+const ECO_RESEARCH_BUILDINGS = ['lumbercamp', 'mill', 'miningcamp'];
+// Military upgrades come out of the same purse as the next wave, so they wait
+// until there is an army for them to improve.
+const MILITARY_RESEARCH_BUILDINGS = ['blacksmith', 'archeryrange', 'barracks'];
+const MILITARY_TECH_MIN_ARMY = 6;
+// One think in four. Nothing here is expensive, but nothing here changes in
+// half a second either, and the pass walks every building the AI owns.
+const TECH_THINK_EVERY = 4;
+
 // --- Small guards -----------------------------------------------------------
 
 function live(e) {
@@ -233,6 +288,12 @@ class EnemyAI {
       miningCampsStarted: 0,
       villagersQueued: 0,
       militaryQueued: 0,
+      techsResearched: 0,
+      // One entry per age-up *started*: { t, age }. Started rather than
+      // finished, because the interesting question in a test is "did it decide
+      // to", and the sixty-five seconds it then spends researching are the
+      // engine's business, not the AI's.
+      ageUps: [],
       wavesLaunched: 0,
       wavesWiped: 0,
       wavesReachedBase: 0,
@@ -294,6 +355,10 @@ class EnemyAI {
     this.manageConstruction();
     this.manageVillagers(doRebalance);
     this.manageTraining();
+    // After training, deliberately. Villagers and soldiers are the things that
+    // win the match; an upgrade only makes them better, so it may never take
+    // the food a unit was about to be queued on (see TECH_RESERVE).
+    if (this.think % TECH_THINK_EVERY === 0) this.manageTech();
     this.manageArmy();
   }
 
@@ -1356,6 +1421,129 @@ class EnemyAI {
         if (type === 'militia') militia++;
         else archers++;
       }
+    }
+  }
+
+  // --- tech ----------------------------------------------------------------
+
+  /**
+   * Can we pay for this and still have a working float left over?
+   *
+   * Plain affordability is the wrong test for an upgrade. Bow Saw at exactly
+   * 150 food and 100 wood leaves the AI with nothing, and the next thing that
+   * happens is a Town Center with an empty queue and a house it cannot start —
+   * an upgrade that stalls production for forty seconds has cost more than it
+   * gave. `reserve` is what has to survive the purchase.
+   */
+  affordWithReserve(cost, reserve) {
+    const r = this.res();
+    for (const k of ['food', 'wood', 'gold', 'stone']) {
+      const need = (cost && cost[k]) || 0;
+      if (!need) continue;
+      if ((r[k] || 0) < need + ((reserve && reserve[k]) || 0)) return false;
+    }
+    return this.afford(cost);
+  }
+
+  /** Queue a research, counting it. Never throws out of the think pass. */
+  research(building, techId) {
+    if (!liveIn(this.world, building) || !building.complete) return false;
+    let ok = false;
+    try {
+      ok = queueResearch(this.world, building, techId) !== false;
+    } catch {
+      return false;
+    }
+    if (!ok) return false;
+    this.stats.techsResearched++;
+    const t = TECHS[techId];
+    if (t && t.advancesTo !== undefined) {
+      this.stats.ageUps.push({ t: Math.round(this.world.time), age: t.advancesTo });
+    }
+    return true;
+  }
+
+  /** Is anyone on our books actually assigned to this resource right now? */
+  workingOn(resType) {
+    for (const j of this.jobs.values()) if (j.res === resType) return true;
+    return false;
+  }
+
+  /** A completed building of `type` with nothing in its research slot. */
+  freeResearcher(type) {
+    for (const b of this.myBuildings(type)) {
+      if (!b.complete || b.dead) continue;
+      if ((b.research || []).length === 0) return b;
+    }
+    return null;
+  }
+
+  /**
+   * The first tech at `building` that is legal, wanted, and leaves a float.
+   * TECHS is declared in the order a player would buy it — Feudal tier before
+   * Castle tier, and prerequisites before what they unlock — so first-legal is
+   * also the sensible order, with no priority table to keep in sync.
+   */
+  nextTechAt(building, reserve) {
+    for (const id of techsAt(building.type)) {
+      const t = TECHS[id];
+      if (!t || t.advancesTo !== undefined) continue;   // ages are handled above
+      if (hasTech(this.world, this.id, id)) continue;
+      if (researchRefusal(this.world, this.id, id, building, { skipCost: true })) continue;
+      // A gathering upgrade on a resource nobody is working is just a bill.
+      // This AI runs a three-way food/wood/gold split and never posts anyone on
+      // stone (see res()), so Stone Mining would be 100 food and 75 wood spent
+      // on a rate that multiplies zero. The test is against the live job board
+      // rather than a hardcoded exclusion, so the day the split grows a fourth
+      // leg the upgrade starts being bought by itself.
+      if (t.gather && !Object.keys(t.gather).some((k) => this.workingOn(k))) continue;
+      if (!this.affordWithReserve(t.cost, reserve)) continue;
+      return id;
+    }
+    return null;
+  }
+
+  /**
+   * Age up on a schedule, then shop the upgrades. One purchase per pass: the
+   * reserve test is evaluated against the stockpile as it is *now*, and firing
+   * three researches in the same think would spend the same food three times
+   * over as far as that test is concerned.
+   */
+  manageTech() {
+    const w = this.world;
+
+    // 1. The age. It gates everything else, so it goes first and it is the one
+    //    purchase allowed to be expensive.
+    const ageId = nextAgeTech(w, this.id);
+    if (ageId) {
+      const t = TECHS[ageId];
+      const tc = this.freeResearcher('towncenter');
+      const due = t.advancesTo === AGE.FEUDAL ? FEUDAL_AGE_TIME : CASTLE_AGE_TIME;
+      const need = t.advancesTo === AGE.FEUDAL ? AGE_UP_VILLAGERS : AGE_UP_VILLAGERS_CASTLE;
+      if (tc && w.time >= due && this.myUnits('villager').length >= need &&
+          this.affordWithReserve(t.cost, AGE_UP_RESERVE)) {
+        if (this.research(tc, ageId)) return;
+      }
+    }
+
+    // 2. Economy upgrades, at whichever drop-off is free.
+    for (const type of ECO_RESEARCH_BUILDINGS) {
+      const b = this.freeResearcher(type);
+      if (!b) continue;
+      const id = this.nextTechAt(b, TECH_RESERVE);
+      if (id && this.research(b, id)) return;
+    }
+
+    // 3. Blacksmith line, once there is an army worth improving. Behind the
+    //    economy on purpose: +1 attack on four militia is worth less than the
+    //    wood that pays for the next eight.
+    const army = this.myUnits().filter(isMilitary).length;
+    if (army < MILITARY_TECH_MIN_ARMY) return;
+    for (const type of MILITARY_RESEARCH_BUILDINGS) {
+      const b = this.freeResearcher(type);
+      if (!b) continue;
+      const id = this.nextTechAt(b, TECH_RESERVE);
+      if (id && this.research(b, id)) return;
     }
   }
 
