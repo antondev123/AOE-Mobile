@@ -175,6 +175,16 @@ export function createRenderer(scene, world) {
       camMap.sx === camera.scrollX && camMap.sy === camera.scrollY &&
       camMap.zoom === camera.zoom && camMap.w === camera.width && camMap.h === camera.height
     ) return;
+    // getWorldPoint reads camera.matrix, which Phaser only rebuilds during its
+    // own preRender pass. centerOn() runs in scene create, before the camera has
+    // ever rendered, so the matrix is still identity and the sampled affine
+    // comes out as plain scroll*zoom. The memo key then already equals the final
+    // camera state, so that wrong answer sticks until a pan changes scroll —
+    // which is why every tap landed up to 193px from the finger for the first
+    // half-minute of a match, and why it silently healed the moment you panned.
+    // At zoom 1.0 the bad affine happens to be correct, which is how this hid
+    // until the default zoom moved to 0.7.
+    camera.preRender();
     camera.getWorldPoint(0, 0, _wp0);
     camera.getWorldPoint(100, 100, _wp1);
     camMap.ax = (_wp1.x - _wp0.x) / 100;
