@@ -17,8 +17,7 @@ import { EV } from '../core/events.js';
 import {
   spawnUnit, spawnBuilding, removeEntity, canPlace, isBlocked, inBounds,
   applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy, forEachNear,
-  onBuildingComplete, setGateOpen, garrisonUnit, ungarrisonUnit, evictGarrison,
-  canGarrison, isHostile,
+  onBuildingComplete, setGateOpen, isHostile,
 } from '../core/world.js';
 import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 // tech.js imports the three stockpile primitives back out of this module, so
@@ -753,45 +752,6 @@ export function updateGates(world) {
     setGateOpen(world, b, occupied || (friend && !hostile));
   }
 }
-
-// --- Garrison ---------------------------------------------------------------
-//
-// The entity surgery is in core/world.js; what is here is the gameplay rule that
-// has to happen alongside it — the population figures. A garrisoned unit still
-// costs population (AoE2's rule, and the thing that stops a Castle being a free
-// storage locker for an over-cap army), so both directions end with a recount.
-//
-// The *order* — walk to the building, then go in — belongs to unitAI.js. See
-// HANDOFF-walls.md for the two calls it should make.
-
-/** Put a unit inside a building. Returns true when it went in. */
-export function garrison(world, building, unit) {
-  if (!garrisonUnit(world, building, unit)) return false;
-  recomputePop(world, building.player);
-  if (building.player === PLAYER) {
-    world.events.emit(EV.TOAST, {
-      text: `Garrisoned — ${building.garrison.length}/${building.garrisonCapacity}`,
-      tone: 'info',
-    });
-  }
-  return true;
-}
-
-/** Turn everybody out of a building. Returns the units that came out. */
-export function ungarrisonAll(world, building) {
-  const out = evictGarrison(world, building);
-  if (out.length) recomputePop(world, building.player);
-  return out;
-}
-
-/** Turn one unit out (the last one in, unless named). */
-export function ungarrison(world, building, unit = null) {
-  const u = ungarrisonUnit(world, building, unit);
-  if (u) recomputePop(world, building.player);
-  return u;
-}
-
-export { canGarrison };
 
 /**
  * Abandon an unfinished building: refund what it cost and take the site back.

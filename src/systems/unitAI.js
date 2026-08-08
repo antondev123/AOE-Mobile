@@ -42,7 +42,8 @@ import {
 } from './economy.js';
 import {
   inRange, canAttack, attackReach, stanceOf, setStance, isGarrisoned,
-  garrisonUnit, garrisonRefusal, nearestShelter, ungarrisonUnit,
+  garrisonUnit, garrisonRefusal, garrisonCount, garrisonCapacity,
+  nearestShelter, ungarrisonUnit,
 } from './combat.js';
 
 // --- Tuning -----------------------------------------------------------------
@@ -1392,9 +1393,10 @@ function tickGarrison(world, u, dt, ctx) {
     clearMovement(u);
     u.facing = dirIndex(b.x - u.x, b.y - u.y);
     if (garrisonUnit(world, u, b)) return;
-    // Refused at the door. Full is worth waiting a beat for — somebody may
-    // step out — but anything structural (not ours, still a foundation) is not.
-    if (garrisonRefusal(world, u, b) !== 'Full') {
+    // Refused at the door. A full building is worth waiting a beat for —
+    // somebody may step out — but anything structural (not ours, still a
+    // foundation, holds nobody at all) is not.
+    if (!garrisonRefusal(world, u, b) || garrisonCount(b) < garrisonCapacity(b)) {
       u.task = null;
       u.state = 'idle';
       return;

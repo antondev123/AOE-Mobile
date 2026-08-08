@@ -347,14 +347,17 @@ forty bounded flood fills inside a drag handler is a visible stutter, and "does
 
 ### What is waiting on other files
 
-`HANDOFF-walls.md` has the details. In short: `combat.js` has to grow a
-buildings-that-shoot loop (the Castle and the Watch Tower already carry `attack`,
-`range`, `attackCooldown`, `cooldown`, `target` and `garrison` under the same
-field names a unit uses, and `volleySize()` returns AoE2's one-arrow-per-body),
-and `unitAI.js` should start passing `u.player` to the pathfinder and gain a
-garrison order. The building side of garrisoning is done: a unit inside is
-spliced out of `world.units` — so no loop anywhere has to learn the word — while
-staying in `world.entities` and on the population.
+The Castle and the Watch Tower declare `attack`, `attackRange`, `attackCooldown`
+and `garrisonCapacity` in `BUILDING_STATS`, and `world.js` stamps every building
+with the mutable state a volley ticks (`cooldown`, `attackAnim`, `garrison`).
+The military pass's `combat.js` reads both and does the shooting, so towers and
+Castles fire the day their stats land — which they now have.
+
+One thing is genuinely outstanding, and `HANDOFF-walls.md` has it: `unitAI.js`
+should start passing `u.player` to the pathfinder. Without it a unit walks *to*
+its own gate, waits for it to open, and repaths through — rather than planning
+the route through it from across the map. It works either way; the argument just
+removes the hop.
 
 ### Tests
 

@@ -289,6 +289,9 @@ test('a soldier shot out of the dark does not charge into it', () => {
   const victim = spawnUnit(w, 'militia', PLAYER, 18, 10);
   reindex(w);
   w.vision.update();
+  // Handed its target rather than left to find one: eight tiles is past what an
+  // archer can see too, and the case under test is the *victim's* blindness.
+  sniper.target = victim;
 
   stepUntil(w, 400, () => victim.hp < victim.maxHp);
   assert(victim.hp < victim.maxHp, 'the sniper is hitting it');
@@ -305,7 +308,7 @@ test('a player-ordered attack still works on a target that walks into fog', () =
 
   commandUnits(w, [m], { type: 'attack', target: foe });
   eq(m.target, foe, 'the order lands');
-  eq(m.autoTarget, false, 'and it is an order, not an acquisition');
+  assert(!m.autoTarget, 'and it is an order, not an acquisition');
   step(w, 20);
   eq(m.target, foe, 'an explicit order is not second-guessed by the fog');
 });
@@ -349,9 +352,11 @@ test('Stand Ground fights what walks in and never takes a step', () => {
   eq(m.target, null, 'a target it cannot hit from here is not a target');
   eq(m.x, 10, 'and it has not moved a tile');
 
-  // Walk the enemy into its reach.
+  // Walk the enemy into its reach. Ten steps, not forty: a villager that gets
+  // hit panics and runs (combat.js), so waiting longer would be measuring the
+  // flee behaviour rather than the stance.
   foe.x = 10.9;
-  step(w, 40);
+  step(w, 10);
   eq(m.target, foe, 'what comes to it, it fights');
   assert(foe.hp < foe.maxHp, 'and it is actually swinging');
   eq(m.x, 10, 'still without moving');
@@ -394,12 +399,16 @@ test('Aggressive keeps the ground it took', () => {
   w.vision.update();
 
   stepUntil(w, 60, () => m.target === foe);
-  foe.x = 30;
-  stepUntil(w, 300, () => !m.target);
+  // A real chase: the quarry walks away and the militia follows until the leash
+  // runs out. (Snapping the quarry across the map instead would test nothing —
+  // the leash breaks in the same step and the unit never takes a pace.)
+  commandUnits(w, [foe], { type: 'move', gx: 40, gy: 10 });
+  stepUntil(w, 600, () => !m.target && m.state === 'idle');
   step(w, 60);
   assert(
-    Math.hypot(m.x - 10, m.y - 10) > 1.0,
-    'an aggressive unit does not trudge home — that is what Defensive is for',
+    Math.hypot(m.x - 10, m.y - 10) > 1.5,
+    `an aggressive unit does not trudge home — that is what Defensive is for ` +
+    `(ended ${Math.hypot(m.x - 10, m.y - 10).toFixed(2)} from its post)`,
   );
 });
 
@@ -651,20 +660,26 @@ test('a building does not shoot what its owner cannot see', () => {
   // blind. Prove the gate directly instead: an entity the mask does not cover.
   const foe = spawnUnit(w, 'militia', ENEMY, 24, 20);
   foe.hp = foe.maxHp = 100000;
+  // No Attack, so it stands there and takes it. Left aggressive it would charge
+  // the Town Center and walk off the tile the mask is being patched on.
+  setStance(foe, STANCE.NO_ATTACK);
   const mask = w.vision.state(PLAYER).visible;
-  const tile = Math.floor(foe.y) * w.width + Math.floor(foe.x);
-  assert(mask[tile] === 1, 'the ground the foe stands on is lit');
+  assert(mask[Math.floor(foe.y) * w.width + Math.floor(foe.x)] === 1,
+    'the ground the foe stands on is lit');
   step(w, 40);
   assert(foe.hp < foe.maxHp, 'so it is shot');
 
-  const hpLit = foe.hp;
   // Blind the mask over the target and confirm the volley stops. (Nothing in
   // the game writes the mask by hand; this is a test reaching in to isolate the
-  // one rule under examination.)
-  const patch = () => { mask[tile] = 0; };
-  patch();
-  for (let i = 0; i < 40; i++) { step(w, 1); patch(); }
-  eq(foe.hp, hpLit, 'blind, the building holds its fire');
+  // one rule under examination — the mask is re-patched before every step
+  // because vision.update() rebuilds it from the viewers each time.)
+  const patch = () => { mask[Math.floor(foe.y) * w.width + Math.floor(foe.x)] = 0; };
+  // Let the arrows already in the air land first, or they would be counted as
+  // shots taken blind.
+  for (let i = 0; i < 20; i++) { patch(); step(w, 1); }
+  const hpBlind = foe.hp;
+  for (let i = 0; i < 60; i++) { patch(); step(w, 1); }
+  eq(foe.hp, hpBlind, 'blind, the building holds its fire');
 });
 
 test('garrisoned units are ejected rather than deleted when the building falls', () => {
@@ -696,7 +711,11 @@ test('garrisoned units are ejected rather than deleted when the building falls',
 test('attack-move stops for a fight and then carries on', () => {
   const w = field();
   const m = spawnUnit(w, 'militia', PLAYER, 10, 10);
-  const foe = spawnUnit(w, 'villager', ENEMY, 16, 10);
+  // A soldier that stands its ground and dies there, rather than a villager:
+  // a panicking villager runs, and an attack-mover that correctly chases it is
+  // then measured as having "failed to resume".
+  const foe = spawnUnit(w, 'militia', ENEMY, 16, 10);
+  setStance(foe, STANCE.NO_ATTACK);
   reindex(w);
   w.vision.update();
 

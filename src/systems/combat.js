@@ -859,7 +859,20 @@ function garrisonCtx(world) {
   GARRISON_CTX.set(world, ctx);
   world.events.on(EV.REMOVED, (p) => {
     const b = p && p.entity;
-    if (!b || b.kind !== 'building') return;
+    if (!b) return;
+    // A unit removed while it was inside something must not leave a corpse on
+    // the building's roll: garrisonCount() is what the HUD prints and what the
+    // volley is sized from, and a dead body would keep firing arrows.
+    if (b.kind === 'unit') {
+      const host = b.garrisonedIn;
+      if (host && host.garrison) {
+        const i = host.garrison.indexOf(b);
+        if (i >= 0) host.garrison.splice(i, 1);
+      }
+      b.garrisonedIn = null;
+      return;
+    }
+    if (b.kind !== 'building') return;
     if (!b.garrison || !b.garrison.length) return;
     // The building is gone. AoE2 kills what was inside it; this ejects it
     // instead, wounded and standing in the rubble. Losing a Town Center is

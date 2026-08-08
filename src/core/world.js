@@ -384,24 +384,17 @@ export function spawnBuilding(world, type, player, gx, gy, { complete = true } =
     state: complete ? 'idle' : 'foundation',
     dead: false,
 
-    // --- The shooting half ---------------------------------------------------
-    // Stamped from the stats block so a Castle or a tower carries everything a
-    // combat pass needs on the entity itself — the same field names a unit
-    // carries, so the code that swings for a unit can swing for a building
-    // without learning a second vocabulary. Zero for everything else, which is
-    // the same "does not fight" answer buildings have always given.
-    attack: s.attack || 0,
-    range: s.attackRange || 0,
-    attackCooldown: s.attackCooldown || 0,
+    // --- State a defensive building mutates -----------------------------------
+    // The *numbers* a Castle or a Watch Tower shoots with (attack, attackRange,
+    // attackCooldown, garrisonCapacity) stay in BUILDING_STATS and are read from
+    // there by systems/combat.js, which owns both the volley and the garrison.
+    // What is stamped here is only the mutable state those systems tick, so that
+    // every building carries it from birth and no loop has to guard for
+    // undefined: the swing timer, the swing pose, and the array of bodies
+    // sheltering inside.
     cooldown: 0,
-    target: null,
     attackAnim: 0,
-    armor: s.armor || 0,
-    // Units sheltering inside. Each one adds an arrow to the volley (AoE2's
-    // rule); they are off the map but still on the population. See
-    // garrisonUnit() in systems/economy.js.
     garrison: [],
-    garrisonCapacity: s.garrisonCapacity || 0,
 
     // Wall pieces: which neighbours to draw a join to, and whether a gate is
     // standing open. Filled in below for the pieces that have them.
@@ -488,10 +481,6 @@ export function removeEntity(world, e) {
       setBlocked(world, tx, ty, 0);
       if (inBounds(world, tx, ty)) world.gateOwner[ty * world.width + tx] = 0;
     }
-    // Anyone sheltering inside a building that has just been razed comes out
-    // where it stood. Leaving them in the entity map but off the unit list would
-    // be an invisible population leak that nothing on screen could explain.
-    if (e.garrison && e.garrison.length) evictGarrison(world, e);
     if (isWallType(e.type)) refreshWallsAround(world, Math.floor(e.x), Math.floor(e.y));
   } else if (e.kind === 'resource') {
     const i = world.resources.indexOf(e);
@@ -514,128 +503,6 @@ export function removeEntity(world, e) {
     }
   }
   world.events.emit(EV.REMOVED, { entity: e });
-}
-
-// --- Garrison ---------------------------------------------------------------
-//
-// A garrisoned unit is *off the map but still in the game*: it keeps its entity
-// id, it stays in `world.entities` and in its owner's `owned` set — so
-// recomputePop still counts it, which is AoE2's rule and the thing that stops
-// garrisoning being a free way to duck the population cap — and it is spliced
-// out of `world.units`.
-//
-// That one splice is what does all the work. Every system that could see the
-// unit walks `world.units`: the renderer, the spatial index, unit AI, combat's
-// acquisition sweep. None of them needs to learn the word "garrison"; the unit
-// is simply not in the list any more. The alternative — a `garrisoned` flag that
-// eleven loops have to remember to test — is the same feature with eleven places
-// to forget it.
-//
-// The *order* to enter or leave is the unit AI's (a garrison order is a walk
-// followed by a disappearance, and walking is not this module's business). What
-// is here is the disappearance itself. See HANDOFF-walls.md.
-
-/** Room for one more body inside this building? */
-export function canGarrison(world, b, unit) {
-  if (!b || b.dead || b.kind !== 'building' || !b.complete) return false;
-  if (!unit || unit.dead || unit.kind !== 'unit') return false;
-  if (unit.player !== b.player) return false;
-  if (!b.garrisonCapacity) return false;
-  return (b.garrison ? b.garrison.length : 0) < b.garrisonCapacity;
-}
-
-/** Take a unit off the map and into `b`. Returns true when it went in. */
-export function garrisonUnit(world, b, unit) {
-  if (!canGarrison(world, b, unit)) return false;
-  const i = world.units.indexOf(unit);
-  if (i < 0) return false;                 // already inside something
-  world.units.splice(i, 1);
-  unit.garrisonedIn = b;
-  unit.task = null;
-  unit.path = null;
-  unit.target = null;
-  unit.state = 'garrison';
-  world.selection.delete(unit.id);
-  if (!b.garrison) b.garrison = [];
-  b.garrison.push(unit);
-  return true;
-}
-
-/**
- * Put one unit (the last one in, or `unit` if named) back on the map beside the
- * building. Returns the unit, or null when there was nobody to let out or
- * nowhere to put them.
- */
-export function ungarrisonUnit(world, b, unit = null) {
-  const list = b && b.garrison;
-  if (!list || !list.length) return null;
-  const idx = unit ? list.indexOf(unit) : list.length - 1;
-  if (idx < 0) return null;
-  const spot = freeTileAround(world, b);
-  if (!spot) return null;
-  const u = list[idx];
-  list.splice(idx, 1);
-  u.garrisonedIn = null;
-  u.x = spot.x;
-  u.y = spot.y;
-  u.px = spot.x;
-  u.py = spot.y;
-  u.state = 'idle';
-  if (!world.units.includes(u)) world.units.push(u);
-  return u;
-}
-
-/** Empty a building out. Used when it is destroyed, and by "unload". */
-export function evictGarrison(world, b) {
-  const out = [];
-  let guard = 64;
-  while (b.garrison && b.garrison.length && guard-- > 0) {
-    const u = ungarrisonUnit(world, b);
-    if (!u) break;
-    out.push(u);
-  }
-  // Nowhere at all to stand — the building is walled in and being razed. The
-  // bodies inside die with it rather than leaking out of every list at once.
-  if (b.garrison && b.garrison.length) {
-    for (const u of b.garrison.slice()) {
-      u.garrisonedIn = null;
-      u.hp = 0;
-      removeEntity(world, u);
-    }
-    b.garrison.length = 0;
-  }
-  return out;
-}
-
-/** First free tile on a widening ring around a building, or null. */
-function freeTileAround(world, b) {
-  const ox = Math.floor(b.x - b.fw / 2);
-  const oy = Math.floor(b.y - b.fh / 2);
-  for (let r = 1; r <= 4; r++) {
-    for (let y = oy - r; y < oy + b.fh + r; y++) {
-      for (let x = ox - r; x < ox + b.fw + r; x++) {
-        const onRing =
-          x === ox - r || x === ox + b.fw + r - 1 ||
-          y === oy - r || y === oy + b.fh + r - 1;
-        if (!onRing || !inBounds(world, x, y)) continue;
-        const i = y * world.width + x;
-        if (world.blocked[i] !== 0) continue;
-        if (world.terrain[i] === TERRAIN.WATER) continue;
-        return { x: x + 0.5, y: y + 0.5 };
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * How many arrows this building looses in one volley: its own, plus one per
- * body sheltering inside, exactly as an AoE2 Castle works. A building that
- * cannot shoot fires nothing however full it is.
- */
-export function volleySize(b) {
-  if (!b || !(b.attack > 0)) return 0;
-  return 1 + (b.garrison ? b.garrison.length : 0);
 }
 
 // --- Population -------------------------------------------------------------

@@ -842,7 +842,14 @@ export function createHud(scene, world) {
     // actually wants under fire — they are not choosing *which* Town Center,
     // they are getting their villagers off the field before the scouts arrive.
     if (units.length) {
-      const shelter = units.map((u) => nearestShelter(world, u)).find(Boolean);
+      // First unit that has somewhere to go decides whether the button exists;
+      // the order itself re-asks per unit, so a mixed group still each find
+      // their own nearest shelter.
+      let shelter = null;
+      for (const u of units) {
+        shelter = nearestShelter(world, u);
+        if (shelter) break;
+      }
       if (shelter) {
         panel.appendChild(cmdButton('Garrison', {
           cls: 'garrison',

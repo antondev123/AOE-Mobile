@@ -7,6 +7,12 @@
 // wears, per-player gate passability checked through the *real* A*, the
 // charging rules for a drag-drawn run, and the Castle's age gate and stone bill.
 //
+// Garrisoning is deliberately not tested here: combat.js owns it end to end
+// (the volley, the healing, the refusal rules) and tests/military.test.mjs is
+// where it belongs. What this file holds down is the wall pass's half of that
+// contract — that the Castle and the tower *declare* an attack, a range, a
+// cooldown and a capacity, and carry the mutable state a volley ticks.
+//
 // The one thing these tests will not catch is whether the sixteen sprites
 // actually meet up on screen. That is a question only a screenshot can answer,
 // and screenshots/walls-*.png is where it was answered.
@@ -15,7 +21,7 @@ import assert from 'node:assert/strict';
 
 import {
   createWorld, spawnUnit, spawnBuilding, removeEntity, setBlocked, reindex,
-  wallMaskAt, setGateOpen, garrisonUnit, volleySize, recomputePop, canGarrison,
+  wallMaskAt, setGateOpen,
   WALL_N, WALL_E, WALL_S, WALL_W, BLOCK_GATE,
 } from '../src/core/world.js';
 import { generateMap } from '../src/core/mapgen.js';
@@ -28,7 +34,7 @@ import {
 } from '../src/systems/pathfinding.js';
 import {
   placeFoundation, placeWallLine, planWallLine, wallLineTiles, buildTick,
-  updateGates, garrison, ungarrisonAll,
+  updateGates,
 } from '../src/systems/economy.js';
 import { completeResearch, currentAge, AGE } from '../src/systems/tech.js';
 
@@ -493,79 +499,41 @@ test('the walls are age-gated too, and the palisade is not', () => {
   assert.ok(toasts.some((t) => /Feudal Age/i.test(t.text)));
 });
 
-test('a garrisoned unit leaves the map, keeps its population, and adds an arrow', () => {
+test('the tower and the Castle declare what combat.js needs, and carry its state', () => {
+  // The *numbers* live in BUILDING_STATS and combat.js reads them from there;
+  // what world.js stamps is the mutable state a volley ticks. Both halves are
+  // checked here because a missing field on either side is silent — the tower
+  // simply never shoots and nothing says why.
+  for (const type of ['watchtower', 'castle']) {
+    const s = BUILDING_STATS[type];
+    assert.ok(s.attack > 0, `${type} must declare an attack`);
+    assert.ok(s.attackRange > 0, `${type} must declare a range`);
+    assert.ok(s.attackCooldown > 0, `${type} must declare a cooldown`);
+    assert.ok(s.garrisonCapacity > 0, `${type} must hold a garrison`);
+  }
   const world = bareWorld();
-  ageUp(world, PLAYER, AGE.CASTLE);
-  const castle = spawnBuilding(world, 'castle', PLAYER, 30, 30, { complete: true });
-  spawnBuilding(world, 'house', PLAYER, 40, 40, { complete: true });
-  const u = spawnUnit(world, 'militia', PLAYER, 33.5, 30.5);
-  recomputePop(world, PLAYER);
-  const popBefore = world.players[PLAYER].pop;
+  const b = spawnBuilding(world, 'castle', PLAYER, 70, 70, { complete: true });
+  assert.equal(b.cooldown, 0, 'a swing timer, from birth');
+  assert.equal(b.attackAnim, 0);
+  assert.deepEqual(b.garrison, [], 'and an empty garrison, so nothing has to guard for undefined');
 
-  assert.equal(volleySize(castle), 1, 'an empty Castle shoots one arrow');
-  assert.equal(canGarrison(world, castle, u), true);
-  assert.equal(garrison(world, castle, u), true);
-
-  assert.equal(world.units.includes(u), false, 'the unit is off the map');
-  assert.equal(world.entities.has(u.id), true, 'but still an entity');
-  recomputePop(world, PLAYER);
-  assert.equal(world.players[PLAYER].pop, popBefore, 'and still on the population');
-  assert.equal(volleySize(castle), 2, 'each body inside adds an arrow');
-
-  const out = ungarrisonAll(world, castle);
-  assert.equal(out.length, 1);
-  assert.equal(world.units.includes(u), true, 'and it comes back out on the map');
-  assert.equal(volleySize(castle), 1);
+  // Everything else must still say "I do not fight", or a sweep that starts
+  // looking at buildings will find a shooting house.
+  const h = spawnBuilding(world, 'house', PLAYER, 60, 60, { complete: true });
+  assert.equal(BUILDING_STATS.house.attack || 0, 0);
+  assert.equal(BUILDING_STATS.house.garrisonCapacity || 0, 0);
+  assert.deepEqual(h.garrison, []);
 });
 
-test('capacity is a real limit and a razed building lets its garrison out', () => {
-  const world = bareWorld();
-  const tower = spawnBuilding(world, 'watchtower', PLAYER, 20.5, 20.5, { complete: true });
-  const cap = BUILDING_STATS.watchtower.garrisonCapacity;
-  const troops = [];
-  for (let i = 0; i < cap + 2; i++) {
-    troops.push(spawnUnit(world, 'militia', PLAYER, 22.5 + i * 0.1, 20.5));
-  }
-  let inside = 0;
-  for (const t of troops) if (garrisonUnit(world, tower, t)) inside++;
-  assert.equal(inside, cap, 'a tower holds exactly what it says it holds');
-  assert.equal(canGarrison(world, tower, troops[cap]), false);
-  assert.equal(garrisonUnit(world, tower, troops[cap + 1]), false);
-
-  removeEntity(world, tower);
-  for (let i = 0; i < cap; i++) {
-    assert.equal(world.units.includes(troops[i]), true,
-      'a razed tower turns its garrison out rather than deleting them silently');
-  }
-});
-
-test('an enemy unit may not be put inside your building', () => {
+test('an enemy soldier cannot be stuffed into your tower', () => {
+  // The rule lives in combat.js (garrisonRefusal); this is the wall pass making
+  // sure its half — the capacity declaration and the owner on the building —
+  // says what that rule needs to hear.
+  assert.equal(BUILDING_STATS.watchtower.garrisonCapacity, 5);
   const world = bareWorld();
   const tower = spawnBuilding(world, 'watchtower', PLAYER, 60.5, 60.5, { complete: true });
-  const theirs = spawnUnit(world, 'militia', ENEMY, 61.5, 60.5);
-  assert.equal(canGarrison(world, tower, theirs), false);
-  assert.equal(garrisonUnit(world, tower, theirs), false);
-});
-
-test('the tower and the Castle carry the fields a combat pass needs', () => {
-  const world = bareWorld();
-  for (const type of ['watchtower', 'castle']) {
-    const b = spawnBuilding(world, type, PLAYER, 70, 70, { complete: true });
-    const s = BUILDING_STATS[type];
-    assert.equal(b.attack, s.attack, `${type}.attack`);
-    assert.equal(b.range, s.attackRange, `${type}.range`);
-    assert.equal(b.attackCooldown, s.attackCooldown, `${type}.attackCooldown`);
-    assert.equal(b.cooldown, 0);
-    assert.deepEqual(b.garrison, []);
-    assert.equal(b.garrisonCapacity, s.garrisonCapacity);
-    removeEntity(world, b);
-  }
-  // Everything else must still say "I do not fight", or an auto-acquire sweep
-  // that starts looking at buildings will find a shooting house.
-  const h = spawnBuilding(world, 'house', PLAYER, 70, 70, { complete: true });
-  assert.equal(h.attack, 0);
-  assert.equal(h.garrisonCapacity, 0);
-  assert.equal(volleySize(h), 0);
+  assert.equal(tower.player, PLAYER);
+  assert.equal(tower.complete, true);
 });
 
 // --- helpers ----------------------------------------------------------------

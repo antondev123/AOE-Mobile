@@ -5,113 +5,52 @@ belongs to another agent this sprint. None of it is a known bug in the wall
 work — the buildings, the block grid, the drag-to-draw placement, the sprites
 and the tests are all complete and shipping.
 
-Two files are waiting on somebody: **`src/systems/combat.js`** (buildings that
-shoot) and **`src/systems/unitAI.js`** (pathing that knows who is walking, and
-the order to garrison). Sections 1 and 2 are the ones with teeth; section 3 is
-the enemy AI, which is optional.
+One thing is genuinely outstanding: **`src/systems/unitAI.js`** should start
+telling the pathfinder who is walking, so a unit can plan a route through its own
+gate instead of only walking through one it has already reached (section 2).
+Section 1 is the combat contract, which the military pass has already
+implemented — it is recorded here so neither side breaks it. Section 3 is the
+enemy AI, which is optional.
 
 ---
 
-## 1. `combat.js` — make the Castle and the Watch Tower shoot
+## 1. `combat.js` — done, and what it consumes
 
-The **state is already there**. `spawnBuilding()` in `core/world.js` stamps every
-building with the same field names a unit carries, taken from `BUILDING_STATS`:
+The military pass landed `updateBuildings()` while this one was in flight, so
+the Castle and the Watch Tower already shoot and already garrison. Nothing is
+outstanding. What follows is only the contract, so that neither side breaks it
+by accident.
 
-| field on the building | Castle | Watch Tower | everything else |
+**`combat.js` reads the numbers straight out of `BUILDING_STATS`** — it does not
+read them off the entity — so the wall pass owns these four fields and adding a
+fifth shooting building needs no edit in `combat.js` at all:
+
+| field in `BUILDING_STATS` | Castle | Watch Tower | everything else |
 | --- | --- | --- | --- |
-| `attack` | 12 | 6 | `0` |
-| `range` (tiles, from `attackRange`) | 9 | 7 | `0` |
-| `attackCooldown` (seconds) | 2.0 | 2.0 | `0` |
-| `cooldown` | ticked by you | ticked by you | `0` |
-| `target` | `null` | `null` | `null` |
-| `attackAnim` | `0` | `0` | `0` |
-| `garrison` (array of units inside) | `[]` | `[]` | `[]` |
-| `garrisonCapacity` | 10 | 5 | `0` |
+| `attack` | 12 | 6 | absent |
+| `attackRange` (tiles) | 9 | 7 | absent |
+| `attackCooldown` (seconds) | 2.0 | 2.0 | absent |
+| `garrisonCapacity` | 10 | 5 | absent |
 
-They are the *same names* on purpose: `attackReach()`, `inRange()`,
-`effectiveAttack()` and `launchProjectile()` already work on anything carrying
-`attack` / `range` / `radius`, so nothing in the damage path needs a second
-vocabulary for masonry.
+**`world.js` stamps only the mutable state** those systems tick, so no loop has
+to guard for `undefined`: `cooldown`, `attackAnim` and `garrison: []`. It
+deliberately does *not* copy the stats onto the entity — two copies of a number
+is one more than can be kept in step.
 
-### What has to change
+Two things worth knowing if the balance is revisited. A Watch Tower at 6 damage
+every 2.0s is 3 dps against 1-armour militia: it kills a lone raider and loses to
+four, which is what 100 stone should do. A Castle at 12 every 2.0s is 6 dps
+empty; `buildingWeapon()` adds one arrow per garrisoned body, so a full one is
+several times that, which is what 250 stone should buy.
 
-**a. `canAttack()` currently refuses every non-unit attacker.**
+An earlier draft of this document asked for all of the above to be built. It is
+kept only as the record of what the two passes agreed.
 
-```js
-if (attacker.kind !== 'unit') return false;       // buildings do not fight back
-```
+## 2. `unitAI.js` — one change left
 
-That line is the whole of the block. Replace it with a test that a building may
-attack when it is finished and armed:
-
-```js
-if (attacker.kind === 'building') {
-  if (!attacker.complete) return false;           // a building site does not shoot
-} else if (attacker.kind !== 'unit') {
-  return false;
-}
-```
-
-`attack > 0` is already tested on the next line, so an unarmed building still
-falls out. Nothing else in `canAttack` needs touching — `isHostile` works on any
-entity with a `player`.
-
-**b. `updateCombat()` needs a second loop over `world.buildings`.**
-
-It should be an exact echo of the unit loop, minus everything about walking:
-
-```js
-for (const b of world.buildings) {
-  if (b.dead || !b.complete || !(b.attack > 0)) continue;
-  if (b.cooldown > 0) b.cooldown = Math.max(0, b.cooldown - dt);
-  if (b.target && !canAttack(b, b.target)) b.target = null;
-  if (b.target && !inRange(b, b.target)) b.target = null;   // no leash: it cannot chase
-  if (!b.target) acquireForBuilding(world, b, dt);
-  if (!b.target || b.cooldown > 0) continue;
-  b.cooldown = b.attackCooldown;
-  for (let i = 0; i < volleySize(b); i++) launchProjectile(world, b, b.target);
-}
-```
-
-Three things to be careful about, in order of how badly they bite:
-
-1. **`volleySize(b)`** is exported from `core/world.js` and returns
-   `1 + b.garrison.length` for an armed building, `0` for anything else. That is
-   AoE2's rule — every body inside a Castle adds an arrow — and it is the whole
-   point of the garrison. A full Castle looses eleven arrows a volley.
-2. **`launchProjectile` reads `effectiveAttack(world, u)`**, which calls
-   `attackBonus(world, unit)` in `tech.js`. That already returns `0` for a
-   building (`unitClass()` returns `null` for a type with no `UNIT_STATS` entry),
-   so a building swings with its base `attack` and no blacksmith line. That is
-   the intended behaviour — AoE2's Fletching does buff towers, so if you want it,
-   add a `'building'` class to `unitClass()` rather than special-casing here.
-3. **Acquisition must prefer units over buildings and must not use
-   `ENGAGE_RANGE`.** A tower's range *is* its range. Use `forEachNear(world, b.x,
-   b.y, b.range + 1, ...)`, filter with `canAttack(b, e)`, score by
-   `edgeDist2(e, b.x, b.y)` and push buildings to the back exactly the way
-   `acquire()` already does.
-
-**c. `applyDamage` and `kill` already work on buildings** — a Castle taking fire
-goes through the same path a Town Center does, `raiseAlert` already treats every
-building hit as relevant, and `removeEntity` empties the garrison out (see
-`evictGarrison` in `world.js`). Nothing to do.
-
-**d. Do not give the projectile a `duration` from the launcher's centre for a
-4x4 Castle.** `launchProjectile` measures `dist(u.x, u.y, target.x, target.y)`,
-which for a Castle is measured from the middle of a four-tile building; the arrow
-will appear to start inside it. Launching from the footprint edge toward the
-target — or simply from `u.x, u.y - 1` — reads better and costs nothing.
-
-### Suggested balance sanity check
-
-A Watch Tower (6 damage, 2.0s) is 3 dps against 1-armour militia — it kills a
-lone raider and loses to four of them, which is what a 100-stone building should
-do. An empty Castle (12 damage, 2.0s) is 6 dps; a full one is 66 dps and shreds
-an early army, which is what 250 stone should buy.
-
----
-
-## 2. `unitAI.js` — three small changes
+Garrisoning is done too: `combat.js` owns `garrisonUnit` / `ungarrisonUnit` /
+`ungarrisonAll` / `garrisonRefusal`, the HUD has its button, and `unitAI` has the
+order. What is still outstanding is the pathfinder's new argument.
 
 ### a. Pass the walking player into the pathfinder (the important one)
 
@@ -163,40 +102,7 @@ through. Passing the player removes that hop.
 `enemyAI.js:994` calls `findPath` too, and should pass `{ player: this.playerId }`
 for the same reason.
 
-### b. The garrison order
-
-The building side is done. `core/world.js` exports the surgery
-(`canGarrison`, `garrisonUnit`, `ungarrisonUnit`, `evictGarrison`, `volleySize`)
-and `economy.js` exports the gameplay wrappers that also fix the population
-(`garrison`, `ungarrison`, `ungarrisonAll`, re-exported `canGarrison`). What is
-missing is the *order*: walking there, and then going in.
-
-```js
-// in commandUnits, a new order type:
-case 'garrison': {
-  u.task = { type: 'garrison', target: order.target };
-  break;
-}
-// in the task step, on arrival (use findAdjacentStandTile against the building):
-if (economy.canGarrison(world, task.target, u)) economy.garrison(world, task.target, u);
-u.task = null;
-```
-
-A garrisoned unit is spliced out of `world.units` and left in `world.entities`
-and in its owner's `owned` set, so:
-
-* **nothing in `unitAI` will ever see it again** — no flag to test, no loop to
-  teach. That is why it was done by splicing rather than by a `garrisoned` bool.
-* it **still counts against the population cap**, which is AoE2's rule and stops
-  garrisoning being a way to duck the cap.
-* `ungarrison(world, building)` puts one back on a free tile beside the building;
-  `ungarrisonAll` empties it. A razed building empties itself.
-
-The HUD side (an "Unload" button on a selected Castle) belongs to whoever owns
-`hud.js`; `economy.ungarrisonAll(world, building)` is the one call it needs, and
-`building.garrison.length` / `building.garrisonCapacity` are the numbers to show.
-
-### c. Spread builders along a wall run (nice to have)
+### b. Spread builders along a wall run (nice to have)
 
 `ui/input.js` places N foundations in one drag and then sends every selected
 villager to **the first one**. A wall built from one end inwards is useful while
@@ -231,15 +137,14 @@ keys in `BUILDABLE`; `isWallType()` and `isGateType()`.
 
 **`core/world.js`** — `BLOCK_FREE/SOLID/TERRAIN/GATE`; `world.gateOwner`;
 `WALL_N/E/S/W`, `wallMaskAt`, `refreshWallMask`, `refreshWallsAround`,
-`setGateOpen`, `onBuildingComplete`; `canGarrison`, `garrisonUnit`,
-`ungarrisonUnit`, `evictGarrison`, `volleySize`.
+`setGateOpen`, `onBuildingComplete`; `cooldown` / `attackAnim` / `garrison` on
+every building.
 
 **`systems/pathfinding.js`** — the optional `player` argument described above.
 
 **`systems/economy.js`** — `wallLineTiles`, `planWallLine`, `placeWallLine`,
-`MAX_WALL_RUN`, `tilesTrapReason`, `updateGates` (called from `updateEconomy`),
-`garrison` / `ungarrison` / `ungarrisonAll`; `placeFoundation` gained
-`opts.quiet` and `opts.skipTrap`.
+`MAX_WALL_RUN`, `tilesTrapReason`, `updateGates` (called from `updateEconomy`);
+`placeFoundation` gained `opts.quiet` and `opts.skipTrap`.
 
 **`ui/input.js`** — the `wallDraw` pointer mode.
 
@@ -250,6 +155,6 @@ keys in `BUILDABLE`; `isWallType()` and `isGateType()`.
 **`gfx/render.js`** — `setWallPreview()`, `setWallReadout()`, connected-variant
 frame selection.
 
-**`tests/walls.test.mjs`** — 27 assertions covering all sixteen mask cases, gate
-passability through the real A*, run charging, enclosure refusal, the Castle's
-age gate and the garrison.
+**`tests/walls.test.mjs`** — 25 assertions covering all sixteen mask cases, gate
+passability through the real A*, run charging, enclosure refusal and the
+Castle's age gate. Garrison behaviour is `tests/military.test.mjs`'s.
