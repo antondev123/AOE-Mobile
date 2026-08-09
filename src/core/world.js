@@ -204,19 +204,48 @@ export function footprintTiles(gx, gy, fw, fh) {
 
 /** Can a building of this footprint be placed centred at (gx, gy)? */
 export function canPlace(world, gx, gy, fw, fh) {
+  return placeBlockedBy(world, gx, gy, fw, fh) === null;
+}
+
+/**
+ * WHY a footprint is refused, in words, or null when it is fine.
+ *
+ * "Cannot build there" was the answer to six different questions — off the map,
+ * in the sea, on a tree, on your own foundation, on an enemy's wall, on your own
+ * open gate — and on a phone, where the ghost sits an inch above your thumb and
+ * the toast is one line, that is the difference between "move a little" and
+ * "give up". Every caller that used to print the generic string can print this
+ * instead; canPlace() above is the same predicate with the reason thrown away.
+ */
+export function placeBlockedBy(world, gx, gy, fw, fh) {
+  let reason = null;
   for (const [tx, ty] of footprintTiles(gx, gy, fw, fh)) {
-    if (!inBounds(world, tx, ty)) return false;
+    if (!inBounds(world, tx, ty)) return 'Off the edge of the map';
     const i = ty * world.width + tx;
-    if (world.blocked[i] !== 0) return false;
+    if (world.terrain[i] === TERRAIN.WATER) return 'You cannot build on water';
     // An *open* gate reads as free ground in the block grid — that is the whole
     // trick that lets its owner walk through it — so the occupancy test is what
     // stops a player dropping a house on top of their own open gate. Every other
     // occupied tile is already blocked, so this costs one array read and only
     // ever changes the answer for gates.
-    if (world.occupant[i] !== 0) return false;
-    if (world.terrain[i] === TERRAIN.WATER) return false;
+    if (world.blocked[i] !== 0 || world.occupant[i] !== 0) {
+      // Keep looking: water and the map edge are more useful things to say than
+      // "something is in the way", so they win if the footprint hits both.
+      reason = reason || occupantReason(world, i);
+    }
   }
-  return true;
+  return reason;
+}
+
+/** Name what is sitting on tile index `i`, as far as the player needs to know. */
+function occupantReason(world, i) {
+  const id = world.occupant[i];
+  const e = id ? world.entities.get(id) : null;
+  if (e && e.kind === 'building') {
+    return e.complete ? `The ${e.type === 'towncenter' ? 'Town Center' : 'building'} there is in the way`
+      : 'There is already a foundation there';
+  }
+  return 'Something is in the way';
 }
 
 // --- Walls ------------------------------------------------------------------

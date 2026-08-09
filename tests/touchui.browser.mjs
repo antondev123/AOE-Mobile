@@ -65,7 +65,7 @@ async function tapGrid(page, gx, gy, pointerId) {
     const canvas = g.scene.game.canvas;
     const r = canvas.getBoundingClientRect();
     const size = g.scene.game.scale.gameSize;
-    const GHOST_LIFT = 62; // must match ui/input.js
+    const GHOST_LIFT = g.input._ghostLift(); // the lift the ghost is actually using
     const opts = {
       pointerId: id,
       pointerType: 'touch',
@@ -337,12 +337,18 @@ async function idleButtonRun() {
     }
     check('each tap selects a different idle villager',
       new Set(visited.slice(0, 3)).size === 3, visited.join(' -> '));
-    check('and the camera lands on the one it selected',
+    // Centred on the part of the screen the player can SEE, not on the middle
+    // of the canvas. The HUD covers the bottom third, so a jump aimed at the
+    // geometric centre used to land its villager under the dock — behind the
+    // controls, and behind the thumb pressing them.
+    check('and the camera lands on the one it selected, in the visible map band',
       await page.evaluate(() => {
         const g = window.__game;
         const u = g.world.entities.get([...g.world.selection][0]);
         const p = g.input._toScreen(u.x, u.y);
-        return Math.hypot(p.x - g.input.camera.width / 2, p.y - g.input.camera.height / 2) < 2;
+        const v = g.input._viewRect();
+        return Math.abs(p.x - g.input.camera.width / 2) < 2 &&
+               Math.abs(p.y - (v.top + v.height / 2)) < 2;
       }), `camera jumps: ${jumps.join(', ')} world px`);
     check('the fourth tap wraps back to the first',
       visited[3] === visited[0], visited.join(' -> '));
