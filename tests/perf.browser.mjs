@@ -325,7 +325,7 @@ const run = async () => {
       'sim.units.act', 'sim.units.separate', 'sim.combat', 'sim.economy', 'sim.enemyAI', 'sim.vision',
       'input', 'render', 'render.terrain', 'render.cliffs', 'render.resources',
       'render.buildings', 'render.units', 'render.memory', 'render.fog',
-      'render.fx', 'hud', 'hud.dom', 'hud.minimap',
+      'render.fx', 'hud', 'hud.dom', 'hud.minimap', 'audio',
     ];
 
     console.log(`\n  stress: ${p.unitsAtStart} units at the top of the window, ` +

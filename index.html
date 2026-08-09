@@ -75,6 +75,13 @@
       <h1>Age of Skirmish</h1>
       <p class="boot-sub">A pocket-sized real-time strategy skirmish</p>
       <div class="boot-status" id="boot-status">Loading&hellip;</div>
+      <!-- Resume comes first and is the loud button when there is a match to
+           come back to: a player who reopens the page after their phone killed
+           the tab is here to continue, not to throw the last ten minutes away.
+           "Start Skirmish" demotes itself to the quiet variant beneath it, and
+           says out loud that it discards the save — starting a new game is the
+           one irreversible thing this card can do. -->
+      <button id="btn-resume" class="start-btn" hidden>Resume match</button>
       <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
       <details class="boot-help">
         <summary>How to play</summary>

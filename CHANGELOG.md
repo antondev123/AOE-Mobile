@@ -1,5 +1,236 @@
 # Changelog
 
+## Saves, the Market, sound, and two enemy AI defects
+
+### Two enemy AI defects
+
+**It could reach four minutes pop-capped with no soldiers at all.** Reproduced
+across 24 seeds of the shipped mapgen: two of them ended the fourth minute with
+zero military, one with a finished Barracks and 600 banked wood, one with no
+Barracks at all — and fifteen of the twenty-four sat on a full population cap.
+Two causes, both structural rather than a tuning miss.
+
+*The placement search was sampling a quarter of its own candidates.*
+`findBuildSpot` walked 90 offsets of a ~350-entry annulus with a fixed stride
+and gave up. On a base ringed tightly enough by forest that only two or three
+legal 5x5 clearings existed inside eleven tiles, it found none of them for a
+hundred seconds at a stretch — a Barracks wanted at 1:47 and placed at 3:34.
+It now sweeps the near band **entire** (a stride coprime with the band's length,
+so the order still fans around the base rather than filling one side) and, only
+when that finds nothing at all, sweeps a second band out to seventeen tiles. The
+cost is ~350 `canPlace` calls, tens of microseconds, at most twice per think;
+the expensive half — the reachability path checks — stays bounded at 8 in the
+near band and 4 in the far one.
+
+*And a building it could not site took the whole construction pass with it.*
+`chooseBuilding()` answered with one type, and when that type had nowhere to go
+the AI built **nothing** for six seconds and then asked for the same impossible
+thing again — no house behind it, no field, no camp. It is now
+`buildingWishlist()`, a priority-ordered list, and `manageConstruction` falls
+through to the first thing it can both afford and find ground for. The retry
+back-off moved from one global gate to one per *type*, because the House behind
+the Barracks is not the Barracks' fault. The one case where saving up must block
+everything — rebuilding a lost Town Center — is handled by that wishlist having
+nothing else in it.
+
+Two smaller changes finish the job. The Town Center may no longer take the last
+few population slots once there is somewhere to train soldiers
+(`militaryPopReserve`, two per military building, charged only while the army is
+short of what the next wave wants): two producers draw on one cap, the Town
+Center trains in 16 seconds against a militia's 22, and it is asked first, so
+left alone it ends exactly one way. And the House buffer widens from 2 spare
+population to 6 once a Barracks is standing, because the cap is then being eaten
+from two queues at once.
+
+**Measured, same 24 seeds, at 4:00:** zero-army seeds 2 → **0**; pop-capped
+seeds 15 → **0**; every seed now has a completed Barracks and 2-5 soldiers on
+the field. Three consecutive `smoke.mjs --minutes 4` runs report 4, 4 and 5
+soldiers where the check used to flake.
+
+**`sim.enemyAI` spiked 22ms on every wave launch.** Measured over ten minutes on
+each of five seeds: the phase sat at 0.03ms mean and 22.02-22.85ms max, and the
+whole 60fps frame is 16.7ms. It was not the "army pass" thinking; it was
+`launchWave` handing sixteen soldiers a single group order across eighty-five
+tiles of map. `commandUnits` grants a *fresh* immediate A\* allowance to every
+order it is given (`IMMEDIATE_SEARCHES_PER_ORDER`, 48) precisely so a player's
+tap always registers on the step it was made — and a player taps once. Sixteen
+full-map searches at ~1.4ms each landed inside one fixed step. The villager
+rebalance and the construction staffing did quieter versions of the same thing
+(10.1ms and 8.0ms worst).
+
+The work is neither avoidable nor wasted; it simply must not all land on one
+step. Every order the AI issues now goes through a queue drained a couple of
+units per **sim step** rather than per think, so the backlog clears at 40 units
+a second and a sixteen-soldier wave is fully under way a third of a second after
+it is ordered — well inside the time the first man takes to walk out of the
+staging point. Splitting a group is exact for the verbs the AI gives in bulk
+(attack, gather, build and garrison are all per-unit loops inside `unitAI`), and
+its group *moves* are short walks to a staging point a few tiles away. Anything
+that re-issues a standing order every think — the defensive recall, the
+evacuation — now asks `awaitingOrder()` as well as `idle()`, because a fresh
+order supersedes the pending one and goes to the *back* of the queue, and forty
+units re-ordered every half second would push the last of them backwards forever.
+
+**Measured, same five seeds, ten minutes each (60000 steps):**
+
+| | before | after |
+| --- | --- | --- |
+| `launchWave` worst | 22.50ms | **0.65ms** |
+| `manageArmy` worst | 22.54ms | 0.95ms |
+| `manageVillagers` worst | 10.11ms | 1.21ms |
+| `sim.enemyAI` worst step | 22.85ms | **9.11ms** |
+| steps over 4ms | 22 | **3** |
+
+The 9.11ms residue is a think that placed a building (the enclosure test in
+`placeFoundation` floods once per owned unit) landing on the same step as two
+queued orders, three times in fifty minutes of simulation. It was 22ms *on every
+wave launch*.
+
+### Saving and resuming a match
+
+`src/core/save.js`. A phone browser is killed without warning and none of the
+ways it happens give the page a chance to ask, so there is no Save button
+anywhere in the design: the game saves itself every 30 seconds of wall clock and
+again on `visibilitychange` — the last event a page is guaranteed to see before
+the OS suspends it — and the only control a player meets is **Resume match** on
+the boot card, which says how far in the match was.
+
+A save is a *continuation*, not a screenshot. Three things carry that, and
+`tests/save.test.mjs` asserts it directly: it saves mid-match, restores, then
+steps **both** worlds two more minutes and compares a fingerprint of every
+entity's position, task, target, queue, carry and hitpoints, both stockpiles,
+both tech lists, the build queues and the fog — at four checkpoints, and again
+after a saved-mid-fight run and a saved-after-razing run.
+
+- `world.rng` is written as its 32-bit state, not as its seed (`rng.getState` /
+  `setState` are new). A save carrying only the seed rewinds the generator to
+  zero draws, so the next wave interval, building variant and placement cursor
+  after the load come out of a different part of the stream.
+- `world.nextId` is written, because both `combat.js` (which staggers swings by
+  id) and `unitAI.js` (which breaks ties by id) derive behaviour from them.
+- Every ordered collection keeps its order — `world.units`, `world.buildings`,
+  `world.resources`, the entity map itself, and each player's `owned` **set**.
+  Half the simulation iterates one of those and stops at its first hit.
+
+Entities are packed generically: every own property is written, and any live
+entity met along the way becomes `{ $ref: id }`, resolved back to the *same
+object* on the way in. A hand-written field list would be one sprint away from
+silently dropping a stance, a rally point or one of the pathfinder's six
+bookkeeping fields — the test asserts that no task, target or garrison entry
+comes back as a copy.
+
+Derived state is deliberately not written and is rebuilt instead: the spatial
+buckets, the block and occupancy grids (from the terrain plus the entities
+standing on it), the fog's visible mask and viewer cache (the first
+`vision.update()` after a load, which is the same code path a fresh match uses),
+and the tech multiplier cache. Writing a derived value is how a save file grows
+a way of disagreeing with itself. Each system that owns lazily-attached world
+state gained a matching `serialize`/`restore` pair — tech, economy (the build
+queue and the pop-cap nag timers), allocation (including the cooldown map, which
+is keyed on `world.time`), vision (`explored` and the object memory only) and
+the market. The enemy AI serialises its own memory too: its job board, its wave
+clock and escalation count, its placement back-offs and its dispatch backlog.
+Restoring the tech state does **not** replay `completeResearch` — that would
+re-emit three ages at the player and apply the age's hitpoint scale a second
+time on top of the values just read out of the file.
+
+The format is versioned with one integer, checked before anything is built out
+of the payload, and there is no migration path on purpose: the cost of a refused
+load is one match, whereas a half-applied migration costs a match *and* leaves
+the player somewhere the game cannot be played from. An incompatible save is
+reported on the boot card in a sentence ("That saved match is from an older
+version of the game (v0, this build plays v1)") rather than hidden, because a
+player who left a match ten minutes ago and comes back to a bare Start button
+would reasonably conclude the game lost their game. A corrupt payload, a
+different map size, and no `localStorage` at all are each handled the same way.
+
+Measured: 436kB of JSON and 13.6ms to produce at 6:40 of a match with 1863
+entities, against a 5MB quota. Autosaving twice a minute is a couple of dropped
+frames on a phone; the alternative interval loses somebody five minutes of their
+afternoon.
+
+### The Market
+
+A Feudal Age building, AoE2's 175 wood, 3x3 rather than AoE2's 4x4 (nothing
+wider than three tiles is ground the AI or a 390px screen can reliably find).
+`tech.js` already named `market` in its unlock table, so the build menu, the age
+gating and the placement rules picked it up with no edit — which is exactly what
+that table's forward declarations were for.
+
+**The pricing rule is AoE2's, with its numbers.** Food, wood and stone each
+carry a price in gold per hundred units, starting at 100. Gold itself is never
+traded — it is the currency, not a commodity, which is what makes "I am out of
+gold" a problem this building can answer at all.
+
+- **Buying** a lot of 100 costs the price in gold and pushes that resource's
+  price **up** by 3.
+- **Selling** a lot pays the price **less a 30% commission**, and pushes the
+  price **down** by 3.
+- Prices are clamped to 20-500, and they are one set for the whole world rather
+  than one per player, as in AoE2: a market price is a fact about the map.
+
+Everything follows from those four lines. The commission is on the sell side
+only, which is what makes the Market a *sink* rather than an arbitrage machine —
+buy a lot and sell it straight back and you are down the commission plus twice
+the price step, so there is no loop to farm. The drifting price is what stops it
+being an infinite tap: ten consecutive sales take wood from 100 to 70, and the
+tenth lot pays 21 gold less than the first. The floor matters most to the player
+the building is here to rescue — whatever they have dumped, a lot of it still
+buys something and never nothing.
+
+The touch UI is a sheet, not six buttons in the command panel. Three rows, each
+with the resource, what it has in store, and the two figures that decide the
+trade. Buy and Sell are the two most confusable buttons in the game, so: they
+sit at opposite edges of the row with the lot size between them (the one place a
+thumb never covers), they are different colours and different words — Buy is
+cool and names a *cost*, Sell is gold and names a *gain* — each prints its own
+gold figure rather than pointing a direction, a trade that cannot happen is
+`disabled` outright so a stray tap is a no-op rather than a refusal to dismiss,
+and every trade that lands raises a toast naming both sides of it. All controls
+are 52px tall and the sheet is in `touchui.browser.mjs`'s layout sweep.
+
+New art: a low, wide, thatched hall behind two striped awnings over trestles of
+goods, with a pair of gold scales on the gable. Stripes do the work — nothing
+else on this map is striped, so it survives being shrunk to a thumbnail and
+having its lower half behind a tree, which is the same test the three drop-offs
+had to pass. The thatch is deliberately not the Town Center's warm tile: that
+roof is the one thing the Town Center owns outright on this map.
+
+### Audio, wired
+
+`src/audio/` shipped complete and unwired. It is wired now, along the lines its
+own README recommended, and all four of the "hooks the codebase does not have
+yet" it listed have been closed.
+
+- Constructed in `GameScene.create()`, seeded off the match. The camera centre
+  is fed to `setListener()` and `update()` runs **every frame**, before the
+  listener is used and whether or not the simulation stepped — a tail still has
+  to be allowed to finish while the game is paused or over.
+- `src/audio/adapter.js` is the one place that knows both the event bus and the
+  catalogue: one subscription per event, one cue per subscription. The engine
+  itself still subscribes to nothing, so it stays testable with no game and the
+  simulation stays testable with no sound. `EV.TOAST` is deliberately not wired
+  (every warn toast is already accompanied by `EV.INSUFFICIENT` or
+  `EV.POP_CAPPED`, and wiring it would give two buzzes for one refusal); a
+  Market trade reuses `deposit`, which is the same gesture.
+- **`EV.BUILD_TICK`** is new — emitted from `tickBuild()` on a fixed 0.45s beat
+  rather than once per sim step. The beat belongs in the simulation so the sound
+  and any future spark agree about when a blow lands, and per-step emission
+  would have put four hundred dispatches a second through the bus with twenty
+  builders working.
+- **`EV.AGE_ADVANCE`** arrived with the tech tree and now plays the fanfare.
+- The AudioContext is unlocked on the first canvas pointer-down (belt and braces
+  over the engine's own one-shot document listeners), and the ambient bed starts
+  the first time that succeeds.
+- Mute and separate Effects/Music volumes live in the HUD's menu sheet — full
+  width, with a state word, in the same shape as the allocation manager's on/off
+  — and persist themselves through the engine's own preferences.
+
+The browser harness boots with `?autostart` and never gestures, so the context
+stays locked and the game runs silently there with no console errors. That is
+the README's stated correct behaviour, and all six suites are green with it.
+
+
 ## Economy foundation
 
 ### Stone, a fourth resource

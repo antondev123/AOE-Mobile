@@ -28,8 +28,13 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${name}${detail ? `  (${detail})` : ''}`);
 }
 
-/** Force a synchronous HUD re-render, so a read never races the frame. */
-const paint = (page) => page.evaluate(() => window.__game.hud.update(0.016));
+/**
+ * Force a synchronous HUD re-render, so a read never races the frame. A no-op
+ * before the game has started, which is the state the boot-card sweep runs in.
+ */
+const paint = (page) => page.evaluate(() => {
+  if (window.__game && window.__game.hud) window.__game.hud.update(0.016);
+});
 
 /** Centre the camera on a grid point and return its CSS coordinates. */
 async function aim(page, gx, gy) {
@@ -609,7 +614,12 @@ const AUDIT = `(() => {
   const bad = [];
   const seen = [];
   const scrolls = (n) => n.scrollHeight > n.clientHeight + 1 || n.scrollWidth > n.clientWidth + 1;
-  for (const n of document.querySelectorAll('#hud button, #hud input, #hud .tappable')) {
+  // The boot card is in the sweep too. It is the first screen a player ever
+  // touches and, since the save landed, it can carry two full-width buttons
+  // instead of one — which is exactly the kind of change that pushes something
+  // off a 390px screen without anyone noticing.
+  for (const n of document.querySelectorAll(
+    '#hud button, #hud input, #hud .tappable, #boot button, #boot summary')) {
     if (n.hidden || n.disabled) continue;
     const st = getComputedStyle(n);
     if (st.display === 'none' || st.visibility === 'hidden') continue;
@@ -762,6 +772,29 @@ async function layoutRun() {
           window.__game.hud.onFoundationPlaced(put);
         });
       }],
+      ['the market trade sheet open', async () => {
+        await page.evaluate(async () => {
+          const { spawnBuilding } = await import('/src/core/world.js');
+          const { setSelection } = await import('/src/ui/selection.js');
+          const w = window.__game.world;
+          const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
+          // Somewhere clear of the town, so the 3x3 lands.
+          let stall = null;
+          for (let r = 5; r <= 14 && !stall; r++) {
+            for (const [dx, dy] of [[r, 0], [0, r], [-r, 0], [0, -r]]) {
+              const gx = Math.round(tc.x) + dx;
+              const gy = Math.round(tc.y) + dy;
+              const { canPlace } = await import('/src/core/world.js');
+              if (!canPlace(w, gx, gy, 3, 3)) continue;
+              stall = spawnBuilding(w, 'market', 0, gx, gy);
+              break;
+            }
+          }
+          if (stall) setSelection(w, [stall]);
+        });
+        await paint(page);
+        await page.locator('#cmd-panel .cbtn', { hasText: 'Trade' }).first().click();
+      }],
       ['an under-attack alert up', async () => {
         await page.evaluate(() => {
           const g = window.__game;
@@ -778,7 +811,8 @@ async function layoutRun() {
     for (const [label, setup] of states) {
       await setup();
       await audit(page, label);
-      if (label === 'the allocation sheet open' || label === 'placing a building with a queue up') {
+      if (label === 'the allocation sheet open' || label === 'placing a building with a queue up' ||
+          label === 'the market trade sheet open' || label === 'the menu sheet open') {
         await page.screenshot({
           path: path.join(SHOT_DIR, `touch-layout-${label.split(' ')[1]}.png`),
         });
@@ -818,6 +852,210 @@ async function layoutRun() {
   }
 }
 
+// --- Run 6: the sound controls, and silence under test ------------------------
+//
+// Two claims, and the second one is the one that matters here. The engine is
+// wired — cues actually reach it from the simulation, and the menu sheet's mute
+// and volumes drive it — and the harness never gestures, so the AudioContext
+// stays locked, the game runs silently, and nothing is logged. The README calls
+// that the correct behaviour rather than a failure; this is where it is checked.
+
+async function soundRun() {
+  const h = await boot();
+  const { page, errors } = h;
+  try {
+    const wired = await page.evaluate(() => {
+      const a = window.__game.audio;
+      return {
+        present: !!a,
+        names: a ? a.names.length : 0,
+        hasAge: !!(a && a.has('ageAdvance')),
+        hasHammer: !!(a && a.has('hammer')),
+        played: a ? a.stats().played : -1,
+      };
+    });
+    check('the scene owns an audio engine', wired.present && wired.names >= 24,
+      `${wired.names} cues`);
+    check('and the cues the wiring needs are in it', wired.hasAge && wired.hasHammer);
+
+    // Run a minute of simulation. Hundreds of events go through the adapter —
+    // gather ticks, deposits, hammer blows, training — and not one of them may
+    // start a voice, because nothing has gestured.
+    await step(page, 1200);
+    const silent = await page.evaluate(() => {
+      const s = window.__game.audio.stats();
+      return { played: s.played, voices: s.voices };
+    });
+    check('a minute of play with no gesture plays nothing at all',
+      silent.played === 0 && silent.voices === 0,
+      `${silent.played} played, ${silent.voices} voices`);
+
+    // Now gesture, the way a player does, and prove the wiring is real: a
+    // selection is the cheapest cue to raise from outside the audio module.
+    await page.locator('#btn-menu').click();
+    const after = await page.evaluate(() => {
+      const g = window.__game;
+      const unlocked = g.audio.unlock();
+      const before = g.audio.stats().played;
+      g.world.events.emit('selection', { ids: [1] });
+      return { unlocked, before, after: g.audio.stats().played };
+    });
+    check('once unlocked, a game event really does reach the engine',
+      !after.unlocked || after.after > after.before,
+      after.unlocked ? `${after.before} -> ${after.after} voices played`
+        : 'no AudioContext in this browser — the silent stub is doing its job');
+
+    // --- The controls -------------------------------------------------------
+    await page.evaluate(() => window.__game.hud.toggleMenu(true));
+    await paint(page);
+    const controls = await page.evaluate(() => {
+      const m = document.querySelector('.sound-mute');
+      const rows = [...document.querySelectorAll('.sound-row')];
+      const box = (n) => {
+        const r = n.getBoundingClientRect();
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      };
+      return {
+        mute: m ? { ...box(m), text: m.textContent.replace(/\s+/g, ' ').trim() } : null,
+        rows: rows.map((r) => ({
+          label: r.querySelector('.who').textContent,
+          ...box(r.querySelector('input')),
+        })),
+      };
+    });
+    check('the menu sheet carries a mute toggle', !!controls.mute,
+      controls.mute && controls.mute.text);
+    check('and separate effects and music volumes',
+      controls.rows.length === 2 &&
+      controls.rows[0].label === 'Effects' && controls.rows[1].label === 'Music',
+      controls.rows.map((r) => r.label).join(', '));
+    check('every sound control is a full touch target',
+      controls.mute.h >= 44 && controls.rows.every((r) => r.h >= 44),
+      `mute ${controls.mute.w}x${controls.mute.h}, ` +
+      controls.rows.map((r) => `${r.label} ${r.w}x${r.h}`).join(', '));
+
+    await page.locator('.sound-mute').click();
+    const muted = await page.evaluate(() => ({
+      muted: window.__game.audio.isMuted(),
+      label: document.querySelector('.sound-mute .state').textContent,
+      stored: localStorage.getItem('aos.audio.v1'),
+    }));
+    check('tapping it mutes the game', muted.muted === true, muted.label);
+    check('and the preference is written down, not just held in memory',
+      !!muted.stored && /"muted":true/.test(muted.stored), muted.stored);
+
+    await page.locator('.sound-mute').click();
+    const unmuted = await page.evaluate(() => window.__game.audio.isMuted());
+    check('and tapping it again brings it back', unmuted === false);
+
+    // The music slider drives the engine, and it too is remembered.
+    await page.evaluate(() => {
+      const s = [...document.querySelectorAll('.sound-row input')][1];
+      s.value = '40';
+      s.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const vol = await page.evaluate(() => ({
+      music: window.__game.audio.getMusicVolume(),
+      stored: localStorage.getItem('aos.audio.v1'),
+    }));
+    check('the music slider sets the music bus', Math.abs(vol.music - 0.4) < 0.001,
+      String(vol.music));
+    check('and that is persisted too', /"music":0\.4/.test(vol.stored || ''), vol.stored);
+
+    check('no console errors (sound run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
+// --- Run 7: the boot card, with and without a saved match ---------------------
+//
+// The card grew a second full-width button when saving landed, and it is the one
+// screen every player sees before anything else. Two things are checked: the
+// buttons are real touch targets that fit on a 390px phone, and the resume path
+// actually comes back to the match it claims to — the label says "12m 30s in"
+// and the world behind it had better agree.
+
+async function bootCardRun() {
+  const h = await boot({ query: 'autostart' });
+  const { page, errors } = h;
+  try {
+    // Play a while, then take the save the way the page itself would.
+    await step(page, 1400);
+    const saved = await page.evaluate(() => {
+      const g = window.__game;
+      const r = g.save();
+      return { ok: r && r.ok, bytes: r && r.bytes, time: g.world.time, tick: g.world.tick };
+    });
+    check('a match writes itself to local storage', saved.ok,
+      `${(saved.bytes / 1024).toFixed(0)}kB at ${saved.time.toFixed(0)}s`);
+
+    // Reload onto the boot card. The save has to survive the page going away.
+    await page.goto(page.url().replace(/\?.*$/, ''), { waitUntil: 'load' });
+    await page.waitForSelector('#btn-resume:not([hidden])', { timeout: 10000 });
+
+    const card = await page.evaluate(() => {
+      const b = (sel) => {
+        const n = document.querySelector(sel);
+        if (!n || n.hidden) return null;
+        const r = n.getBoundingClientRect();
+        return {
+          w: Math.round(r.width), h: Math.round(r.height),
+          on: r.left >= -0.5 && r.right <= innerWidth + 0.5 &&
+            r.top >= -0.5 && r.bottom <= innerHeight + 0.5,
+          text: n.textContent.replace(/\s+/g, ' ').trim(),
+        };
+      };
+      return { resume: b('#btn-resume'), start: b('#btn-start'), vw: innerWidth };
+    });
+    check('the boot card offers Resume match', !!card.resume,
+      card.resume ? card.resume.text : 'no resume button');
+    check('and says how far in the match was',
+      /\d+m \d\ds in/.test(card.resume ? card.resume.text : ''), card.resume && card.resume.text);
+    check('the new-game button says it discards the save',
+      /discards/.test(card.start ? card.start.text : ''), card.start && card.start.text);
+    check('both buttons are full touch targets on screen',
+      card.resume.w >= 44 && card.resume.h >= 44 && card.resume.on &&
+      card.start.w >= 44 && card.start.h >= 44 && card.start.on,
+      `resume ${card.resume.w}x${card.resume.h}, new ${card.start.w}x${card.start.h}, vw ${card.vw}`);
+
+    const boot1 = await audit(page, 'the boot card with a saved match');
+    check('the boot card sweep actually saw the buttons', boot1.n >= 3, `${boot1.n} controls`);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'boot-resume.png') });
+
+    // Take it. The world that comes back has to be the one that was saved.
+    await page.locator('#btn-resume').click();
+    await page.waitForFunction(() => window.__game && window.__game.world, null, { timeout: 20000 });
+    const back = await page.evaluate(() => {
+      const w = window.__game.world;
+      return { time: w.time, tick: w.tick, entities: w.entities.size, seed: w.seed };
+    });
+    // The resumed scene is already running frames by the time this reads it, so
+    // the honest claim is that it picked up *from* the save and not from zero —
+    // never earlier, and never more than a few ticks later. The tick-for-tick
+    // equality is asserted properly, with the clock held still, in
+    // tests/save.test.mjs.
+    check('resuming comes back to the same match',
+      back.tick >= saved.tick && back.tick - saved.tick < 40 && back.seed > 0,
+      `saved ${saved.time.toFixed(2)}s/${saved.tick}, resumed ${back.time.toFixed(2)}s/${back.tick}`);
+    check('...with its world intact', back.entities > 100, `${back.entities} entities`);
+    await page.screenshot({ path: path.join(SHOT_DIR, 'boot-resumed.png') });
+
+    // And a new skirmish throws it away, so the next boot has nothing to offer.
+    await page.goto(page.url().replace(/\?.*$/, ''), { waitUntil: 'load' });
+    await page.waitForSelector('#btn-start:not([hidden])', { timeout: 10000 });
+    await page.locator('#btn-start').click();
+    await page.waitForFunction(() => window.__game && window.__game.world, null, { timeout: 20000 });
+    const gone = await page.evaluate(() => localStorage.getItem('aos.save.v1'));
+    check('starting a new skirmish discards the saved match', gone === null,
+      gone === null ? 'cleared' : 'the old save is still there');
+
+    check('no console errors (boot card run)', errors.length === 0, errors.slice(0, 3).join(' | '));
+  } finally {
+    await h.close();
+  }
+}
+
 const run = async () => {
   fs.mkdirSync(SHOT_DIR, { recursive: true });
   const runs = [
@@ -826,6 +1064,8 @@ const run = async () => {
     ['batch placement and the build queue', batchPlacementRun],
     ['the training queue', trainQueueRun],
     ['HUD layout at phone size, worst case', layoutRun],
+    ['the sound controls, and silence under test', soundRun],
+    ['the boot card and resuming a match', bootCardRun],
   ];
   for (const [name, fn] of runs) {
     if (ONLY && !name.includes(ONLY)) continue;

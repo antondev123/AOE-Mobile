@@ -131,6 +131,27 @@ export function createInput(scene, world, renderer, hud) {
   let cx = camera.midPoint ? camera.midPoint.x : 0;
   let cy = camera.midPoint ? camera.midPoint.y : 0;
 
+  // --- Audio ----------------------------------------------------------------
+  //
+  // The engine lives on the scene (see GameScene.create) rather than being
+  // passed in, so that a page booted without one — or a test that swaps it —
+  // costs nothing here but a null check.
+
+  let musicStarted = false;
+
+  function unlockAudio() {
+    const audio = scene.audio;
+    if (!audio) return;
+    if (!audio.unlock()) return;
+    // Only once the context is genuinely running: startMusic() is a no-op while
+    // locked, and calling it every pointer-down until it took would be a silent
+    // way of never noticing it had not.
+    if (!musicStarted) {
+      musicStarted = true;
+      audio.startMusic();
+    }
+  }
+
   // ---------------------------------------------------------------- geometry
 
   function gamePoint(ev) {
@@ -1061,6 +1082,12 @@ export function createInput(scene, world, renderer, hud) {
     if (st.destroyed) return;
     if (ev.pointerType === 'mouse' && ev.button !== 0) return;
     ev.preventDefault();
+    // Belt and braces on the mobile autoplay policy. The engine attaches its own
+    // one-shot document listeners, but this is the first *trusted* gesture the
+    // game itself sees, it costs a state check after the first success, and it
+    // is the moment the ambient bed should start — a player who has just touched
+    // the map is a player who is playing.
+    unlockAudio();
 
     const p = gamePoint(ev);
     const now = performance.now();

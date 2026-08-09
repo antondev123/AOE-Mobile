@@ -119,6 +119,41 @@ export function allocationState(world, playerId = PLAYER) {
   return allocState(world).players[playerId];
 }
 
+// --- Save and load ----------------------------------------------------------
+//
+// The cooldown map goes with it. It is keyed on `world.time`, which the save
+// restores, so dropping it would let a reload move every villager the manager
+// had just deliberately left alone — which is exactly the churn the deadband
+// exists to prevent, and it would be visible as the whole workforce shuffling
+// the moment a match is resumed.
+
+export function serializeAllocation(world) {
+  return allocState(world).players.map((p) => ({
+    on: p.on,
+    split: { ...p.split },
+    timer: p.timer,
+    moves: p.moves,
+    cooldown: Array.from(p.cooldown.entries()),
+  }));
+}
+
+export function restoreAllocation(world, data) {
+  const st = allocState(world);
+  if (!Array.isArray(data)) return;
+  for (let i = 0; i < st.players.length; i++) {
+    const rec = data[i];
+    if (!rec) continue;
+    const p = st.players[i];
+    p.on = !!rec.on;
+    p.split = { ...DEFAULT_SPLIT, ...(rec.split || {}) };
+    p.timer = Number.isFinite(rec.timer) ? rec.timer : 0;
+    p.moves = Number.isFinite(rec.moves) ? rec.moves : 0;
+    p.cooldown = new Map(
+      (rec.cooldown || []).filter(([id]) => world.entities.has(id)),
+    );
+  }
+}
+
 export function isAllocationOn(world, playerId = PLAYER) {
   return allocationState(world, playerId).on;
 }

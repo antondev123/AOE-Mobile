@@ -894,6 +894,38 @@ export function researchOptions(world, playerId, building) {
   return out;
 }
 
+// --- Save and load ----------------------------------------------------------
+//
+// The per-player record is two facts — which age, and which techs — and one
+// cache derived from the second. Only the two facts are written; `totals` is
+// recomputed on the way back in, so a save can never restore a stale multiplier
+// and a tech table edited between the save and the load is simply re-read.
+//
+// This is deliberately *not* replayed through completeResearch(): that function
+// emits EV.RESEARCH_DONE and EV.AGE_ADVANCE and re-scales every building's
+// hitpoints, all of which already happened in the match being restored. A load
+// that fired them again would toast three ages at the player and, worse, would
+// apply the age's hitpoint scale a second time on top of the values it just
+// read out of the save.
+
+export function serializeTech(world) {
+  return techState(world).map((pt) => ({ age: pt.age, done: Array.from(pt.done) }));
+}
+
+export function restoreTech(world, data) {
+  const st = techState(world);
+  if (!Array.isArray(data)) return;
+  for (let i = 0; i < st.length; i++) {
+    const rec = data[i];
+    st[i].age = rec && Number.isFinite(rec.age) ? rec.age : AGE.DARK;
+    // Unknown ids are dropped rather than kept: a tech that no longer exists
+    // contributes nothing to the totals and would otherwise sit in `done`
+    // forever, blocking its own replacement from ever being researched.
+    st[i].done = new Set((rec && rec.done ? rec.done : []).filter((id) => TECHS[id]));
+    recomputeTotals(st[i]);
+  }
+}
+
 /**
  * The next age-up tech for a player, or null in the Castle Age. Used by the HUD
  * to put "Advance to the Feudal Age" at the top of the Town Center panel and by

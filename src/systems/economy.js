@@ -1094,6 +1094,35 @@ export function updateEconomy(world, dt) {
   for (let i = 0; i < world.players.length; i++) recomputePop(world, i);
 }
 
+// --- Save and load ----------------------------------------------------------
+//
+// Two things: the population nag timers (so a reloaded game does not shout
+// "population capped" the instant it starts) and the build queue, which is an
+// ordered list of foundation ids and therefore the one piece of economy state
+// that cannot be re-derived from the world. Everything else this module owns —
+// stockpiles, training queues, farm stocks, build progress — lives on the
+// players and the entities and is saved with them.
+
+export function serializeEconomy(world) {
+  const st = econState(world);
+  return {
+    popNag: st.popNag.slice(),
+    buildQueue: st.buildQueue.map((q) => q.slice()),
+  };
+}
+
+export function restoreEconomy(world, data) {
+  const st = econState(world);
+  if (!data) return;
+  for (let i = 0; i < st.popNag.length; i++) {
+    st.popNag[i] = Number.isFinite(data.popNag && data.popNag[i]) ? data.popNag[i] : 0;
+    const q = data.buildQueue && data.buildQueue[i];
+    // Ids only, and pruned on read (see buildQueue) — a site that finished or
+    // was destroyed between the save and the load simply drops out.
+    st.buildQueue[i] = Array.isArray(q) ? q.filter((id) => world.entities.has(id)) : [];
+  }
+}
+
 // --- Read-only helpers for the HUD / AI -------------------------------------
 
 /** Progress 0..1 of the unit currently training at a building (0 if idle). */

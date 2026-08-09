@@ -56,6 +56,37 @@ import {
 const THINK_PERIOD = 0.5;      // seconds of sim time between decision passes
 const REBALANCE_PERIOD = 2.0;  // seconds between villager re-assignment passes
 
+// --- The order budget -------------------------------------------------------
+//
+// Handing a unit an order is not free: commandUnits() plans a path for it, and
+// unitAI grants a *fresh* immediate A* allowance to every order it is given
+// (IMMEDIATE_SEARCHES_PER_ORDER, 48) precisely so that a player's tap always
+// registers on the step it was made. A player taps once. This AI does not: when
+// a wave launches it hands sixteen soldiers a single group order across
+// eighty-five tiles of map, and sixteen full-map A* searches land inside one
+// fixed step.
+//
+// Measured, ten minutes on each of five seeds: `sim.enemyAI` sat at 0.03ms mean
+// and spiked to 22.5ms on the steps a wave went out — 1.4ms of pathfinding per
+// soldier, all of it charged to one step. The whole 60fps frame is 16.7ms, so
+// every wave launch was a guaranteed dropped frame, and so, more quietly, was
+// every villager rebalance that re-tasked eight workers at once.
+//
+// The work is not avoidable and it is not wasted; it simply must not all land on
+// one step. So every order this AI issues goes into a queue and is dispatched a
+// few units at a time, once per *sim step* rather than once per think — so the
+// backlog drains at 40-60 units a second and a sixteen-soldier wave is fully
+// under way a third of a second after it is ordered, which is well inside the
+// time the first man takes to walk out of the staging point.
+//
+// Three is the budget because three cross-map searches measured 3-4ms, which is
+// a quarter of the frame and leaves the rest of the simulation its own room. It
+// also has to be high enough that a think can never enqueue faster than the ten
+// steps behind it can drain: the largest single pass the AI makes is one order
+// per villager (24) plus one per soldier (26 at the cap), and thirty a think
+// covers it.
+const ORDERS_PER_STEP = 2;
+
 // Villager cap.
 //
 // The old figure (16) was derived from "food is finite: 6 nodes x 150 = 900".
@@ -99,6 +130,38 @@ const MAX_FARMS = 8;
 const BARRACKS_TIME = 105;     // earliest barracks (seconds)
 const BARRACKS2_TIME = 330;    // second barracks, for wave escalation
 const MILL_MIN_WALK = 5.0;     // build a Mill if berries are further than this
+
+// Population the Town Center may not take once there is somewhere to train
+// soldiers.
+//
+// Two producers draw on one population cap and the Town Center wins every race:
+// it trains in 16 seconds against a militia's 22, and manageTraining asks it
+// first, so every slot a house opens is a villager before the Barracks has
+// looked at it. Left alone that ends exactly one way, and it is the way the
+// smoke run kept catching: four minutes, 25/25, a finished Barracks and
+// twenty-five villagers.
+//
+// Two slots per military building is one unit in the queue and one on the way
+// out of it, capped so that a second Barracks does not quietly stop the economy.
+// It is only ever charged while there is a wave's worth of army still missing
+// (see armyTarget), so an AI that already has its soldiers goes straight back to
+// making villagers.
+const MILITARY_POP_PER_TRAINER = 2;
+const MAX_MILITARY_POP_RESERVE = 5;
+
+// Population headroom a House is started at.
+//
+// Two was the figure for a base whose only consumer was the Town Center, and it
+// is still right there: one villager every sixteen seconds against a House that
+// adds five in twenty. It is badly wrong the moment a Barracks is also standing,
+// because then the cap is being eaten from two queues at once and the AI spends
+// most of the fourth minute sitting on a full one — which is the other half of
+// how a pop-capped AI ends up with no army. Six is a wave and a half of slack,
+// and a House is 25 wood, which is the cheapest thing on the list to be wrong
+// about in this direction.
+const HOUSE_BUFFER = 2;
+const HOUSE_BUFFER_BOOMING = 3;   // ...once the economy is large enough to spend it
+const HOUSE_BUFFER_MILITARY = 6;  // ...once soldiers are competing for the same cap
 
 // Forward drop-offs (Lumber Camp / Mining Camp).
 //
@@ -147,6 +210,18 @@ const STUCK_WINDOW = 1.5;      // seconds between motion samples
 const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
 const BUILD_RETRY_DELAY = 6;   // no infinite placement retries
 const FOUNDATION_STALL = 60;   // abandon a foundation nobody is finishing
+// Ground searches allowed in one think. Each one that gets far enough costs up
+// to MAX_REACH_CHECKS path queries, so this is what stops a base with three
+// things it wants and no room for any of them turning a think into a frame drop.
+// Two is enough to fall past a single unsiteable type to the thing behind it,
+// which is the whole point of the wishlist.
+const SPOT_SEARCHES_PER_THINK = 2;
+// Path checks spent proving a candidate site is actually walkable to, per band.
+// The far band gets fewer because it is the fallback: a site sixteen tiles out
+// that we cannot prove is reachable is still better than no building at all, and
+// the fallback path already covers it.
+const MAX_REACH_CHECKS = 8;
+const FAR_REACH_CHECKS = 4;
 
 // Every soldier in the game, read off UNIT_STATS rather than written out, so a
 // unit added to the roster is one this AI trains, counts, waves and defends
@@ -273,18 +348,41 @@ function isMilitary(u) {
   return live(u) && u.kind === 'unit' && MILITARY_TYPES.includes(u.type);
 }
 
-// Candidate offsets for building placement, nearest-first. Built once.
-const PLACEMENT_RING = (() => {
-  const out = [];
-  for (let dy = -11; dy <= 11; dy++) {
-    for (let dx = -11; dx <= 11; dx++) {
+// Candidate offsets for building placement, in two bands. Built once.
+//
+// The near band is where a building *belongs*: at least 3.2 tiles from the
+// anchor so the AI never builds on top of itself, at most eleven so the base
+// stays one base. The far band is only ever reached when the near one has
+// nothing at all — and that is not the rare accident it sounds like. Measured
+// over 24 seeds of the shipped mapgen, two enemy bases were ringed tightly
+// enough by forest that no 5x5 clearing existed within eleven tiles of the Town
+// Center for the whole opening. Both spent a hundred seconds asking for a
+// Barracks, banking six hundred wood, and reached four minutes with no soldiers.
+//
+// `stride` is what makes the sweep both complete and spread out. Walking the
+// offsets in distance order would put every building on the same side of the
+// base; walking them by a stride coprime with the band's length visits every
+// candidate exactly once, in an order that fans around the anchor. The old code
+// used a fixed stride of 7 and stopped after 90 tries, which sampled about a
+// quarter of the near band — the direct cause of the hundred seconds above.
+function placementBand(min, max) {
+  const offsets = [];
+  const r = Math.ceil(max);
+  for (let dy = -r; dy <= r; dy++) {
+    for (let dx = -r; dx <= r; dx++) {
       const d = Math.sqrt(dx * dx + dy * dy);
-      if (d >= 3.2 && d <= 11) out.push({ dx, dy, d });
+      if (d >= min && d <= max) offsets.push({ dx, dy, d });
     }
   }
-  out.sort((a, b) => a.d - b.d);
-  return out;
-})();
+  offsets.sort((a, b) => a.d - b.d);
+  let stride = 1;
+  for (const s of [7, 11, 13, 17, 19, 23, 29, 31, 37]) {
+    if (offsets.length % s !== 0) { stride = s; break; }
+  }
+  return { offsets, stride };
+}
+const PLACEMENT_NEAR = placementBand(3.2, 11);
+const PLACEMENT_FAR = placementBand(11, 17);
 
 // ---------------------------------------------------------------------------
 
@@ -303,6 +401,11 @@ class EnemyAI {
     // Villagers pulled off gathering to construct something: unitId -> true
     this.builders = new Set();
 
+    // Orders waiting to be handed to unitAI, oldest first, and the index that
+    // says which unit is waiting on which of them. See ORDERS_PER_STEP.
+    this.orderQueue = [];      // [{ ids: [unitId], order }]
+    this.orderPending = new Map(); // unitId -> the queue entry holding it
+
     // Nearest reachable node of each resource, refreshed once per think.
     this.available = { food: null, wood: null, gold: null };
     this.home = null;          // last known base centre, survives TC loss
@@ -311,12 +414,12 @@ class EnemyAI {
     this.pending = null;       // { type, entity, since, progress }
     this.abandoned = new Set(); // foundation ids nobody could ever reach
     this.badSpots = [];        // sites that proved unreachable, never retried
-    this.buildBlockedUntil = 0;
+    // Per *type* rather than one global gate: a Barracks that cannot be sited
+    // must back itself off without taking the House behind it down with it. The
+    // single `buildBlockedUntil` this replaces is precisely why a base with no
+    // room for a 3x3 stopped building anything at all.
+    this.blockedUntil = new Map();
     this.placeCursor = 0;
-    // Where the next drop-off camp should go, decided by chooseBuilding at the
-    // same moment it decides it wants one — the node that justified the camp is
-    // the only sensible place to anchor it, and it is not worth finding twice.
-    this.campAnchor = null;
 
     this.wave = null;          // { ids, target, launchedAt, size }
     this.waveNumber = 0;
@@ -376,6 +479,15 @@ class EnemyAI {
     if (!w || w.over) return;
     const me = w.players && w.players[this.id];
     if (!me || me.defeated) return;
+
+    // Every step, before the think: the backlog is what makes the think cheap,
+    // and a step that skips draining it is a step the wave stands still for.
+    try {
+      this.dispatchOrders();
+    } catch (err) {
+      this.stats.errors++;
+      this.stats.lastError = err && err.stack ? err.stack : String(err);
+    }
 
     this.acc += dt;
     if (this.acc < THINK_PERIOD) return;
@@ -651,28 +763,36 @@ class EnemyAI {
       return;
     }
 
-    if (w.time < this.buildBlockedUntil) return;
+    if (!this.myUnits('villager').length) return;
 
-    const want = this.chooseBuilding();
-    if (!want) return;
+    // Walk the wishlist and put down the best thing we can actually pay for and
+    // find ground for. Falling through is the whole point: the old code asked
+    // for one type and, when that type had nowhere to go, built *nothing* for
+    // BUILD_RETRY_DELAY and then asked for the same impossible thing again.
+    let searches = 0;
+    for (const wish of this.buildingWishlist()) {
+      if (searches >= SPOT_SEARCHES_PER_THINK) break;
+      if (w.time < (this.blockedUntil.get(wish.type) || 0)) continue;
+      const stats = BUILDING_STATS[wish.type];
+      // Not "return" — a House we can afford beats a Barracks we cannot, and
+      // the one case where saving up must block everything (rebuilding a lost
+      // Town Center) is handled by that wishlist having nothing else in it.
+      if (!stats || !this.afford(stats.cost)) continue;
 
-    const stats = BUILDING_STATS[want];
-    if (!stats || !this.afford(stats.cost)) return;
-
-    const villagers = this.myUnits('villager');
-    if (!villagers.length) return;
-
-    const anchor = this.anchorFor(want);
-    const spot = this.findBuildSpot(want, anchor);
-    if (!spot) {
-      // No room right now — back off rather than hammering the search.
-      this.buildBlockedUntil = w.time + BUILD_RETRY_DELAY;
-      return;
+      searches++;
+      const spot = this.findBuildSpot(wish.type, wish.anchor || this.home);
+      if (spot && this.startBuilding(wish.type, spot)) return;
+      // No ground for this one right now. Back *this type* off and try the next.
+      this.blockedUntil.set(wish.type, w.time + BUILD_RETRY_DELAY);
     }
+  }
 
+  /** Place a foundation, count it, and put builders on it. */
+  startBuilding(type, spot) {
+    const w = this.world;
     let foundation = null;
     try {
-      foundation = placeFoundation(this.world, this.id, want, spot.gx, spot.gy);
+      foundation = placeFoundation(w, this.id, type, spot.gx, spot.gy);
     } catch {
       foundation = null;
     }
@@ -680,30 +800,41 @@ class EnemyAI {
       // Some economy implementations return a bool; look the foundation up.
       foundation = findNearestGlobal(
         w, spot.gx, spot.gy, this.myBuildings(),
-        (b) => !b.complete && b.type === want,
+        (b) => !b.complete && b.type === type,
       );
     }
-    if (!foundation) {
-      this.buildBlockedUntil = w.time + BUILD_RETRY_DELAY;
-      return;
-    }
+    if (!foundation) return false;
 
-    if (want === 'house') this.stats.housesStarted++;
-    else if (want === 'barracks') this.stats.barracksStarted++;
-    else if (want === 'mill') this.stats.millsStarted++;
-    else if (want === 'farm') this.stats.farmsStarted++;
-    else if (want === 'lumbercamp') this.stats.lumberCampsStarted++;
-    else if (want === 'miningcamp') this.stats.miningCampsStarted++;
+    if (type === 'house') this.stats.housesStarted++;
+    else if (type === 'barracks') this.stats.barracksStarted++;
+    else if (type === 'mill') this.stats.millsStarted++;
+    else if (type === 'farm') this.stats.farmsStarted++;
+    else if (type === 'lumbercamp') this.stats.lumberCampsStarted++;
+    else if (type === 'miningcamp') this.stats.miningCampsStarted++;
 
     this.pending = {
-      type: want, entity: foundation, since: w.time,
+      type, entity: foundation, since: w.time,
       progress: foundation.buildProgress || 0,
     };
     this.staffConstruction(foundation);
+    return true;
   }
 
-  /** What the base needs next, in priority order. Returns a type or null. */
-  chooseBuilding() {
+  /**
+   * What the base wants built, best first: [{ type, anchor }].
+   *
+   * This used to answer with a single type, and the difference turned out to be
+   * whether the AI fields an army at all. A type it wants but cannot *site* — a
+   * Barracks needing a clear 5x5 in a base ringed by forest — took the entire
+   * construction pass down with it: no House went up behind it, no field, no
+   * camp, for as long as the ground stayed unavailable. Measured over 24 seeds,
+   * two bases spent a hundred seconds of the opening in exactly that state and
+   * reached four minutes pop-capped, six hundred wood in the bank, no soldiers.
+   *
+   * A list lets manageConstruction fall through to the next thing it *can* put
+   * down, which is what a human does without noticing they are doing it.
+   */
+  buildingWishlist() {
     const w = this.world;
     const p = w.players[this.id];
     const pop = this.popState();
@@ -711,18 +842,20 @@ class EnemyAI {
     const complete = (t) => buildings.some((b) => b.type === t && b.complete);
     const anyOf = (t) => buildings.filter((b) => b.type === t).length;
     const villagers = this.myUnits('villager').length;
+    const out = [];
+    const wish = (type, anchor = null) => out.push({ type, anchor });
 
     // 0. No Town Center? Rebuilding it is everything, if we still have a builder.
+    //    This list is returned on its own: nothing else may be built out of the
+    //    money the Town Center is being saved for.
     const noTC = !buildings.some((b) => b.type === 'towncenter');
     if (noTC && villagers > 0) {
-      if (this.afford(BUILDING_STATS.towncenter.cost)) return 'towncenter';
-
-      // Cannot afford one. What matters now is not "have a drop-off" but "have a
-      // drop-off for the resource the Town Center costs" — and a Town Center is
-      // 275 wood. With only a Mill standing, every villager sent to the trees
-      // fills its pack, finds nowhere to put it, and stands there: the AI can
-      // hold a thousand food and still never rebuild, which is exactly what a
-      // decapitated base did before the Lumber Camp existed.
+      // What matters here is not "have a drop-off" but "have a drop-off for the
+      // resource the Town Center costs" — and a Town Center is 275 wood. With
+      // only a Mill standing, every villager sent to the trees fills its pack,
+      // finds nowhere to put it, and stands there: the AI can hold a thousand
+      // food and still never rebuild, which is exactly what a decapitated base
+      // did before the Lumber Camp existed.
       //
       // So: a Lumber Camp first, at 100 wood — a third of a Town Center, and the
       // only building that turns standing timber back into a bank balance. A
@@ -730,66 +863,64 @@ class EnemyAI {
       // strictly cheaper than the thing being saved for, so neither delays it.
       const takes = (res) =>
         buildings.some((b) => b.complete && b.dropoff && b.dropoff.includes(res));
-
-      if (!takes(RES.WOOD) && anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD) &&
-          this.afford(BUILDING_STATS.lumbercamp.cost)) {
-        this.campAnchor = this.campAnchorFor(this.available.wood);
-        return 'lumbercamp';
+      if (!takes(RES.WOOD) && anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD)) {
+        wish('lumbercamp', this.campAnchorFor(this.available.wood));
       }
-      if (!takes(RES.FOOD) && anyOf('mill') === 0 && this.hasNodeFor(RES.FOOD) &&
-          this.afford(BUILDING_STATS.mill.cost)) {
-        return 'mill';
+      if (!takes(RES.FOOD) && anyOf('mill') === 0 && this.hasNodeFor(RES.FOOD)) {
+        wish('mill', this.millAnchor());
       }
-      return 'towncenter'; // keep saving for it; manageConstruction just waits
+      wish('towncenter');
+      return out;
     }
 
     // 1. Houses, always ahead of the cap. Getting housed is the classic stall.
-    // Since MAX_POP_CAP went to 200 this test no longer stops anything on its
-    // own — MAX_HOUSES does — but it stays as the honest engine-level guard, so
-    // an AI that is ever allowed to build past nine houses still stops at 200
-    // instead of pouring wood into houses that raise nothing.
+    // The MAX_POP_CAP test no longer stops anything on its own — MAX_HOUSES does
+    // — but it stays as the honest engine-level guard, so an AI that is ever
+    // allowed to build past nine houses still stops at 200 instead of pouring
+    // wood into houses that raise nothing.
     const housed = pop.cap >= MAX_POP_CAP;
-    if (!housed && anyOf('house') < MAX_HOUSES && pop.room <= 2) return 'house';
+    const roomy = !housed && anyOf('house') < MAX_HOUSES;
+    if (roomy && pop.room <= this.houseBuffer(villagers)) wish('house');
 
     // 1b. Starving: the berries in reach are gone and the larder is nearly
     //     empty. A field beats a barracks we could not staff anyway.
-    if (this.wantsFarm() && this.foodStarving()) return 'farm';
+    if (this.wantsFarm() && this.foodStarving()) wish('farm');
 
     // 2. Barracks, once the economy is on its feet.
     if (w.time >= BARRACKS_TIME && villagers >= 5 && anyOf('barracks') === 0) {
-      return 'barracks';
+      wish('barracks');
     }
 
     // 3. Mill, if the berries are a real walk from the drop-off.
-    if (complete('barracks') && anyOf('mill') === 0 && this.millWorthIt()) return 'mill';
+    if (complete('barracks') && anyOf('mill') === 0 && this.millWorthIt()) {
+      wish('mill', this.millAnchor());
+    }
 
     // 3a. Forward drop-offs. This sits ahead of farms because it is the cheaper
     //     fix for the same complaint: a farm converts wood into food, a camp
     //     converts a walk into everything. It is gated hard enough (see
     //     campWanted) that it can never take the wood a House or a field needs.
     const camp = this.campWanted();
-    if (camp) {
-      this.campAnchor = camp.anchor;
-      return camp.type;
-    }
+    if (camp) wish(camp.type, camp.anchor);
 
     // 3b. Farms, from the moment the local berries thin out and for the rest of
     //     the match — a farm is consumed as fast as it is worked, so this is a
     //     standing order, not a one-off building.
-    if (this.wantsFarm()) return 'farm';
+    if (this.wantsFarm()) wish('farm');
 
-    // 4. Keep a house buffer as pop grows (build one at 3 spare, not 2).
-    if (!housed && anyOf('house') < MAX_HOUSES && pop.room <= 3 && villagers >= 8) {
-      return 'house';
-    }
-
-    // 5. Second barracks to feed bigger waves.
+    // 4. Second barracks to feed bigger waves.
     if (w.time >= BARRACKS2_TIME && anyOf('barracks') === 1 && villagers >= 12 &&
         p.resources.wood >= BUILDING_STATS.barracks.cost.wood + 80) {
-      return 'barracks';
+      wish('barracks');
     }
 
-    return null;
+    return out;
+  }
+
+  /** Population headroom below which the next House goes up. See HOUSE_BUFFER. */
+  houseBuffer(villagers) {
+    if (this.militaryPopReserve() > 0) return HOUSE_BUFFER_MILITARY;
+    return villagers >= 8 ? HOUSE_BUFFER_BOOMING : HOUSE_BUFFER;
   }
 
   // --- farms ---------------------------------------------------------------
@@ -888,15 +1019,6 @@ class EnemyAI {
     };
   }
 
-  /** Where the next building of this type should be anchored. */
-  anchorFor(type) {
-    if (type === 'mill') return this.millAnchor();
-    if (type === 'lumbercamp' || type === 'miningcamp') {
-      return this.campAnchor || this.home;
-    }
-    return this.home;
-  }
-
   // --- forward drop-offs ---------------------------------------------------
 
   /**
@@ -962,9 +1084,9 @@ class EnemyAI {
   }
 
   /**
-   * Anchor a camp near the node it is for. findBuildSpot only considers ground
-   * 3.2 to 11 tiles from its anchor (PLACEMENT_RING, which exists so the AI
-   * never builds on top of itself), so anchoring exactly on the node would put
+   * Anchor a camp near the node it is for. findBuildSpot prefers ground 3.2 to
+   * 11 tiles from its anchor (PLACEMENT_NEAR, which exists so the AI never
+   * builds on top of itself), so anchoring exactly on the node would put
    * the camp anywhere in a ring around it. Pulling the anchor a quarter of the
    * way back toward home biases that ring onto the near side of the resource,
    * which is the side the villagers are walking from anyway.
@@ -984,37 +1106,41 @@ class EnemyAI {
    * guarantees the AI can never wall itself in or seal its own Town Center —
    * every building it plants keeps a walkable corridor around it.
    *
-   * The scan is bounded (MAX_TRIES candidates) and starts at a seeded rotating
-   * cursor so successive buildings spread around the base instead of stacking
-   * on one side, and so a failed search cannot spin.
+   * The near band is swept *entire* — every one of its ~350 candidates — and
+   * only then does the far band get a look. That completeness is the fix for the
+   * defect described on PLACEMENT_NEAR: the old scan took 90 samples with a
+   * fixed stride, which is about a quarter of the band, and a base with only
+   * two or three legal 5x5 clearings in it failed to find any of them for a
+   * hundred seconds at a stretch. Sweeping the lot costs ~350 canPlace calls,
+   * which is a few tens of microseconds and happens at most twice per think.
    *
    * A clearing being *open* is not the same as it being *reachable*: a 5x5 hole
    * in the middle of the forest passes every canPlace test and then swallows the
    * build order, because the builders can never walk to it. So the handful of
-   * candidates that survive the cheap tests are path-checked from home, at most
-   * MAX_REACH_CHECKS of them, and anywhere a foundation has already stalled is
-   * struck off for good.
+   * candidates that survive the cheap tests are path-checked from home — that is
+   * the expensive half, and it stays bounded — and anywhere a foundation has
+   * already stalled is struck off for good.
    */
   findBuildSpot(type, anchor) {
-    const w = this.world;
     const s = BUILDING_STATS[type];
     if (!s) return null;
-    const MAX_TRIES = 90;
-    const MAX_REACH_CHECKS = 8;
-    const n = PLACEMENT_RING.length;
+    // Deterministic rotating start point, shared by both bands so successive
+    // buildings fan around the base instead of stacking on one side.
+    this.placeCursor = (this.placeCursor + this.world.rng.int(1, 17)) % 4096;
+    return this.scanBand(s, anchor, PLACEMENT_NEAR, MAX_REACH_CHECKS)
+      || this.scanBand(s, anchor, PLACEMENT_FAR, FAR_REACH_CHECKS);
+  }
+
+  /** Sweep one placement band for ground `s` fits on. See findBuildSpot. */
+  scanBand(s, anchor, band, reachBudget) {
+    const w = this.world;
+    const n = band.offsets.length;
     if (!n) return null;
-
-    // Deterministic rotating start point.
-    this.placeCursor = (this.placeCursor + w.rng.int(1, 17)) % n;
-
-    let tried = 0;
     let checks = 0;
     let fallback = null;
-    let i = this.placeCursor;
-    while (tried < MAX_TRIES) {
-      const off = PLACEMENT_RING[i % n];
-      i += 7; // stride, so we sample the whole annulus rather than one arc
-      tried++;
+    let i = this.placeCursor % n;
+    for (let tried = 0; tried < n; tried++, i = (i + band.stride) % n) {
+      const off = band.offsets[i];
       const gx = Math.round(anchor.x + off.dx);
       const gy = Math.round(anchor.y + off.dy);
       if (gx < 2 || gy < 2 || gx > w.width - 3 || gy > w.height - 3) continue;
@@ -1023,7 +1149,7 @@ class EnemyAI {
       // ...and so must a one-tile ring around it, so we never self-wall.
       if (!canPlace(w, gx, gy, s.fw + 2, s.fh + 2)) continue;
       if (this.isBadSpot(gx, gy)) continue;
-      if (checks >= MAX_REACH_CHECKS) {
+      if (checks >= reachBudget) {
         // Out of path budget: remember the first plausible site and stop.
         fallback = fallback || { gx, gy };
         break;
@@ -1210,6 +1336,11 @@ class EnemyAI {
 
   idle(u) {
     if (!live(u)) return false;
+    // A unit with an order still in the queue is not idle, it is a unit whose
+    // order has not been handed over yet. Without this every pass that asks
+    // "who has nothing to do" would re-order the whole backlog, and the queue
+    // would churn instead of draining.
+    if (this.orderPending.has(u.id)) return false;
     try {
       return !!isIdle(u);
     } catch {
@@ -1217,14 +1348,78 @@ class EnemyAI {
     }
   }
 
+  /**
+   * Ask for an order. It goes out within a step or three — see ORDERS_PER_STEP.
+   *
+   * Every order this AI gives comes through here, which is what makes one budget
+   * enough to cover all of them.
+   */
   command(units, order) {
-    if (!units || !units.length) return;
+    if (!units || !units.length || !order) return;
     const list = units.filter((u) => live(u));
     if (!list.length) return;
-    try {
-      commandUnits(this.world, list, order);
-    } catch {
-      /* a system still under construction must not take the match down */
+    // A unit given a new order drops out of whatever it was still waiting on:
+    // the latest instruction is the one that meant something, and issuing a
+    // superseded one first would make the unit visibly change its mind.
+    for (const u of list) this.dropPending(u.id);
+    const entry = { ids: list.map((u) => u.id), order };
+    this.orderQueue.push(entry);
+    for (const id of entry.ids) this.orderPending.set(id, entry);
+  }
+
+  /**
+   * Is this unit already holding an order we have not handed over yet?
+   *
+   * Anything that re-issues the *same* standing order every think — the
+   * defensive recall, the evacuation — has to ask this, not just `idle`. Every
+   * fresh order supersedes the pending one and goes to the *back* of the queue,
+   * so a pass that re-orders forty units every half second would push the last
+   * of them backwards forever and they would never move at all.
+   */
+  awaitingOrder(u) {
+    return !!u && this.orderPending.has(u.id);
+  }
+
+  dropPending(id) {
+    const entry = this.orderPending.get(id);
+    if (!entry) return;
+    this.orderPending.delete(id);
+    const i = entry.ids.indexOf(id);
+    if (i >= 0) entry.ids.splice(i, 1);
+  }
+
+  /**
+   * Hand at most ORDERS_PER_STEP units their orders. Called once per sim step.
+   *
+   * Units are taken off the front of the oldest entry, so a group order is
+   * issued in the order the group was listed and a later order never overtakes
+   * an earlier one. Splitting a group across steps is exact for the verbs the AI
+   * actually gives in bulk — attack, gather, build and garrison are all
+   * per-unit loops inside unitAI — and for the one verb where it is not (`move`
+   * assigns formation slots across whichever units it is handed), the AI's group
+   * moves are short walks to a staging point a few tiles away, where a slot is a
+   * couple of feet either way.
+   */
+  dispatchOrders() {
+    let budget = ORDERS_PER_STEP;
+    while (budget > 0 && this.orderQueue.length) {
+      const entry = this.orderQueue[0];
+      const batch = [];
+      while (batch.length < budget && entry.ids.length) {
+        const id = entry.ids.shift();
+        this.orderPending.delete(id);
+        const u = this.world.entities.get(id);
+        // A unit that died while it waited costs nothing and is simply dropped.
+        if (live(u)) batch.push(u);
+      }
+      if (!entry.ids.length) this.orderQueue.shift();
+      if (!batch.length) continue;
+      budget -= batch.length;
+      try {
+        commandUnits(this.world, batch, entry.order);
+      } catch {
+        /* a system still under construction must not take the match down */
+      }
     }
   }
 
@@ -1391,7 +1586,7 @@ class EnemyAI {
     this.garrisonUntil = this.world.time + GARRISON_HOLD;
 
     for (const v of villagers) {
-      if (isGarrisoned(v)) continue;
+      if (isGarrisoned(v) || this.awaitingOrder(v)) continue;
       // Only re-order villagers actually near the fighting.
       if (this.threat && dist(v.x, v.y, this.threat.x, this.threat.y) > DEFEND_RADIUS) continue;
 
@@ -1472,17 +1667,56 @@ class EnemyAI {
     return MAX_VILLAGERS;
   }
 
+  /** Every completed building of ours that can put a soldier on the map. */
+  militaryTrainers() {
+    return this.myBuildings().filter(
+      (b) => b.complete && !b.dead && (b.trains || []).some((t) => MILITARY_TYPES.includes(t)),
+    );
+  }
+
+  /** Soldiers the next wave wants, standing plus queued. */
+  armyTarget() {
+    const needed = Math.min(
+      MAX_WAVE_SIZE,
+      FIRST_WAVE_SIZE + this.waveNumber * WAVE_SIZE_STEP,
+    );
+    // Plus a couple, so the AI is still training while a wave is out rather than
+    // starting from nothing every time one leaves.
+    return needed + 2;
+  }
+
+  /**
+   * Population the Town Center is not allowed to take. See the note on
+   * MILITARY_POP_PER_TRAINER.
+   *
+   * Charged only while there is somewhere to train soldiers *and* the army is
+   * short of what the next wave wants. A reserve held open past that point is
+   * just an idle Town Center, and an AI that has its sixteen soldiers should be
+   * making villagers again.
+   */
+  militaryPopReserve() {
+    const trainers = this.militaryTrainers().length;
+    if (!trainers) return 0;
+    const census = this.armyCensus();
+    let army = 0;
+    for (const t of MILITARY_TYPES) army += census[t] || 0;
+    if (army >= this.armyTarget()) return 0;
+    return Math.min(MAX_MILITARY_POP_RESERVE, trainers * MILITARY_POP_PER_TRAINER);
+  }
+
   manageTraining() {
     const pop = this.popState();
     const r = this.res();
     const villagers = this.myUnits('villager').length;
     const villTarget = this.villagerTarget();
 
-    // Town Center: villagers, non-stop, while pop and food allow.
+    // Town Center: villagers, non-stop, while pop and food allow — but never
+    // into the last few slots once soldiers are competing for the same cap.
+    const reserve = this.militaryPopReserve();
     const tc = this.townCenter();
     if (tc && tc.complete && !tc.dead) {
       const queued = tc.queue ? tc.queue.length : 0;
-      if (pop.room > 0 && queued < 2 && villagers + queued < villTarget &&
+      if (pop.room > reserve && queued < 2 && villagers + queued < villTarget &&
           this.afford(UNIT_STATS.villager.cost)) {
         this.train(tc, 'villager');
       }
@@ -1491,10 +1725,8 @@ class EnemyAI {
     // Military buildings: whatever the counter maths says, at whichever of them
     // can make it. The list is every building we own that trains a soldier, so
     // an Archery Range or a Stable landing from another pass is picked up with
-    // no edit — see trainersFor().
-    const barracks = this.myBuildings().filter(
-      (b) => b.complete && !b.dead && (b.trains || []).some((t) => MILITARY_TYPES.includes(t)),
-    );
+    // no edit — see militaryTrainers().
+    const barracks = this.militaryTrainers();
     if (!barracks.length) return;
 
     const have = this.armyCensus();
@@ -1823,7 +2055,8 @@ class EnemyAI {
     if (this.defending) {
       // Everything comes home, including whatever is mid-attack.
       const point = this.threat || this.home;
-      const rally = army.filter((u) => this.idle(u) || dist(u.x, u.y, point.x, point.y) > 16);
+      const rally = army.filter((u) => !this.awaitingOrder(u) &&
+        (this.idle(u) || dist(u.x, u.y, point.x, point.y) > 16));
       if (rally.length) {
         this.command(rally, { type: 'attack', gx: point.x, gy: point.y, target: this.nearestFoeNear(point) });
       }
@@ -2046,6 +2279,163 @@ class EnemyAI {
       this.stats.wavesReachedBase++;
     }
   }
+
+  // --- Save and load --------------------------------------------------------
+  //
+  // The AI's own memory is not derivable from the board, and a resumed match
+  // that starts it from scratch is not the same game: the wave clock would reset
+  // to FIRST_WAVE_TIME, every villager's job would be re-decided from nothing,
+  // the escalation count would go back to zero and the squad already walking
+  // across the map would be disowned mid-march.
+  //
+  // Entities are written as ids and looked back up on the way in, so anything
+  // that died between the save and the load simply drops out — which is the same
+  // thing that happens to it during an ordinary match.
+
+  serialize() {
+    return {
+      think: this.think,
+      acc: this.acc,
+      rebalanceAcc: this.rebalanceAcc,
+      jobs: Array.from(this.jobs.entries()),
+      builders: Array.from(this.builders),
+      home: this.home ? { ...this.home } : null,
+      staging: this.staging ? { ...this.staging } : null,
+      pending: this.pending
+        ? {
+          type: this.pending.type,
+          entity: this.pending.entity ? this.pending.entity.id : 0,
+          since: this.pending.since,
+          progress: this.pending.progress,
+        }
+        : null,
+      abandoned: Array.from(this.abandoned),
+      badSpots: this.badSpots.map((s) => ({ x: s.x, y: s.y })),
+      blockedUntil: Array.from(this.blockedUntil.entries()),
+      placeCursor: this.placeCursor,
+      wave: this.wave
+        ? {
+          ids: this.wave.ids.slice(),
+          target: this.wave.target ? this.wave.target.id : 0,
+          launchedAt: this.wave.launchedAt,
+          lastOrder: this.wave.lastOrder,
+          size: this.wave.size,
+          arrived: !!this.wave.arrived,
+        }
+        : null,
+      waveNumber: this.waveNumber,
+      nextWaveTime: this.nextWaveTime,
+      lostLastWave: this.lostLastWave,
+      motion: Array.from(this.motion.entries()).map(([id, r]) => [id, { ...r }]),
+      lastDamageTime: this.lastDamageTime,
+      lastDamageAt: this.lastDamageAt ? { ...this.lastDamageAt } : null,
+      defendingUntil: this.defendingUntil,
+      garrisonUntil: this.garrisonUntil || 0,
+      stats: JSON.parse(JSON.stringify(this.stats)),
+      // The dispatch backlog goes with it, orders and all. Dropping it would
+      // silently cancel whatever the AI asked for in the last tenth of a second
+      // — most visibly the launch order of a wave saved on the step it left.
+      orderQueue: this.orderQueue.map((e) => ({
+        ids: e.ids.slice(), order: packOrder(e.order),
+      })),
+    };
+  }
+
+  restore(data) {
+    if (!data) return;
+    const w = this.world;
+    const live_ = (id) => {
+      const e = w.entities.get(id);
+      return e && !e.dead ? e : null;
+    };
+    this.think = data.think || 0;
+    this.acc = data.acc || 0;
+    this.rebalanceAcc = data.rebalanceAcc || 0;
+    this.jobs = new Map((data.jobs || []).filter(([id]) => live_(id)));
+    this.builders = new Set((data.builders || []).filter((id) => live_(id)));
+    if (data.home) this.home = { ...data.home };
+    if (data.staging) this.staging = { ...data.staging };
+    this.pending = null;
+    if (data.pending) {
+      const f = live_(data.pending.entity);
+      if (f && !f.complete) {
+        this.pending = {
+          type: data.pending.type, entity: f,
+          since: data.pending.since, progress: data.pending.progress || 0,
+        };
+      }
+    }
+    this.abandoned = new Set(data.abandoned || []);
+    this.badSpots = (data.badSpots || []).map((s) => ({ x: s.x, y: s.y }));
+    this.blockedUntil = new Map(data.blockedUntil || []);
+    this.placeCursor = data.placeCursor || 0;
+    this.wave = null;
+    if (data.wave) {
+      const ids = (data.wave.ids || []).filter((id) => live_(id));
+      const target = live_(data.wave.target);
+      // A wave whose whole squad or whose objective died while the game was
+      // closed is not a wave any more. driveWave would reach the same verdict on
+      // its next pass; reaching it here keeps the restored state self-consistent.
+      if (ids.length && target) {
+        this.wave = {
+          ids,
+          target,
+          launchedAt: data.wave.launchedAt,
+          lastOrder: data.wave.lastOrder,
+          size: data.wave.size,
+          arrived: !!data.wave.arrived,
+        };
+      }
+    }
+    this.waveNumber = data.waveNumber || 0;
+    this.nextWaveTime = Number.isFinite(data.nextWaveTime)
+      ? data.nextWaveTime : FIRST_WAVE_TIME;
+    this.lostLastWave = !!data.lostLastWave;
+    this.motion = new Map(
+      (data.motion || []).filter(([id]) => live_(id)).map(([id, r]) => [id, { ...r }]),
+    );
+    this.lastDamageTime = Number.isFinite(data.lastDamageTime) ? data.lastDamageTime : -999;
+    this.lastDamageAt = data.lastDamageAt ? { ...data.lastDamageAt } : null;
+    this.defendingUntil = Number.isFinite(data.defendingUntil) ? data.defendingUntil : -999;
+    this.garrisonUntil = data.garrisonUntil || 0;
+    if (data.stats) Object.assign(this.stats, data.stats);
+    // minDistToFoeBase is Infinity until a soldier has walked somewhere, and
+    // Infinity does not survive JSON — it comes back as null.
+    if (this.stats.minDistToFoeBase === null) this.stats.minDistToFoeBase = Infinity;
+
+    this.orderQueue = [];
+    this.orderPending = new Map();
+    for (const e of data.orderQueue || []) {
+      const ids = (e.ids || []).filter((id) => live_(id));
+      const order = unpackOrder(w, e.order);
+      if (!ids.length || !order) continue;
+      const entry = { ids, order };
+      this.orderQueue.push(entry);
+      for (const id of ids) this.orderPending.set(id, entry);
+    }
+  }
+}
+
+/**
+ * An order is a small plain object that may name an entity. Only `target` ever
+ * does, so the pair below is two lines rather than a general graph walk.
+ */
+function packOrder(order) {
+  if (!order) return null;
+  const out = { ...order };
+  if (out.target) out.target = out.target.id;
+  return out;
+}
+
+function unpackOrder(world, rec) {
+  if (!rec) return null;
+  const out = { ...rec };
+  if (out.target) {
+    const e = world.entities.get(out.target);
+    if (!e || e.dead) return null;   // the order was about something now gone
+    out.target = e;
+  }
+  return out;
 }
 
 /**
@@ -2056,6 +2446,10 @@ export function createEnemyAI(world, playerId) {
   const ai = new EnemyAI(world, playerId);
   return {
     update: (dt) => ai.update(dt),
+    // Everything the AI remembers, for src/core/save.js. Call restore() after
+    // the world it belongs to has been rebuilt: it looks entities up by id.
+    serialize: () => ai.serialize(),
+    restore: (data) => ai.restore(data),
     // Not part of the contract — exposed for the headless test and debugging.
     _ai: ai,
     get stats() {

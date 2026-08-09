@@ -23,6 +23,7 @@ import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
 import * as tech from '../systems/tech.js';
 import * as alloc from '../systems/allocation.js';
+import * as market from '../systems/market.js';
 import {
   stanceOf, garrisonCapacity, garrisonCount, isGarrisoned, nearestShelter,
   ungarrisonAll,
@@ -66,7 +67,7 @@ const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
   spearman: 'SPR', scout: 'CAV', ram: 'RAM',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
-  lumbercamp: 'LMB', miningcamp: 'MIN',
+  lumbercamp: 'LMB', miningcamp: 'MIN', market: 'MKT',
   berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
 };
 // The build menu lists the whole tech tree, locked entries included, and on a
@@ -242,8 +243,19 @@ function costNode(cost) {
   return box;
 }
 
-export function createHud(scene, world) {
+export function createHud(scene, world, audio = null) {
   const doc = document;
+  /**
+   * The click of a HUD control.
+   *
+   * Every control in this file goes through one of three doors — cmdButton(),
+   * a dock button, or a sheet's own buttons — so this is called in three places
+   * rather than sixty, and a control added tomorrow gets its click for free by
+   * using the same helpers. It is a no-op with no engine and a no-op while the
+   * context is locked, which is the state the browser harness plays the whole
+   * match in.
+   */
+  const click = () => { if (audio) audio.play('buttonTap'); };
   // If the overlay markup is missing, fall back to a detached root so a broken
   // page still boots into a playable (if chrome-less) game rather than throwing.
   const root = doc.getElementById('hud') || doc.createElement('div');
@@ -275,6 +287,9 @@ export function createHud(scene, world) {
     buildMenuOpen: false,
     menuOpen: false,
     allocOpen: false,
+    marketOpen: false,
+    marketSig: '',
+    liveMarket: null,        // { rows } — the trade sheet
     placedThisArm: 0,        // foundations put down since the type was armed
     bqSig: '',               // build-queue strip signature
     allocSig: '',            // allocation readout signature
@@ -321,6 +336,11 @@ export function createHud(scene, world) {
   allocSheet.id = 'alloc-sheet';
   allocSheet.hidden = true;
   sheets.appendChild(allocSheet);
+
+  const marketSheet = el('div', 'market-sheet');
+  marketSheet.id = 'market-sheet';
+  marketSheet.hidden = true;
+  sheets.appendChild(marketSheet);
 
   const placeBar = el('div', 'place-bar');
   placeBar.id = 'place-bar';
@@ -816,7 +836,9 @@ export function createHud(scene, world) {
       b.appendChild(el('span', 'cost', sub));
     }
     if (disabled) b.disabled = true;
-    if (onTap) b.addEventListener('click', (ev) => { ev.stopPropagation(); onTap(); });
+    if (onTap) {
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); click(); onTap(); });
+    }
     return b;
   }
 
@@ -875,6 +897,19 @@ export function createHud(scene, world) {
       }
       renderQueue(panel, trainer);
       renderRallyNote(panel, trainer);
+    }
+
+    // The Market. A sheet rather than six buttons in this panel: a trade is two
+    // numbers and two decisions per resource, which is three rows of controls,
+    // and the command panel is already the most crowded 150px on the screen.
+    const stall = buildings.find((b) => b.type === 'market');
+    if (stall) {
+      panel.appendChild(cmdButton('Trade', {
+        cls: 'primary market',
+        sub: 'buy and sell',
+        aria: 'Open the market. Buy and sell resources for gold.',
+        onTap: () => toggleMarket(true),
+      }));
     }
 
     // Research. Preferring the building that also trains keeps the Town
@@ -1450,6 +1485,7 @@ export function createHud(scene, world) {
       // of them open at once is 60% of the screen with the map behind it.
       toggleAlloc(false);
       toggleMenu(false);
+      toggleMarket(false);
       renderBuildMenu();
     } else {
       state.liveBuild = []; // stop refreshing buttons nobody can see
@@ -1800,6 +1836,7 @@ export function createHud(scene, world) {
       const b = el('button', null, label);
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
+        click();
         fn();
         toggleMenu(false);
       });
@@ -1824,6 +1861,84 @@ export function createHud(scene, world) {
       else toast('No soldiers yet', 'warn');
     });
     add('Clear selection', () => clearSelection(world));
+    renderSoundControls();
+  }
+
+  // --- Sound ------------------------------------------------------------------
+  //
+  // Mute and two volumes, in the menu sheet, because that is where a player
+  // looks for a setting and because the dock has no room for a fifth button.
+  //
+  // Mute is a full-width toggle with a state word on it, exactly like the
+  // allocation manager's on/off — a control that silences the game has to be
+  // findable in one glance and reversible in one tap. The two sliders sit under
+  // it and are separate on purpose: "the music is too loud" and "the game is too
+  // loud" are different complaints, and a single volume answers neither of them.
+  //
+  // Nothing here has to be persisted by hand. The engine writes mute and all
+  // three volumes to localStorage on every setter (see the preferences note in
+  // src/audio/README.md), so a player who turns the music down finds it down
+  // tomorrow.
+
+  function soundSlider(label, aria, get, set) {
+    const row = el('div', 'sound-row');
+    row.appendChild(el('span', 'who', label));
+    const slider = doc.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '100';
+    slider.step = '5';
+    slider.value = String(Math.round(get() * 100));
+    slider.setAttribute('aria-label', aria);
+    const pct = el('span', 'pct', `${slider.value}%`);
+    slider.addEventListener('input', (ev) => {
+      ev.stopPropagation();
+      const v = Number(slider.value);
+      set(v / 100);
+      slider.style.setProperty('--fill', `${v}%`);
+      pct.textContent = `${v}%`;
+    });
+    // The slider owns its own drag outright, exactly as the job sliders do.
+    for (const t of ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove']) {
+      slider.addEventListener(t, (ev) => ev.stopPropagation());
+    }
+    slider.style.setProperty('--fill', `${slider.value}%`);
+    row.appendChild(slider);
+    row.appendChild(pct);
+    return row;
+  }
+
+  function renderSoundControls() {
+    if (!audio) return;
+    menuSheet.appendChild(el('div', 'menu-head', 'Sound'));
+
+    const mute = el('button', 'alloc-toggle sound-mute');
+    mute.appendChild(el('span', null, 'Sound'));
+    const stateLbl = el('span', 'state');
+    mute.appendChild(stateLbl);
+    const paint = () => {
+      const off = audio.isMuted();
+      stateLbl.textContent = off ? 'MUTED' : 'ON';
+      mute.classList.toggle('on', !off);
+      mute.setAttribute('aria-pressed', off ? 'true' : 'false');
+      mute.setAttribute('aria-label', off ? 'Sound is muted. Tap to unmute.' : 'Sound is on. Tap to mute.');
+    };
+    paint();
+    mute.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const off = audio.toggleMuted();
+      paint();
+      // The click plays *after* the toggle, so unmuting is confirmed by the
+      // sound of the button that unmuted it and muting is confirmed by silence.
+      if (!off) click();
+      toast(off ? 'Sound off' : 'Sound on', 'info');
+    });
+    menuSheet.appendChild(mute);
+
+    menuSheet.appendChild(soundSlider('Effects', 'Sound effects volume',
+      () => audio.getSfxVolume(), (v) => audio.setSfxVolume(v)));
+    menuSheet.appendChild(soundSlider('Music', 'Music volume',
+      () => audio.getMusicVolume(), (v) => audio.setMusicVolume(v)));
   }
 
   function toggleMenu(force) {
@@ -1833,6 +1948,7 @@ export function createHud(scene, world) {
     if (open) {
       toggleAlloc(false);
       toggleBuildMenu(false);
+      toggleMarket(false);
       renderMenuSheet();
     }
   }
@@ -1986,7 +2102,154 @@ export function createHud(scene, world) {
     if (open) {
       toggleMenu(false);
       toggleBuildMenu(false);
+      toggleMarket(false);
       renderAllocSheet();
+    }
+  }
+
+  // --- The Market -------------------------------------------------------------
+  //
+  // Three rows, one per tradeable resource, each carrying the two numbers that
+  // decide the trade — what a hundred of it costs to buy, and what a hundred of
+  // it fetches to sell — and two large buttons a long way apart.
+  //
+  // THE MIS-TAP PROBLEM. Buy and Sell are opposites with the same shape, sitting
+  // next to each other, operated by a thumb that covers both. Four things keep
+  // them apart, and they are all in service of the same rule: a stray tap must
+  // either do nothing, or do something the player can see they did not mean.
+  //
+  //   * They are on opposite sides of the row with a gap between them wide
+  //     enough that a thumb centred on one cannot reach the other.
+  //   * They are different colours and different words — Buy is the cool one and
+  //     names a *cost*, Sell is the gold one and names a *gain* — and each
+  //     prints its own gold figure, so the button says what it is about to do
+  //     rather than which direction it points.
+  //   * A trade that cannot happen is disabled outright rather than merely
+  //     greyed, so tapping it is a no-op rather than a refusal toast.
+  //   * Every trade that does happen raises a toast naming both sides of it, so
+  //     a mis-tap is legible the instant it lands rather than three minutes
+  //     later when the gold is gone.
+
+  const MARKET_LABEL = { food: 'Food', wood: 'Wood', stone: 'Stone' };
+
+  function renderMarketSheet() {
+    marketSheet.textContent = '';
+    state.marketSig = '';
+    const rows = [];
+
+    const head = el('div', 'head');
+    head.appendChild(el('span', null, 'Market'));
+    const gold = el('span', 'gold');
+    head.appendChild(gold);
+    marketSheet.appendChild(head);
+
+    for (const res of market.TRADED) {
+      const row = el('div', 'market-row');
+      row.dataset.res = res;
+
+      const who = el('span', 'who');
+      who.appendChild(el('i', `ico ico-${res}`));
+      who.appendChild(el('b', null, MARKET_LABEL[res] || res));
+      const stock = el('small', 'stock');
+      who.appendChild(stock);
+      row.appendChild(who);
+
+      // Buy on the left, sell on the right, with the price between them: the
+      // number both buttons are about, in the one place a thumb never covers.
+      const buy = el('button', 'trade buy');
+      buy.type = 'button';
+      buy.appendChild(el('span', 'verb', 'Buy'));
+      const buyCost = el('span', 'gold');
+      buy.appendChild(buyCost);
+      buy.addEventListener('click', (ev) => { ev.stopPropagation(); click(); trade('buy', res); });
+      row.appendChild(buy);
+
+      const mid = el('span', 'lot');
+      mid.appendChild(el('b', null, `${market.TRADE_LOT}`));
+      mid.appendChild(el('small', null, MARKET_LABEL[res] || res));
+      row.appendChild(mid);
+
+      const sell = el('button', 'trade sell');
+      sell.type = 'button';
+      sell.appendChild(el('span', 'verb', 'Sell'));
+      const sellGold = el('span', 'gold');
+      sell.appendChild(sellGold);
+      sell.addEventListener('click', (ev) => { ev.stopPropagation(); click(); trade('sell', res); });
+      row.appendChild(sell);
+
+      marketSheet.appendChild(row);
+      rows.push({ res, row, buy, sell, buyCost, sellGold, stock });
+    }
+
+    marketSheet.appendChild(el('div', 'why',
+      `Selling drops a price by ${market.PRICE_STEP} gold and buying raises it. ` +
+      `A sale pays ${Math.round(market.COMMISSION * 100)}% less than the price — ` +
+      'that commission is the market’s cut, and it is why trading is the ' +
+      'expensive way to get a resource.'));
+
+    const foot = el('div', 'foot');
+    const close = el('button', null, 'Close');
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMarket(false); });
+    foot.appendChild(close);
+    marketSheet.appendChild(foot);
+
+    state.liveMarket = { rows, gold };
+    refreshMarket();
+  }
+
+  function refreshMarket() {
+    const live = state.liveMarket;
+    if (!live || marketSheet.hidden) return;
+    const opts = market.tradeOptions(world, PLAYER);
+    const purse = Math.floor(world.players[PLAYER].resources.gold || 0);
+    const sig = `${purse}|` + opts.map((o) =>
+      `${o.res}:${o.cost}:${o.value}:${o.have}:${o.canBuy ? 1 : 0}${o.canSell ? 1 : 0}`).join(',');
+    if (sig === state.marketSig) return;
+    state.marketSig = sig;
+
+    live.gold.textContent = `${purse} gold`;
+    for (const r of live.rows) {
+      const o = opts.find((x) => x.res === r.res);
+      if (!o) continue;
+      r.buyCost.textContent = `${o.cost}g`;
+      r.sellGold.textContent = `+${o.value}g`;
+      r.stock.textContent = `${o.have} in store`;
+      r.buy.disabled = !o.canBuy;
+      r.sell.disabled = !o.canSell;
+      r.buy.setAttribute('aria-label',
+        `Buy ${o.lot} ${MARKET_LABEL[o.res]} for ${o.cost} gold.` +
+        (o.buyRefusal ? ` ${o.buyRefusal}.` : ''));
+      r.sell.setAttribute('aria-label',
+        `Sell ${o.lot} ${MARKET_LABEL[o.res]} for ${o.value} gold.` +
+        (o.sellRefusal ? ` ${o.sellRefusal}.` : ''));
+      r.row.classList.toggle('rich', o.have >= market.TRADE_LOT);
+    }
+  }
+
+  function trade(side, res) {
+    const before = market.tradeOptions(world, PLAYER).find((o) => o.res === res);
+    const ok = side === 'buy' ? market.buy(world, PLAYER, res) : market.sell(world, PLAYER, res);
+    if (!ok) return;
+    const name = (MARKET_LABEL[res] || res).toLowerCase();
+    toast(side === 'buy'
+      ? `Bought ${market.TRADE_LOT} ${name} for ${before.cost} gold`
+      : `Sold ${market.TRADE_LOT} ${name} for ${before.value} gold`, 'info');
+    state.marketSig = '';
+    state.resSig = '';
+    refreshMarket();
+  }
+
+  function toggleMarket(force) {
+    const open = force === undefined ? !state.marketOpen : force;
+    state.marketOpen = open;
+    marketSheet.hidden = !open;
+    if (open) {
+      toggleAlloc(false);
+      toggleMenu(false);
+      toggleBuildMenu(false);
+      renderMarketSheet();
+    } else {
+      state.liveMarket = null;
     }
   }
 
@@ -2046,7 +2309,10 @@ export function createHud(scene, world) {
     // An arm belongs to the buildings that were in hand when it was armed;
     // changing the selection must never carry it over to something else.
     state.demolishArm = null;
-    if (world.selection.size === 0) toggleBuildMenu(false);
+    if (world.selection.size === 0) {
+      toggleBuildMenu(false);
+      toggleMarket(false);
+    }
   }));
 
   // An age-up changes the whole build menu (three shelves' worth of locked
@@ -2078,17 +2344,18 @@ export function createHud(scene, world) {
   off.push(world.events.on(EV.REMOVED, () => { state.bqSig = ''; }));
 
   // Buttons.
-  const onIdle = (ev) => { ev.stopPropagation(); cycleIdle(); };
+  const onIdle = (ev) => { ev.stopPropagation(); click(); cycleIdle(); };
   if (dom.idleBtn) dom.idleBtn.addEventListener('click', onIdle);
 
-  const onMenu = (ev) => { ev.stopPropagation(); toggleMenu(); };
+  const onMenu = (ev) => { ev.stopPropagation(); click(); toggleMenu(); };
   if (dom.menuBtn) dom.menuBtn.addEventListener('click', onMenu);
 
-  const onJobs = (ev) => { ev.stopPropagation(); toggleAlloc(); };
+  const onJobs = (ev) => { ev.stopPropagation(); click(); toggleAlloc(); };
   if (dom.jobsBtn) dom.jobsBtn.addEventListener('click', onJobs);
 
   const onChip = (ev) => {
     ev.stopPropagation();
+    click();
     if (state.input && state.input.cycleDragPreference) {
       const next = state.input.cycleDragPreference();
       toast(next === 'auto' ? 'Drag: automatic' : next === 'box' ? 'Drag: box-select' : 'Drag: pan camera', 'info');
@@ -2117,6 +2384,7 @@ export function createHud(scene, world) {
     ev.preventDefault();
     ev.stopPropagation();
     miniDragging = true;
+    click();
     if (dom.minimap.setPointerCapture) {
       try { dom.minimap.setPointerCapture(ev.pointerId); } catch (_) { /* fine */ }
     }
@@ -2139,11 +2407,12 @@ export function createHud(scene, world) {
   // Tapping the map (never the HUD) closes any transient sheet.
   const gameRoot = doc.getElementById('game-root');
   const onDocDown = (ev) => {
-    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden) return;
+    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden && marketSheet.hidden) return;
     if (!gameRoot || !gameRoot.contains(ev.target)) return;
     toggleMenu(false);
     toggleBuildMenu(false);
     toggleAlloc(false);
+    toggleMarket(false);
   };
   document.addEventListener('pointerdown', onDocDown, true);
 
@@ -2186,6 +2455,7 @@ export function createHud(scene, world) {
     refreshAffordability();
     refreshBuildQueue();
     refreshAlloc();
+    refreshMarket();
 
     renderModeChip();
     perfEnd('hud.dom', _tDom);
@@ -2256,7 +2526,7 @@ export function createHud(scene, world) {
     document.removeEventListener('pointerdown', onDocDown, true);
     if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
     for (const n of [modeChip, idleBtn, jobsBtn, menuBtn,
-      buildMenu, allocSheet, placeBar, attackBar, menuSheet]) n.remove();
+      buildMenu, allocSheet, marketSheet, placeBar, attackBar, menuSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
     if (dom.jobNote) { dom.jobNote.textContent = ''; dom.jobNote.hidden = true; }
@@ -2282,6 +2552,7 @@ export function createHud(scene, world) {
     placedThisArm: () => state.placedThisArm,
     toggleAlloc,
     toggleMenu,
+    toggleMarket,
     cycleIdle,
     flashRes,
     underAttackAlert,

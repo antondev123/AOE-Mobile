@@ -1086,6 +1086,77 @@ body {
   text-align: left;
   padding: 0 10px;
 }
+/* The menu sheet grows sections once sound lives in it, so it needs a heading
+   and a scroller. 52vh is the same ceiling the other two sheets use — the map
+   underneath has to stay more than half visible whatever is open over it. */
+.menu-sheet {
+  max-height: 52vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.menu-head {
+  margin-top: 4px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.sound-mute { text-align: left; }
+.sound-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: var(--tap);
+}
+.sound-row .who {
+  flex: 0 0 52px;
+  font-size: 11.5px;
+  font-weight: 800;
+}
+.sound-row .pct {
+  flex: 0 0 40px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+/* Same slider as the job splits, and deliberately so: a phone should only ever
+   have to learn one slider. See the note on .alloc-row input[type="range"]. */
+.sound-row input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--tap);
+  margin: 0;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+.sound-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--gold-dim) 0%, var(--gold-dim) var(--fill, 0%), #1b140d var(--fill, 0%), #1b140d 100%);
+  border: 1px solid #000;
+}
+.sound-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c);
+  border: 1px solid #5d4315;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+.sound-row input[type="range"]::-moz-range-track {
+  height: 8px; border-radius: 4px; background: #1b140d; border: 1px solid #000;
+}
+.sound-row input[type="range"]::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c); border: 1px solid #5d4315;
+}
 
 /* --- Build queue strip -------------------------------------------------------
    The foundations the player tapped out in one breath, in the order they asked
@@ -1272,6 +1343,142 @@ body {
 .alloc-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
 .alloc-sheet .why { font-size: 10px; line-height: 1.3; color: var(--parch-dim); }
 
+/* --- The market trade sheet ---------------------------------------------------
+
+   Same shell as the allocation sheet — a phone should only have to learn one
+   kind of sheet — with one rule of its own: Buy and Sell are the two most
+   confusable buttons in the game, so they are pushed to opposite edges of the
+   row with the lot size between them, coloured differently, and each prints its
+   own gold figure. The gap in the middle is not decoration; it is the thing
+   that stops a thumb aimed at one landing on the other. */
+
+.market-sheet {
+  padding: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  max-height: 52vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  animation: sheetin 140ms ease-out;
+}
+.market-sheet .head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.market-sheet .head .gold {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+
+.market-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 52px;
+}
+.market-row .who {
+  flex: 0 0 66px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11.5px;
+  font-weight: 800;
+  line-height: 1.15;
+}
+.market-row .who .ico { margin-right: 3px; vertical-align: -1px; }
+.market-row .who .stock {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--parch-dim);
+  font-variant-numeric: tabular-nums;
+}
+/* The row lights up once there is a full lot to sell — the one fact that turns
+   the sheet from a price list into a decision. */
+.market-row.rich .who .stock { color: var(--gold); }
+
+/* The lot size, dead centre, between the two buttons. It is the subject of both
+   of them, and the only place on the row a thumb never covers. */
+.market-row .lot {
+  flex: 0 0 46px;
+  text-align: center;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.market-row .lot b { display: block; font-size: 14px; font-weight: 900; color: var(--parch); }
+.market-row .lot small { font-size: 9px; font-weight: 700; color: var(--parch-dim); }
+
+.market-row .trade {
+  flex: 1 1 0;
+  min-width: 62px;
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 4px;
+  border-radius: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.market-row .trade .verb {
+  font-size: 12.5px;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.market-row .trade .gold { font-size: 12px; font-weight: 800; }
+
+/* Buy spends: cool, and its figure is the cost. */
+.market-row .trade.buy {
+  border-color: #3f5a78;
+  background: linear-gradient(180deg, #2b3c4f 0%, #172230 100%);
+  color: #cfe0f0;
+}
+.market-row .trade.buy .gold { color: #9fc4e6; }
+/* Sell earns: gold, and its figure is the gain. */
+.market-row .trade.sell {
+  border-color: #7a5a1c;
+  background: linear-gradient(180deg, #5c4a24 0%, #2e2413 100%);
+  color: #f0dfae;
+}
+.market-row .trade.sell .gold { color: var(--gold); }
+
+/* A trade that cannot happen is dead, not merely dim: a disabled button eats
+   the tap instead of raising a refusal the player has to read and dismiss. */
+.market-row .trade:disabled {
+  opacity: 0.34;
+  filter: grayscale(0.7);
+  pointer-events: none;
+}
+
+.market-sheet .why { font-size: 10px; line-height: 1.35; color: var(--parch-dim); }
+.market-sheet .foot { display: flex; gap: 5px; }
+.market-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
+
+/* A capped, scrolling sheet must SCROLL, not squeeze.
+   All three sheets are flex columns with `max-height: 52vh; overflow-y: auto`,
+   and a flex item's default `flex-shrink: 1` means that once the content passes
+   that cap the rows are compressed instead — which took the market sheet's Close
+   button to 43.99px and tripped the 44px floor in tests/touchui.browser.mjs. It
+   is worth fixing on all three: the same latent squeeze is one added row away in
+   each of them, and a control that is 43px on a tall phone and 44px on a short
+   one is the hardest kind of layout bug to see. */
+.market-sheet > *, .alloc-sheet > *, .menu-sheet > * { flex: 0 0 auto; }
+
 /* --- Landscape --------------------------------------------------------------- */
 
 @media (orientation: landscape) and (max-height: 500px) {
@@ -1367,6 +1574,26 @@ body {
   touch-action: manipulation;
 }
 .start-btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #5d4315; }
+/* Two buttons on the boot card need a gap, and the second of them needs to stop
+   competing with the first. `.secondary` keeps the full 52px target — it is
+   still a button a thumb has to hit — and gives up only the gold. */
+.start-btn + .start-btn { margin-top: 10px; }
+.start-btn.secondary {
+  color: var(--parch);
+  background: linear-gradient(180deg, #37301f, #241e13);
+  border-color: #574a2c;
+  box-shadow: 0 3px 0 #17120a, var(--shadow);
+  font-weight: 700;
+}
+.start-btn.secondary:active { box-shadow: 0 1px 0 #17120a; }
+.start-btn .sub {
+  display: block;
+  margin-top: 1px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  opacity: 0.75;
+}
 
 .boot-help {
   margin-top: 14px;
@@ -1374,9 +1601,16 @@ body {
   font-size: 12.5px;
   color: var(--parch-dim);
 }
+/* A real touch target, not a link. It is 35px tall at this font size with the
+   padding it had, which is under the 44px floor every other control in the game
+   holds to — and it is the only control on the first screen a player ever
+   sees. */
 .boot-help summary {
   cursor: pointer;
-  padding: 10px 0;
+  display: flex;
+  align-items: center;
+  min-height: var(--tap);
+  padding: 4px 0;
   font-weight: 700;
   color: var(--parch);
   list-style: none;

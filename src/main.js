@@ -1,9 +1,11 @@
 // Entry point: sizes the canvas for phones, boots Phaser, wires the start card.
 
 import { GameScene } from './scenes/GameScene.js';
+import { saveInfo, clearSave } from './core/save.js';
 
 const bootStatus = document.getElementById('boot-status');
 const startBtn = document.getElementById('btn-start');
+const resumeBtn = document.getElementById('btn-resume');
 const bootCard = document.getElementById('boot');
 const hud = document.getElementById('hud');
 
@@ -20,7 +22,7 @@ window.addEventListener('unhandledrejection', (e) => fail('Startup error', e.rea
 
 let game = null;
 
-function launch(seed) {
+function launch(seed, resume = null) {
   if (game) {
     game.destroy(true);
     game = null;
@@ -51,16 +53,72 @@ function launch(seed) {
   };
 
   game = new Phaser.Game(config);
-  game.scene.start('game', { seed });
+  game.scene.start('game', { seed, resume });
   window.__phaser = game;
   return game;
 }
 
-function start() {
+function enterGame() {
   bootCard.hidden = true;
   hud.hidden = false;
   document.body.classList.add('playing');
+}
+
+function start() {
+  // Starting a new skirmish throws the saved one away. It is the one
+  // irreversible thing on this card, which is why the button says so.
+  clearSave();
+  enterGame();
   launch(Math.floor(Math.random() * 1e9));
+}
+
+function resume(payload) {
+  enterGame();
+  launch(payload.seed, payload);
+}
+
+/**
+ * Offer the saved match, if there is one this build can read.
+ *
+ * A save from an incompatible version is *reported*, not hidden: a player who
+ * left a match ten minutes ago and comes back to a bare "Start Skirmish" would
+ * reasonably conclude the game lost their game, and it did — it should say so.
+ */
+function wireResume() {
+  if (!resumeBtn) return;
+  let info = null;
+  try {
+    info = saveInfo();
+  } catch (err) {
+    console.warn('[save] could not read the stored match:', err);
+    info = null;
+  }
+  if (!info) return;
+  if (info.error) {
+    bootStatus.textContent = info.error;
+    bootStatus.classList.add('error');
+    clearSave();
+    return;
+  }
+  resumeBtn.textContent = '';
+  resumeBtn.appendChild(document.createTextNode('Resume match'));
+  const sub = document.createElement('span');
+  sub.className = 'sub';
+  sub.textContent = `${info.label} in`;
+  resumeBtn.appendChild(sub);
+  resumeBtn.setAttribute('aria-label', `Resume the saved match, ${info.label} in.`);
+  resumeBtn.hidden = false;
+  resumeBtn.addEventListener('click', () => resume(info.data));
+
+  // With something to come back to, a new game is the quieter of the two.
+  startBtn.classList.add('secondary');
+  startBtn.textContent = '';
+  startBtn.appendChild(document.createTextNode('New skirmish'));
+  const s2 = document.createElement('span');
+  s2.className = 'sub';
+  s2.textContent = 'discards the saved match';
+  startBtn.appendChild(s2);
+  startBtn.setAttribute('aria-label', 'Start a new skirmish. This discards the saved match.');
 }
 
 function boot() {
@@ -70,18 +128,35 @@ function boot() {
   }
   bootStatus.textContent = `Phaser ${Phaser.VERSION} ready`;
   startBtn.hidden = false;
+  wireResume();
 
   startBtn.addEventListener('click', start, { once: false });
 
   const again = document.getElementById('btn-again');
   again.addEventListener('click', () => {
     document.getElementById('endcard').hidden = true;
+    clearSave();
     launch(Math.floor(Math.random() * 1e9));
   });
 
-  // Let the test harness (and impatient players) skip the start card.
-  if (new URLSearchParams(location.search).has('autostart')) start();
+  // Let the test harness (and impatient players) skip the start card. `?resume`
+  // takes the saved match instead, which is how tests/save.browser.mjs drives
+  // the round trip through the real page.
+  const params = new URLSearchParams(location.search);
+  if (params.has('resume')) {
+    const info = saveInfo();
+    if (info && !info.error) resume(info.data);
+    else start();
+  } else if (params.has('autostart')) {
+    start();
+  }
   window.__startGame = start;
+  window.__resumeGame = () => {
+    const info = saveInfo();
+    if (!info || info.error) return false;
+    resume(info.data);
+    return true;
+  };
 }
 
 boot();

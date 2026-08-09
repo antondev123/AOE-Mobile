@@ -128,8 +128,12 @@ about one per second — and the drone is seven nodes that live for the match.
 
 ## Integration points
 
-Recommended wiring, in the order it should be done. Nothing below has been
-applied; this module ships unwired.
+**All of the below is now wired.** The mapping lives in `adapter.js`
+(`createAudioAdapter(world, audio, { playerId })`) — one subscription per event,
+one cue per subscription, and nothing else; the engine itself still subscribes to
+nothing. The scene owns the lifecycle. What follows is kept as the description of
+that wiring, with the four "hooks the codebase does not have yet" resolved at the
+bottom.
 
 ### Ownership and lifecycle — `src/scenes/GameScene.js`
 
@@ -184,32 +188,34 @@ applied; this module ships unwired.
 `EV.INSUFFICIENT` or `EV.POP_CAPPED` in every current emitter, and doubling them
 would produce two `invalid` buzzes for one refusal.
 
-### Hooks the codebase does not have yet
+One cue was added to the table above by the wiring rather than by this module:
+`EV.TRADE` (a Market buy or sell) plays `deposit`. It is the same gesture — a
+sack put down and coins counted — and the catalogue did not need a
+twenty-fifth entry to say it.
 
-1. **Hammer taps while building.** There is no build-tick event. The cheapest
-   option needs no changes to `systems/`: in the audio adapter's per-frame
-   update, keep a `0.4 s` timer and, when it fires, scan `world.units` for the
-   first unit with `state === 'build'` inside the view rect and
-   `play('hammer', { x: u.x, y: u.y })`. The per-cue cap and coalescing keep a
-   large build crew down to a plausible number of hammers. If a cleaner signal
-   is wanted later, emit `EV.BUILD_TICK { unit, building }` from `tickBuild()`
-   in `src/systems/unitAI.js` and map it directly.
-2. **Age advance.** There is no age system in the codebase yet, so
-   `ageAdvance` currently has no trigger. When ages land, emit
-   `EV.AGE_ADVANCE { player, age }` and map it to
-   `if (player === PLAYER) play('ageAdvance')`.
-3. **Button taps.** `src/ui/hud.js` funnels almost every control through
-   `cmdButton()`'s click handler (line ~606) — one `audio.play('buttonTap')`
-   there covers the command panel, the build menu and the placement bar. The
-   mode chip, the idle-villager button and the minimap pointer-down are
-   separate handlers and need their own call. The HUD does not currently
-   receive the engine; pass it in `createHud(scene, world, audio)` or hang it
-   off the scene.
-4. **Music transport.** Call `audio.startMusic()` once the first gesture has
-   unlocked the context (a good place is right after `unlock()` succeeds in the
-   input layer) and `audio.stopMusic()` on `EV.GAME_OVER`. A mute/volume
-   control in the HUD menu (`#btn-menu`) maps straight onto
-   `toggleMuted()` / `setVolume()` / `setMusicVolume()`.
+### The four hooks this module was waiting for — all four now exist
+
+1. **Hammer taps while building.** `EV.BUILD_TICK { unit, building }` is now
+   emitted from `tickBuild()` in `src/systems/unitAI.js`, on a fixed
+   `HAMMER_PERIOD` (0.45 s) beat rather than once per sim step. The beat is in
+   the simulation on purpose, so the sound and any future spark agree about when
+   a blow lands; per-step emission would have put four hundred dispatches a
+   second through the bus with twenty builders working, and every `emit` copies
+   its handler list. The polling alternative described here originally is not
+   used.
+2. **Age advance.** `EV.AGE_ADVANCE { player, age }` arrived with the tech tree
+   (`src/systems/tech.js`, `completeResearch`) and is mapped straight to
+   `ageAdvance` for the human player.
+3. **Button taps.** `createHud(scene, world, audio)` takes the engine, and a
+   single local `click()` helper is called from `cmdButton()`, the four dock
+   buttons, the menu-sheet rows, the market's Buy/Sell and the minimap's
+   pointer-down. It is a no-op with no engine and a no-op while the context is
+   locked.
+4. **Music transport.** `src/ui/input.js` calls `audio.unlock()` on every canvas
+   pointer-down and `startMusic()` the first time it succeeds; the adapter calls
+   `stopMusic()` on `EV.GAME_OVER`. Mute and the two volumes live in the HUD's
+   menu sheet and map straight onto `toggleMuted()` / `setSfxVolume()` /
+   `setMusicVolume()`, which persist themselves.
 
 ## Self-test
 

@@ -1574,6 +1574,13 @@ const BSPEC = {
   farm: { fw: 2, fh: 2, w: 140, h: 100, stages: 3 },
   lumbercamp: { fw: 2, fh: 2, lumber: true, w: 152, h: 116 },
   miningcamp: { fw: 2, fh: 2, mine: true, w: 152, h: 150 },
+  // The Market. Two striped awnings over a trestle of goods, in front of a low
+  // plaster hall. Stripes are the whole design: there is nothing else striped
+  // anywhere on this map, so a Market is identifiable at any zoom, from any
+  // angle, and with its lower half behind a tree — which is the same test the
+  // three drop-offs above had to pass. Deliberately *low* as well, so it never
+  // competes with the Mill's tower or the Town Center's mast for the eye.
+  market: { fw: 3, fh: 3, market: true, w: 200, h: 150 },
   // The two stone buildings that shoot. Both are drawn tall on purpose: a
   // defensive building whose silhouette does not clear the houses around it is a
   // defensive building the player forgets they own.
@@ -1670,6 +1677,10 @@ function drawBuilding(g, type, s, cx, cy, col, colDark) {
   }
   if (s.mine) {
     drawMiningCamp(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.market) {
+    drawMarket(g, s, cx, cy, col, colDark);
     return;
   }
 
@@ -2233,6 +2244,136 @@ function drawMiningCamp(g, s, cx, cy, col, colDark) {
   g.strokeTriangle(shx, peakY - 16, shx + 14, peakY - 12, shx, peakY - 7);
   g.fillStyle(colDark, 1);
   g.fillTriangle(shx, peakY - 13.5, shx + 7, peakY - 11.6, shx, peakY - 9.6);
+}
+
+// ---------------------------------------------------------------------------
+// The Market
+// ---------------------------------------------------------------------------
+//
+// A low plaster hall at the back, two striped awnings on poles in front of it,
+// and a trestle of goods under them. The stripes do all the work: nothing else
+// on this map is striped, so a Market survives the two tests the drop-offs had
+// to pass — shrunk to a thumbnail, and with its lower half behind a tree.
+//
+// It is drawn deliberately *wide and low* rather than tall. The tall silhouettes
+// are all spoken for (the Mill's tower, the Town Center's mast, the tower and
+// the Castle), and a fourth one would start a crowd; a broad flat shape with a
+// bright roofline is the gap in the base's skyline that nothing else fills.
+
+/** One awning: an iso quad in two colours, striped along its slope. */
+function awning(g, cx, cy, hw, hh, lift, a, b) {
+  const W = { x: cx - hw, y: cy + lift * 0.35 };
+  const S = { x: cx, y: cy + hh + lift * 0.5 };
+  const E = { x: cx + hw, y: cy + lift * 0.35 };
+  const N = { x: cx, y: cy - hh };
+  const quad = [W, S, E, N];
+  g.fillStyle(a, 1);
+  g.fillPoints(quad, true, true);
+  // Stripes run from the ridge (N-E edge) down to the eave (W-S edge), which is
+  // the direction a real awning's cloth runs and the direction that reads as
+  // fabric rather than as a chequerboard.
+  g.fillStyle(b, 1);
+  for (let k = 0; k < 4; k++) {
+    const t0 = k / 4 + 0.02;
+    const t1 = t0 + 0.11;
+    const p = (from, to, t) => ({
+      x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t,
+    });
+    g.fillPoints([
+      p(W, S, t0), p(W, S, t1), p(N, E, t1), p(N, E, t0),
+    ], true, true);
+  }
+  g.lineStyle(2.2, OUT, 1);
+  g.strokePoints(quad, true, true);
+  return quad;
+}
+
+function drawMarket(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  platform(g, cx, cy, hw, hh, false);
+
+  // The hall at the back: plaster and timber, like a house, under thatch. Not
+  // the Town Center's warm tile and not a team roof — the tile is the one thing
+  // the Town Center owns outright on this map (see the note above drawTownCenter)
+  // and a second building wearing it would cost the base its landmark.
+  const THATCH = 0x9a8850;
+  const THATCH_D = 0x6a5c31;
+  const hallX = cx - hw * 0.18;
+  const hallY = cy - hh * 0.34;
+  const hiw = hw * 0.52;
+  const hih = hh * 0.52;
+  const wallH = 26;
+  isoBox(g, hallX, hallY, hiw, hih, wallH, PLASTER, PLASTER_D, shade(PLASTER, 0.1));
+  timbers(g, hallX, hallY, hiw, hih, wallH);
+  isoRoof(g, hallX, hallY - wallH, hiw * 1.16, hih * 1.16, 15, THATCH, THATCH_D);
+  g.fillStyle(WOOD_D, 1);
+  g.fillRoundedRect(hallX - 6, hallY + hih - wallH + 3, 12, wallH - 7, 2.5);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRoundedRect(hallX - 6, hallY + hih - wallH + 3, 12, wallH - 7, 2.5);
+
+  // Two stalls in front, the near one lower and to the right so they overlap
+  // and read as a row rather than as one wide tent.
+  const stalls = [
+    { x: cx - hw * 0.46, y: cy + hh * 0.22, w: hw * 0.58, a: 0xe8e0d0, b: col },
+    { x: cx + hw * 0.38, y: cy + hh * 0.5, w: hw * 0.54, a: 0xe8e0d0, b: colDark },
+  ];
+  for (const st of stalls) {
+    const top = st.y - 34;
+    // Four poles, drawn before the cloth so the cloth sits on them.
+    stick(g, st.x - st.w * 0.8, st.y + 6, st.x - st.w * 0.8, top + 6, 2.2, 0x7b5a33);
+    stick(g, st.x + st.w * 0.8, st.y + 6, st.x + st.w * 0.8, top + 6, 2.2, 0x7b5a33);
+    // The trestle table under it: a plank on two crossed legs.
+    g.fillStyle(OUT, 1);
+    g.fillEllipse(st.x, st.y + 4, st.w * 1.5, st.w * 0.44);
+    g.fillStyle(WOOD, 1);
+    g.fillEllipse(st.x, st.y + 2.5, st.w * 1.4, st.w * 0.4);
+    g.fillStyle(shade(WOOD, 0.16), 1);
+    g.fillEllipse(st.x - 1, st.y + 1, st.w * 1.15, st.w * 0.3);
+    // Goods on it: a sack of grain, a stack of planks, a pale stone block and
+    // one coin, so all three tradeable things and the money are on the counter.
+    g.fillStyle(OUT, 1);
+    g.fillCircle(st.x - st.w * 0.42, st.y - 4, 6.6);
+    g.fillStyle(0xd9c489, 1);
+    g.fillCircle(st.x - st.w * 0.42, st.y - 4.8, 5.2);
+    g.fillStyle(OUT, 1);
+    g.fillRect(st.x - 6, st.y - 9, 15, 8);
+    g.fillStyle(WOOD, 1);
+    g.fillRect(st.x - 5, st.y - 8, 13, 3);
+    g.fillStyle(shade(WOOD, 0.2), 1);
+    g.fillRect(st.x - 5, st.y - 4.5, 13, 3);
+    g.fillStyle(OUT, 1);
+    g.fillRect(st.x + st.w * 0.4 - 5, st.y - 9, 11, 9);
+    g.fillStyle(0xc9c2b2, 1);
+    g.fillRect(st.x + st.w * 0.4 - 4, st.y - 8, 9, 7);
+    g.fillStyle(0xf5c333, 1);
+    g.fillCircle(st.x + st.w * 0.72, st.y - 2, 2.6);
+    g.lineStyle(1.2, OUT, 1);
+    g.strokeCircle(st.x + st.w * 0.72, st.y - 2, 2.6);
+    // The cloth last, over the top of all of it.
+    awning(g, st.x, top, st.w, st.w * 0.36, 9, st.a, st.b);
+  }
+
+  // A pair of scales on the hall's gable — the one decal that says *trade*
+  // rather than "shop", and the only place a straight vertical line survives at
+  // this size.
+  const sx = hallX + hiw * 0.62;
+  const sy = hallY - wallH - 6;
+  stick(g, sx, sy + 12, sx, sy - 6, 1.8, 0x6a5334);
+  stick(g, sx - 9, sy - 4, sx + 9, sy - 4, 1.6, 0x6a5334);
+  for (const dx of [-9, 9]) {
+    g.lineStyle(1.2, OUT, 1);
+    g.beginPath();
+    g.moveTo(sx + dx, sy - 4);
+    g.lineTo(sx + dx, sy + 1);
+    g.strokePath();
+    g.fillStyle(OUT, 1);
+    g.fillEllipse(sx + dx, sy + 2.5, 9, 4);
+    g.fillStyle(0xf5c333, 1);
+    g.fillEllipse(sx + dx, sy + 2, 7, 3);
+  }
+
+  banner(g, cx + hw * 0.78, cy + hh * 0.1, col, colDark, 24);
 }
 
 // ---------------------------------------------------------------------------

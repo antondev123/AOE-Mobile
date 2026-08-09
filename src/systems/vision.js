@@ -575,6 +575,61 @@ export function createVision(world) {
     viewers.clear();
   }
 
+  // --- Save and load --------------------------------------------------------
+  //
+  // Two of the six per-player arrays are written, and the other four are not,
+  // because only two of them are *facts*:
+  //
+  //   explored   history. Nothing can re-derive it — it is the record of
+  //              everywhere this player has ever been, and losing it would hand
+  //              a resumed match a black map it had already paid to open.
+  //   memory     the ghosts. Also history, and by construction they describe
+  //              buildings and trees that may no longer exist, so they cannot be
+  //              rebuilt from the world either.
+  //
+  // `visible`, `count`, `memoryTile` and the viewer cache are all *derived from
+  // where the units are standing right now*, and the units are restored before
+  // this is called. So they are left empty and the first update() after a load
+  // stamps every viewer in from scratch — which is exactly what the first
+  // update() of a fresh match does, and is the one code path that cannot drift
+  // from the incremental one.
+
+  function serialize() {
+    return states.map((st) => ({
+      explored: st.explored.slice(),
+      // The snapshots are plain data already (see snapshot()), but they are
+      // pooled and reused in place, so they are copied rather than referenced.
+      memory: st.memory.map((s) => ({ ...s, tiles: s.tiles.slice() })),
+    }));
+  }
+
+  function restore(data) {
+    if (!Array.isArray(data)) return;
+    for (let i = 0; i < states.length; i++) {
+      const st = states[i];
+      const rec = data[i];
+      st.visible.fill(0);
+      st.count.fill(0);
+      st.memoryTile.fill(0);
+      st.memory.length = 0;
+      st.memoryIndex.clear();
+      st.explored.fill(0);
+      if (!rec) continue;
+      if (rec.explored && rec.explored.length === N) st.explored.set(rec.explored);
+      for (const snap of rec.memory || []) {
+        if (!snap || !Array.isArray(snap.tiles) || !snap.tiles.length) continue;
+        st.memoryIndex.set(snap.id, st.memory.length);
+        st.memory.push(snap);
+        for (const t of snap.tiles) if (t >= 0 && t < N) st.memoryTile[t] = snap.id;
+      }
+      st.revision++;
+    }
+    // Every viewer must be stamped in again from nothing: the cache maps a
+    // viewer to the tile it last stamped, and after a load nothing has been
+    // stamped at all.
+    viewers.clear();
+  }
+
   /**
    * Write the fog alpha field for a player into the alpha bytes of an RGBA
    * buffer sized MAP_W x MAP_H — one texel per tile, ready to be uploaded and
@@ -645,6 +700,8 @@ export function createVision(world) {
     rememberedAt,
     recomputeFromScratch,
     writeFogAlpha,
+    serialize,
+    restore,
     destroy,
     // Exposed for tests and for anyone who wants to reason about the cache.
     _viewers: viewers,

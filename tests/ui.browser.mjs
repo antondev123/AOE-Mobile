@@ -35,6 +35,24 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${name}${detail ? `  (${detail})` : ''}`);
 }
 
+/**
+ * Measure a control's touch target.
+ *
+ * Read inside one synchronous `evaluate` rather than through
+ * `locator.boundingBox()`, which resolves the selector and then measures in two
+ * steps: the command panel re-renders whenever its signature changes — a unit
+ * finishing training is enough — and a node replaced between those two steps
+ * measures as null. That was a 1-in-4 flake on a claim that has nothing to do
+ * with timing.
+ */
+const targetBox = (page, selector) => page.evaluate((sel) => {
+  const n = document.querySelector(sel);
+  if (!n) return null;
+  const r = n.getBoundingClientRect();
+  return { width: r.width, height: r.height };
+}, selector);
+
+
 /** Centre the camera on a grid point and return its CSS coordinates. */
 async function aim(page, gx, gy) {
   return page.evaluate(([x, y]) => {
@@ -781,7 +799,7 @@ async function attackMoveRun() {
 
     const btn = page.locator('#cmd-panel .cbtn.attack');
     check('an attack-move button is offered', await btn.count() > 0);
-    const box = await btn.first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.attack');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
 
@@ -929,7 +947,7 @@ async function demolishRun() {
       await page.evaluate((id) => window.__game.world.selection.has(id), house.id));
 
     check('a demolish button is offered for it', await demolishBtn(page).count() > 0);
-    const box = await demolishBtn(page).first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.demolish');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
     check('and it does not look like the other, harmless, buttons',
@@ -1651,7 +1669,7 @@ async function placementGhostRun() {
     check('the panel offers a Cancel for it, and not a Demolish',
       panel.cancels === 1 && panel.demolish === 0,
       `${panel.cancels} cancel, ${panel.demolish} demolish — note: ${panel.note}`);
-    const box = await page.locator('#cmd-panel .cbtn.danger').first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.danger');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
 

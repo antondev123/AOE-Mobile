@@ -153,6 +153,11 @@ const SIDESTEP_MIN = 0.35;
 // walking into one Town Center will not all reach the same tile.
 const GARRISON_REACH = 1.6;
 
+// Seconds between hammer blows on a building site (EV.BUILD_TICK). Slower than
+// a real hammer on purpose: at 0.45s a lone villager reads as somebody working
+// steadily, and a crew of six reads as a building site rather than as static.
+const HAMMER_PERIOD = 0.45;
+
 // How far a villager will walk to find replacement work.
 const RETASK_RADIUS = 24;
 const FOLLOWUP_WORK_RADIUS = 14;
@@ -1354,6 +1359,18 @@ function tickBuild(world, u, dt, ctx) {
     clearMovement(u);
     u.state = 'build';
     u.facing = dirIndex(b.x - u.x, b.y - u.y);
+    // The hammer beat. Construction is continuous — buildTick advances progress
+    // every one of the twenty steps a second — but a *blow* is not, and the beat
+    // belongs in the simulation rather than in whatever happens to be listening
+    // for it, so the sound and any future spark agree about when the hammer
+    // lands. Emitting per step instead would put four hundred dispatches a
+    // second through the bus with twenty builders working, and every one of them
+    // copies its handler list.
+    u.buildBeat = (u.buildBeat || 0) + dt;
+    if (u.buildBeat >= HAMMER_PERIOD) {
+      u.buildBeat = 0;
+      world.events.emit(EV.BUILD_TICK, { unit: u, building: b });
+    }
     const done = buildTick(world, u, b, dt);
     if (done) onJobFinished(world, u, ctx, b);
     return;

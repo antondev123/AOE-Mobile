@@ -371,6 +371,34 @@ export const BUILDING_STATS = {
     lineOfSight: 4,
   },
 
+  // --- The Market: where a surplus becomes something else ---------------------
+  //
+  // AoE2's costs exactly: 175 wood, which is a Barracks, and that is the right
+  // comparison to make a player weigh — the Market is the second building you
+  // choose in the Feudal Age, against more soldiers.
+  //
+  // 3x3 rather than AoE2's 4x4. The footprint rule on this map is that anything
+  // wider than three tiles is a building the AI (and, on a 390px screen, the
+  // player) struggles to find ground for, which is why the Castle is the only
+  // 4x4 in the game and why it costs 250 stone to be one. A Market a player
+  // cannot place is a Market a player does not build.
+  //
+  // No dropoff. A Market that banked resources would be a Town Center with a
+  // trade menu, and the walk it saved would quietly become the reason to build
+  // one — which is not what it is for. See systems/market.js.
+  market: {
+    name: 'Market',
+    hp: 600, fw: 3, fh: 3,
+    cost: { food: 0, wood: 175, gold: 0, stone: 0 },
+    // AoE2 spends 60 seconds on it. 40 is the same fraction of a ten-minute
+    // match, and it is deliberately slower than the Barracks it competes with:
+    // the Market pays out for the rest of the game, so it should cost you the
+    // window it goes up in.
+    buildTime: 40,
+    trains: [],
+    lineOfSight: 6,
+  },
+
   // --- Defences: what stone is actually for -----------------------------------
   //
   // Until this pass stone was a resource with no sink. Two ten-minute

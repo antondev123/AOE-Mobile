@@ -90,10 +90,20 @@ export const EV = {
   // applied, so a listener always sees the new world, not the old one.
   AGE_ADVANCE: 'ageAdvance',
 
+  // { player, side, resource, amount, gold, price } — a Market trade went
+  // through. `side` is 'buy' or 'sell', `gold` is what actually changed hands
+  // (commission already taken off a sale), and `price` is the *new* price of
+  // that resource, after the trade moved it. See systems/market.js.
+  TRADE: 'trade',
+
   // { building } — construction finished
   BUILT: 'built',
   // { building, builder } — foundation placed
   FOUNDATION: 'foundation',
+  // { unit, building } — a villager landed a blow on a building site. Emitted
+  // on a fixed beat (see HAMMER_PERIOD in systems/unitAI.js), NOT once per sim
+  // step: construction progress is continuous, a hammer blow is not.
+  BUILD_TICK: 'buildTick',
 
   // { ids } — the player's selection changed
   SELECTION: 'selection',

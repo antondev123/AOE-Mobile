@@ -255,6 +255,55 @@ const run = async () => {
       await page.evaluate(() => window.__game.renderer.camera.setZoom(0.7));
     }
 
+    // --- 4b. the Market, beside the two buildings it has to be told apart from
+    //
+    // Barracks, Market, Town Center on one screen-horizontal line. All three are
+    // 3x3 and all three sit in the middle of a base, so the only thing keeping
+    // them apart is silhouette — and the Market's is deliberately the low, wide,
+    // striped one. If it ever starts reading as "a barracks with a flag", this
+    // is the picture that says so.
+    if (want('market')) {
+      await page.evaluate(() => {
+        const g = window.__game;
+        const w = g.world;
+        const W = window.__world;
+        const tc = [...w.players[0].owned].map((id) => w.entities.get(id))
+          .find((e) => e && e.type === 'towncenter');
+        const gx = Math.round(tc.x) + 14;
+        const gy = Math.round(tc.y) + 14;
+        for (const e of [...w.resources, ...w.buildings, ...w.units]) {
+          if (Math.abs(e.x - gx) < 18 && Math.abs(e.y - gy) < 18) W.removeEntity(w, e);
+        }
+        // Flatten the ground under them: this is a silhouette comparison, and a
+        // pond behind one of the three is a distraction, not a control.
+        for (let ty = gy - 12; ty <= gy + 12; ty++) {
+          for (let tx = gx - 12; tx <= gx + 12; tx++) {
+            if (tx < 0 || ty < 0 || tx >= w.width || ty >= w.height) continue;
+            const i = ty * w.width + tx;
+            if (w.terrain[i] === 2) { w.terrain[i] = 0; w.blocked[i] = 0; }
+          }
+        }
+        ['barracks', 'market', 'towncenter'].forEach((t, i) => {
+          W.spawnBuilding(w, t, 0, gx - 4 + i * 4, gy + 4 - i * 4);
+        });
+        W.spawnBuilding(w, 'house', 0, gx + 3, gy + 8);
+        w.vision.update();
+        w.over = true;
+        const st = w.vision.state(0);
+        st.visible.fill(1);
+        st.explored.fill(1);
+        st.revision++;
+        g.renderer.centerOn(gx + 1, gy + 1);
+        g.renderer.camera.scrollY += 210;
+      });
+      await page.waitForTimeout(400);
+      await shot(page, 'art-market-070');
+      await page.evaluate(() => window.__game.renderer.camera.setZoom(1.3));
+      await page.waitForTimeout(300);
+      await shot(page, 'art-market-130');
+      await page.evaluate(() => window.__game.renderer.camera.setZoom(0.7));
+    }
+
     // --- 5. construction stages ---------------------------------------------
     if (want('build')) {
       await page.evaluate(() => {
