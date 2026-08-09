@@ -550,6 +550,18 @@ export function isGateType(type) {
   return !!(s && s.gate);
 }
 
+/**
+ * The wall line a piece belongs to: 'palisade', 'stone', or null.
+ *
+ * Used to decide which segments a gate may be cut into. A Palisade Gate belongs
+ * in a palisade and a Stone Gate in a stone wall; letting either replace the
+ * other would be a way to launder 20 wood into a stone wall segment.
+ */
+export function wallFamily(type) {
+  if (!isWallType(type)) return null;
+  return type.startsWith('palisade') ? 'palisade' : 'stone';
+}
+
 // Buildings a villager may place, in the order the build menu lists them.
 //
 // This is the *candidate* list, not the available one. Two filters run over it:
@@ -727,11 +739,32 @@ export const ZOOM_MAX = 1.9;
 export const ZOOM_DEFAULT = 0.7;
 
 // --- Input tuning (touch-first) --------------------------------------------
-// A pointer that moves less than this (screen px) counts as a tap, not a drag.
-export const TAP_SLOP = 12;
+//
+// THESE TWO MUST STAY EQUAL. A pointer that travels more than TAP_SLOP is not a
+// tap; a pointer that travels more than DRAG_BOX_THRESHOLD starts a drag. When
+// they were 12 and 14 the two pixels between them belonged to neither: a press
+// released after 13px of travel had never entered pan or box (onMove returns
+// below the drag floor, so the mode was still 'tap') and then failed the tap
+// test on the way up. Nothing happened at all — no order, no selection, no
+// sound — and 13px is 2.4mm, which is exactly where a thumb lands on a moving
+// bus or at the far end of a one-handed reach. A gap here is invisible in code
+// review and reads in the hand as "the game ignored me".
+//
+// 16px (2.9mm on a 390px phone) is a deliberate loosening from 12 on top of
+// closing the gap: it is still less than a quarter of the 34px pick radius, so
+// it cannot make two neighbouring things ambiguous, and it forgives the wobble
+// of tapping while walking.
+export const TAP_SLOP = 16;
+// Drag-box selection only begins after the pointer exceeds this.
+export const DRAG_BOX_THRESHOLD = 16;
 // A press shorter than this is a tap.
 export const TAP_TIME_MS = 300;
-// Drag-box selection only begins after the pointer exceeds this.
-export const DRAG_BOX_THRESHOLD = 14;
 // Fat-finger radius: tapping selects the best entity within this many screen px.
 export const TAP_PICK_RADIUS = 34;
+// The same radius, for a tap that is giving an *order* rather than choosing
+// something. Much tighter on purpose. 34px at ZOOM_MIN is a disc covering ~11
+// tiles, and with your own troops ranked first a "move over there" aimed at
+// bare ground beside your army landed on the army instead — which replaced the
+// selection, issued nothing and said nothing. When something is already in
+// hand, aim should decide; the fat finger has already done its job.
+export const ORDER_PICK_RADIUS = 18;

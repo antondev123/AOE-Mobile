@@ -1,5 +1,246 @@
 # Changelog
 
+## Playing it with a thumb: the HUD's screen budget, the gestures, and the walls
+
+Three complaints from a phone playtest — "controls and selection are clunky",
+"the HUD can take up most of the screen and sometimes everything isn't even
+selectable or goes off screen", and "building is hard, especially walls". Each
+one turned out to be several separate faults sharing a symptom. Measured on
+three viewports (390x844, 360x640 and 844x390 landscape), because every existing
+browser test ran at 390x844 only and none of the worst faults were visible from
+there.
+
+### One lost `pointerup` bricked the game until you reloaded the page
+
+The worst thing found, and the literal reading of "sometimes everything isn't
+even selectable". `st.pointers`/`st.order` were only ever emptied by `onUp` and
+`onCancel`. Pull down Control Centre mid-drag, take a call, or let the tab go to
+the background, and the up event for that finger never arrives — so a phantom
+stays in the map forever. From then on the *next* single touch made
+`order.length === 2` and became a one-finger pinch against a finger that was not
+there, throwing the camera across the map; on release the pinch branch handed
+the phantom the role of surviving pointer and returned early, leaving `driving`
+true so even the camera-adoption path in `update()` was dead. Every gesture
+after that was wrong, permanently.
+
+`resetPointers()` now runs on `blur`, `pagehide`, `visibilitychange` and
+`lostpointercapture`; `onDown` de-duplicates a repeated id (the other way the
+two containers could disagree, which killed input silently); `beginPinch()` no
+longer leaves the mode unset when the bookkeeping is inconsistent; and
+`update()` compares `order.length` against `pointers.size` once a frame as a
+backstop. Covered by a test that presses, never releases, blurs the window, and
+checks the next tap still selects.
+
+### A two-pixel band where taps did nothing
+
+`TAP_SLOP` was 12 and `DRAG_BOX_THRESHOLD` was 14, and the two pixels between
+them belonged to neither: a press released after 13px of travel had never
+entered pan or box, then failed the tap test on the way up. No order, no
+selection, no sound. 13px is 2.4mm — where a thumb lands on a moving bus. Both
+are now 16, which also forgives more wobble than 12 did.
+
+### Your own troops ate every move order
+
+With units in hand, a tap was resolved with the 34px selection radius and the
+preference order "own units first". At ZOOM_MIN that radius is a disc covering
+**eleven tiles**, so tapping the ground just ahead of your army — the commonest
+order in any RTS — picked one of your own soldiers, replaced the whole selection
+with it, issued nothing, and said nothing. Tapping your own Town Center to walk
+villagers home did the same.
+
+There are now two radii. Choosing something keeps the fat-finger 34px;
+*ordering* uses `ORDER_PICK_RADIUS` (18px), a smaller tier slack, and excludes
+whatever is already selected. Aim decides once you have already chosen.
+
+### Queueing a villager took away one-finger panning
+
+`effectiveDragMode()` returned `'box'` whenever *anything* of yours was
+selected. Selecting your Town Center to queue a villager happens every few
+seconds all match, and for as long as it stayed selected a one-finger drag drew
+a selection rectangle instead of moving the camera — which, being empty, then
+wiped the selection in silence. Now only a selected **unit** turns the drag into
+a box; a building is menu state.
+
+The long press was doing the same damage from the other side. At
+`LONG_PRESS_MS = TAP_TIME_MS` (300ms) it armed a box during the ordinary start
+of a deliberate pan, and it ran unconditionally — including when the player had
+explicitly locked the mode chip to "pan", which is the one thing that lock is
+for. It is now 500ms, decoupled, gated on the rule actually being `pan`, and it
+announces itself.
+
+And an **empty box keeps your selection** and says so, instead of throwing the
+army away without a word. The minimum is a real rectangle now (24px on a side
+and 900px² of area, not `w < 14 && h < 14`, which let a 15x3 scuff through), and
+the box is clipped to the visible map band so it can no longer select units
+hidden behind the dock.
+
+### The HUD ate up to 97% of the screen, and some of it could not be reached
+
+`.hud-stack` was anchored only at the bottom with no `top`, no `max-height` and
+no `overflow`, while each sheet capped itself at `52vh` — a fraction of the
+*viewport*, not of the space the sheet actually had. On a 360x640 phone the free
+band above the dock is ~240px and 52vh is 333, so the menu sheet opened with its
+title and first rows above `y=0`: unreachable, and unscrollable, because the
+sheet's own scroller only owned the part that was on screen. The allocation
+sheet lost its master ON/OFF switch the same way.
+
+The stack is now bounded at both ends and the sheets slot is the only part
+allowed to flex, so a sheet that does not fit scrolls inside the band instead of
+escaping it. Everything else follows from measuring rather than guessing:
+
+- `--band` (viewport less the safe areas, the top strip and the bottom bar) is
+  published by the HUD and every ceiling is expressed against it. Below 320px of
+  band the minimap stands down — pinch and pan reach everywhere it does, and the
+  dock holds the only doors to Jobs, the menu and the idle villagers.
+- **While a sheet is open** the minimap and the build-queue strip stand down for
+  the same reason. Menu open on a 390x844 phone went from 6px of visible map to
+  ~110px; the measured chrome from 97% to 87%, and Jobs from 92% to 76%.
+- **Nothing selected** — the commonest state in the match — collapsed the bottom
+  bar from 108px of two panels saying twice that there was nothing to say, to
+  one line. Resting chrome: 39% -> 33% at 390x844, 52% -> 43% at 360x640.
+- Every `vh` ceiling is now also declared in `dvh`. `body` is
+  `position: fixed; inset: 0` (the *small* viewport) while `vh` is the large one
+  on iOS Safari, so every cap was 8-13% bigger than the space it was capping.
+- A **short-portrait breakpoint** at `max-height: 720px`. There was a phone
+  layout and a landscape layout and nothing in between, so every portrait screen
+  from 500 to 844px tall got the 390x844 design with 314px of fixed furniture.
+- Landscape stopped *raising* the allocation ceiling to 62vh on the shortest
+  screen in the game, the selection chip went back over the touch floor (34px ->
+  40, the only control in the file under it), and the fixed minimap no longer
+  lands on the resource strip.
+- `.hud-top` and `.hud-bottom` no longer swallow taps. The top strip has had no
+  controls in it since they moved to the dock, and it was eating 4% of the
+  screen; the bottom bar's box is mostly its own fade, whose top is fully
+  transparent — the player could see units through it and have taps vanish.
+- Outgoing toasts leave the layout immediately instead of holding their place
+  for the 260ms of their fade, which had the stack at 176px against a 96px
+  contract. (This was already failing on `main`.)
+- The boot card centres with `margin: auto` rather than `align-items: center`,
+  which on a 360x640 screen with "How to play" open pushed the title and both
+  start buttons above the scroll origin, where nothing could reach them.
+- The build-queue strip fades its right edge while there is more to the right —
+  it is a horizontal scroller with about four chips visible, feeding a feature
+  whose whole point is placing a row of houses in one go.
+- Sliders use `touch-action: pan-y` instead of `none`. Four 44px slider rows are
+  176px of a 368px allocation sheet, so half its surface silently nudged a
+  percentage instead of scrolling to the buttons at the bottom.
+- The allocation and market sheets, and the selection panel, joined the scroll
+  fade and the scroller registry they had been left out of.
+- The minimap jumps on *release*, with a 6px slop, instead of on touch. It sits
+  six pixels above the dock, so overshooting a dock button used to teleport the
+  camera before the finger had settled.
+- The armed attack-move bar is exclusive with the sheets, and the sticky Close
+  buttons in the build menu and help sheet no longer clip 6 of their 44px.
+
+### Every camera jump landed its target under the dock
+
+`centerOnGrid` centred on the geometric middle of the canvas, but the HUD covers
+the bottom third of it. So "centre on Town Center", the minimap jump and the
+idle-villager button all put what you asked for ~115px too low — behind the
+controls, and behind the thumb pressing them. Jumps now aim at the middle of the
+visible band, and `onScreen()` (which backs double-tap "select every one of
+these on screen") is bounded by it too.
+
+### Walls
+
+**A straight swipe made a chevron.** `wallLineTiles` draws an L, which is right
+for a wall that turns. But the grid axes run at +-26.6 degrees across an
+isometric screen, so the gesture for "a wall across the front of my base" is a
+straight horizontal swipe — and that is an exact grid anti-diagonal,
+`dx = +n, dy = -n`. It came out as *n* tiles down-right then *n* up-right: twice
+the length asked for, twice the price, in a shape nobody has ever wanted, and no
+amount of aiming could avoid it.
+
+The question was wrong, not the tolerance. It is now whether the **finger**
+turned: the stroke's maximum deviation from the chord between its ends is
+tracked live, and under 30px the run is one straight wall along whichever grid
+axis best matches the direction the finger actually went (decided in screen
+space, because that is the only place the question has an answer). A stroke that
+visibly bends keeps its corner. Verified both ways.
+
+**The ghost and the wall drag disagreed about which tile was under the finger.**
+`ghostAt` snapped with `floor(g - fw/2) + fw/2` — for a 1x1 that is
+`floor(g - 0.5)`, the tile *before* the one under the touch unless the fraction
+was past a half — while `tileUnder` floored. They agreed on a quarter of the map
+area. Every wall, every gate and the tower is 1x1, so a gate tapped into the gap
+left by a wall you had just dragged missed the gap. One `snapFootprint` now
+serves both, and a test asserts they land on the same tile at five different
+sub-tile positions.
+
+**A gate could not be put into a wall at all** — the thing the build menu's own
+ordering promises ("you draw a run and then put the door in it"). A wall segment
+blocks its tile and `canPlace` does not care who put it there, so the only route
+was demolish-for-no-refund and then hit a one-tile gap with a ghost that did not
+agree about where it was. A gate of the same family now replaces its owner's
+wall segment and refunds it.
+
+**A run could not be longer than the screen.** `MAX_WALL_RUN` is 40 tiles; a
+390px portrait phone at zoom 1 shows about twelve, and the two-finger gesture
+that would scroll the map is the documented way to abandon the run. Holding the
+finger near the edge of the visible band now pans and keeps drawing. The
+readout also admits when a drag exceeded the cap, instead of silently reporting
+the truncated count as the whole run, and it names the reason some segments are
+grey while there is still time to move.
+
+**The commit re-plans.** It gated on the plan cached from the last tile the
+finger crossed, so holding still while stone came in gave a preview that said
+"3 of 12" and a placement that laid all twelve.
+
+**Builders spread along the run** instead of all being sent to segment one — a
+1x1 tile with at most six standable neighbours, where the surplus failed their
+approach four times over and were dropped back to gathering. And the toast only
+claims "villagers on the way" when villagers were actually sent.
+
+### Placement mode
+
+The bar that explains what you are placing is pinned to the top of the screen,
+deliberately, so the middle stays clear for aiming — but that put the only
+control that ends the mode in the top-right corner, which `index.html`'s own
+design note calls out as unreachable one-handed. The **dock's mode chip becomes
+Done** while placement is armed; it has nothing to say then anyway, because
+placement owns the drag.
+
+The bar also **shows the cost** (it was on the build-menu button, and arming the
+mode closes the build menu, so the figure vanished exactly when the player
+started spending it), **refreshes as the purse changes** instead of reading
+"Place House" through a batch that ran dry four houses ago, and **disarms itself
+when there are no villagers left**, the way attack-move already disarms when the
+last soldier dies. The idle ghost re-evaluates so it cannot stay green over
+ground you can no longer afford.
+
+An armed attack-move spent on a tap with no soldiers selected now says so rather
+than vanishing while the tap quietly did something else.
+
+### "Cannot build there" was the answer to six different questions
+
+Off the map, in the sea, on a tree, on your own foundation, on an enemy's wall,
+on your own open gate. On a phone, where the ghost sits an inch above your thumb
+and the toast is one line, that is the difference between "move a little" and
+"give up". `placeBlockedBy` returns the reason and every caller prints it, and
+the ghost's affordability message names the resource the way the build menu
+already did.
+
+### The ghost drifted three and a half tiles between zoom levels
+
+`GHOST_LIFT` is 62 screen px, which is right — it is dodging a thumb, and a
+thumb is a fixed number of millimetres. But the map is not: 62px is 3.5
+tile-rows at ZOOM_MIN and 1.0 at ZOOM_MAX, so the aim learned at one zoom was
+wrong at the other. It is now capped in tiles as well, at 2.0, so the ghost sits
+two rows up-screen from the finger at every zoom. `PICK_PROBE_DOWN` had the
+mirror-image bug — a world-space compensation applied in screen space — and is
+now scaled by the zoom.
+
+### A test that would have caught all of it
+
+`tests/mobile.browser.mjs` sweeps three viewports through seven states and
+asserts three things per cell: nothing painted escapes the viewport unless a
+scroller could bring it back, the chrome stays inside a per-state budget, and no
+interactive control falls under 40px. Then it drives the gestures with real
+`PointerEvent`s — the 13px wobble, the empty box, the drag mode with a building
+in hand, the order beside your own troops, the lost `pointerup`, the ghost
+against the wall drag, and the gate into the wall. `npm run test:mobile`, or
+`npm run test:browser` for the lot.
+
 ## The first sixty seconds, the fog, and the roster the HUD could not draw
 
 A reviewer played the finished build on a 390x844 phone at DPR 2, measured

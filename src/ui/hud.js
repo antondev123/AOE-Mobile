@@ -254,8 +254,20 @@ function costNode(cost) {
   return box;
 }
 
+// Below this many pixels of free band — viewport less the top bar, the bottom
+// bar and the safe areas — the HUD stops trying to show everything at once and
+// drops the minimap. Measured: a 360x640 phone with a Town Center selected has
+// ~230px of band, which is a dock (50), a minimap (116) and 60px of map. The
+// minimap has a full-screen alternative in pan-and-pinch; the dock does not.
+const TIGHT_BAND = 320;
+// How far a finger may slide on the minimap before it is a scrub rather than a
+// tap. Well under the map's own gesture slop: this control is 116px square and
+// wants to be responsive, it just must not fire before the finger settles.
+const MINI_DRAG_SLOP = 6;
+
 export function createHud(scene, world, audio = null) {
   const doc = document;
+  const win = window;
   /**
    * The click of a HUD control.
    *
@@ -302,6 +314,7 @@ export function createHud(scene, world, audio = null) {
     allocOpen: false,
     marketOpen: false,
     marketSig: '',
+    placeSig: '',            // placement bar signature (see refreshPlaceBar)
     liveMarket: null,        // { rows } — the trade sheet
     placedThisArm: 0,        // foundations put down since the type was armed
     bqSig: '',               // build-queue strip signature
@@ -314,6 +327,10 @@ export function createHud(scene, world, audio = null) {
     resSig: '',
     idleSig: '',
     minimapAcc: 0,
+    hudH: 108,               // measured height of the bottom bar
+    topH: 48,                // measured height of the resource bar
+    band: -1,                // free vertical space between the two (see syncBand)
+    sheetOpen: false,        // is anything open over the map (see syncSheetOpen)
     idleCycle: 0,
     lastToast: new Map(),
     toasts: [],
@@ -443,10 +460,58 @@ export function createHud(scene, world, audio = null) {
   let sizeObserver = null;
   if (bottomBar && typeof ResizeObserver === 'function') {
     sizeObserver = new ResizeObserver((entries) => {
-      const h = Math.round(entries[0].contentRect.height + 12);
+      // offsetHeight, not contentRect + 12. The 12 was the bar's 6px of padding
+      // top and bottom written out as a magic number, which stopped being true
+      // in landscape (4 and 4, hud.css) and never included the bottom safe-area
+      // inset that lives in the same padding. The border-box height is the
+      // thing every consumer actually wants, and it cannot drift from the
+      // stylesheet.
+      const h = Math.round(entries[0].target.offsetHeight);
       root.style.setProperty('--hud-h', `${h}px`);
+      state.hudH = h;
+      syncBand();
     });
     sizeObserver.observe(bottomBar);
+  }
+
+  /**
+   * How much vertical room the HUD has to work with, and how much map is left.
+   *
+   * `vh` units are the wrong ruler for anything inside this overlay: they
+   * measure the viewport, and by the time a sheet opens the top bar, the dock,
+   * the minimap and the bottom bar have already spent most of it. A sheet
+   * capped at 52vh on a 360x640 phone asked for 333px of a band that was 240px
+   * wide and simply hung off the top of the screen, out of reach — its own
+   * scroller only owned the part that was on screen, so scrolling could not
+   * bring the title back.
+   *
+   * --band is the real number: viewport minus the safe areas, the top bar and
+   * the bottom bar. Every ceiling in the stylesheet is expressed against it,
+   * and `.is-tight` lets the layout give up an ornament (the minimap) rather
+   * than give up reachability when even the band is small.
+   */
+  function syncBand() {
+    const vh = win.innerHeight || 0;
+    if (!vh) return;
+    // --hud-h is a border-box height and already carries the bottom safe-area
+    // inset (it is part of the bar's own padding); --topbar-h does not carry
+    // the top one, because .hud-top is offset by it rather than padded with it.
+    const band = Math.max(0, vh - safeInset() - (state.topH || 48) - (state.hudH || 114));
+    if (band === state.band) return;
+    state.band = band;
+    root.style.setProperty('--band', `${band}px`);
+    // Below this the dock, the minimap and a sheet cannot all be on screen and
+    // still leave a map worth looking at. The minimap is the one that goes: it
+    // is a convenience with a full-screen alternative (pan and pinch), while
+    // the dock is the only way to reach Jobs, the menu and the idle villagers.
+    root.classList.toggle('is-tight', band < TIGHT_BAND);
+  }
+
+  /** env(safe-area-inset-top) as a number, via the value the stylesheet resolved. */
+  function safeInset() {
+    const v = getComputedStyle(root).getPropertyValue('--safe-t');
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : 0;
   }
 
   // The top bar is measured for the same reason: the resource bar wraps to a
@@ -459,6 +524,8 @@ export function createHud(scene, world, audio = null) {
     topObserver = new ResizeObserver((entries) => {
       const h = Math.round(entries[0].contentRect.height + 14);
       root.style.setProperty('--topbar-h', `${h}px`);
+      state.topH = h;
+      syncBand();
       // Also on the document element, because the end card lives outside the
       // HUD overlay and its "Results" pill has to tuck under the same bar.
       doc.documentElement.style.setProperty('--topbar-h', `${h}px`);
@@ -858,11 +925,18 @@ export function createHud(scene, world, audio = null) {
     state.liveGarrison = null;
 
     const sel = selectedEntities(world);
+    // NOTHING SELECTED IS THE COMMONEST STATE IN THE GAME, and it used to cost
+    // 108px of a 844px phone — two panels at their 96px floor, holding one
+    // sentence of advice and one sentence saying there was nothing to say. That
+    // is 13% of the screen, permanently, for no information, on top of the dock
+    // and the minimap. The bar now collapses to a single quiet line and gives
+    // the map back; `is-idle` is what the stylesheet keys the collapse off.
+    root.classList.toggle('is-idle', sel.length === 0);
     if (sel.length === 0) {
       const empty = el('div', 'sel-empty', 'Nothing selected.');
       // Keep this honest about the gesture model: with an empty selection a
       // one-finger drag pans, and the box needs a hold first.
-      empty.appendChild(el('small', 'sel-hint', 'Tap a unit. Drag to look around. Hold, then drag, to box-select.'));
+      empty.appendChild(el('small', 'sel-hint', 'Tap a unit · drag to look around · hold then drag to box-select'));
       panel.appendChild(empty);
       return;
     }
@@ -1948,17 +2022,26 @@ export function createHud(scene, world, audio = null) {
     const s = BUILDING_STATS[type];
     const name = s ? s.name : type;
     const n = state.placedThisArm;
+    const poor = !!(s && !affordable(world, PLAYER, s.cost));
     placeBar.textContent = '';
-    const txt = el('div', 'txt', n
-      ? `${name} ×${n} placed`
-      : `Place ${name}`);
+    const head = el('div', 'head');
+    head.appendChild(el('span', 'name', n ? `${name} ×${n} placed` : `Place ${name}`));
+    // WHAT IT COSTS, WHILE IT COSTS IT. The price is on the build-menu button,
+    // and arming the mode closes the build menu — so the figure vanished at
+    // exactly the moment the player started spending it, one tap at a time,
+    // through a batch that stays armed until they say stop.
+    if (s && s.cost) head.appendChild(costNode(s.cost));
+    const txt = el('div', 'txt');
+    txt.appendChild(head);
     // A gate is a wall piece but not a run: it goes down one at a time (see
     // wallType in ui/input.js), so it must not be advertised as draggable.
-    txt.appendChild(el('small', null, isWallType(type) && !isGateType(type)
-      ? 'Drag to draw a run — two fingers to cancel'
-      : n
-        ? 'Keep tapping to queue more'
-        : 'Drag to aim — lift to place'));
+    txt.appendChild(el('small', null, poor
+      ? `Not enough ${RES_LABEL[missingResource(world, PLAYER, s.cost)] || 'resources'} for the next one`
+      : isWallType(type) && !isGateType(type)
+        ? 'Drag to draw a run — two fingers to cancel'
+        : n
+          ? 'Keep tapping to queue more'
+          : 'Drag to aim — lift to place'));
     placeBar.appendChild(txt);
     const done = el('button', n ? 'primary' : 'danger', n ? 'Done' : 'Cancel');
     done.setAttribute('aria-label', n
@@ -1967,6 +2050,7 @@ export function createHud(scene, world, audio = null) {
     done.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
     placeBar.appendChild(done);
     placeBar.hidden = false;
+    placeBar.classList.toggle('is-poor', poor);
     root.classList.add('placing');
     // The toast stack sits directly under the resource bar and the bar has just
     // taken that space, so it is measured and handed over rather than guessed
@@ -2004,6 +2088,42 @@ export function createHud(scene, world, audio = null) {
 
   function getPlacementType() { return state.placement; }
 
+  /**
+   * Keep the placement bar telling the truth, once a frame.
+   *
+   * It used to be drawn only when the mode was armed and when a foundation
+   * landed, so it read "Place House" all the way through a batch that had run
+   * the player out of wood four houses ago — the one line on screen dedicated
+   * to the thing they were doing, and it never mentioned the reason it had
+   * stopped working. The cost belongs here for the same reason: it is shown in
+   * the build menu, which arming the mode closes, so the moment the number
+   * starts to matter is the moment it disappears.
+   *
+   * And placement disarms itself when there is nobody left to build, exactly as
+   * attack-move already disarms when the last soldier dies. Otherwise a player
+   * whose villagers have been raided goes on buying foundations that nothing
+   * will ever come to.
+   */
+  function refreshPlaceBar() {
+    if (!state.placement) return;
+    if (!anyVillager()) {
+      setPlacementMode(null);
+      toast('No villagers left to build — placement cancelled', 'warn');
+      return;
+    }
+    const sig = `${state.placement}:${state.placedThisArm}:${affordable(world, PLAYER, BUILDING_STATS[state.placement] && BUILDING_STATS[state.placement].cost) ? 1 : 0}`;
+    if (sig === state.placeSig) return;
+    state.placeSig = sig;
+    renderPlaceBar();
+  }
+
+  function anyVillager() {
+    for (const u of world.units) {
+      if (!u.dead && u.player === PLAYER && u.type === 'villager') return true;
+    }
+    return false;
+  }
+
   // --- Attack-move arming ---------------------------------------------------
   // "Advance to here and fight what you meet" is a two-part order: a verb and a
   // place. On a phone the verb has to be a button and the place has to be the
@@ -2025,9 +2145,17 @@ export function createHud(scene, world, audio = null) {
       return;
     }
 
-    // The two armed modes both claim the next tap; only one may be live.
+    // The two armed modes both claim the next tap; only one may be live. And
+    // the bar lives in the same slot as the sheets, so a sheet left open under
+    // it stacked another ~58px onto a column that is already the tightest thing
+    // on the screen — the one case where "the HUD is over everything" was the
+    // HUD arguing with itself.
     setPlacementMode(null);
     toggleBuildMenu(false);
+    toggleAlloc(false);
+    toggleMarket(false);
+    toggleMenu(false);
+    closeHelp();
 
     attackBar.textContent = '';
     const txt = el('div', 'txt', 'Attack-move armed');
@@ -2472,7 +2600,9 @@ export function createHud(scene, world, audio = null) {
       toggleBuildMenu(false);
       toggleMarket(false);
       closeHelp();
+      setAttackArmed(false, { quiet: true });
       renderAllocSheet();
+      markCut(allocSheet);
     }
   }
 
@@ -2617,7 +2747,9 @@ export function createHud(scene, world, audio = null) {
       toggleMenu(false);
       toggleBuildMenu(false);
       closeHelp();
+      setAttackArmed(false, { quiet: true });
       renderMarketSheet();
+      markCut(marketSheet);
     } else {
       state.liveMarket = null;
     }
@@ -2630,10 +2762,36 @@ export function createHud(scene, world, audio = null) {
     const inp = state.input;
     const pref = inp ? inp.getDragPreference() : 'auto';
     const eff = inp ? inp.effectiveDragMode() : 'pan';
-    const sig = `${pref}:${eff}`;
+    // WHILE PLACEMENT IS ARMED THIS BUTTON ENDS IT.
+    //
+    // The bar that explains what you are placing is pinned to the top of the
+    // screen, deliberately — the middle of the screen is where the ghost is and
+    // where the player is aiming. But that put the one control that ends the
+    // mode in the top-right corner, which index.html's own design note calls
+    // out as a place a one-handed thumb cannot reach without re-gripping. And
+    // this chip has nothing to say while placing: placement owns the drag, so
+    // "what does a drag do" is already answered.
+    //
+    // So the dock — the designated thumb zone, four buttons wide, always in the
+    // same place — grows a Done for as long as there is something to be done
+    // with. The bar keeps its own button too; they do the same thing.
+    const armed = !!state.placement;
+    const sig = armed ? `place:${state.placement}:${state.placedThisArm}` : `${pref}:${eff}`;
     if (modeChip.dataset.sig === sig) return;
     modeChip.dataset.sig = sig;
     modeChip.textContent = '';
+    modeChip.classList.toggle('is-done', armed);
+    if (armed) {
+      const n = state.placedThisArm;
+      modeChip.appendChild(el('span', 'glyph', '✓'));
+      modeChip.appendChild(el('span', 'lbl', n ? `Done ×${n}` : 'Cancel'));
+      modeChip.setAttribute('aria-label', n
+        ? `Stop placing. ${n} already queued.`
+        : 'Stop placing.');
+      modeChip.classList.remove('is-box');
+      return;
+    }
+    modeChip.removeAttribute('aria-label');
     modeChip.appendChild(el('span', 'glyph', eff === 'box' ? '⬚' : '✥'));
     modeChip.appendChild(el('span', 'lbl', eff === 'box' ? 'Select' : 'Pan'));
     if (pref === 'auto') modeChip.appendChild(el('span', 'auto', 'AUTO'));
@@ -2727,6 +2885,11 @@ export function createHud(scene, world, audio = null) {
   const onChip = (ev) => {
     ev.stopPropagation();
     click();
+    // While placement is armed this button is Done — see renderModeChip.
+    if (state.placement) {
+      setPlacementMode(null);
+      return;
+    }
     if (state.input && state.input.cycleDragPreference) {
       const next = state.input.cycleDragPreference();
       toast(next === 'auto' ? 'Drag: automatic' : next === 'box' ? 'Drag: box-select' : 'Drag: pan camera', 'info');
@@ -2738,6 +2901,7 @@ export function createHud(scene, world, audio = null) {
   // --- Minimap interaction --------------------------------------------------
 
   let miniDragging = false;
+  let miniStart = null;
 
   function miniJump(ev) {
     if (!dom.minimap || !minimap) return;
@@ -2751,28 +2915,54 @@ export function createHud(scene, world, audio = null) {
     );
   }
 
+  // THE JUMP HAPPENS ON RELEASE, NOT ON TOUCH. The minimap is 116px square and
+  // sits six pixels above the dock, so overshooting the top of a dock button by
+  // a thumb's width used to teleport the camera across the map before the
+  // finger had even settled — no threshold, no undo, and the player's hand was
+  // nowhere near where they now were. Pressing and dragging still scrubs the
+  // camera live, which is the one case where following the finger is the point;
+  // a press that never moves resolves when it lifts, and a press that slides
+  // off onto the dock resolves nowhere.
+  let miniMoved = false;
   const onMiniDown = (ev) => {
     ev.preventDefault();
     ev.stopPropagation();
     miniDragging = true;
+    miniMoved = false;
+    miniStart = { x: ev.clientX, y: ev.clientY };
     click();
     if (dom.minimap.setPointerCapture) {
       try { dom.minimap.setPointerCapture(ev.pointerId); } catch (_) { /* fine */ }
     }
-    miniJump(ev);
   };
   const onMiniMove = (ev) => {
     if (!miniDragging) return;
     ev.preventDefault();
+    if (!miniMoved && miniStart &&
+        Math.hypot(ev.clientX - miniStart.x, ev.clientY - miniStart.y) <= MINI_DRAG_SLOP) return;
+    miniMoved = true;
     miniJump(ev);
   };
-  const onMiniUp = () => { miniDragging = false; };
+  const onMiniUp = (ev) => {
+    if (miniDragging && !miniMoved && ev && Number.isFinite(ev.clientX) &&
+        inside(dom.minimap, ev.clientX, ev.clientY)) {
+      miniJump(ev);
+    }
+    miniDragging = false;
+    miniStart = null;
+  };
+
+  /** Is this client point still over `node`? */
+  function inside(node, x, y) {
+    const r = node.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  }
 
   if (dom.minimap) {
     dom.minimap.addEventListener('pointerdown', onMiniDown);
     dom.minimap.addEventListener('pointermove', onMiniMove);
     dom.minimap.addEventListener('pointerup', onMiniUp);
-    dom.minimap.addEventListener('pointercancel', onMiniUp);
+    dom.minimap.addEventListener('pointercancel', () => { miniDragging = false; miniStart = null; });
   }
 
   // Tapping the map (never the HUD) closes any transient sheet.
@@ -2834,7 +3024,9 @@ export function createHud(scene, world, audio = null) {
     refreshAlloc();
     refreshMarket();
 
+    refreshPlaceBar();
     renderModeChip();
+    syncSheetOpen();
     perfEnd('hud.dom', _tDom);
 
     state.minimapAcc += dt;
@@ -2844,6 +3036,28 @@ export function createHud(scene, world, audio = null) {
       minimap.draw(camera());
       perfEnd('hud.minimap', _t);
     }
+  }
+
+  /**
+   * Tell the stylesheet whether anything is open over the map.
+   *
+   * A sheet is 300-440px tall and it sits in a column that already holds the
+   * minimap (116), the dock (50) and the build queue, above a bottom bar that
+   * is another 110-250. Measured with the menu open on a 390x844 phone, the
+   * player could see six pixels of map at the top of the screen and six more
+   * between the sheet and the dock. That is not a HUD over a game any more.
+   *
+   * So while a sheet is up, the two ornaments in the column stand down: the
+   * minimap (pinch and pan reach everywhere it does) and the build queue strip
+   * (it is a progress readout, and the thing in front of you is a decision).
+   * The dock stays, because it is how the sheet gets closed.
+   */
+  function syncSheetOpen() {
+    const open = !buildMenu.hidden || !allocSheet.hidden || !marketSheet.hidden ||
+      !menuSheet.hidden || !helpSheet.hidden || !attackBar.hidden;
+    if (open === state.sheetOpen) return;
+    state.sheetOpen = open;
+    root.classList.toggle('sheet-open', open);
   }
 
   // --- Scroll fades -----------------------------------------------------------
@@ -2884,6 +3098,13 @@ export function createHud(scene, world, audio = null) {
   watchScroller(buildMenu);
   watchScroller(menuSheet);
   watchScroller(helpSheet);
+  // These two scroll for exactly the same reason and were simply left out, so
+  // on any phone where the allocation sheet did not fit — a 640px screen, every
+  // landscape — the "Even split" and "Close" buttons sat below the fold with
+  // nothing on screen to suggest there was a fold.
+  watchScroller(allocSheet);
+  watchScroller(marketSheet);
+  watchScroller(dom.selPanel);
 
   function commandSignature() {
     const sel = selectedEntities(world);
@@ -2926,6 +3147,11 @@ export function createHud(scene, world, audio = null) {
     state.destroyed = true;
     if (sizeObserver) sizeObserver.disconnect();
     if (topObserver) topObserver.disconnect();
+    win.removeEventListener('resize', onResize);
+    win.removeEventListener('orientationchange', onResize);
+    root.classList.remove('is-tight');
+    root.classList.remove('sheet-open');
+    root.style.removeProperty('--band');
     root.style.removeProperty('--hud-h');
     root.style.removeProperty('--topbar-h');
     root.style.removeProperty('--placebar-h');
@@ -2981,12 +3207,33 @@ export function createHud(scene, world, audio = null) {
     // only full-width thing the toast stack ever holds and it must be measured.
     _ageCard: ageCard,
     alertCount: () => state.alerts,
+    /**
+     * How much of the canvas the HUD is sitting on, in CSS px.
+     *
+     * The map is drawn across the whole viewport but only the middle of it is
+     * visible: the resource bar covers the top and the dock, the minimap and
+     * the bottom bar cover a much deeper strip at the bottom. Everything that
+     * aims the camera used the geometric centre of the canvas, which on the
+     * reference phone is ~115px below the centre of the part you can see — so
+     * "centre on Town Center", the minimap jump and the idle-villager button
+     * all put their target underneath the dock, which is also exactly where
+     * the player's thumb is. The input layer offsets by this instead.
+     */
+    viewInsets: () => ({ top: state.topH || 0, bottom: state.hudH || 0 }),
     attachInput(input) { state.input = input; modeChip.dataset.sig = ''; },
     _dom: dom,
     _minimap: minimap,
   };
 
+  // The band also moves when the window does — a rotate, a keyboard, a browser
+  // chrome bar sliding away — and neither ResizeObserver fires for that on its
+  // own when the bars happen to keep their height.
+  const onResize = () => syncBand();
+  win.addEventListener('resize', onResize);
+  win.addEventListener('orientationchange', onResize);
+
   // First paint.
+  syncBand();
   updateResources();
   updateIdle();
   renderSelection();

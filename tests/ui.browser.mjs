@@ -1522,7 +1522,7 @@ async function placementGhostRun() {
       const canvas = g.scene.game.canvas;
       const r = canvas.getBoundingClientRect();
       const size = g.scene.game.scale.gameSize;
-      const GHOST_LIFT = 62; // must match ui/input.js
+      const GHOST_LIFT = g.input._ghostLift(); // the lift the ghost is actually using
       const opts = {
         pointerId: 11,
         pointerType: 'touch',
@@ -1586,7 +1586,7 @@ async function placementGhostRun() {
         pointerId: 12,
         pointerType: 'touch',
         clientX: r.left + (p.x * r.width) / size.width,
-        clientY: r.top + ((p.y + 62) * r.height) / size.height,
+        clientY: r.top + ((p.y + g.input._ghostLift()) * r.height) / size.height,
         bubbles: true,
         cancelable: true,
       };
@@ -1609,7 +1609,7 @@ async function placementGhostRun() {
         pointerId: 13,
         pointerType: 'touch',
         clientX: r.left + (p.x * r.width) / size.width,
-        clientY: r.top + ((p.y + 62) * r.height) / size.height,
+        clientY: r.top + ((p.y + g.input._ghostLift()) * r.height) / size.height,
         bubbles: true,
         cancelable: true,
       };

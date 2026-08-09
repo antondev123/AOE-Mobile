@@ -8,6 +8,8 @@
     "serve": "python3 -m http.server 8080",
     "test": "node --test \"tests/*.test.mjs\"",
     "smoke": "node tests/smoke.mjs",
+    "test:browser": "node tests/mobile.browser.mjs && node tests/ui.browser.mjs && node tests/touchui.browser.mjs && node tests/camera.browser.mjs && node tests/combat.browser.mjs",
+    "test:mobile": "node tests/mobile.browser.mjs",
     "standalone": "node tools/build-standalone.mjs"
   },
   "devDependencies": {

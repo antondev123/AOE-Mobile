@@ -11,11 +11,11 @@
 import {
   RES, CARRY_CAPACITY, GATHER_RATE, BUILD_RATE,
   UNIT_STATS, BUILDING_STATS, TERRAIN, MAX_POP_CAP, PLAYER,
-  isWallType, isGateType,
+  isWallType, isGateType, wallFamily,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
-  spawnUnit, spawnBuilding, removeEntity, canPlace, isBlocked, inBounds,
+  spawnUnit, spawnBuilding, removeEntity, canPlace, placeBlockedBy, isBlocked, inBounds,
   applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy, forEachNear,
   onBuildingComplete, setGateOpen, isHostile,
 } from '../core/world.js';
@@ -482,8 +482,35 @@ export function placementRefusal(world, playerId, type, gx, gy) {
   // *some* tiles would teach the player that the tile was the problem.
   const locked = lockReason(world, playerId, type);
   if (locked) return locked;
-  if (!canPlace(world, gx, gy, s.fw, s.fh)) return 'Cannot build there';
+  // A gate cut into one of our own wall segments is not "blocked" — see
+  // gateReplaceable and the note in placeFoundation. The ghost has to know, or
+  // it goes red over the one tile the placement will actually accept.
+  if (!gateReplaceable(world, playerId, type, gx, gy)) {
+    const blocked = placeBlockedBy(world, gx, gy, s.fw, s.fh);
+    if (blocked) return blocked;
+  }
   return placementTrapReason(world, playerId, type, gx, gy);
+}
+
+/**
+ * The wall segment a gate would be cut into here, or null.
+ *
+ * Only ours, only a finished-or-building wall of the same family, only for a
+ * type that is actually a gate, and only for the 1x1 footprint every gate has.
+ * Everything else falls through to the ordinary "something is in the way".
+ */
+export function gateReplaceable(world, playerId, type, gx, gy) {
+  if (!isGateType(type)) return null;
+  const fam = wallFamily(type);
+  if (!fam) return null;
+  const tx = Math.floor(gx);
+  const ty = Math.floor(gy);
+  if (!inBounds(world, tx, ty)) return null;
+  const id = world.occupant[ty * world.width + tx];
+  const e = id ? world.entities.get(id) : null;
+  if (!e || e.dead || e.kind !== 'building' || e.player !== playerId) return null;
+  if (isGateType(e.type) || wallFamily(e.type) !== fam) return null;
+  return e;
 }
 
 /**
@@ -517,9 +544,26 @@ export function placeFoundation(world, playerId, type, gx, gy, opts = {}) {
     }
     return null;
   }
-  if (!canPlace(world, gx, gy, s.fw, s.fh)) {
-    if (!quiet) world.events.emit(EV.TOAST, { text: `Cannot build there`, tone: 'warn' });
-    return null;
+  // A GATE GOES INTO A WALL, which is the only place anybody has ever wanted
+  // one. BUILDABLE lists the gate right beside its wall "because they are
+  // placed in the same breath: you draw a run and then put the door in it" —
+  // and the code refused exactly that, because a wall segment blocks its tile
+  // and canPlace does not care who put it there. The only way through was to
+  // select the segment, demolish it for no refund, and then hit the one-tile
+  // gap with a ghost that (before this pass) did not even agree with the drag
+  // about which tile it was on.
+  //
+  // So the gate replaces the segment. Same owner, same wall family, and the
+  // segment's cost comes back — the player is not paying twice for one tile,
+  // and swapping a palisade for a stone gate is not a way to launder cheap wood
+  // into an expensive wall.
+  const replaces = gateReplaceable(world, playerId, type, gx, gy);
+  if (!replaces) {
+    const blocked = placeBlockedBy(world, gx, gy, s.fw, s.fh);
+    if (blocked) {
+      if (!quiet) world.events.emit(EV.TOAST, { text: blocked, tone: 'warn' });
+      return null;
+    }
   }
   // skipTrap: the wall-line placer has already asked this question once about
   // the finished run, which is both the cheaper and the more honest form of it
@@ -541,6 +585,14 @@ export function placeFoundation(world, playerId, type, gx, gy, opts = {}) {
     return null;
   }
   if (!pay(world, playerId, s.cost, `build:${type}`)) return null;
+
+  // The segment comes out only once the gate is paid for, so a refused payment
+  // cannot leave a hole in the wall.
+  if (replaces) {
+    const back = BUILDING_STATS[replaces.type] && BUILDING_STATS[replaces.type].cost;
+    if (back) refund(world, playerId, back, `regate:${replaces.type}`);
+    removeEntity(world, replaces);
+  }
 
   const b = spawnBuilding(world, type, playerId, gx, gy, { complete: false });
   // A building started in the Castle Age is a Castle Age building from the
@@ -617,7 +669,7 @@ export const MAX_WALL_RUN = 40;
 export function planWallLine(world, playerId, type, tiles) {
   const s = BUILDING_STATS[type];
   const out = {
-    segments: [], count: 0, cost: {}, refused: 0, reason: null, trapped: null,
+    segments: [], count: 0, cost: {}, refused: 0, reason: null, trapped: null, capped: 0,
   };
   if (!s) return out;
   const locked = lockReason(world, playerId, type);
@@ -626,12 +678,17 @@ export function planWallLine(world, playerId, type, tiles) {
   for (const k of RES_KEYS) purse[k] = p ? (p.resources[k] || 0) : 0;
 
   const run = tiles.slice(0, MAX_WALL_RUN);
+  // How many the player asked for that this run will not include. Reported
+  // rather than dropped: a 60-tile drag used to read "40 palisades" with the
+  // other 20 gone in silence, so the preview and the wall disagreed and nothing
+  // ever said why.
+  out.capped = Math.max(0, tiles.length - run.length);
   const buildable = [];
   for (const [tx, ty] of run) {
     const gx = tx + s.fw / 2;
     const gy = ty + s.fh / 2;
     let why = locked;
-    if (!why && !canPlace(world, gx, gy, s.fw, s.fh)) why = 'Cannot build there';
+    if (!why) why = placeBlockedBy(world, gx, gy, s.fw, s.fh);
     if (!why) {
       for (const k of RES_KEYS) {
         if ((s.cost[k] || 0) > purse[k]) { why = 'Not enough resources'; break; }

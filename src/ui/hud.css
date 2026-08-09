@@ -124,8 +124,14 @@ body {
   display: flex;
   gap: 6px;
   align-items: flex-start;
-  /* Swallow taps: an order issued under the HUD would land where you cannot see. */
-  pointer-events: auto;
+  /* NOT `auto`. There is nothing to tap up here any more — every control moved
+     into the dock (see the note in index.html) — so swallowing taps bought
+     nothing and cost 378x34px of map, about 4% of the screen, where a tap did
+     precisely nothing and nothing said why. The bar itself is opaque, so an
+     order issued *through* it still lands somewhere the player cannot see; that
+     is the same deal the rest of the map gets under a transparent HUD, and it
+     is a better deal than a dead zone. */
+  pointer-events: none;
 }
 
 /* Six things live in this bar now — four resources, the population and the age.
@@ -141,7 +147,8 @@ body {
    numbers to 11px so it never wraps — trades a rare second line for a
    permanently harder-to-read counter, which is the wrong way round. */
 .res-bar {
-  pointer-events: auto;
+  /* Read-only, like the strip that holds it — see .hud-top. */
+  pointer-events: none;
   display: flex;
   flex-wrap: wrap;
   gap: 0;
@@ -270,21 +277,64 @@ body {
    rather than landing on top of it, and the whole stack rides on --hud-h, which
    the HUD measures off the bottom bar. */
 
+/* THE STACK IS BOUNDED AT BOTH ENDS, which is the whole reason a sheet can no
+   longer walk off the top of the screen. It used to be anchored only at the
+   bottom and left to grow upwards as tall as its contents wanted, while each
+   sheet capped itself at 52vh — a fraction of the *viewport*, not of the space
+   the sheet actually had. Those are different numbers, and the gap between them
+   is exactly what the player lost: on a 360x640 phone the free band above the
+   dock is ~240px and 52vh is 333, so the menu sheet opened with its title and
+   its first two rows above y=0, unreachable and unscrollable — the sheet's own
+   scroller only owned the part of it that was on screen.
+
+   With a `top` as well as a `bottom`, the column is exactly the free band, the
+   sheets slot is the only part allowed to flex, and a sheet that does not fit
+   scrolls inside the band instead of escaping it. */
 .hud-stack {
   position: absolute;
   left: calc(var(--safe-l) + 6px);
   right: calc(var(--safe-r) + 6px);
-  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 6px);
+  top: calc(var(--safe-t) + var(--topbar-h, 48px) + 4px);
+  bottom: calc(var(--hud-h, 114px) + 6px);
   display: flex;
   flex-direction: column;
   align-items: stretch;
+  justify-content: flex-end;
   gap: 6px;
   /* The column itself is a layout device and must never eat a tap meant for the
      map; each child opts back in. */
   pointer-events: none;
 }
-.hud-stack > * { pointer-events: auto; }
+.hud-stack > * { pointer-events: auto; flex: 0 0 auto; }
+/* The one flexible slot: everything else in the column keeps its natural size
+   and the sheet gives way. min-height:0 is load-bearing — without it a flex
+   item refuses to shrink below its content and the clamp above does nothing. */
+.hud-sheets {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-height: 0;
+  flex: 0 1 auto;
+}
+.hud-sheets > * { min-height: 0; max-height: 100%; }
 .hud-sheets:empty { display: none; }
+
+/* --- When the band runs out --------------------------------------------------
+   Under TIGHT_BAND (see ui/hud.js) the dock, the minimap and whatever is open
+   cannot all be on screen and still leave a map worth looking at. Something has
+   to go, and it is the minimap: pinch and pan reach everywhere it does, whereas
+   the dock holds the only doors to Jobs, the menu and the idle villagers.
+
+   It is hidden rather than shrunk because a 60px minimap of a 96x96 map is
+   less than a pixel a tile — a smear that costs 60px of map to be wrong with. */
+.hud.is-tight .hud-minimap { display: none; }
+.hud.is-tight .build-queue { max-height: 46px; overflow: hidden; }
+
+/* Same trade, taken deliberately rather than because the screen is small: while
+   a sheet is open the column stands its ornaments down so the map is still
+   there behind the decision being made. See syncSheetOpen in ui/hud.js. */
+.hud.sheet-open .hud-minimap,
+.hud.sheet-open .build-queue { display: none; }
 
 /* --- Dock -------------------------------------------------------------------
    The four things a thumb reaches for without looking: what a drag does, idle
@@ -401,7 +451,33 @@ body {
   animation: toastin 160ms ease-out;
 }
 .toast.warn { border-left-color: var(--danger); color: #ffd9d1; }
-.toast.out { animation: toastout 260ms ease-in forwards; }
+/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
+   The exit is a 260ms fade, and for those 260ms the box kept its full height in
+   the flex column — so a stack the HUD believes is two lines tall is briefly
+   four, and the stack sits over the top-left of the map, which is where the
+   player's own base usually is. Measured at 176px against a 96px contract.
+   Collapsing max-height alongside the fade keeps the animation and gives the
+   map back on the frame the toast is retired; the 120px start is simply larger
+   than any toast this stack holds (the alert, the tallest, is 54). */
+/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
+   The exit is a 260ms fade, and for those 260ms the box kept its full place in
+   the flex column — so a stack the HUD believes is two lines tall is really
+   three or four, over the top-left of the map, which is where the player's own
+   base usually is. Measured at 176px against the 96px this stack is allowed.
+
+   Taking it out of flow rather than collapsing its height is what keeps the
+   animation honest: an animated max-height gives the space back gradually,
+   which is no good to a test or to a player who is looking at the map *now*.
+   Out of flow, the survivors slide up immediately and the retired line fades
+   over them, which is what a crossfade looks like anyway. It keeps its static
+   position, so it fades exactly where it was. */
+.toast.out {
+  animation: toastout 260ms ease-in forwards;
+  position: absolute;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
 @keyframes toastin  { from { opacity: 0; transform: translateX(-14px); } }
 @keyframes toastout { to   { opacity: 0; transform: translateY(-8px); } }
 
@@ -522,6 +598,10 @@ body {
   padding: 0 3px;
 }
 .mode-chip.is-box { border-color: var(--gold); }
+/* While placement is armed the chip is the Done button (see renderModeChip):
+   loud, because it is the way out of a mode that claims every tap on the map. */
+.mode-chip.is-done { border-color: var(--gold); background: linear-gradient(180deg, #5a4120 0%, #33240f 100%); }
+.mode-chip.is-done .glyph, .mode-chip.is-done .lbl { color: var(--gold); }
 .mode-chip.is-box .glyph, .mode-chip.is-box .lbl { color: var(--gold); }
 
 @keyframes idlepulse {
@@ -540,7 +620,13 @@ body {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  pointer-events: auto;
+  /* NOT `auto`. The bar's own box is mostly its fade — at full height the top
+     42% is a gradient that starts fully transparent, so the player can see
+     units through it perfectly well and used to have their taps swallowed by a
+     surface that did not look like a surface. The panels inside opt back in
+     (they already carry `pointer-events: auto`), which leaves the see-through
+     part of the bar as what it looks like: map. */
+  pointer-events: none;
   background: linear-gradient(180deg, rgba(15, 11, 7, 0) 0%, rgba(15, 11, 7, 0.72) 42%, rgba(15, 11, 7, 0.95) 100%);
 }
 
@@ -565,7 +651,40 @@ body {
   min-height: 96px;
 }
 
-.sel-panel { flex: 0 0 40%; max-width: 168px; overflow: hidden; }
+.sel-panel {
+  flex: 0 0 40%;
+  max-width: 168px;
+  /* Capped and scrolling for the same reason the command panel is: it was the
+     one part of the bottom bar with no ceiling, so a selection with six
+     different unit types in it could push the bar past the budget the panel
+     beside it is careful to respect — and then clip the overflow with
+     `overflow: hidden` and no way to reach it. */
+  max-height: min(30vh, 240px);
+  max-height: min(30dvh, 240px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* --- Nothing selected -------------------------------------------------------
+   The commonest state in the match, and the one the bottom bar was worst at.
+   Two panels at their 96px floor held "Nothing selected." and "Select a unit or
+   building for orders." — 108px of a 844px phone, permanently, to say twice
+   that there was nothing to say, while the map above it was the game. Collapsed
+   to one line the bar gives ~70px back to every screen that is not commanding
+   anything, which on a 360x640 phone is the difference between a third of the
+   screen being chrome and a fifth. The hint survives, because a player who has
+   just deselected everything is exactly the player who needs it. */
+.hud.is-idle .hud-bottom { background: none; padding-top: 0; }
+.hud.is-idle .sel-panel,
+.hud.is-idle .cmd-panel { min-height: 0; padding: 4px 8px; }
+.hud.is-idle .sel-panel {
+  flex: 1 1 auto;
+  max-width: none;
+}
+/* The right-hand panel has nothing to say while the left one is saying it. */
+.hud.is-idle .cmd-panel { display: none; }
+.hud.is-idle .sel-empty { padding: 0; font-size: 11.5px; }
+.hud.is-idle .sel-hint { margin-top: 1px; font-size: 10.5px; }
 /* Capped and scrolling. A Barracks in the Castle Age offers four upgrades on
    top of two units, a queue row and a rally line, and without a ceiling the
    bottom bar grew until it owned two thirds of the screen — which is the one
@@ -577,7 +696,11 @@ body {
   flex-wrap: wrap;
   align-content: flex-start;
   gap: 5px;
-  max-height: 40vh;
+  /* Bounded against the *free band*, not the raw viewport: `vh` does not know
+     that the dock, the minimap and the top bar have already spent the screen.
+     --band is the height the HUD measures for the map area (see hud.js). */
+  max-height: min(30vh, 240px);
+  max-height: min(30dvh, 240px);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -905,7 +1028,10 @@ body {
   min-width: 0;
   display: flex;
   flex-wrap: wrap;
-  gap: 3px;
+  /* 6px, not 3. These are the stance buttons — Aggressive next to No Attack —
+     and 3px between two 44px targets is inside the error of a thumb: the
+     controls meet the size floor and then fail it by being adjacent. */
+  gap: 6px;
   margin-top: 2px;
 }
 .segrow .seg {
@@ -1140,7 +1266,9 @@ body {
 .build-menu .cbtn.danger {
   flex: 1 1 100%;
   position: sticky;
-  top: -6px;
+  /* 0, not -6: a negative offset tucks 6 of the button's 44px under the
+     scroller's padding edge, and this is the control that closes the sheet. */
+  top: 0;
   z-index: 1;
   background: linear-gradient(180deg, #4a2a1f 0%, #2f1a14 100%);
 }
@@ -1149,7 +1277,12 @@ body {
 /* The menu is capped and scrolls rather than growing: it now lists the whole
    tech tree, and a sheet tall enough for three shelves of buildings would cover
    the base the player is standing in. */
-.build-menu { max-height: 46vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+.build-menu {
+  max-height: min(46vh, 100%);
+  max-height: min(46dvh, 100%);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
 
 /* Age shelves. The locked heading is the label doing the teaching, so it keeps
    its full contrast even though everything under it is dimmed. */
@@ -1210,7 +1343,13 @@ body {
   top: calc(var(--safe-t) + var(--topbar-h, 48px) + var(--placebar-h, 64px));
 }
 
-.place-bar .txt { flex: 1 1 auto; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
+.place-bar .txt { flex: 1 1 auto; min-width: 0; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
+.place-bar .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.place-bar .head .cost { font-size: 11px; }
+/* The next one is unaffordable: say so on the bar rather than only in a toast
+   after the tap is spent. */
+.place-bar.is-poor { border-color: #8c5a2b; }
+.place-bar.is-poor .txt small { color: #ffb4a6; }
 .place-bar .txt small { display: block; font-weight: 600; color: var(--parch-dim); font-size: 10.5px; }
 .place-bar button { min-height: var(--tap); min-width: var(--tap); padding: 0 10px; font-weight: 800; font-size: 12px; }
 
@@ -1248,7 +1387,8 @@ body {
    and a scroller. 52vh is the same ceiling the other two sheets use — the map
    underneath has to stay more than half visible whatever is open over it. */
 .menu-sheet {
-  max-height: 52vh;
+  max-height: min(52vh, 100%);
+  max-height: min(52dvh, 100%);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -1263,7 +1403,8 @@ body {
    sheet 76px above the top of the phone. The layout sweep in
    tests/touchui.browser.mjs is what caught it. */
 .help-sheet {
-  max-height: min(52vh, 400px);
+  max-height: min(52vh, 400px, 100%);
+  max-height: min(52dvh, 400px, 100%);
   font-size: 12.5px;
   color: var(--parch-dim);
 }
@@ -1275,7 +1416,10 @@ body {
    bullet points sliding under it is unreadable in both directions. */
 .help-sheet button.primary {
   position: sticky;
-  bottom: -6px;
+  /* 0, not -6. A negative offset tucks the button under the scroller's padding
+     edge and clips 6 of its 44px away, which is the touch floor failed by the
+     one control that closes the sheet. */
+  bottom: 0;
   /* Above the scroll fade, which is also pinned to the bottom of this scroller
      and would otherwise wash over the one button in the sheet. */
   z-index: 2;
@@ -1335,7 +1479,14 @@ body {
   margin: 0;
   background: transparent;
   pointer-events: auto;
-  touch-action: none;
+  /* pan-y, NOT none. The comment this replaces was right that the map's own
+     handler never sees these events — but the *sheet* they live in scrolls, and
+     `none` told the browser to ignore a vertical drag here too. Four 44px
+     slider rows are 176px of a 368px allocation sheet, so on any phone where
+     that sheet did not fit, half its surface silently nudged a percentage
+     instead of scrolling to the buttons at the bottom. `pan-y` keeps the
+     horizontal drag for the slider and gives the vertical one back. */
+  touch-action: pan-y;
 }
 .sound-row input[type="range"]::-webkit-slider-runnable-track {
   height: 8px;
@@ -1383,6 +1534,30 @@ body {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   animation: sheetin 140ms ease-out;
+  /* A HORIZONTAL SCROLLER NEEDS TO SAY SO. This strip is 364px wide at 390 and
+     the title and Clear take 130 of it, so about four 49px chips fit — and the
+     feature it exists for is placing a whole row of houses in one arming. iOS
+     paints no scrollbar until you touch, the `.is-cut` fade is vertical-only,
+     so chips five and up were simply absent. The mask fades the right-hand edge
+     whenever there is more to the right, which is a thing the eye reads as
+     "keep going" without anybody having to be told. */
+  --bq-fade: 22px;
+  -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - var(--bq-fade)), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 calc(100% - var(--bq-fade)), transparent 100%);
+}
+/* No fade when everything fits: scroll-driven, so it costs no measurement and
+   cannot go stale. Falls back to a permanent (harmless) fade where animation
+   timelines are unsupported. */
+@supports (animation-timeline: scroll(self inline)) {
+  .build-queue {
+    animation: sheetin 140ms ease-out, bqfade linear;
+    animation-timeline: auto, scroll(self inline);
+  }
+  @keyframes bqfade {
+    from { --bq-fade: 22px; }
+    to   { --bq-fade: 0px; }
+  }
+  @property --bq-fade { syntax: "<length>"; inherits: false; initial-value: 22px; }
 }
 .build-queue .qtitle {
   flex: 0 0 auto;
@@ -1431,7 +1606,8 @@ body {
   border: 1px solid var(--edge);
   border-radius: var(--r);
   box-shadow: var(--shadow);
-  max-height: 52vh;
+  max-height: min(52vh, 100%);
+  max-height: min(52dvh, 100%);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   animation: sheetin 140ms ease-out;
@@ -1517,7 +1693,14 @@ body {
   margin: 0;
   background: transparent;
   pointer-events: auto;
-  touch-action: none;
+  /* pan-y, NOT none. The comment this replaces was right that the map's own
+     handler never sees these events — but the *sheet* they live in scrolls, and
+     `none` told the browser to ignore a vertical drag here too. Four 44px
+     slider rows are 176px of a 368px allocation sheet, so on any phone where
+     that sheet did not fit, half its surface silently nudged a percentage
+     instead of scrolling to the buttons at the bottom. `pan-y` keeps the
+     horizontal drag for the slider and gives the vertical one back. */
+  touch-action: pan-y;
 }
 .alloc-row input[type="range"]::-webkit-slider-runnable-track {
   height: 8px;
@@ -1564,7 +1747,8 @@ body {
   border: 1px solid var(--edge);
   border-radius: var(--r);
   box-shadow: var(--shadow);
-  max-height: 52vh;
+  max-height: min(52vh, 100%);
+  max-height: min(52dvh, 100%);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
   animation: sheetin 140ms ease-out;
@@ -1690,8 +1874,13 @@ body {
   .sel-head { margin-bottom: 2px; }
   .hpbar { margin-top: 3px; }
   .sel-panel { flex: 0 0 156px; }
-  .chip { min-width: 34px; min-height: 34px; }
-  .chip .badge { width: 18px; height: 18px; font-size: 9px; }
+  /* 40, not 34. Everything else in this file is held to the 44px floor and
+     this one control quietly went 23% under it — on the screen with the least
+     room for a mis-tap, and never noticed because nothing tests landscape. 40
+     with the 6px gap either side is the most this row can give and still fit
+     six groups. */
+  .chip { min-width: 40px; min-height: 40px; }
+  .chip .badge { width: 20px; height: 20px; font-size: 9px; }
   .hp-text { display: none; }
   .sel-empty { font-size: 11px; }
   .place-bar { flex-wrap: nowrap; }
@@ -1702,17 +1891,46 @@ body {
      screen than a portrait one. */
   .hud-minimap {
     position: fixed;
-    top: calc(var(--safe-t) + 6px);
+    /* Under the resource strip, not on it. The strip is full width with its own
+       background, so a minimap pinned to `safe-t + 6` sat on top of the
+       numbers — and the placement bar, which is pinned to the same measured
+       height and carries a higher z-index, then sat on top of the minimap. */
+    top: calc(var(--safe-t) + var(--topbar-h, 48px));
     right: calc(var(--safe-r) + 6px);
     align-self: auto;
   }
   #minimap { width: 92px; height: 92px; }
   .hud-dock { gap: 4px; }
   .dock-btn { min-height: 44px; font-size: 9.5px; }
-  .alloc-sheet { max-height: 62vh; }
-  .hud-toasts { top: calc(var(--safe-t) + var(--topbar-h, 44px)); width: min(34vw, 182px); }
+  /* NOT 62vh. Raising the ceiling on the shortest viewport in the game is
+     backwards: 62vh of 360 is 223px against 187 under the portrait rule, and
+     with the bar and the dock that left a ten-pixel strip of map. The sheet is
+     bounded by the band like everything else and scrolls when it has to. */
+  .alloc-sheet { max-height: 100%; }
+  .hud-toasts { top: calc(var(--safe-t) + var(--topbar-h, 48px)); width: min(34vw, 182px); }
   .cbtn { font-size: 10.5px; }
   .cbtn .cost { font-size: 9.5px; }
+}
+
+/* --- Short portrait ----------------------------------------------------------
+   The gap this file had. There was a phone layout and a landscape layout, and
+   nothing in between: every portrait screen from 500px to 844px tall got the
+   390x844 design, whose fixed furniture (top strip 40, minimap 116, dock 50,
+   bottom bar 108+) is 314px whatever the screen is. On a 360x640 Android that
+   is 52% of the viewport before anything is selected and 77% with a Barracks
+   in hand. The `vh` ceilings shrank proportionally; the px ones did not.
+
+   So on a short portrait screen the furniture gets smaller rather than the map.
+   Nothing here goes under the 44px touch floor. */
+@media (orientation: portrait) and (max-height: 720px) {
+  #minimap { width: 92px; height: 92px; }
+  .dock-btn { min-height: 46px; font-size: 9.5px; }
+  .hud-stack { gap: 5px; }
+  .sel-panel, .cmd-panel { min-height: 78px; padding: 4px 5px; }
+  .cmd-panel { max-height: min(28vh, 190px); max-height: min(28dvh, 190px); }
+  .sel-panel { max-height: min(28vh, 190px); max-height: min(28dvh, 190px); }
+  .hud-bottom { padding-top: 4px; }
+  .toast { font-size: 11px; padding: 4px 7px; }
 }
 
 @media (max-width: 340px) {
@@ -1727,9 +1945,22 @@ body {
   inset: 0;
   z-index: 40;
   display: flex;
-  align-items: center;
+  /* `align-items: center` centres a card that is TALLER than its box by pushing
+     its top above the scroll origin, where no amount of scrolling can reach it
+     — the classic centred-flex overflow trap. On a 360x640 phone the boot card
+     with "How to play" expanded is ~750px in a 608px box, so the title, Resume
+     match and Start Skirmish all sat above y=0 and the game could not be
+     started. `margin: auto` on the card centres it when it fits and leaves it
+     scrollable when it does not.
+     The horizontal safe-area insets are here for the same reason every other
+     full-bleed element in this file has them: in landscape on a notched phone
+     the 420px card slides under the notch and the rounded corner. */
   justify-content: center;
-  padding: calc(var(--safe-t) + 16px) 16px calc(var(--safe-b) + 16px);
+  padding:
+    calc(var(--safe-t) + 16px)
+    calc(var(--safe-r) + 16px)
+    calc(var(--safe-b) + 16px)
+    calc(var(--safe-l) + 16px);
   background:
     radial-gradient(120% 80% at 50% 0%, #3a2a19 0%, #150f09 65%),
     var(--bg);
@@ -1737,6 +1968,7 @@ body {
 }
 
 .boot-card, .endcard-inner {
+  margin: auto;
   width: min(420px, 100%);
   padding: 20px 18px;
   text-align: center;
