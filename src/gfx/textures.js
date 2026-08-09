@@ -178,6 +178,39 @@ export const DETAIL_BOX = { w: 34, h: 24, ax: 17, ay: 18 };
 export const CLIFF_H = 30;
 export const CLIFF_VARIANTS = 3;
 
+// --- The number font ---------------------------------------------------------
+//
+// Every floating label the game draws is a number with a sign on it: `-12` off a
+// blow that landed, `+15` off a load coming home. They used to be Phaser Text
+// objects, and each one of those carries its own canvas-backed texture — so a
+// melee with a dozen numbers over it cost a dozen extra texture binds, which is
+// a dozen extra draw calls, and a fresh canvas rasterisation and GPU upload
+// every time a number was born. Measured on the stress scenario that was the
+// difference between 18 and 37 draw calls a frame, for eighteen sprites' worth
+// of information.
+//
+// Baking the twelve glyphs into the atlas puts them in the same batch as every
+// other quad in the game: a four-digit number is four more quads on a batch that
+// is already several hundred, and the draw call count does not move at all.
+//
+// They are baked at GLYPH_PX and drawn smaller — the labels want 12 to 17 screen
+// pixels — so what the GPU samples is a supersampled glyph rather than a
+// magnified one. Baked white over a dark outline, so the renderer can tint the
+// number itself (red for your losses, warm white for theirs) and have the
+// outline stay dark.
+export const GLYPHS = '0123456789+-';
+export const GLYPH_PX = 28;
+/** Frame name for one glyph. '+' and '-' cannot go in a frame key verbatim. */
+export function glyphFrame(ch) {
+  return ch === '+' ? 'gl_plus' : ch === '-' ? 'gl_minus' : `gl_${ch}`;
+}
+/**
+ * Advance width of each glyph in baked pixels, and the common baseline offset.
+ * Filled in by buildTextures, because only the browser knows what the system
+ * font actually measures.
+ */
+export const GLYPH_METRICS = { advance: new Map(), height: 0, baseline: 0 };
+
 // How many tiles of sea are actually tiled around the island before the flat
 // deep-water fill takes over. The last ramp colour equals the fill, so the
 // changeover is invisible.
@@ -222,6 +255,16 @@ export function buildTextures(scene) {
     queued.push({ name, w, h, ax, ay, drawFn });
   }
 
+  /**
+   * Queue a frame painted straight onto a 2D context rather than through a
+   * Phaser Graphics. Everything in this file is vector art and belongs in the
+   * Graphics path; the exception is text, which only the browser's font stack
+   * can draw. Packing is identical either way.
+   */
+  function putCanvas(name, w, h, ax, ay, paintFn) {
+    queued.push({ name, w, h, ax, ay, paintFn });
+  }
+
   buildBuildings(put);
   buildWalls(put);
   buildFoundations(put);
@@ -233,6 +276,7 @@ export function buildTextures(scene) {
   buildCliffs(put, rng);
   buildMarkers(put);
   buildFx(put);
+  buildGlyphs(putCanvas, ctx);
 
   // Stable sort by descending height: ties keep declaration order, so the same
   // build always produces the same atlas.
@@ -240,22 +284,31 @@ export function buildTextures(scene) {
   queued.sort((a, b) => (b.h - a.h) || (a._i - b._i));
 
   for (const q of queued) {
-    g.clear();
-    q.drawFn(g);
-    if (scene.textures.exists(TMP)) scene.textures.remove(TMP);
-    g.generateTexture(TMP, q.w, q.h);
-    const src = scene.textures.get(TMP).getSourceImage();
     if (shelf.x + q.w + 1 > SIZE) {
       shelf.x = 1;
       shelf.y += shelf.h + 1;
       shelf.h = 0;
     }
-    ctx.drawImage(src, shelf.x, shelf.y);
+    if (q.paintFn) {
+      // Painted in place. The atlas context is already at the right spot, and a
+      // round trip through a temporary texture would only cost a canvas.
+      ctx.save();
+      ctx.translate(shelf.x, shelf.y);
+      q.paintFn(ctx);
+      ctx.restore();
+    } else {
+      g.clear();
+      q.drawFn(g);
+      if (scene.textures.exists(TMP)) scene.textures.remove(TMP);
+      g.generateTexture(TMP, q.w, q.h);
+      const src = scene.textures.get(TMP).getSourceImage();
+      ctx.drawImage(src, shelf.x, shelf.y);
+      scene.textures.remove(TMP);
+    }
     canvasTex.add(q.name, 0, shelf.x, shelf.y, q.w, q.h);
     origins.set(q.name, { w: q.w, h: q.h, ox: q.ax / q.w, oy: q.ay / q.h });
     shelf.x += q.w + 1;
     if (q.h > shelf.h) shelf.h = q.h;
-    scene.textures.remove(TMP);
   }
 
   if (shelf.y + shelf.h > SIZE) {
@@ -4030,6 +4083,62 @@ function buildMarkers(put) {
 // ---------------------------------------------------------------------------
 // FX bits
 // ---------------------------------------------------------------------------
+
+/**
+ * Bake the twelve glyphs the floating labels need. See GLYPHS above for why
+ * these are in the atlas at all rather than being Phaser Text.
+ *
+ * `measure` is the atlas's own context, borrowed only for its font metrics: the
+ * cell each glyph is packed into has to be exactly as wide as the browser will
+ * draw it, or the layout in fx.js would be spacing letters against numbers this
+ * file guessed at.
+ */
+function buildGlyphs(putCanvas, measure) {
+  const FONT = `700 ${GLYPH_PX}px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif`;
+  // The outline is what makes a number legible over grass, over a roof and over
+  // a fog edge alike; without it a light number vanishes on sand and a dark one
+  // vanishes in a forest. Four baked pixels is the same weight the Text version
+  // used, scaled up with the glyph.
+  const STROKE = 5;
+  const PAD = Math.ceil(STROKE / 2) + 1;
+
+  measure.save();
+  measure.font = FONT;
+  const m = measure.measureText('0');
+  // actualBoundingBox* is what the glyph really covers; the font's declared
+  // ascent leaves a band of empty pixels above every number, and at this scale
+  // that band is a third of the cell.
+  const ascent = Math.ceil(m.actualBoundingBoxAscent || GLYPH_PX * 0.72);
+  const descent = Math.ceil(m.actualBoundingBoxDescent || 0);
+  const cellH = ascent + descent + PAD * 2;
+  const baseline = ascent + PAD;
+  const advances = [];
+  for (const ch of GLYPHS) advances.push(Math.ceil(measure.measureText(ch).width));
+  measure.restore();
+
+  GLYPH_METRICS.height = cellH;
+  GLYPH_METRICS.baseline = baseline;
+
+  [...GLYPHS].forEach((ch, i) => {
+    const adv = advances[i];
+    const cellW = adv + PAD * 2;
+    GLYPH_METRICS.advance.set(ch, adv);
+    // Anchored on the glyph's horizontal centre and on the baseline, so fx.js
+    // lays a string out by advancing a cursor and never has to know a cell size.
+    putCanvas(glyphFrame(ch), cellW, cellH, cellW / 2, baseline, (c) => {
+      c.font = FONT;
+      c.textAlign = 'center';
+      c.textBaseline = 'alphabetic';
+      c.lineJoin = 'round';
+      c.miterLimit = 2;
+      c.lineWidth = STROKE;
+      c.strokeStyle = '#100c07';
+      c.strokeText(ch, cellW / 2, baseline);
+      c.fillStyle = '#ffffff';
+      c.fillText(ch, cellW / 2, baseline);
+    });
+  });
+}
 
 function buildFx(put) {
   put('fx_spark', 20, 20, 10, 10, (g) => {

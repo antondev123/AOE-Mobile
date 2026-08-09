@@ -30,8 +30,11 @@ import {
   UNIT_STATS, ARMOR_CLASS, STANCE, FORMATION, DEFAULT_FORMATION,
   FORMATION_SPACING, SPREAD_SPACING,
 } from '../core/constants.js';
-import { forEachNear, edgeDist, edgeDist2, findNearestGlobal } from '../core/world.js';
+import {
+  forEachNear, edgeDist, edgeDist2, findNearestGlobal, snapshotUnits,
+} from '../core/world.js';
 import { EV } from '../core/events.js';
+import { perfBegin, perfEnd } from '../core/perf.js';
 import {
   findPath, findAdjacentStandTile, isWalkable, nearestWalkable, hasLineOfSight,
   isSealedFrom, isPocket,
@@ -349,6 +352,11 @@ export function commandUnits(world, units, order) {
 }
 
 /** One fixed simulation step of unit behaviour. Called from GameScene.simStep. */
+// Reused by updateUnits, which is not re-entrant. Module scope rather than
+// per-world state: two worlds never step at the same time, and the contents do
+// not outlive the call.
+const STEP_SCRATCH = [];
+
 export function updateUnits(world, dt) {
   const ctx = getCtx(world);
   ctx.searches = SEARCHES_PER_STEP;
@@ -356,20 +364,25 @@ export function updateUnits(world, dt) {
 
   // Snapshot: a unit stepping into a Town Center splices itself out of
   // world.units mid-loop, and iterating the live array would silently skip its
-  // neighbour. combat.js takes the same copy for the same reason.
-  const units = world.units.slice();
+  // neighbour. combat.js takes the same copy for the same reason. The buffer is
+  // reused between steps — see snapshotUnits.
+  const units = snapshotUnits(world, STEP_SCRATCH);
+  const _tStep = perfBegin('sim.units.act');
   for (let i = 0; i < units.length; i++) {
     const u = units[i];
     if (!u || u.dead || u.garrisonedIn) continue;
     stepUnit(world, u, dt, ctx);
   }
+  perfEnd('sim.units.act', _tStep);
   // Separation runs after every unit has moved, so pushes are computed against
   // this step's positions and the result is symmetric.
+  const _tSep = perfBegin('sim.units.separate');
   for (let i = 0; i < units.length; i++) {
     const u = units[i];
     if (!u || u.dead || u.garrisonedIn) continue;
     separate(world, u, dt);
   }
+  perfEnd('sim.units.separate', _tSep);
 }
 
 /**
@@ -1997,29 +2010,61 @@ function separate(world, u, dt) {
   let py = 0;
   let n = 0;
 
-  forEachNear(world, u.x, u.y, SEP_RADIUS, (e) => {
-    if (e === u || e.dead || e.kind !== 'unit') return;
-    let dx = u.x - e.x;
-    let dy = u.y - e.y;
-    const d2 = dx * dx + dy * dy;
-    const min = (u.radius + e.radius) * 1.15;
-    if (d2 > min * min) return;
-    let d = Math.sqrt(d2);
-    if (d < 1e-4) {
-      // Exactly stacked (two units spawned on one spot): break the tie by id so
-      // the result is deterministic and the pair never chases itself. Uses the
-      // id rather than world.rng, which belongs to the seeded simulation.
-      const a = u.id * 2.3999632;
-      dx = Math.cos(a);
-      dy = Math.sin(a);
-      d = 1;
+  // Walked inline over the units-only index rather than through forEachNear.
+  // This is the hottest function in the simulation — 150 units times 20 steps a
+  // second — and the callback form cost it twice over: a closure capturing four
+  // mutable locals, allocated fresh on every call, and a walk over every tree
+  // and building sharing the cells with the fight. Neither is visible in a
+  // profile as a line of its own; both showed up as `separate` being the single
+  // most expensive JavaScript function in the frame.
+  const cs = world._unitCell;
+  const cols = world._unitCols;
+  const buckets = world._unitBuckets;
+  // The sweep is SEP_RADIUS wide and no wider. forEachNear pads its query by two
+  // whole tiles because a building's centre can sit that far from the edge the
+  // caller is really asking about — but every candidate here is a unit, which is
+  // a point, so nothing outside a tile of the query can possibly qualify and
+  // every cell that pad added was scanned only to reject everything in it. In a
+  // melee, where the cells around a fight hold thirty units each, that was most
+  // of the work this function did.
+  const pad = SEP_RADIUS;
+  const bx0 = Math.max(0, Math.floor((u.x - pad) / cs));
+  const bx1 = Math.min(cols - 1, Math.floor((u.x + pad) / cs));
+  const by0 = Math.max(0, Math.floor((u.y - pad) / cs));
+  const by1 = Math.min(world._unitRows - 1, Math.floor((u.y + pad) / cs));
+  const near2 = SEP_RADIUS * SEP_RADIUS;
+
+  for (let by = by0; by <= by1; by++) {
+    for (let bx = bx0; bx <= bx1; bx++) {
+      const list = buckets[by * cols + bx];
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        if (e === u || e.dead) continue;
+        let dx = u.x - e.x;
+        let dy = u.y - e.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > near2) continue;
+        const min = (u.radius + e.radius) * 1.15;
+        if (d2 > min * min) continue;
+        let d = Math.sqrt(d2);
+        if (d < 1e-4) {
+          // Exactly stacked (two units spawned on one spot): break the tie by
+          // id so the result is deterministic and the pair never chases itself.
+          // Uses the id rather than world.rng, which belongs to the seeded
+          // simulation.
+          const a = u.id * 2.3999632;
+          dx = Math.cos(a);
+          dy = Math.sin(a);
+          d = 1;
+        }
+        const weight = e.dest ? 1 : STATIONARY_WEIGHT;
+        const push = ((min - d) / min) * weight;
+        px += (dx / d) * push;
+        py += (dy / d) * push;
+        n++;
+      }
     }
-    const weight = e.dest ? 1 : STATIONARY_WEIGHT;
-    const push = ((min - d) / min) * weight;
-    px += (dx / d) * push;
-    py += (dy / d) * push;
-    n++;
-  });
+  }
 
   if (n === 0) return;
   const mag = Math.hypot(px, py);

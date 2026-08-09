@@ -373,3 +373,223 @@ garrisoned unit leaves the map, keeps its population and adds an arrow.
 
 Screenshots in `screenshots/walls-*.png` are the other half of that: the sixteen
 variants meeting up is not a thing a headless test can see.
+
+## Performance
+
+The target is a stable 60fps on a mid-range Android phone with 100+ units. This
+pass profiled first, then fixed what the profile pointed at, and — the part that
+took the longest — worked out which of the numbers this repo can measure are
+statements about a phone and which are statements about the build machine.
+
+### The measurement problem, and what was done about it
+
+Every browser test here runs Chromium with `--use-gl=swiftshader`: software
+rasterisation, no GPU. That matters more than it sounds. Two measurements settle
+what it does to a frame time.
+
+**The floor.** Hide every Game Object in the scene — draw literally nothing, and
+leave only Phaser's loop and the buffer swap — and a frame on this machine still
+costs 21ms on an idle box and past 30ms on a busy one. The 60fps budget is
+16.7ms. There is no version of this game, or of any game, that renders inside a
+frame budget here.
+
+**The split.** Of a 45ms frame with two hundred units fighting, about 4ms is our
+JavaScript and 87% of the rest is native time inside the rasteriser. Hiding one
+layer at a time attributes it: the fog quad 9.6ms, the baked terrain 8.6ms, the
+overlay Graphics 5.1ms, and all 450 sprites together 2.9ms. Every one of those is
+fill rate — screen-sized textured quads, which a phone GPU draws in microseconds
+and a CPU pretending to be one takes ten milliseconds over.
+
+So the old check — `130 units still render inside a frame budget`, asserting a
+median under 34ms — was measuring the wrong machine, and 34 was a number chosen
+to sit above whatever the renderer cost on the day. It has been replaced, in
+`tests/art.browser.mjs`, by assertions on draw calls, Game Objects touched and
+JavaScript milliseconds, with the wall clock still printed next to the *measured*
+empty-scene floor so a reader can see the ratio for themselves.
+
+`src/core/perf.js` is the instrument: a per-phase CPU profiler, off by default,
+costing two function calls and a boolean test per phase when it is on. Every
+phase of a frame reports separately — sim, and inside it allocation, units,
+combat, economy, enemy AI and vision; render, and inside it terrain, cliffs,
+resources, buildings, units, memory, fog and effects; input; HUD, and inside it
+the DOM pass and the minimap.
+
+### Before and after
+
+Stress scenario (`tests/perf.browser.mjs`): 216 units, two armies of 85 in
+contact under a real `attackMove` so combat, damage numbers, sparks, corpses and
+arrows are all live, 40 villagers still gathering, fog updating every step, the
+minimap redrawing at 10Hz and the HUD holding a live twelve-unit selection.
+
+| | before | after |
+|---|---|---|
+| **draw calls / frame** | **36.9** | **16.1** |
+| Game Objects touched / frame (p95) | 603-700 | 658-721 |
+| allocation / frame (sampled) | 1.6-1.7 kB | 1.4-2.0 kB |
+| render CPU, median | 1.20 ms | 1.20 ms |
+| render CPU, worst frame | 5.1 ms | 2.9 ms |
+| `render.units`, worst frame | 4.7 ms | 2.4 ms |
+| `render.resources`, worst frame | 2.0 ms | 0.4 ms |
+| draw + HUD + input, low quartile | 1.0-1.3 ms | 1.1-1.4 ms |
+| wall clock median (swiftshader) | 45-82 ms | 44-82 ms |
+
+Read that table honestly. **The draw call count halved and that is the headline.**
+The renderer's *median* CPU did not move at all, and it was never going to:
+Chrome clamps `performance.now()` to 100 microseconds, the whole unit pass costs
+0.7ms, and the renderer changes below are each worth tens of microseconds. What
+they did move is the tail — the worst frame in the run is roughly half what it
+was — and they removed work that scales with entity count and with map size,
+which is the axis a slower core runs out of road on first. The draw + HUD + input
+row overlaps in both directions between runs; it is reported at the low quartile
+because contention can only ever add to a sample, and even so it is inside the
+noise.
+
+The simulation was measured with no browser at all, which is the quietest
+instrument available and the one `tests/simperf.test.mjs` now guards:
+
+| headless fixed step, 120 units in melee | before | after |
+|---|---|---|
+| **median** | **1.86 ms** | **1.51 ms** |
+| p95 | 2.85 ms | 2.48 ms |
+| best case | 0.93 ms | 0.80 ms |
+
+Three runs each, spread under 5%. That is a 19% cut in the cost of a simulation
+step, and it is the one CPU improvement in this pass big enough to see clearly.
+
+### What each change bought
+
+**Floating damage numbers are baked glyphs, not Phaser Text.** Every `-12` over
+a fight was a `Text` object, and every one of those carries its own
+canvas-backed texture — so eighteen numbers over a melee were eighteen extra
+texture binds, which is eighteen extra draw calls, plus a canvas rasterisation
+and a GPU upload each time a number was born. Twelve glyphs (`0-9`, `+`, `-`)
+are now baked into the atlas at build time and a label is a run of pooled
+sprites out of the same batch as everything else. **37 → 27 draw calls.** A
+four-digit number is now four quads on a batch of several hundred instead of one
+texture switch.
+
+This one has a cost as well as a benefit and it should be stated: a label that
+was one Game Object to position each frame is now up to four. That is more CPU
+and more objects in the batch, traded for eighteen fewer texture binds and no
+canvas rasterisation. On any GPU ever shipped that trade is heavily in credit —
+a draw call is worth tens to hundreds of quads — but it is a trade, not a free
+win, and it is why the objects-per-frame column did not fall.
+
+**Off-screen terrain chunks are hidden.** Phaser does not frustum-cull an Image
+or a RenderTexture: everything in the display list is submitted every frame, and
+because each baked chunk is its own texture, each is its own draw call. Twenty
+chunks were resident in the stress scenario to draw the six on screen — and
+after twenty minutes of a real match the player has visited most of the map and
+ninety-one of them are resident. **27 → 16 draw calls**, and, more importantly,
+a number that no longer grows with how much of the map has been explored.
+
+**Separation steering walks a units-only index on a finer grid.** It was the
+hottest function in the simulation: 200 units × 20Hz, each asking "who is within
+one tile of me" through `forEachNear`, which allocated a closure per call, walked
+the ~1700 trees and the buildings sharing those cells, and swept a 12×12 tile
+neighbourhood because its query pad is sized for buildings, which have footprints,
+rather than for units, which are points. Now: inline over a units-only index with
+two-tile cells and a one-tile pad. **`sim.units.separate` 1.00ms → 0.50ms
+median.** The candidate set is unchanged and visited in the same order, so the
+simulation is bit-for-bit the same game.
+
+**Per-frame string building in the renderer is gone.** Working out which frame a
+unit shows built four template strings and probed the atlas up to four times —
+once per unit per frame, so thirteen thousand throwaway strings a second with
+two hundred units on screen. Memoised on (type, player, facing, pose) in a
+nested lookup that allocates nothing and builds no key, and it now returns the
+frame's origin alongside its name so the draw loop does one lookup instead of
+two. Below the resolution of the timer here; it is in for the phone's sake and
+for the garbage, not for a number this machine can show.
+
+**Pooled sprite resets are guarded.** `setFrame` unconditionally cleared the
+tint, the flip, the rotation and the alpha of every sprite it handed out —
+around two thousand Phaser setter calls a frame, each doing real work
+(`clearTint` writes four packed colours and a flag, `setAlpha` writes four more
+and re-derives the render flags). Each reset is now guarded on the value it
+would write, which is a hundred or so actual writes instead of two thousand.
+
+**Resource nodes have a static index.** ~1900 of them on a full map against the
+forty the camera can hold, and the draw pass walked all of them and rejected
+them one at a time. They are now bucketed eight tiles to a cell, keyed off the
+event bus rather than rebuilt on a clock, so a query touches about two hundred
+candidates. `render.resources`' worst frame went from 2.0ms to 0.4ms; its median
+was already inside the timer's resolution. It deliberately does *not* reuse `world._buckets`: that index is
+rebuilt at the top of each fixed step, and the draw pass runs three times per
+step, so anything spawned between steps would be invisible until the next tick.
+
+**The per-step allocations are gone.** `updateUnits` and `updateCombat` each
+took `world.units.slice()` every step — forty two-hundred-element arrays a
+second so that a loop could have a stable view of a list it already owns. They
+share a reused buffer now (`snapshotUnits`). `checkVictory` allocated four
+arrays of up to two hundred entities per step, per player, to answer two
+questions that stop at their first hit; it is a scan.
+
+### What degrades under load, and when
+
+Nothing was cut. Two things thin out, and both are keyed on a measurement rather
+than on a frame time — frame time is a lagging, noisy signal that would make the
+effects flicker between full and thinned.
+
+**Effects, keyed on the particle budget** (`src/gfx/fx.js`). Below 45%
+occupancy of the 220-particle pool, everything is exactly as it was. Between 45%
+and 85%, spawn counts fall off linearly to a third — a burst of four sparks
+becomes two, then one, never zero. Above 85%, the two purely atmospheric effects
+stop: footfall dust behind moving units, and the dust puff under a landed blow.
+The sparks, the corpses, the arrows and the damage numbers never stop, because
+those are what a player reads a fight from. In practice a skirmish of twenty
+never leaves full detail, and a hundred-a-side melee spends most of its time in
+the middle band, where a third of the sparks were landing on top of each other
+anyway.
+
+**Health bar decoration, keyed on the bar count** (`src/gfx/render.js`). A bar
+is six filled rectangles: an outer shadow, an outline, the track, the fill and a
+gloss. Above 48 bars in a frame — a fight of about two dozen a side — the outer
+shadow and the gloss are dropped and the bar keeps its outline, its track and
+its fill. In a two-hundred-unit battle that is 1200 rectangles a frame instead of
+over 2000, submitted through the Graphics pipeline. The *information* is
+untouched: the length and the colour are what a player reads, and both are
+exactly as before. The count is taken from the previous frame, so the decision
+costs nothing and cannot oscillate within a frame.
+
+Neither degradation is permanent and neither has a hysteresis problem worth
+worrying about: both thresholds sit well away from the density an ordinary game
+reaches.
+
+### The guards
+
+`tests/perf.browser.mjs` — the full stress scenario, asserting the transferable
+metrics: the drawing half of the frame's CPU at its low quartile and at its p95,
+draw calls, Game Objects touched, and allocation per frame measured with V8's
+sampling allocation profiler rather than by watching `usedJSHeapSize`, which
+swings by a factor of two between identical runs because what it really measures
+is where the collector last got to. The low quartile is used because a process
+descheduled mid-frame charges that time to whichever phase was running, so
+contention can only add to a sample and never subtract — which makes a low
+percentile the only stable estimator available here, and a real regression
+raises it along with everything else. The simulation's cost is deliberately
+*not* asserted here; `simperf` measures it better. `--verbose` prints the
+per-phase table and names the top allocation sites.
+
+`tests/simperf.test.mjs` — the same battle with no browser at all, in `npm test`.
+It is the quiet instrument: under 5% spread between runs, so it catches a small
+regression that the browser guard would lose in machine weather.
+
+`tests/art.browser.mjs` — the rewritten section 8, asserting draw calls, objects
+touched and JavaScript milliseconds, and printing the wall clock beside the
+measured empty-scene floor.
+
+### What could not be measured from here
+
+There is no GPU in this environment, so nothing was measured about actual fill
+rate, overdraw cost, texture bandwidth or shader throughput on a real tile-based
+mobile GPU — only the structural quantities that predict them. Specifically
+unverified: whether the full-screen fog quad and its 12Hz texture upload are as
+cheap on an Adreno or Mali as the arithmetic says they should be; whether the
+2048² atlas fits comfortably in a mid-range phone's texture budget alongside the
+resident terrain chunks; and whether the browser's own compositor on Android
+leaves as much of the 16.7ms as this assumes. The honest claim this pass can
+make is the one its numbers support: with 216 units in a pitched battle the game
+asks for about 5ms of JavaScript, 16 draw calls, 650 Game Objects and under 2kB
+of garbage per frame — and a device that cannot hold 60fps on that is not being
+held back by anything in this repository.

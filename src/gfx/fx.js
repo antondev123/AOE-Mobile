@@ -8,13 +8,40 @@
 
 import { EV } from '../core/events.js';
 import { HALF_W, HALF_H, MAP_W, MAP_H, PLAYER } from '../core/constants.js';
-import { ATLAS, unitFrame } from './textures.js';
+import {
+  ATLAS, unitFrame, glyphFrame, GLYPH_METRICS, GLYPH_PX,
+} from './textures.js';
+import { perfCount } from '../core/perf.js';
 
 const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa7b4 };
 const CMD_COLOR = { move: 0x4ade80, attack: 0xf05252, gather: 0xfacc15, rally: 0x60a5fa };
 
 const MAX_PARTICLES = 220;
 const MAX_TEXTS = 18;
+// A number is never longer than this. `-999` is four; anything that wants more
+// is a number nobody is reading off a battlefield anyway.
+const MAX_GLYPHS = 5;
+
+// --- Load shedding -----------------------------------------------------------
+//
+// Effects are the first thing that should give way when a frame is in trouble,
+// and the last thing that should be cut when it is not. Everything below scales
+// with how much of the effect budget is already committed, so a skirmish looks
+// exactly as it always did and only a hundred-a-side melee — where a third of
+// the sparks land on top of each other anyway — thins out.
+//
+// The trigger is the particle pool's own occupancy, not a frame time: frame
+// time is a lagging, noisy signal that would make the effects flicker between
+// full and thinned, whereas "how many particles are already alive" is exact,
+// free to read, and is the thing that actually costs.
+//
+// Below LOAD_SOFT the game is at full detail. Between LOAD_SOFT and LOAD_HARD
+// spawn counts fall off linearly to a third. Above LOAD_HARD only the effects
+// that carry information a player acts on — the hit sparks, the death, the
+// floating number — still fire, and the purely atmospheric ones (footfall dust,
+// the dust puff under a blow) stop.
+const LOAD_SOFT = 0.45;
+const LOAD_HARD = 0.85;
 
 export function createFx(scene, world, opts) {
   const depthOf = opts.depthFor;
@@ -27,10 +54,38 @@ export function createFx(scene, world, opts) {
   const spritePool = [];  // idle Phaser images
   let spriteCount = 0;
 
-  const texts = [];       // { obj, life, maxLife, vy, wx, wy }
+  // Floating labels. Each one is a run of pooled glyph sprites out of the atlas
+  // rather than a Phaser Text — see GLYPHS in textures.js for the draw-call
+  // arithmetic that bought.
+  const texts = [];       // { glyphs: [], n, w, x, y, life, max, rise, alpha, tint }
   const textPool = [];
+  const glyphPool = [];
 
   const projSprites = [];
+
+  // How full the effect budget is, 0..1. Read by every recipe below.
+  function load() {
+    return parts.length / MAX_PARTICLES;
+  }
+
+  /**
+   * Scale a spawn count by the current load. Never returns 0 for a request of 1:
+   * an effect that exists at all must not blink out of existence at the load
+   * threshold, because that is exactly when the player is looking at it.
+   */
+  function scaled(n) {
+    const l = load();
+    if (l <= LOAD_SOFT) return n;
+    const k = l >= LOAD_HARD
+      ? 0.34
+      : 1 - ((l - LOAD_SOFT) / (LOAD_HARD - LOAD_SOFT)) * 0.66;
+    return Math.max(1, Math.round(n * k));
+  }
+
+  /** True when the frame has no room left for purely atmospheric effects. */
+  function saturated() {
+    return load() >= LOAD_HARD;
+  }
 
   function getSprite() {
     let s = spritePool.pop();
@@ -109,29 +164,78 @@ export function createFx(scene, world, opts) {
 
   // --- floating text -------------------------------------------------------
 
+  function getGlyph() {
+    let s = glyphPool.pop();
+    if (!s) {
+      s = scene.add.image(0, 0, ATLAS, glyphFrame('0'));
+      s.setDepth(900000);
+    }
+    s.setVisible(true);
+    return s;
+  }
+
+  function releaseText(t) {
+    for (let i = 0; i < t.n; i++) {
+      const s = t.glyphs[i];
+      s.setVisible(false);
+      glyphPool.push(s);
+      t.glyphs[i] = null;
+    }
+    t.n = 0;
+  }
+
+  /**
+   * Lay a short number out of baked glyphs.
+   *
+   * The layout is done once, at spawn, in baked-pixel units; the per-frame work
+   * is then one position and one alpha per glyph, exactly as it was for the
+   * single Text object this replaced. `px` is the screen height the label wants,
+   * which the glyphs are scaled down to — see GLYPHS in textures.js.
+   */
   function floatText(str, wx, wy, color, big, small) {
     if (texts.length >= MAX_TEXTS) return;
+    const s = String(str);
     let t = textPool.pop();
-    if (!t) {
-      const obj = scene.add.text(0, 0, '', {
-        fontFamily: 'system-ui, -apple-system, Segoe UI, Roboto, sans-serif',
-        fontSize: '15px',
-        fontStyle: '700',
-        color: '#ffffff',
-        stroke: '#100c07',
-        strokeThickness: 4,
-      });
-      obj.setOrigin(0.5, 1);
-      t = { obj };
+    if (!t) t = { glyphs: new Array(MAX_GLYPHS).fill(null), n: 0 };
+
+    const px = big ? 17 : small ? 12 : 14;
+    const scale = px / GLYPH_PX;
+    let width = 0;
+    let n = 0;
+    for (let i = 0; i < s.length && n < MAX_GLYPHS; i++) {
+      const adv = GLYPH_METRICS.advance.get(s[i]);
+      if (adv === undefined) continue;   // nothing in the font for it; skip
+      width += adv;
+      n++;
     }
-    const o = t.obj;
-    o.setVisible(true);
-    o.setText(str);
-    o.setFontSize(big ? 17 : small ? 12 : 14);
-    o.setColor(typeof color === 'string' ? color : `#${(color >>> 0).toString(16).padStart(6, '0')}`);
-    o.setDepth(900000);
-    o.setPosition(wx, wy);
-    o.setAlpha(1);
+    if (n === 0) {
+      textPool.push(t);
+      return;
+    }
+
+    const tint = typeof color === 'string' ? 0xffffff : (color >>> 0);
+    let cursor = -width / 2;
+    let k = 0;
+    for (let i = 0; i < s.length && k < n; i++) {
+      const ch = s[i];
+      const adv = GLYPH_METRICS.advance.get(ch);
+      if (adv === undefined) continue;
+      const g = getGlyph();
+      g.setTexture(ATLAS, glyphFrame(ch));
+      g.setTint(tint);
+      // Every glyph is anchored on its own baseline, so a run of them sits on
+      // one line whatever mix of digits and signs it is made of.
+      const o = origins && origins.get(glyphFrame(ch));
+      if (o) g.setOrigin(o.ox, o.oy);
+      t.glyphs[k] = g;
+      // Offset from the label's anchor, in baked pixels. Scaling happens once
+      // per frame in update(), against the camera zoom.
+      g._dx = (cursor + adv / 2) * scale;
+      cursor += adv;
+      k++;
+    }
+    t.n = n;
+    t.scale = scale;
     t.x = wx;
     t.y = wy;
     t.life = 0;
@@ -207,9 +311,10 @@ export function createFx(scene, world, opts) {
 
   // --- effect recipes ------------------------------------------------------
 
-  function sparks(gx, gy, n, tint) {
+  function sparks(gx, gy, count, tint) {
     const x = wx(gx, gy);
     const y = wy(gx, gy) - 16;
+    const n = scaled(count);
     for (let i = 0; i < n; i++) {
       const a = Math.random() * Math.PI * 2;
       const sp = 40 + Math.random() * 70;
@@ -227,9 +332,10 @@ export function createFx(scene, world, opts) {
     }
   }
 
-  function dust(gx, gy, n, tint) {
+  function dust(gx, gy, count, tint) {
     const x = wx(gx, gy);
     const y = wy(gx, gy);
+    const n = scaled(count);
     for (let i = 0; i < n; i++) {
       spawn('fx_puff', x + (Math.random() - 0.5) * 10, y + (Math.random() - 0.5) * 5, {
         vx: (Math.random() - 0.5) * 26,
@@ -332,8 +438,10 @@ export function createFx(scene, world, opts) {
     sparks(t.x, t.y, t.kind === 'building' ? 3 : 4, t.kind === 'building' ? 0xd8c9a0 : 0xffd27a);
     // A puff of dust at the feet on every landed blow. Sparks alone say "metal
     // hit metal"; the dust is what makes it land on the ground the fight is
-    // standing on.
-    if (t.kind !== 'resource' && Math.random() < 0.7) {
+    // standing on. First thing to go when the budget is full: in a melee dense
+    // enough to saturate it, every one of these lands under somebody's feet
+    // where nothing of it can be seen.
+    if (t.kind !== 'resource' && !saturated() && Math.random() < 0.7) {
       dust(t.x, t.y, 1, t.kind === 'building' ? 0xbdae94 : 0xc9bda3);
     }
     if (p.amount < 1) return;
@@ -500,6 +608,7 @@ export function createFx(scene, world, opts) {
     for (let i = n; i < projSprites.length; i++) {
       if (projSprites[i].visible) projSprites[i].setVisible(false);
     }
+    return n;
   }
 
   // --- per-frame -----------------------------------------------------------
@@ -539,27 +648,35 @@ export function createFx(scene, world, opts) {
       if (p.vr) s.setAngle(p.rot);
     }
 
+    // Keep world-space labels a constant size on screen at any zoom.
+    const invZoom = 1 / camera.zoom;
     for (let i = texts.length - 1; i >= 0; i--) {
       const tx = texts[i];
       tx.life += dt;
       const t = tx.life / tx.max;
       if (t >= 1) {
-        tx.obj.setVisible(false);
+        releaseText(tx);
         texts.splice(i, 1);
         textPool.push(tx);
         continue;
       }
       tx.y -= (tx.rise || 26) * dt;
-      const a = tx.alpha === undefined ? 1 : tx.alpha;
-      tx.obj.setPosition(tx.x, tx.y);
-      tx.obj.setAlpha(a * (t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4));
-      // Keep world-space text a constant size on screen at any zoom.
-      tx.obj.setScale(1 / camera.zoom);
+      const a = (tx.alpha === undefined ? 1 : tx.alpha)
+        * (t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4);
+      const sc = tx.scale * invZoom;
+      for (let k = 0; k < tx.n; k++) {
+        const g = tx.glyphs[k];
+        g.setPosition(tx.x + g._dx * invZoom, tx.y);
+        g.setAlpha(a);
+        g.setScale(sc);
+      }
     }
 
-    // Footfall dust for moving units, rate-limited across the whole army.
+    // Footfall dust for moving units, rate-limited across the whole army — and
+    // dropped entirely once the budget is full, since a fight at that density
+    // is already standing in a cloud of its own.
     dustTimer -= dt;
-    if (dustTimer <= 0) {
+    if (dustTimer <= 0 && !saturated()) {
       dustTimer = 0.09;
       const units = world.units;
       const view = opts.viewRect;
@@ -578,7 +695,14 @@ export function createFx(scene, world, opts) {
       }
     }
 
-    syncProjectiles();
+    const arrows = syncProjectiles();
+
+    // Effect sprites are Game Objects like any other and belong in the frame's
+    // object count; leaving them out would let the effect budget grow without
+    // ever showing up in the number that guards it.
+    let glyphs = 0;
+    for (let i = 0; i < texts.length; i++) glyphs += texts[i].n;
+    perfCount('objects', parts.length + glyphs + arrows);
   }
 
   function destroy() {
@@ -588,10 +712,11 @@ export function createFx(scene, world, opts) {
     parts.length = 0;
     for (const s of spritePool) s.destroy();
     spritePool.length = 0;
-    for (const t of texts) t.obj.destroy();
+    for (const t of texts) releaseText(t);
     texts.length = 0;
-    for (const t of textPool) t.obj.destroy();
     textPool.length = 0;
+    for (const s of glyphPool) s.destroy();
+    glyphPool.length = 0;
     for (const s of projSprites) s.destroy();
     projSprites.length = 0;
   }

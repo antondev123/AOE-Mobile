@@ -56,7 +56,7 @@ import {
 import { EV } from '../core/events.js';
 import {
   edgeDist, edgeDist2, forEachNear, isHostile, removeEntity, findNearestGlobal,
-  inBounds, isBlocked,
+  inBounds, isBlocked, snapshotUnits,
 } from '../core/world.js';
 import { dist, dirIndex } from '../core/iso.js';
 import { attackBonus, armorBonus } from './tech.js';
@@ -544,11 +544,15 @@ function phaseOf(u) {
 
 // --- Main update ------------------------------------------------------------
 
+// Reused by updateCombat, which is not re-entrant. See the note in unitAI.js.
+const STEP_SCRATCH = [];
+
 export function updateCombat(world, dt) {
   if (!world.projectiles) world.projectiles = [];
 
-  // Snapshot: kills splice world.units mid-loop.
-  const units = world.units.slice();
+  // Snapshot: kills splice world.units mid-loop. The buffer is reused between
+  // steps — see snapshotUnits in core/world.js.
+  const units = snapshotUnits(world, STEP_SCRATCH);
   for (const u of units) {
     if (u.dead) continue;
 

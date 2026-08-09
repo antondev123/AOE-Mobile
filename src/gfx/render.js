@@ -34,6 +34,7 @@ import {
 } from './textures.js';
 import { createFx } from './fx.js';
 import { EV } from '../core/events.js';
+import { perfBegin, perfEnd, perfCount } from '../core/perf.js';
 
 // Facing index -> { back, flip }. See DIRS in iso.js: 0=S 1=SW 2=W 3=NW 4=N
 // 5=NE 6=E 7=SE on screen.
@@ -123,6 +124,24 @@ function poseOf(u, t, phase) {
 
 // How far outside the camera an entity may be before we stop drawing it.
 const CULL_PAD = 140;
+
+// --- Health bars under load ---------------------------------------------------
+//
+// A bar is six filled rectangles: an outer shadow, an outline, the track, the
+// fill, and a gloss across the top of the fill. That is the right shape for the
+// dozen bars a skirmish puts on screen and the wrong one for the two hundred a
+// pitched battle does — at that point the overlay Graphics is submitting well
+// over a thousand rectangles a frame, which is more geometry than every unit
+// sprite in the fight put together, to draw decoration nobody can see at 24
+// screen pixels wide amid a hundred moving bodies.
+//
+// So above this many bars in a frame the two decorative layers are dropped and
+// the bar keeps its outline, its track and its fill. The information is
+// untouched — the length and the colour are what a player reads — and the count
+// is taken from the *previous* frame so the decision costs nothing and cannot
+// oscillate within a frame. Forty-eight is a fight of about two dozen a side,
+// which is where the bars stop being individually readable anyway.
+const BAR_PLAIN_ABOVE = 48;
 
 const TERRAIN_CHUNK = 512;
 
@@ -258,6 +277,14 @@ export function createRenderer(scene, world) {
   const fogState = fog ? fog.state : null;
   const visMask = fogState ? fogState.visible : null;
 
+  // --- static index --------------------------------------------------------
+  // Resource nodes do not move, and there are about 1900 of them on a full
+  // 96x96 map against the forty or so the camera can hold. Walking the whole
+  // list and rejecting it a node at a time is the map-sized work the view cull
+  // exists to avoid — cheap per node, but it is 1900 of them sixty times a
+  // second, and it does not get cheaper as the phone gets slower.
+  const resIndex = makeStaticIndex(world);
+
   // --- cliffs --------------------------------------------------------------
   // Terrain the player cannot cross, and the only thing on the map with real
   // height that is not a building. Placement belongs to mapgen (see
@@ -288,6 +315,10 @@ export function createRenderer(scene, world) {
   let dragBox = null;    // screen-space { x, y, w, h }
   let wallRun = null;    // { type, segments: [{ tx, ty, mask, valid }] }
   let t = 0;
+  // Bars drawn this frame, and whether the last frame drew enough of them to
+  // switch to the plain form. See BAR_PLAIN_ABOVE.
+  let barCount = 0;
+  let plainBars = false;
 
   // --- combat feedback ------------------------------------------------------
   // Two facts, both read straight off the damage event: which units were hit
@@ -337,16 +368,48 @@ export function createRenderer(scene, world) {
   const has = (frame) => origins.has(frame);
   /** Clamp an owner id into the range we generated colours for. */
   const pi = (player) => (player === 1 ? 1 : 0);
-  function unitFrameFor(type, player, back, pose = 'i') {
+
+  /**
+   * Which frame a unit shows, memoised on (type, player, back, pose).
+   *
+   * The answer never changes for the life of the atlas, and working it out
+   * costs four template strings and up to four Map probes. That was being paid
+   * once per unit per frame — thirteen thousand throwaway strings a second with
+   * two hundred units on screen, which is both the renderer's largest single
+   * source of garbage and, at 0.06ms a frame, more than it cost to draw the
+   * ground. The key is built once; the value is the interned frame name.
+   */
+  // type -> [player][back] -> pose -> { f, o }: the frame name and its origin,
+  // so the draw loop gets both from one lookup and builds no key of its own.
+  const unitFrameCache = new Map();
+  function unitPoseFor(type, player, back, pose) {
+    let byPlayer = unitFrameCache.get(type);
+    if (byPlayer === undefined) {
+      byPlayer = [
+        [Object.create(null), Object.create(null)],
+        [Object.create(null), Object.create(null)],
+      ];
+      unitFrameCache.set(type, byPlayer);
+    }
+    const slot = byPlayer[player === 1 ? 1 : 0][back ? 1 : 0];
+    let rec = slot[pose];
+    if (rec !== undefined) return rec;
     let f = unitFrame(type, player, back, pose);
-    if (has(f)) return f;
-    // A type with art but no such pose (a soldier asked to "gather") falls back
-    // to its own idle before it falls back to somebody else's body.
-    f = unitFrame(type, player, back, 'i');
-    if (has(f)) return f;
-    f = unitFrame('villager', player, back, pose);
-    return has(f) ? f : unitFrame('villager', player, back, 'i');
+    if (!has(f)) {
+      // A type with art but no such pose (a soldier asked to "gather") falls
+      // back to its own idle before it falls back to somebody else's body.
+      f = unitFrame(type, player, back, 'i');
+      if (!has(f)) {
+        f = unitFrame('villager', player, back, pose);
+        if (!has(f)) f = unitFrame('villager', player, back, 'i');
+      }
+    }
+    rec = { f, o: origins.get(f) };
+    slot[pose] = rec;
+    return rec;
   }
+  const unitFrameFor = (type, player, back, pose = 'i') =>
+    unitPoseFor(type, player, back, pose).f;
   function buildingFrameFor(type, player, b) {
     if (type === 'farm') return farmFrame(player, farmStage(b));
     if (isWallType(type)) return wallPieceFrame(type, player, b);
@@ -525,7 +588,9 @@ export function createRenderer(scene, world) {
 
     // Ground the camera is about to reach has to exist before anything is drawn
     // on top of it; see bakeTerrain for why this is not done up front.
+    const _tTerrain = perfBegin('render.terrain');
     terrain.ensure(viewRect);
+    perfEnd('render.terrain', _tTerrain);
 
     cliffPool.reset();
     markerPool.reset();
@@ -536,16 +601,28 @@ export function createRenderer(scene, world) {
     ghostPool.reset();
 
     overlay.clear();
+    plainBars = barCount > BAR_PLAIN_ABOVE;
+    barCount = 0;
     // Bars and dots are only *partially* zoom-compensated: fully compensating
     // makes them swamp the units when zoomed out, not compensating at all makes
     // them unreadable. sqrt splits the difference.
     const invZ = 1 / Math.sqrt(camera.zoom);
 
+    const _tCliffs = perfBegin('render.cliffs');
     drawCliffs();
+    perfEnd('render.cliffs', _tCliffs);
+    const _tRes = perfBegin('render.resources');
     drawResources();
+    perfEnd('render.resources', _tRes);
+    const _tBld = perfBegin('render.buildings');
     drawBuildings(invZ);
+    perfEnd('render.buildings', _tBld);
+    const _tUnits = perfBegin('render.units');
     drawUnits(alpha, invZ);
+    perfEnd('render.units', _tUnits);
+    const _tMem = perfBegin('render.memory');
     drawMemory();
+    perfEnd('render.memory', _tMem);
     drawGhost();
     drawWallRun();
 
@@ -559,9 +636,20 @@ export function createRenderer(scene, world) {
 
     drawDragBox();
 
+    const _tFog = perfBegin('render.fog');
     if (fog) fog.update(dt);
+    perfEnd('render.fog', _tFog);
 
+    const _tFx = perfBegin('render.fx');
     fx.update(dt);
+    perfEnd('render.fx', _tFx);
+
+    // Structural metrics. These are what predicts the cost of a frame on a real
+    // phone GPU — how many quads were submitted and how many Game Objects the
+    // scene graph had to walk — and unlike a wall-clock number they mean the
+    // same thing on this machine as on that one.
+    perfCount('objects', cliffPool.used() + markerPool.used() + unitPool.used()
+      + bldPool.used() + resPool.used() + selPool.used() + ghostPool.used());
   }
 
   function visible(wx, wy) {
@@ -626,28 +714,30 @@ export function createRenderer(scene, world) {
     }
   }
 
-  function drawResources() {
-    const list = world.resources;
-    for (let i = 0; i < list.length; i++) {
-      const e = list[i];
-      if (e.dead) continue;
-      if (!litAt(e.x, e.y)) continue;
-      const wx = (e.x - e.y) * HALF_W;
-      const wy = (e.x + e.y) * HALF_H;
-      if (!visible(wx, wy)) continue;
-      const frame = resourceFrameFor(e.type, e.variant || 0);
-      const s = resPool.get();
-      setFrame(s, frame, origins);
-      s.setPosition(wx, wy);
-      s.setDepth(depthFor(e.x, e.y, 2));
-      // A node visibly shrinks as it is worked out, so players can see which
-      // trees are nearly gone without selecting them.
-      const left = e.maxAmount ? e.amount / e.maxAmount : 1;
-      s.setScale(0.82 + 0.18 * Math.max(0, Math.min(1, left)));
-      if (world.selection.has(e.id)) {
-        overlayNodeRing(e);
-      }
+  // Hoisted rather than written inline at the call site: a fresh closure per
+  // frame is a fresh closure per frame.
+  function drawResourceNode(e) {
+    if (e.dead) return;
+    if (!litAt(e.x, e.y)) return;
+    const wx = (e.x - e.y) * HALF_W;
+    const wy = (e.x + e.y) * HALF_H;
+    if (!visible(wx, wy)) return;
+    const frame = resourceFrameFor(e.type, e.variant || 0);
+    const s = resPool.get();
+    setFrame(s, frame, origins);
+    s.setPosition(wx, wy);
+    s.setDepth(depthFor(e.x, e.y, 2));
+    // A node visibly shrinks as it is worked out, so players can see which
+    // trees are nearly gone without selecting them.
+    const left = e.maxAmount ? e.amount / e.maxAmount : 1;
+    s.setScale(0.82 + 0.18 * Math.max(0, Math.min(1, left)));
+    if (world.selection.has(e.id)) {
+      overlayNodeRing(e);
     }
+  }
+
+  function drawResources() {
+    resIndex.forEachInView(viewRect, drawResourceNode);
   }
 
   function overlayNodeRing(e) {
@@ -710,12 +800,14 @@ export function createRenderer(scene, world) {
       // the structure rather than hovering over empty sky.
       const top = o.h * o.oy;
       if (!b.complete) {
-        const visTop = Math.max(fo ? fo.h * fo.oy : 0, top * progress);
-        bar(overlay, wx, wy - visTop - 7 * invZ, 30 * invZ, 4.5 * invZ, progress, 0xf3c04a, invZ);
+        barCount++;
+        bar(overlay, wx, wy - visTopOf(fo, top, progress) - 7 * invZ,
+          30 * invZ, 4.5 * invZ, progress, 0xf3c04a, invZ, plainBars);
       } else if (b.hp < b.maxHp || selected) {
+        barCount++;
         bar(
           overlay, wx, wy - top - 7 * invZ, 30 * invZ, 4.5 * invZ,
-          b.hp / b.maxHp, b.player === PLAYER ? 0x4ade80 : 0xf05252, invZ,
+          b.hp / b.maxHp, b.player === PLAYER ? 0x4ade80 : 0xf05252, invZ, plainBars,
         );
       }
 
@@ -941,12 +1033,12 @@ export function createRenderer(scene, world) {
       const back = FACE_BACK[face & 7];
       const flip = FACE_FLIP[face & 7];
       const phase = (u.id % 32) * 0.63;
-      const uFrame = unitFrameFor(u.type, player, back, poseOf(u, t, phase));
+      const rec = unitPoseFor(u.type, player, back, poseOf(u, t, phase));
       const s = unitPool.get();
-      setFrame(s, uFrame, origins);
-      s.setFlipX(flip);
+      setFrame(s, rec.f, origins);
+      if (flip) s.setFlipX(true);
       s.setDepth(depth + 0.2);
-      const uo = origins.get(uFrame);
+      const uo = rec.o;
 
       // The poses carry the limb motion; this is only the whole-body travel
       // that a drawn frame cannot express — the rise and fall of a stride, and
@@ -976,9 +1068,10 @@ export function createRenderer(scene, world) {
       //    it only for units that have already been hit answers it too late.
       const hurt = u.hp < u.maxHp;
       if (hurt || selected || (barsWanted && u.player === PLAYER)) {
+        barCount++;
         healthBar(
           overlay, wx, top - 6 * invZ, u.hp / u.maxHp,
-          u.player === PLAYER ? 0x4ade80 : 0xf05252, invZ,
+          u.player === PLAYER ? 0x4ade80 : 0xf05252, invZ, plainBars,
         );
       }
 
@@ -1217,6 +1310,7 @@ export function createRenderer(scene, world) {
     for (const off of evOffs) off();
     evOffs.length = 0;
     fx.destroy();
+    resIndex.destroy();
     cliffPool.destroy();
     markerPool.destroy();
     unitPool.destroy();
@@ -1306,7 +1400,25 @@ function footprintFrameWidth(fw) {
   return w < 1 ? 1 : w > 4 ? 4 : w;
 }
 
-/** Set a pooled sprite's frame and re-apply that frame's origin. */
+/**
+ * Set a pooled sprite's frame and put every other property back to its default,
+ * so a sprite handed out for a corpse this frame does not arrive still wearing
+ * last frame's tint, flip or crop.
+ *
+ * Every reset is guarded on the value it would write. This runs four hundred
+ * times a frame, and each of these Phaser setters does real work — clearTint
+ * writes four packed colours and a flag, setAlpha writes four more and
+ * re-derives renderFlags, setRotation recomputes the transform. Guarding them
+ * turns about two thousand setter calls a frame into the hundred or so where
+ * something has actually changed.
+ *
+ * Honest about the size of it: the saving is below what this repo can measure.
+ * Chrome clamps performance.now() to 100 microseconds and the whole unit pass
+ * costs 0.7ms, so a change of this shape does not move the median at all. What
+ * it does move is the tail — render.units' worst frame went from 4.7ms to
+ * 2.4ms — and it removes work that scales with the number of units on screen,
+ * which is the axis a phone runs out of road on first.
+ */
 function setFrame(s, frame, origins) {
   if (s._frameKey !== frame) {
     s.setTexture(ATLAS, frame);
@@ -1315,10 +1427,122 @@ function setFrame(s, frame, origins) {
     s._frameKey = frame;
   }
   if (s.isCropped) s.setCrop();
-  s.clearTint();
-  s.setFlipX(false);
-  s.setRotation(0);
-  s.setAlpha(1);
+  if (s.isTinted) s.clearTint();
+  if (s.flipX) s.setFlipX(false);
+  if (s.rotation !== 0) s.setRotation(0);
+  if (s.alpha !== 1) s.setAlpha(1);
+}
+
+/**
+ * A grid index over the map's resource nodes, for the draw pass.
+ *
+ * WHY A SECOND INDEX AND NOT world._buckets
+ * -----------------------------------------
+ * The simulation's spatial index is rebuilt at the top of every fixed step, so
+ * anything spawned between steps is missing from it — and this pass runs three
+ * times per step. Reading it here would make a tree planted by a test, or a
+ * unit trained mid-frame, invisible until the next step ticked. It is also
+ * sized for the simulation's one-to-five-tile proximity queries rather than for
+ * a screenful, and it holds units and buildings this pass does not want.
+ *
+ * So: a static index of its own, keyed off events rather than rebuilt on a
+ * clock. Nodes never move, so an entry is only ever added (a farm, a test
+ * arranging a scene) or retired. A retired node is left in place — the draw
+ * pass already skips dead entities — and the whole index is only rebuilt once
+ * enough of them have accumulated to be worth compacting. In an ordinary match
+ * that is a handful of rebuilds over twenty minutes.
+ *
+ * INDEX_CELL is eight tiles: the camera's grid-space bounding box at the
+ * default zoom is about thirty tiles square, so a query touches sixteen cells
+ * of roughly a dozen nodes each — two hundred candidates against nineteen
+ * hundred.
+ */
+const INDEX_CELL = 8;
+
+function makeStaticIndex(world) {
+  const cols = Math.ceil(MAP_W / INDEX_CELL);
+  const rows = Math.ceil(MAP_H / INDEX_CELL);
+  const cells = new Array(cols * rows);
+  for (let i = 0; i < cells.length; i++) cells[i] = [];
+  let stale = 0;
+  let live = 0;
+
+  function cellOf(e) {
+    let cx = Math.floor(e.x / INDEX_CELL);
+    let cy = Math.floor(e.y / INDEX_CELL);
+    if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+    if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+    return cy * cols + cx;
+  }
+
+  function rebuild() {
+    for (let i = 0; i < cells.length; i++) cells[i].length = 0;
+    const list = world.resources;
+    for (let i = 0; i < list.length; i++) {
+      if (!list[i].dead) cells[cellOf(list[i])].push(list[i]);
+    }
+    live = list.length;
+    stale = 0;
+  }
+
+  const offs = [
+    world.events.on(EV.SPAWN, (p) => {
+      const e = p && p.entity;
+      if (!e || e.kind !== 'resource') return;
+      cells[cellOf(e)].push(e);
+      live++;
+    }),
+    world.events.on(EV.REMOVED, (p) => {
+      const e = p && p.entity;
+      if (!e || e.kind !== 'resource') return;
+      stale++;
+      // Compact once the dead outnumber a quarter of what is left, so the walk
+      // never degenerates into a walk over a graveyard.
+      if (stale > 64 && stale * 4 > live) rebuild();
+    }),
+  ];
+
+  rebuild();
+
+  /**
+   * Call `fn` for every node whose cell overlaps the visible world rectangle.
+   *
+   * The view is an axis-aligned rectangle in world pixels, which in grid space
+   * is a diamond; its four corners give the grid-space bounding box, and that
+   * box is what the cells are tested against. Conservative — it includes some
+   * ground off the corners of the screen — and the per-node view test the
+   * caller already does throws that away.
+   */
+  function forEachInView(view, fn) {
+    const a0 = view.x / HALF_W;
+    const a1 = view.r / HALF_W;
+    const b0 = view.y / HALF_H;
+    const b1 = view.b / HALF_H;
+    // gx = (a + b) / 2, gy = (b - a) / 2, over the four corners.
+    const gxMin = Math.min(a0 + b0, a1 + b0, a0 + b1, a1 + b1) / 2;
+    const gxMax = Math.max(a0 + b0, a1 + b0, a0 + b1, a1 + b1) / 2;
+    const gyMin = Math.min(b0 - a0, b0 - a1, b1 - a0, b1 - a1) / 2;
+    const gyMax = Math.max(b0 - a0, b0 - a1, b1 - a0, b1 - a1) / 2;
+
+    const cx0 = Math.max(0, Math.floor(gxMin / INDEX_CELL));
+    const cx1 = Math.min(cols - 1, Math.floor(gxMax / INDEX_CELL));
+    const cy0 = Math.max(0, Math.floor(gyMin / INDEX_CELL));
+    const cy1 = Math.min(rows - 1, Math.floor(gyMax / INDEX_CELL));
+    for (let cy = cy0; cy <= cy1; cy++) {
+      const base = cy * cols;
+      for (let cx = cx0; cx <= cx1; cx++) {
+        const list = cells[base + cx];
+        for (let i = 0; i < list.length; i++) fn(list[i]);
+      }
+    }
+  }
+
+  function destroy() {
+    for (const off of offs) off();
+    offs.length = 0;
+  }
+
+  return { forEachInView, destroy };
 }
 
 function makePool(create) {
@@ -1336,6 +1560,10 @@ function makePool(create) {
       return it;
     },
     reset() { n = 0; },
+    /** How many objects this pool handed out during the frame just drawn. */
+    used() { return n; },
+    /** How many objects the pool has ever had to create. */
+    size() { return items.length; },
     trim() {
       for (let i = n; i < items.length; i++) {
         if (items[i].visible) items[i].setVisible(false);
@@ -1349,24 +1577,35 @@ function makePool(create) {
   };
 }
 
-/** Health / progress bar in world space, pre-scaled to hold its screen size. */
-function bar(g, wx, wy, w, h, frac, color, invZ) {
+/**
+ * Health / progress bar in world space, pre-scaled to hold its screen size.
+ *
+ * `plain` drops the two decorative layers — see BAR_PLAIN_ABOVE for when and
+ * why. What is left is the outline, the track and the fill, which is the whole
+ * of the information; what goes is the soft outer shadow and the gloss across
+ * the top of the fill.
+ */
+function bar(g, wx, wy, w, h, frac, color, invZ, plain) {
   const f = frac < 0 ? 0 : frac > 1 ? 1 : frac;
   const pad = 1.4 * invZ;
   // Two rings of dark around the bar, not one. On grass at 0.7 zoom a single
   // hairline outline is the same value as the ground behind it and the bar's
   // ends dissolve; a solid black surround is what makes a 20px bar read as an
   // object rather than as a smear of colour.
-  g.fillStyle(0x000000, 0.55);
-  g.fillRect(wx - w / 2 - pad * 2, wy - pad * 2, w + pad * 4, h + pad * 4);
+  if (!plain) {
+    g.fillStyle(0x000000, 0.55);
+    g.fillRect(wx - w / 2 - pad * 2, wy - pad * 2, w + pad * 4, h + pad * 4);
+  }
   g.fillStyle(0x0b0906, 0.95);
   g.fillRect(wx - w / 2 - pad, wy - pad, w + pad * 2, h + pad * 2);
   g.fillStyle(0x3a3630, 1);
   g.fillRect(wx - w / 2, wy, w, h);
   g.fillStyle(color, 1);
   g.fillRect(wx - w / 2, wy, w * f, h);
-  g.fillStyle(0xffffff, 0.3);
-  g.fillRect(wx - w / 2, wy, w * f, h * 0.42);
+  if (!plain) {
+    g.fillStyle(0xffffff, 0.3);
+    g.fillRect(wx - w / 2, wy, w * f, h * 0.42);
+  }
 }
 
 /**
@@ -1378,12 +1617,12 @@ function bar(g, wx, wy, w, h, frac, color, invZ) {
  * glance at a melee sorts it into "fine / hurt / about to die" without
  * measuring any lengths.
  */
-function healthBar(g, wx, wy, frac, ownColor, invZ) {
+function healthBar(g, wx, wy, frac, ownColor, invZ, plain) {
   const f = frac < 0 ? 0 : frac > 1 ? 1 : frac;
   const color = ownColor === 0x4ade80
     ? (f > 0.6 ? 0x4ade80 : f > 0.3 ? 0xf0b429 : 0xf05252)
     : ownColor;
-  bar(g, wx, wy, 24 * invZ, 5 * invZ, f, color, invZ);
+  bar(g, wx, wy, 24 * invZ, 5 * invZ, f, color, invZ, plain);
 }
 
 /** Blend two packed RGB colours. Used for the "unpainted masonry" tint. */
@@ -1393,6 +1632,11 @@ function mixColor(a, b, k) {
   const g = ((a >> 8) & 255) + (((b >> 8) & 255) - ((a >> 8) & 255)) * f;
   const bl = (a & 255) + ((b & 255) - (a & 255)) * f;
   return (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(bl);
+}
+
+/** Top of the visible part of a building under construction. */
+function visTopOf(fo, top, progress) {
+  return Math.max(fo ? fo.h * fo.oy : 0, top * progress);
 }
 
 function strokeDiamond(g, cx, cy, hw, hh) {
@@ -1602,17 +1846,34 @@ function bakeTerrain(scene, world, rect) {
     rt.endDraw();
   }
 
-  /** Paint every planned chunk overlapping the view (plus a margin). */
+  /**
+   * Paint every planned chunk overlapping the view (plus a margin), and show
+   * only the chunks the camera can actually see.
+   *
+   * The visibility half matters as much as the baking half, and it is not the
+   * same test. Phaser does not frustum-cull an Image or a RenderTexture: every
+   * one in the display list is submitted every frame, and because each chunk is
+   * its own texture, every one of them is a texture bind and therefore its own
+   * draw call. After twenty minutes of a match the player has visited most of
+   * the map and ninety-one chunks are resident — so an uncut list is ninety-one
+   * draw calls a frame to draw the six that are on screen. Measured on the
+   * stress scenario with twenty chunks resident, hiding the off-screen ones took
+   * the frame from 27 draw calls to 13.
+   */
   function ensure(view) {
-    const x0 = view.x - PREBAKE_PAD;
-    const y0 = view.y - PREBAKE_PAD;
-    const x1 = view.r + PREBAKE_PAD;
-    const y1 = view.b + PREBAKE_PAD;
+    const bx0 = view.x - PREBAKE_PAD;
+    const by0 = view.y - PREBAKE_PAD;
+    const bx1 = view.r + PREBAKE_PAD;
+    const by1 = view.b + PREBAKE_PAD;
     for (let i = 0; i < planned.length; i++) {
       const c = planned[i];
-      if (c.rt) continue;
-      if (c.ox > x1 || c.ox + size < x0 || c.oy > y1 || c.oy + size < y0) continue;
-      paint(c);
+      if (!c.rt) {
+        if (c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0) continue;
+        paint(c);
+      }
+      const on = !(c.ox > view.r || c.ox + size < view.x
+        || c.oy > view.b || c.oy + size < view.y);
+      if (c.rt.visible !== on) c.rt.setVisible(on);
     }
   }
 

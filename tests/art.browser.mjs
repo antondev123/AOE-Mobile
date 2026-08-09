@@ -459,6 +459,37 @@ const run = async () => {
     }
 
     // --- 8. performance ------------------------------------------------------
+    //
+    // WHAT THIS CHECKS, AND WHY IT NO LONGER CHECKS A FRAME TIME
+    // ----------------------------------------------------------
+    // This section used to assert a median frame time under a fixed number of
+    // milliseconds. It cannot: the harness runs Chromium with
+    // `--use-gl=swiftshader`, so there is no GPU and every pixel is rasterised
+    // on the CPU. Two measurements settle it.
+    //
+    // First, the floor. With the whole display list hidden — nothing drawn at
+    // all, just Phaser's loop and the swap — a frame here costs twenty to
+    // thirty milliseconds depending on how busy the build box is. The 60fps
+    // budget is 16.7ms. There is no arrangement of this game, or of any game,
+    // that renders inside a frame budget on this machine, so a wall-clock
+    // pass/fail here can only ever be a number picked to sit above whatever the
+    // renderer currently costs. The floor is measured and printed below rather
+    // than quoted, so the reader can see it for themselves on the day.
+    //
+    // Second, the split. Of a 45ms frame in a two-hundred unit battle, about
+    // 4ms is our JavaScript and the rest is software rasterisation — and the
+    // per-layer breakdown is all fill: the fog quad and the terrain, both of
+    // which are single screen-sized textured quads that a phone GPU draws in
+    // microseconds and swiftshader takes ten milliseconds over.
+    //
+    // So the assertions are the structural ones, which mean the same thing on
+    // both machines: how many draw calls the frame submits, how many Game
+    // Objects it touches, and how many milliseconds of JavaScript it costs. The
+    // wall clock is printed next to the measured floor, because the ratio
+    // between them is informative and the absolute number is not.
+    //
+    // tests/perf.browser.mjs is the full version of this: a running battle with
+    // the fog, the minimap and the HUD all live, and budgets per phase.
     if (want('perf')) {
       const perf = await page.evaluate(async () => {
         const g = window.__game;
@@ -497,37 +528,71 @@ const run = async () => {
         gl.drawElements = (...a) => { calls++; return de(...a); };
         gl.drawArrays = (...a) => { calls++; return da(...a); };
 
-        const frames = [];
-        let last = performance.now();
-        await new Promise((resolve) => {
-          let n = 0;
-          const tick = () => {
-            const now = performance.now();
-            frames.push(now - last);
-            last = now;
-            if (++n >= 90) resolve();
-            else requestAnimationFrame(tick);
-          };
-          requestAnimationFrame(tick);
-        });
+        const spin = async (n) => {
+          const out = [];
+          let last = performance.now();
+          await new Promise((resolve) => {
+            let k = 0;
+            const tick = () => {
+              const now = performance.now();
+              out.push(now - last);
+              last = now;
+              if (++k >= n) resolve();
+              else requestAnimationFrame(tick);
+            };
+            requestAnimationFrame(tick);
+          });
+          const kept = out.slice(Math.floor(n / 3)).sort((a, b) => a - b);
+          return { all: out, median: kept[Math.floor(kept.length / 2)],
+            p95: kept[Math.floor(kept.length * 0.95)] };
+        };
+
+        g.perf.enable(true);
+        const live = await spin(90);
+        g.perf.enable(false);
         gl.drawElements = de;
         gl.drawArrays = da;
-        const kept = frames.slice(30).sort((a, b) => a - b);
+
+        // The floor: the same loop with nothing in the display list at all.
+        // Whatever this costs is the harness, not the game.
+        const list = g.scene.children.list.slice();
+        const was = list.map((o) => o.visible);
+        list.forEach((o) => o.setVisible(false));
+        const empty = await spin(60);
+        list.forEach((o, i) => o.setVisible(was[i]));
+
+        const report = g.perf.report(30);
         return {
           units: w.units.length,
-          drawCallsPerFrame: calls / frames.length,
-          medianMs: kept[Math.floor(kept.length / 2)],
-          p95Ms: kept[Math.floor(kept.length * 0.95)],
+          drawCallsPerFrame: calls / live.all.length,
+          medianMs: live.median,
+          p95Ms: live.p95,
+          floorMs: empty.median,
+          cpuMs: (report['scene.update'] || { median: 0 }).median,
+          objects: (report.objects || { p95: 0 }).p95,
         };
       });
       console.log(`\n  perf: ${perf.units} units on screen — ` +
         `${perf.drawCallsPerFrame.toFixed(1)} draw calls/frame, ` +
-        `median frame ${perf.medianMs.toFixed(1)}ms, p95 ${perf.p95Ms.toFixed(1)}ms`);
+        `${perf.objects.toFixed(0)} objects touched, ` +
+        `${perf.cpuMs.toFixed(2)}ms of JavaScript`);
+      console.log(`  wall clock ${perf.medianMs.toFixed(1)}ms median, ` +
+        `p95 ${perf.p95Ms.toFixed(1)}ms — against a ${perf.floorMs.toFixed(1)}ms floor ` +
+        'for an empty display list on this software rasteriser, versus a 16.7ms ' +
+        '60fps budget. Not a phone number; see the note above.');
       await shot(page, 'art-crowd');
       check('the batch is not being broken per sprite',
-        perf.drawCallsPerFrame < 40, `${perf.drawCallsPerFrame.toFixed(1)} calls`);
-      check('130 units still render inside a frame budget',
-        perf.medianMs < 34, `${perf.medianMs.toFixed(1)}ms median (swiftshader, no GPU)`);
+        perf.drawCallsPerFrame < 24, `${perf.drawCallsPerFrame.toFixed(1)} calls`);
+      // Only what the camera holds. 130 units at the default zoom is about 260
+      // bodies and markers plus the ground under them; the map's 1900 trees and
+      // every remembered ghost must not be in this number.
+      check('130 units cost only the objects the camera can hold',
+        perf.objects < 700, `${perf.objects.toFixed(0)} Game Objects touched`);
+      // The transferable half of a frame. A tenth of the 60fps budget spent in
+      // our own JavaScript, with the whole of the rest left for the browser,
+      // the driver and the phone's slower core.
+      check('130 units cost little enough JavaScript to leave the budget alone',
+        perf.cpuMs < 4, `${perf.cpuMs.toFixed(2)}ms of scene update`);
     }
 
     check('no console errors', errors.length === 0, errors.slice(0, 3).join(' | '));

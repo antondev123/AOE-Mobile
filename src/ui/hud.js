@@ -32,6 +32,7 @@ import { createMinimap, miniToGrid } from './minimap.js';
 import {
   selectedEntities, setSelection, clearSelection, selectionSignature,
 } from './selection.js';
+import { perfBegin, perfEnd } from '../core/perf.js';
 
 const MINIMAP_HZ = 10;
 const TOAST_MS = 2400;
@@ -2151,6 +2152,7 @@ export function createHud(scene, world) {
   function update(dt) {
     if (state.destroyed) return;
     const now = performance.now();
+    const _tDom = perfBegin('hud.dom');
 
     updateResources();
     updateIdle();
@@ -2186,11 +2188,14 @@ export function createHud(scene, world) {
     refreshAlloc();
 
     renderModeChip();
+    perfEnd('hud.dom', _tDom);
 
     state.minimapAcc += dt;
     if (minimap && state.minimapAcc >= 1 / MINIMAP_HZ) {
       state.minimapAcc = 0;
+      const _t = perfBegin('hud.minimap');
       minimap.draw(camera());
+      perfEnd('hud.minimap', _t);
     }
   }
 

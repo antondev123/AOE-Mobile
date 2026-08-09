@@ -60,11 +60,17 @@ export const PHONE = {
  * Returns { browser, page, errors, close() }. `errors` accumulates console
  * errors and uncaught exceptions — a clean run must leave it empty.
  */
-export async function boot({ query = 'autostart', context: ctxOpts = {} } = {}) {
+export async function boot({ query = 'autostart', context: ctxOpts = {}, args = [] } = {}) {
   const { server, port } = await serve();
   const browser = await chromium.launch({
     executablePath: CHROMIUM,
-    args: ['--no-sandbox', '--disable-dev-shm-usage', '--use-gl=swiftshader'],
+    args: [
+      '--no-sandbox', '--disable-dev-shm-usage', '--use-gl=swiftshader',
+      // Extra flags, for the performance pass: it needs byte-accurate heap
+      // readings (--enable-precise-memory-info) and a collector it can drive
+      // itself, neither of which any other test wants paid for.
+      ...args,
+    ],
   });
   const context = await browser.newContext({ ...PHONE, ...ctxOpts });
   const page = await context.newPage();

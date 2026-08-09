@@ -19,6 +19,8 @@ import { createVision } from '../systems/vision.js';
 // of cells, large enough that the bucket array stays small. It scales with the
 // map rather than being a fixed grid — see createWorld.
 const BUCKET_SIZE = 4;
+// Side of one bucket in the units-only index. See _unitBuckets below.
+const UNIT_BUCKET_SIZE = 2;
 
 export function createWorld(seed = 12345) {
   const rng = makeRng(seed);
@@ -70,9 +72,30 @@ export function createWorld(seed = 12345) {
     _cols: Math.ceil(MAP_W / BUCKET_SIZE),
     _rows: Math.ceil(MAP_H / BUCKET_SIZE),
     _buckets: null,
+    // A second index holding units only, on a finer grid.
+    //
+    // Separation steering asks "which units are within a tile of me" once per
+    // unit per step — 200 queries at 20Hz — and it is the hottest loop in the
+    // simulation by measurement. Two things made it expensive against the mixed
+    // index. It walked the ~1700 trees and the buildings sharing those cells and
+    // rejected them one at a time; and the cells are four tiles across, sized
+    // for forEachNear's one-to-five-tile queries, so a one-tile question dragged
+    // in a twelve-by-twelve tile neighbourhood — which in a melee is a hundred
+    // and fifty units to reject for every one that qualifies.
+    //
+    // Two-tile cells make the same query a two-by-two sweep of four tiles each.
+    // The cost is 2304 empty arrays to clear per step instead of 576, which is a
+    // length assignment apiece and does not register.
+    _unitCell: UNIT_BUCKET_SIZE,
+    _unitCols: Math.ceil(MAP_W / UNIT_BUCKET_SIZE),
+    _unitRows: Math.ceil(MAP_H / UNIT_BUCKET_SIZE),
+    _unitBuckets: null,
   };
 
   world._buckets = Array.from({ length: world._cols * world._rows }, () => []);
+  world._unitBuckets = Array.from(
+    { length: world._unitCols * world._unitRows }, () => [],
+  );
 
   // Fog of war. Built here rather than in the scene so that every world — the
   // real one and every headless test world — carries the same masks, and so
@@ -537,16 +560,58 @@ export function recomputePop(world, playerId) {
 
 /** Rebuild the spatial buckets. Called once per sim step by the game loop. */
 export function reindex(world) {
-  for (const b of world._buckets) b.length = 0;
+  const buckets = world._buckets;
+  const unitBuckets = world._unitBuckets;
+  for (let i = 0; i < buckets.length; i++) buckets[i].length = 0;
+  for (let i = 0; i < unitBuckets.length; i++) unitBuckets[i].length = 0;
   const cs = world._cellSize;
-  const push = (e) => {
-    const cx = Math.min(world._cols - 1, Math.max(0, Math.floor(e.x / cs)));
-    const cy = Math.min(world._rows - 1, Math.max(0, Math.floor(e.y / cs)));
-    world._buckets[cy * world._cols + cx].push(e);
+  const cols = world._cols;
+  const maxX = cols - 1;
+  const maxY = world._rows - 1;
+  const cell = (e) => {
+    let cx = Math.floor(e.x / cs);
+    let cy = Math.floor(e.y / cs);
+    if (cx < 0) cx = 0; else if (cx > maxX) cx = maxX;
+    if (cy < 0) cy = 0; else if (cy > maxY) cy = maxY;
+    return cy * cols + cx;
   };
-  for (const e of world.units) push(e);
-  for (const e of world.buildings) push(e);
-  for (const e of world.resources) push(e);
+  const ucs = world._unitCell;
+  const ucols = world._unitCols;
+  const umaxX = ucols - 1;
+  const umaxY = world._unitRows - 1;
+  const units = world.units;
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    buckets[cell(u)].push(u);
+    let cx = Math.floor(u.x / ucs);
+    let cy = Math.floor(u.y / ucs);
+    if (cx < 0) cx = 0; else if (cx > umaxX) cx = umaxX;
+    if (cy < 0) cy = 0; else if (cy > umaxY) cy = umaxY;
+    unitBuckets[cy * ucols + cx].push(u);
+  }
+  const blds = world.buildings;
+  for (let i = 0; i < blds.length; i++) buckets[cell(blds[i])].push(blds[i]);
+  const res = world.resources;
+  for (let i = 0; i < res.length; i++) buckets[cell(res[i])].push(res[i]);
+}
+
+/**
+ * Copy the live unit list into a caller-owned array.
+ *
+ * Both updateUnits and updateCombat have to iterate a snapshot rather than the
+ * live array, because a kill or a garrison splices an entry out from under the
+ * loop. They took `world.units.slice()` for it, which is a fresh two-hundred
+ * element array twice per step — forty of them a second, purely so that a loop
+ * could have a stable view of a list it already owns. Handing in a scratch
+ * array the caller keeps costs nothing and makes the steady state allocate
+ * nothing at all.
+ */
+export function snapshotUnits(world, out) {
+  const src = world.units;
+  const n = src.length;
+  for (let i = 0; i < n; i++) out[i] = src[i];
+  out.length = n;
+  return out;
 }
 
 /**
