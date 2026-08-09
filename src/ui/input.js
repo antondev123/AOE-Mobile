@@ -712,22 +712,45 @@ export function createInput(scene, world, renderer, hud) {
     const f = economy.placeFoundation(world, PLAYER, gh.type, gh.gx, gh.gy);
     if (!f) return; // economy already explained why
 
-    let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
-    if (!builders.length) {
-      // Nothing selected? Send the nearest villager rather than doing nothing.
-      let best = null;
-      let bd = Infinity;
-      for (const u of world.units) {
-        if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
-        const d = (u.x - f.x) ** 2 + (u.y - f.y) ** 2;
-        if (d < bd) { bd = d; best = u; }
-      }
-      if (best) builders = [best];
-    }
-    command(builders, { type: 'build', gx: f.x, gy: f.y, target: f });
+    if (typeof economy.enqueueFoundation === 'function') economy.enqueueFoundation(world, f);
     fx(f.x, f.y, 'build');
-    hud.setPlacementMode(null);
+
+    // Only send builders when nobody is already building. A batch is placed
+    // faster than it is built, and re-ordering the same crew onto every new
+    // site as it lands would walk them off the half-finished house to the one
+    // you just tapped, over and over — the fifth tap would leave four
+    // foundations standing and one villager sprinting. They work the queue
+    // through instead (onJobFinished in unitAI.js), and the only thing this has
+    // to guarantee is that *somebody* starts.
+    if (!anyBuilding()) {
+      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      if (!builders.length) {
+        // Nothing selected? Send the nearest villager rather than doing nothing.
+        let best = null;
+        let bd = Infinity;
+        for (const u of world.units) {
+          if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+          const d = (u.x - f.x) ** 2 + (u.y - f.y) ** 2;
+          if (d < bd) { bd = d; best = u; }
+        }
+        if (best) builders = [best];
+      }
+      command(builders, { type: 'build', gx: f.x, gy: f.y, target: f });
+    }
+
+    // Placement stays armed: the next tap places the next one. `Done` on the
+    // placement bar (or Escape, or the build menu) is what ends the batch.
+    if (hud && typeof hud.onFoundationPlaced === 'function') hud.onFoundationPlaced(1);
     syncPlacement();
+  }
+
+  /** Is any villager of ours already on a construction site? */
+  function anyBuilding() {
+    for (const u of world.units) {
+      if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+      if (u.task && u.task.type === 'build') return true;
+    }
+    return false;
   }
 
   // ------------------------------------------------------- wall drawing mode
@@ -884,26 +907,36 @@ export function createInput(scene, world, renderer, hud) {
     else hud.toast(`${label} — villagers on the way`, 'info');
 
     // The foundations are ordinary construction sites, so ordinary builders
-    // finish them. Sending everyone to the *first* segment rather than sharing
-    // them out is deliberate for now: a wall built from one end inwards is a
-    // wall that is useful while it is going up, and a batch/queue system that
-    // spreads builders along a run is another pass's job (see HANDOFF-walls.md).
+    // finish them — and they are now queued, in the order the run was drawn, so
+    // a villager that finishes one segment walks to the next along the line
+    // instead of going back to a tree. That is what HANDOFF-walls.md left open:
+    // the wall is still built from one end inwards, which is what makes it
+    // useful while it is going up, but the crew no longer has to be re-ordered
+    // segment by segment.
     const first = res.placed[0];
-    let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
-    if (!builders.length) {
-      let best = null;
-      let bd = Infinity;
-      for (const u of world.units) {
-        if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
-        const d = (u.x - first.x) ** 2 + (u.y - first.y) ** 2;
-        if (d < bd) { bd = d; best = u; }
-      }
-      if (best) builders = [best];
+    if (typeof economy.enqueueFoundation === 'function') {
+      for (const b of res.placed) economy.enqueueFoundation(world, b);
     }
-    command(builders, { type: 'build', gx: first.x, gy: first.y, target: first });
+    if (!anyBuilding()) {
+      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      if (!builders.length) {
+        let best = null;
+        let bd = Infinity;
+        for (const u of world.units) {
+          if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+          const d = (u.x - first.x) ** 2 + (u.y - first.y) ** 2;
+          if (d < bd) { bd = d; best = u; }
+        }
+        if (best) builders = [best];
+      }
+      command(builders, { type: 'build', gx: first.x, gy: first.y, target: first });
+    }
     fx(first.x, first.y, 'build');
 
-    hud.setPlacementMode(null);
+    // Stays armed, exactly as tapped placement now does: the next drag draws the
+    // next run. Two fingers still abandons a run mid-draw, and Done on the
+    // placement bar ends the batch.
+    if (hud && typeof hud.onFoundationPlaced === 'function') hud.onFoundationPlaced(n);
     syncPlacement();
   }
 

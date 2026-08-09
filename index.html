@@ -17,6 +17,14 @@
   <!-- HUD overlay. Pointer events are opt-in per control so the map stays
        draggable everywhere the HUD is not. -->
   <div id="hud" class="hud" hidden>
+    <!-- The top strip is now nothing but the standing numbers. Every control
+         that used to live up here has moved into the dock at the bottom (see
+         .hud-stack below): the top corners of a 390x844 phone are the two
+         places a thumb cannot reach without re-gripping, and the menu button
+         parked in one of them owned "centre on Town Center" and both
+         select-alls — the three things a one-handed player needs most. What is
+         left here is read, never tapped, so it can wrap as freely as it likes
+         with nothing to push off the screen. -->
     <div class="hud-top">
       <div class="res-bar" id="res-bar">
         <div class="res" id="res-food"><i class="ico ico-food"></i><span>0</span></div>
@@ -30,22 +38,35 @@
              for a second row of chrome across the top. -->
         <div class="res age" id="res-age"><span>Dark</span></div>
       </div>
-      <button class="icon-btn" id="btn-menu" aria-label="Menu">&#9776;</button>
-    </div>
-
-    <div class="hud-minimap" id="minimap-wrap">
-      <canvas id="minimap" width="160" height="160"></canvas>
     </div>
 
     <div class="hud-toasts" id="toasts" aria-live="polite"></div>
 
-    <div class="hud-bottom" id="hud-bottom">
-      <div class="sel-panel" id="sel-panel"></div>
-      <div class="cmd-panel" id="cmd-panel"></div>
+    <!-- Everything between the map and the bottom bar, stacked bottom-up in one
+         flex column: transient sheets, the build queue, the minimap, and the
+         dock. A column rather than four independently positioned boxes because
+         they have to give way to each other — a build queue that appears must
+         push the minimap up, not sit on top of it. -->
+    <div class="hud-stack" id="hud-stack">
+      <div class="hud-sheets" id="hud-sheets"></div>
+      <div class="build-queue" id="build-queue" hidden></div>
+      <div class="hud-minimap" id="minimap-wrap">
+        <canvas id="minimap" width="160" height="160"></canvas>
+      </div>
+      <div class="hud-dock" id="hud-dock"></div>
     </div>
 
-    <div class="idle-vill" id="idle-vill" hidden>
-      <button class="icon-btn wide" id="btn-idle"><i class="ico ico-vill"></i><span id="idle-count">0</span></button>
+    <div class="hud-bottom" id="hud-bottom">
+      <!-- "Gathering wood -> Lumber Camp". Full width of the bar rather than
+           squeezed into the selection panel, where it had 137px to say a
+           190px sentence and ellipsised away the destination — which is the
+           whole payload, and the only proof the player gets that the drop-off
+           they paid 100 wood for changed anything. -->
+      <div class="job-note" id="job-note" hidden></div>
+      <div class="hud-panels">
+        <div class="sel-panel" id="sel-panel"></div>
+        <div class="cmd-panel" id="cmd-panel"></div>
+      </div>
     </div>
   </div>
 
@@ -67,6 +88,8 @@
           <li>Select the <b>Town Center</b> and <b>advance the age</b> &mdash; it unlocks the gathering and blacksmith upgrades, and every building of yours gets tougher.</li>
           <li>Select a <b>Mill</b>, <b>Lumber Camp</b>, <b>Mining Camp</b> or <b>Barracks</b> to research upgrades there. They apply to everything you already own.</li>
           <li>Long walk home? Put a <b>Lumber Camp</b> by the trees or a <b>Mining Camp</b> by the gold &mdash; villagers switch to it on their own.</li>
+          <li>Tap <b>Jobs</b> in the bar at the bottom to set what share of your villagers works each resource. Switch it on and the game keeps them matching it.</li>
+          <li>Placing a building stays armed: tap out a whole row of houses in one go, and your builders work through the queue by themselves.</li>
           <li>Put a building somewhere you regret? Select it and tap <b>Demolish</b> twice.</li>
         </ul>
       </details>

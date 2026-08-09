@@ -14,6 +14,7 @@ import {
   PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
   MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
   FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
+  isWallType,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js';
@@ -21,6 +22,7 @@ import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js'
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
 import * as tech from '../systems/tech.js';
+import * as alloc from '../systems/allocation.js';
 import {
   stanceOf, garrisonCapacity, garrisonCount, isGarrisoned, nearestShelter,
   ungarrisonAll,
@@ -255,10 +257,11 @@ export function createHud(scene, world) {
     toasts: doc.getElementById('toasts'),
     selPanel: doc.getElementById('sel-panel'),
     cmdPanel: doc.getElementById('cmd-panel'),
-    idleWrap: doc.getElementById('idle-vill'),
-    idleBtn: doc.getElementById('btn-idle'),
-    idleCount: doc.getElementById('idle-count'),
-    menuBtn: doc.getElementById('btn-menu'),
+    jobNote: doc.getElementById('job-note'),
+    stack: doc.getElementById('hud-stack'),
+    sheets: doc.getElementById('hud-sheets'),
+    dock: doc.getElementById('hud-dock'),
+    buildQueue: doc.getElementById('build-queue'),
     minimap: doc.getElementById('minimap'),
     minimapWrap: doc.getElementById('minimap-wrap'),
   };
@@ -270,6 +273,11 @@ export function createHud(scene, world) {
     demolishArm: null,       // { key, at } — demolish armed for exactly this set
     buildMenuOpen: false,
     menuOpen: false,
+    allocOpen: false,
+    placedThisArm: 0,        // foundations put down since the type was armed
+    bqSig: '',               // build-queue strip signature
+    allocSig: '',            // allocation readout signature
+    idleLast: -1,            // id of the idle villager the button last showed
     liveJob: null,           // { list, node } — the "where is this going" line
     liveGarrison: null,      // { list, node } — the "how many are inside" line
     selSig: '',
@@ -287,39 +295,87 @@ export function createHud(scene, world) {
     liveCosts: [],           // { el, cost } — command panel
     liveBuild: [],           // { el, cost } — build menu sheet
     liveQueue: null,         // { building, bar, label }
+    liveAlloc: null,         // { rows, tally, toggle } — the allocation sheet
     liveResearch: null,      // { building, fill, label, slots } — research bar
     liveBars: [],            // { kind, list, bar, fill, text } — hp and stock rows
     destroyed: false,
   };
 
   // --- Extra markup (owned here, not in index.html) -------------------------
+  //
+  // The transient sheets all live in one container inside the thumb stack, so
+  // they stack with the build queue, the minimap and the dock rather than being
+  // positioned against the bottom of the screen one at a time. Before this they
+  // each carried their own copy of `bottom: calc(safe-b + hud-h + 8px)`, which
+  // is four places to forget when anything below them changes height.
 
-  const modeChip = el('button', 'mode-chip tappable');
-  modeChip.id = 'mode-chip';
-  modeChip.setAttribute('aria-label', 'One-finger gesture mode');
-  root.appendChild(modeChip);
+  const sheets = dom.sheets || root;
 
   const buildMenu = el('div', 'build-menu');
   buildMenu.id = 'build-menu';
   buildMenu.hidden = true;
-  root.appendChild(buildMenu);
+  sheets.appendChild(buildMenu);
+
+  const allocSheet = el('div', 'alloc-sheet');
+  allocSheet.id = 'alloc-sheet';
+  allocSheet.hidden = true;
+  sheets.appendChild(allocSheet);
 
   const placeBar = el('div', 'place-bar');
   placeBar.id = 'place-bar';
   placeBar.hidden = true;
-  root.appendChild(placeBar);
+  sheets.appendChild(placeBar);
 
   // Same shape as the placement bar on purpose: the game already teaches "a bar
   // across the bottom means the next tap on the map is spoken for".
   const attackBar = el('div', 'place-bar attack');
   attackBar.id = 'attack-bar';
   attackBar.hidden = true;
-  root.appendChild(attackBar);
+  sheets.appendChild(attackBar);
 
   const menuSheet = el('div', 'menu-sheet');
   menuSheet.id = 'menu-sheet';
   menuSheet.hidden = true;
-  root.appendChild(menuSheet);
+  sheets.appendChild(menuSheet);
+
+  // --- The dock -------------------------------------------------------------
+  //
+  // Four equal targets across the bottom of the map, in the arc a right thumb
+  // sweeps without the hand moving. Built here rather than in index.html
+  // because three of the four are stateful (the drag mode, the idle count, the
+  // allocation manager's on/off) and the fourth opens a sheet this module owns.
+
+  function dockButton(id, glyph, label, aria) {
+    const b = el('button', 'dock-btn');
+    b.id = id;
+    b.type = 'button';
+    b.setAttribute('aria-label', aria || label);
+    b.appendChild(el('span', 'glyph', glyph));
+    b.appendChild(el('span', 'lbl', label));
+    if (dom.dock) dom.dock.appendChild(b);
+    return b;
+  }
+
+  const modeChip = el('button', 'mode-chip dock-btn');
+  modeChip.id = 'mode-chip';
+  modeChip.type = 'button';
+  modeChip.setAttribute('aria-label', 'One-finger gesture mode');
+  if (dom.dock) dom.dock.appendChild(modeChip);
+
+  const idleBtn = dockButton('btn-idle', '', 'Idle', 'Idle villagers — tap to visit the next one');
+  idleBtn.classList.add('idle');
+  idleBtn.textContent = '';
+  const idleCount = el('span', 'count', '0');
+  idleBtn.appendChild(idleCount);
+  idleBtn.appendChild(el('span', 'lbl', 'Idle'));
+
+  const jobsBtn = dockButton('btn-jobs', '⚖', 'Jobs', 'Villager jobs — set what share works each resource');
+  const menuBtn = dockButton('btn-menu', '☰', 'Menu', 'Menu');
+
+  dom.idleBtn = idleBtn;
+  dom.idleCount = idleCount;
+  dom.jobsBtn = jobsBtn;
+  dom.menuBtn = menuBtn;
 
   // The floating controls (mode chip, idle button, build menu, placement bar)
   // sit just above the bottom bar. Its height depends on what is selected, so
@@ -603,13 +659,18 @@ export function createHud(scene, world) {
     if (stocked.length) addBar(panel, 'stock', stocked);
 
     // Where this villager's load is going. See jobNoteText: the drop-off is
-    // chosen for the player by the sim, so the panel has to say which one it
+    // chosen for the player by the sim, so the HUD has to say which one it
     // picked or the Lumber Camp they just paid 100 wood for is invisible.
+    //
+    // The line itself lives outside this panel, across the full width of the
+    // bottom bar (see #job-note in index.html) — inside a 151px column it had
+    // to ellipsise the destination, which is the only part of the sentence
+    // worth printing.
     const workers = sel.filter((e) => e.player === PLAYER && e.type === 'villager');
-    if (workers.length) {
-      const note = el('div', 'job-note');
-      panel.appendChild(note);
-      state.liveJob = { list: workers, node: note };
+    if (workers.length && dom.jobNote) {
+      state.liveJob = { list: workers, node: dom.jobNote };
+    } else if (dom.jobNote) {
+      dom.jobNote.hidden = true;
     }
 
     // How many bodies are inside, and how many more will fit. This is the only
@@ -1108,8 +1169,31 @@ export function createHud(scene, world) {
     return Math.max(0, Math.min(1, (b.buildProgress || 0) / total));
   }
 
+  // --- Training queue ---------------------------------------------------------
+  //
+  // A production building answers three questions and the old row answered one
+  // of them. "What is coming out of here" is the question a player asks while
+  // deciding whether to tap Militia again, and a progress bar with no name on it
+  // cannot answer it; "how many are behind it" is the question that decides
+  // whether the answer is worth waiting for; and the queue entries have to be
+  // cancellable with a thumb, which 26px squares are not.
+  //
+  // Cancelling refunds in full (economy.cancelTrain), so — unlike Demolish —
+  // one tap does it. There is nothing to protect the player from: the cost is
+  // back before the toast has faded, and the alternative, an arm-then-confirm on
+  // a button pressed mostly by accident-correction, is two taps to undo one.
+
   function renderQueue(panel, b) {
     const row = el('div', 'queue');
+    const head = el('div', 'qhead');
+    const what = el('span', 'what');
+    const behind = el('span', 'behind');
+    const eta = el('span', 'eta');
+    head.appendChild(what);
+    head.appendChild(behind);
+    head.appendChild(eta);
+    row.appendChild(head);
+
     const prog = el('div', 'qprog');
     const fill = el('i');
     prog.appendChild(fill);
@@ -1118,7 +1202,7 @@ export function createHud(scene, world) {
     const slots = el('div', 'qslots');
     row.appendChild(slots);
     panel.appendChild(row);
-    state.liveQueue = { building: b, fill, slots, drawn: -1 };
+    state.liveQueue = { building: b, fill, slots, what, behind, eta, drawn: -1, drawnType: '' };
     refreshQueue();
   }
 
@@ -1129,24 +1213,45 @@ export function createHud(scene, world) {
     const p = typeof economy.trainProgress === 'function' ? economy.trainProgress(q.building) : 0;
     q.fill.style.width = `${(p * 100).toFixed(1)}%`;
 
-    if (q.drawn !== queue.length) {
+    const head = queue[0];
+    const name = head ? (UNIT_STATS[head.type] ? UNIT_STATS[head.type].name : head.type) : '';
+    const whatText = head ? `Training ${name}` : 'Not training';
+    if (q.what.textContent !== whatText) q.what.textContent = whatText;
+    const behindText = queue.length > 1
+      ? `+${queue.length - 1} waiting`
+      : head ? 'last in the queue' : '';
+    if (q.behind.textContent !== behindText) q.behind.textContent = behindText;
+    const etaText = head ? `${Math.max(0, Math.ceil(head.remaining))}s` : '';
+    if (q.eta.textContent !== etaText) q.eta.textContent = etaText;
+
+    // Rebuild the chips only when the queue actually changes shape — this runs
+    // every frame, and the head's type matters as well as the length (cancel the
+    // Militia at the front of Militia/Archer and the count is unchanged).
+    const type = queue.map((e) => e.type).join(',');
+    if (q.drawn !== queue.length || q.drawnType !== type) {
       q.drawn = queue.length;
+      q.drawnType = type;
       q.slots.textContent = '';
       queue.forEach((entry, i) => {
-        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`,
-          ABBR[entry.type] ? ABBR[entry.type].slice(0, 1) : entry.type.slice(0, 1).toUpperCase());
-        s.title = `Cancel ${entry.type}`;
+        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`);
+        const uname = UNIT_STATS[entry.type] ? UNIT_STATS[entry.type].name : entry.type;
+        s.appendChild(el('span', 'ab', ABBR[entry.type] || entry.type.slice(0, 3).toUpperCase()));
+        s.appendChild(el('span', 'x', '×'));
+        s.title = `Cancel ${uname} — cost refunded`;
+        s.setAttribute('aria-label', `Cancel ${uname}, number ${i + 1} in the queue. The cost is refunded.`);
         s.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          if (typeof economy.cancelTrain === 'function') {
-            economy.cancelTrain(world, q.building, i);
-            toast('Cancelled', 'info');
+          if (typeof economy.cancelTrain !== 'function') return;
+          if (economy.cancelTrain(world, q.building, i)) {
+            toast(`${uname} cancelled — cost refunded`, 'info');
             state.cmdSig = ''; // force a re-render
           }
         });
         q.slots.appendChild(s);
       });
-      if (queue.length === 0) q.slots.appendChild(el('span', 'cmd-note', 'idle'));
+      if (queue.length === 0) {
+        q.slots.appendChild(el('span', 'qempty', 'Nothing queued — tap a unit above'));
+      }
     }
   }
 
@@ -1254,12 +1359,16 @@ export function createHud(scene, world) {
 
   function renderResearchQueue(panel, b) {
     const row = el('div', 'queue research-queue');
+    // Same shell as the training queue — name on top, bar under it, cancellable
+    // chips below — so a player learns one pattern and reads both.
+    const head = el('div', 'qhead');
+    const label = el('span', 'qlabel');
+    head.appendChild(label);
+    row.appendChild(head);
     const prog = el('div', 'qprog');
     const fill = el('i');
     prog.appendChild(fill);
     row.appendChild(prog);
-    const label = el('span', 'qlabel');
-    row.appendChild(label);
     const slots = el('div', 'qslots');
     row.appendChild(slots);
     panel.appendChild(row);
@@ -1273,7 +1382,8 @@ export function createHud(scene, world) {
     const queue = q.building.research || [];
     q.fill.style.width = `${(tech.researchProgress(q.building) * 100).toFixed(1)}%`;
     const head = queue[0];
-    const name = head && tech.TECHS[head.id] ? tech.TECHS[head.id].name : '';
+    const name = head && tech.TECHS[head.id]
+      ? `Researching ${tech.TECHS[head.id].name}` : '';
     if (q.label.textContent !== name) q.label.textContent = name;
 
     if (q.drawn !== queue.length) {
@@ -1281,8 +1391,9 @@ export function createHud(scene, world) {
       q.slots.textContent = '';
       queue.forEach((entry, i) => {
         const t = tech.TECHS[entry.id];
-        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`,
-          (t ? t.name : entry.id).slice(0, 1).toUpperCase());
+        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`);
+        s.appendChild(el('span', 'ab', (t ? t.name : entry.id).slice(0, 3).toUpperCase()));
+        s.appendChild(el('span', 'x', '×'));
         s.title = `Cancel ${t ? t.name : entry.id} — full refund`;
         s.setAttribute('aria-label', `Cancel ${t ? t.name : entry.id}. The cost is refunded.`);
         s.addEventListener('click', (ev) => {
@@ -1333,8 +1444,15 @@ export function createHud(scene, world) {
     const open = force === undefined ? !state.buildMenuOpen : force;
     state.buildMenuOpen = open;
     buildMenu.hidden = !open;
-    if (open) renderBuildMenu();
-    else state.liveBuild = []; // stop refreshing buttons nobody can see
+    if (open) {
+      // One sheet at a time. They share the same slot above the dock, and two
+      // of them open at once is 60% of the screen with the map behind it.
+      toggleAlloc(false);
+      toggleMenu(false);
+      renderBuildMenu();
+    } else {
+      state.liveBuild = []; // stop refreshing buttons nobody can see
+    }
   }
 
   /**
@@ -1428,29 +1546,142 @@ export function createHud(scene, world) {
     setTimeout(() => dom.age.classList.remove('flash'), 1000);
   }
 
-  // --- Placement mode -------------------------------------------------------
+  // --- Build queue strip ------------------------------------------------------
+  //
+  // What the batch looks like once it is down. See the build queue section in
+  // economy.js for why the order is remembered at all; this is the half the
+  // player can see and undo.
 
-  function setPlacementMode(typeOrNull) {
-    state.placement = typeOrNull || null;
-    toggleBuildMenu(false);
-    // Placement also claims the next tap, so it cannot coexist with an armed
-    // attack-move. (Only when arming: setPlacementMode(null) must not recurse.)
-    if (state.placement) setAttackArmed(false, { quiet: true });
-    if (!state.placement) {
+  function refreshBuildQueue() {
+    const strip = dom.buildQueue;
+    if (!strip || typeof economy.buildQueue !== 'function') return;
+    const list = economy.buildQueue(world, PLAYER);
+    // Progress is in the signature so the "42%" on the leading chip stays live,
+    // rounded to 5% so the strip is not rebuilt sixty times a second.
+    // The length leads the signature so that an empty queue is "0|" and not the
+    // empty string — which is also the sentinel the events use to force a
+    // rebuild, and the collision left the strip on screen holding chips for
+    // sites that had already been built.
+    const sig = `${list.length}|` + list
+      .map((b) => `${b.id}:${Math.round(progressOf(b) * 20)}`)
+      .join(',');
+    if (sig === state.bqSig) return;
+    state.bqSig = sig;
+
+    strip.textContent = '';
+    strip.hidden = list.length === 0;
+    if (!list.length) return;
+
+    strip.appendChild(el('div', 'qtitle', `Build queue · tap to cancel`));
+    list.forEach((b, i) => {
+      const name = displayName(b);
+      const chip = el('button', `bq-chip ${i === 0 ? 'head' : ''}`);
+      chip.appendChild(el('span', 'ab', ABBR[b.type] || b.type.slice(0, 3).toUpperCase()));
+      chip.appendChild(el('span', 'n', `${Math.round(progressOf(b) * 100)}%`));
+      chip.appendChild(el('span', 'x', '×'));
+      chip.title = `Cancel the queued ${name} — cost refunded`;
+      chip.setAttribute('aria-label',
+        `Cancel the queued ${name}, number ${i + 1} of ${list.length}. The cost is refunded.`);
+      chip.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (typeof economy.cancelQueued !== 'function') return;
+        if (economy.cancelQueued(world, PLAYER, i)) {
+          toast(`${name} cancelled — cost refunded`, 'info');
+          state.bqSig = '';
+          state.cmdSig = '';
+          state.selSig = '';
+        }
+      });
+      strip.appendChild(chip);
+    });
+
+    if (list.length > 1) {
+      const clear = el('button', 'clear', 'Clear');
+      clear.setAttribute('aria-label',
+        `Cancel all ${list.length} queued sites. Every cost is refunded.`);
+      clear.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const n = economy.clearBuildQueue(world, PLAYER);
+        if (n) toast(`${n} sites cancelled — costs refunded`, 'info');
+        state.bqSig = '';
+        state.cmdSig = '';
+        state.selSig = '';
+      });
+      strip.appendChild(clear);
+    }
+  }
+
+  // --- Placement mode -------------------------------------------------------
+  //
+  // BATCH BY DEFAULT. Arming a type used to be spent by the first tap, so a row
+  // of five houses was five trips through Build -> House -> aim -> lift: twenty
+  // gestures, fifteen of which were the same three. It now stays armed until the
+  // player says otherwise, every tap puts another foundation down and joins the
+  // build queue, and the builders work through that queue by themselves (see
+  // onJobFinished in unitAI.js). The bar counts what has been placed and its
+  // button becomes Done once there is something to be done with — "Cancel" is
+  // the wrong word for a button that cannot take back the four houses you have
+  // already paid for, and the strip below it is where those are undone.
+  //
+  // This is the same contract the wall drag already had — one arming, many
+  // foundations — so the two now read as one feature rather than as a special
+  // case for walls.
+
+  function renderPlaceBar() {
+    const type = state.placement;
+    if (!type) {
       placeBar.hidden = true;
       placeBar.textContent = '';
       return;
     }
-    const s = BUILDING_STATS[state.placement];
+    const s = BUILDING_STATS[type];
+    const name = s ? s.name : type;
+    const n = state.placedThisArm;
     placeBar.textContent = '';
-    const txt = el('div', 'txt', `Place ${s ? s.name : state.placement}`);
-    txt.appendChild(el('small', null, 'Drag to aim — lift to place'));
+    const txt = el('div', 'txt', n
+      ? `${name} ×${n} placed`
+      : `Place ${name}`);
+    txt.appendChild(el('small', null, isWallType(type)
+      ? 'Drag to draw a run — two fingers to cancel'
+      : n
+        ? 'Keep tapping to queue more'
+        : 'Drag to aim — lift to place'));
     placeBar.appendChild(txt);
-    const cancel = el('button', 'danger', 'Cancel');
-    cancel.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
-    placeBar.appendChild(cancel);
+    const done = el('button', n ? 'primary' : 'danger', n ? 'Done' : 'Cancel');
+    done.setAttribute('aria-label', n
+      ? `Stop placing. ${n} ${name} already queued.`
+      : `Stop placing the ${name}.`);
+    done.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
+    placeBar.appendChild(done);
     placeBar.hidden = false;
-    toast(`Placing ${s ? s.name : state.placement}`, 'info');
+  }
+
+  function setPlacementMode(typeOrNull) {
+    const next = typeOrNull || null;
+    const changed = next !== state.placement;
+    state.placement = next;
+    if (changed) state.placedThisArm = 0;
+    toggleBuildMenu(false);
+    // Placement also claims the next tap, so it cannot coexist with an armed
+    // attack-move. (Only when arming: setPlacementMode(null) must not recurse.)
+    if (state.placement) setAttackArmed(false, { quiet: true });
+    renderPlaceBar();
+    if (state.placement && changed) {
+      const s = BUILDING_STATS[state.placement];
+      toast(`Placing ${s ? s.name : state.placement}`, 'info');
+    }
+  }
+
+  /**
+   * The input layer telling us a foundation went down. Called once per site —
+   * including once per segment of a wall run — so the bar's count and the queue
+   * strip agree with what is actually on the ground.
+   */
+  function onFoundationPlaced(n = 1) {
+    state.placedThisArm += n;
+    state.bqSig = '';
+    renderPlaceBar();
+    refreshBuildQueue();
   }
 
   function getPlacementType() { return state.placement; }
@@ -1505,15 +1736,44 @@ export function createHud(scene, world) {
     return out;
   }
 
+  /**
+   * The idle count, live — and quiet rather than absent when it is zero.
+   *
+   * The button used to be hidden at zero. A control that appears and vanishes
+   * under a thumb is worse than one that dims: it is the neighbouring buttons
+   * that suffer, because they slide sideways to fill the gap and the next tap
+   * lands on whatever moved into that spot. It also throws away the one piece
+   * of information a well-run economy most wants confirmed — that the answer is
+   * still nought. So it keeps its place in the dock, loses the pulse and the
+   * gold, and says "none".
+   */
   function updateIdle() {
     const list = idleVillagers();
     const sig = String(list.length);
     if (sig === state.idleSig) return;
     state.idleSig = sig;
-    if (dom.idleCount) dom.idleCount.textContent = sig;
-    if (dom.idleWrap) dom.idleWrap.hidden = list.length === 0;
+    if (dom.idleCount) dom.idleCount.textContent = list.length ? sig : '0';
+    if (dom.idleBtn) {
+      dom.idleBtn.classList.toggle('is-zero', list.length === 0);
+      const lbl = dom.idleBtn.querySelector('.lbl');
+      if (lbl) lbl.textContent = list.length === 1 ? 'idle' : list.length ? 'idle' : 'none idle';
+      dom.idleBtn.setAttribute('aria-label', list.length
+        ? `${list.length} idle villager${list.length === 1 ? '' : 's'} — tap to visit the next one`
+        : 'No idle villagers');
+    }
   }
 
+  /**
+   * Visit the next idle villager: select it and put the camera on it.
+   *
+   * The cursor is the *id of the last one shown*, not an index into the list.
+   * An index is wrong the moment the list changes underneath it, which is
+   * constantly — the villager you just looked at stops being idle the instant
+   * you give it a job, every other entry shifts down one, and tapping the button
+   * three times shows you the same two villagers. Anchoring on the id means the
+   * cycle continues from where it was however much the list has churned, and
+   * falls back to the front when the anchor has gone.
+   */
   function cycleIdle() {
     const list = idleVillagers();
     if (!list.length) {
@@ -1521,10 +1781,14 @@ export function createHud(scene, world) {
       return;
     }
     list.sort((a, b) => a.id - b.id);
-    state.idleCycle = (state.idleCycle + 1) % list.length;
-    const v = list[state.idleCycle];
+    const at = list.findIndex((u) => u.id === state.idleLast);
+    const v = list[(at + 1) % list.length];
+    state.idleLast = v.id;
     setSelection(world, [v]);
     centerOnGrid(v.x, v.y);
+    if (list.length > 1) {
+      toast(`Idle villager ${((at + 1) % list.length) + 1} of ${list.length}`, 'info');
+    }
   }
 
   // --- Menu sheet -----------------------------------------------------------
@@ -1565,7 +1829,164 @@ export function createHud(scene, world) {
     const open = force === undefined ? !state.menuOpen : force;
     state.menuOpen = open;
     menuSheet.hidden = !open;
-    if (open) renderMenuSheet();
+    if (open) {
+      toggleAlloc(false);
+      toggleBuildMenu(false);
+      renderMenuSheet();
+    }
+  }
+
+  // --- Villager allocation manager --------------------------------------------
+  //
+  // The sliders. The algorithm behind them is systems/allocation.js; everything
+  // here is about making four percentages draggable with a thumb and making the
+  // result visible enough to trust.
+  //
+  // Three things earn their space. The on/off is first and full width, because a
+  // system that moves your villagers without being asked has to be one tap from
+  // being stopped. Each row carries a live "4 / 5" beside its percentage — the
+  // number actually working against the number the split asks for — which is the
+  // only way to see the manager working without counting villagers on the map,
+  // and it is what makes the deadband legible rather than looking like a bug
+  // ("it says 4 of 5 and nothing is happening" is answered by the note at the
+  // bottom). And a resource the map can no longer offer is greyed with its share
+  // struck through, so "my stone slider does nothing" has an answer on screen.
+
+  const ALLOC_LABEL = { food: 'Food', wood: 'Wood', gold: 'Gold', stone: 'Stone' };
+
+  function renderAllocSheet() {
+    allocSheet.textContent = '';
+    state.allocSig = '';
+    const rows = [];
+
+    const head = el('div', 'head');
+    head.appendChild(el('span', null, 'Villager jobs'));
+    const tally = el('span', 'tally');
+    head.appendChild(tally);
+    allocSheet.appendChild(head);
+
+    const toggle = el('button', 'alloc-toggle');
+    toggle.appendChild(el('span', null, 'Assign villagers for me'));
+    const stateLbl = el('span', 'state', 'OFF');
+    toggle.appendChild(stateLbl);
+    toggle.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const on = alloc.setAllocationOn(world, PLAYER, !alloc.isAllocationOn(world, PLAYER));
+      toast(on
+        ? 'Villagers will be assigned to match the split'
+        : 'Manual control — villagers stay where they are', 'info');
+      state.allocSig = '';
+      refreshAlloc();
+    });
+    allocSheet.appendChild(toggle);
+
+    for (const res of alloc.ALLOC_ORDER) {
+      const row = el('div', 'alloc-row');
+      row.dataset.res = res;
+      const who = el('span', 'who');
+      who.appendChild(el('i', `ico ico-${res}`));
+      who.appendChild(doc.createTextNode(ALLOC_LABEL[res]));
+      row.appendChild(who);
+
+      const slider = doc.createElement('input');
+      slider.type = 'range';
+      slider.min = '0';
+      slider.max = '100';
+      // Fives, not ones. A thumb cannot resolve one percent on a 150px track,
+      // and nobody has ever wanted 37% of their villagers on gold — snapping to
+      // fives makes every drag land on a number the player meant.
+      slider.step = '5';
+      slider.id = `alloc-${res}`;
+      slider.setAttribute('aria-label', `${ALLOC_LABEL[res]} share of villagers`);
+      slider.addEventListener('input', (ev) => {
+        ev.stopPropagation();
+        alloc.setSplit(world, PLAYER, res, Number(slider.value));
+        state.allocSig = '';
+        refreshAlloc();
+      });
+      // The slider owns its own drag outright; nothing about it may reach the
+      // map underneath (the map's handler is on the canvas, but the pointerup
+      // listener is on window, so stopping propagation here is belt and braces).
+      for (const t of ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove']) {
+        slider.addEventListener(t, (ev) => ev.stopPropagation());
+      }
+      row.appendChild(slider);
+
+      const pct = el('span', 'pct');
+      const pctNum = doc.createTextNode('0%');
+      pct.appendChild(pctNum);
+      const count = el('small');
+      pct.appendChild(count);
+      row.appendChild(pct);
+
+      allocSheet.appendChild(row);
+      rows.push({ res, row, slider, pct, pctNum, count });
+    }
+
+    const why = el('div', 'why',
+      'Idle villagers are placed first, then whoever is nearest the work. ' +
+      'A line that is one villager out is left alone — walking someone across ' +
+      'the base costs more than it earns.');
+    allocSheet.appendChild(why);
+
+    const foot = el('div', 'foot');
+    const reset = el('button', null, 'Even split');
+    reset.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      // 25/25/25/25 rather than the opening ratio: "Even" is the one split a
+      // player can predict before tapping it, and the opening ratio is already
+      // where they started.
+      for (const res of alloc.ALLOC_ORDER) alloc.setSplit(world, PLAYER, res, 25);
+      state.allocSig = '';
+      refreshAlloc();
+    });
+    const close = el('button', null, 'Close');
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); toggleAlloc(false); });
+    foot.appendChild(reset);
+    foot.appendChild(close);
+    allocSheet.appendChild(foot);
+
+    state.liveAlloc = { rows, tally, toggle, stateLbl };
+    refreshAlloc();
+  }
+
+  function refreshAlloc() {
+    const live = state.liveAlloc;
+    if (!live || allocSheet.hidden) return;
+    const c = alloc.allocationCounts(world, PLAYER);
+    const sig = `${c.on}|${JSON.stringify(c.split)}|${JSON.stringify(c.assigned)}|` +
+      `${JSON.stringify(c.desired)}|${c.idle}|${c.total}|${c.available.join('')}`;
+    if (sig === state.allocSig) return;
+    state.allocSig = sig;
+
+    live.tally.textContent = c.idle
+      ? `${c.total} villagers · ${c.idle} idle`
+      : `${c.total} villagers`;
+    live.toggle.classList.toggle('on', c.on);
+    live.stateLbl.textContent = c.on ? 'ON' : 'OFF';
+
+    for (const r of live.rows) {
+      const gone = !c.available.includes(r.res);
+      const pctv = c.split[r.res];
+      if (Number(r.slider.value) !== pctv) r.slider.value = String(pctv);
+      r.slider.style.setProperty('--fill', `${pctv}%`);
+      r.pctNum.textContent = `${pctv}%`;
+      r.count.textContent = gone ? 'none left' : `${c.assigned[r.res]} / ${c.desired[r.res]}`;
+      r.pct.classList.toggle('short', !gone && c.assigned[r.res] < c.desired[r.res]);
+      r.row.classList.toggle('gone', gone);
+    }
+  }
+
+  function toggleAlloc(force) {
+    const open = force === undefined ? !state.allocOpen : force;
+    state.allocOpen = open;
+    allocSheet.hidden = !open;
+    if (dom.jobsBtn) dom.jobsBtn.classList.toggle('on', open);
+    if (open) {
+      toggleMenu(false);
+      toggleBuildMenu(false);
+      renderAllocSheet();
+    }
   }
 
   // --- Gesture-mode chip ----------------------------------------------------
@@ -1580,7 +2001,7 @@ export function createHud(scene, world) {
     modeChip.dataset.sig = sig;
     modeChip.textContent = '';
     modeChip.appendChild(el('span', 'glyph', eff === 'box' ? '⬚' : '✥'));
-    modeChip.appendChild(el('span', 'txt', eff === 'box' ? 'Select' : 'Pan'));
+    modeChip.appendChild(el('span', 'lbl', eff === 'box' ? 'Select' : 'Pan'));
     if (pref === 'auto') modeChip.appendChild(el('span', 'auto', 'AUTO'));
     modeChip.classList.toggle('is-box', eff === 'box');
   }
@@ -1650,12 +2071,20 @@ export function createHud(scene, world) {
   off.push(world.events.on(EV.BUILT, () => { state.cmdSig = ''; }));
   off.push(world.events.on(EV.TRAINED, () => { state.cmdSig = ''; }));
 
+  // A foundation finishing, being cancelled or being destroyed all change the
+  // build queue strip, and none of them changes the selection.
+  off.push(world.events.on(EV.BUILT, () => { state.bqSig = ''; }));
+  off.push(world.events.on(EV.REMOVED, () => { state.bqSig = ''; }));
+
   // Buttons.
   const onIdle = (ev) => { ev.stopPropagation(); cycleIdle(); };
   if (dom.idleBtn) dom.idleBtn.addEventListener('click', onIdle);
 
   const onMenu = (ev) => { ev.stopPropagation(); toggleMenu(); };
   if (dom.menuBtn) dom.menuBtn.addEventListener('click', onMenu);
+
+  const onJobs = (ev) => { ev.stopPropagation(); toggleAlloc(); };
+  if (dom.jobsBtn) dom.jobsBtn.addEventListener('click', onJobs);
 
   const onChip = (ev) => {
     ev.stopPropagation();
@@ -1709,10 +2138,11 @@ export function createHud(scene, world) {
   // Tapping the map (never the HUD) closes any transient sheet.
   const gameRoot = doc.getElementById('game-root');
   const onDocDown = (ev) => {
-    if (menuSheet.hidden && buildMenu.hidden) return;
+    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden) return;
     if (!gameRoot || !gameRoot.contains(ev.target)) return;
     toggleMenu(false);
     toggleBuildMenu(false);
+    toggleAlloc(false);
   };
   document.addEventListener('pointerdown', onDocDown, true);
 
@@ -1752,6 +2182,8 @@ export function createHud(scene, world) {
       refreshResearchQueue();
     }
     refreshAffordability();
+    refreshBuildQueue();
+    refreshAlloc();
 
     renderModeChip();
 
@@ -1808,6 +2240,7 @@ export function createHud(scene, world) {
     for (const fn of off) { try { fn(); } catch (_) { /* already gone */ } }
     if (dom.idleBtn) dom.idleBtn.removeEventListener('click', onIdle);
     if (dom.menuBtn) dom.menuBtn.removeEventListener('click', onMenu);
+    if (dom.jobsBtn) dom.jobsBtn.removeEventListener('click', onJobs);
     modeChip.removeEventListener('click', onChip);
     if (dom.minimap) {
       dom.minimap.removeEventListener('pointerdown', onMiniDown);
@@ -1817,9 +2250,12 @@ export function createHud(scene, world) {
     }
     document.removeEventListener('pointerdown', onDocDown, true);
     if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
-    for (const n of [modeChip, buildMenu, placeBar, attackBar, menuSheet]) n.remove();
+    for (const n of [modeChip, idleBtn, jobsBtn, menuBtn,
+      buildMenu, allocSheet, placeBar, attackBar, menuSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
+    if (dom.jobNote) { dom.jobNote.textContent = ''; dom.jobNote.hidden = true; }
+    if (dom.buildQueue) { dom.buildQueue.textContent = ''; dom.buildQueue.hidden = true; }
     for (const rec of state.toasts.slice()) rec.node.remove();
     state.toasts.length = 0;
   }
@@ -1835,6 +2271,12 @@ export function createHud(scene, world) {
     isAttackArmed,
     isDemolishArmed: () => !!state.demolishArm &&
       performance.now() - state.demolishArm.at <= DEMOLISH_ARM_MS,
+    // The input layer reports every foundation it lands so the placement bar's
+    // count and the queue strip stay honest without polling.
+    onFoundationPlaced,
+    placedThisArm: () => state.placedThisArm,
+    toggleAlloc,
+    toggleMenu,
     cycleIdle,
     flashRes,
     underAttackAlert,
@@ -1846,8 +2288,10 @@ export function createHud(scene, world) {
 
   // First paint.
   updateResources();
+  updateIdle();
   renderSelection();
   renderCommands();
+  refreshBuildQueue();
   renderModeChip();
   if (minimap) minimap.draw(camera());
 

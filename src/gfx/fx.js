@@ -83,6 +83,15 @@ export function createFx(scene, world, opts) {
     p.a1 = cfg.a1 !== undefined ? cfg.a1 : 0;
     p.rot = cfg.rot || 0;
     p.vr = cfg.vr || 0;
+    // `hold` keeps a particle at full alpha for this fraction of its life before
+    // the fade starts. A corpse that begins fading the instant it falls is a
+    // corpse the player never sees; one that lies there and *then* goes is the
+    // difference between a death and a despawn.
+    p.hold = cfg.hold || 0;
+    // An optional single frame change partway through, for two-pose sequences.
+    p.swapAt = cfg.swapAt !== undefined ? cfg.swapAt : -1;
+    p.swapFrame = cfg.swapFrame || null;
+    p.swapped = false;
     p.depth = cfg.depth !== undefined ? cfg.depth : depthOf(0, 0, 900);
     p.flipX = !!cfg.flipX;
     s.setDepth(p.depth);
@@ -100,7 +109,7 @@ export function createFx(scene, world, opts) {
 
   // --- floating text -------------------------------------------------------
 
-  function floatText(str, wx, wy, color, big) {
+  function floatText(str, wx, wy, color, big, small) {
     if (texts.length >= MAX_TEXTS) return;
     let t = textPool.pop();
     if (!t) {
@@ -118,7 +127,7 @@ export function createFx(scene, world, opts) {
     const o = t.obj;
     o.setVisible(true);
     o.setText(str);
-    o.setFontSize(big ? 17 : 14);
+    o.setFontSize(big ? 17 : small ? 12 : 14);
     o.setColor(typeof color === 'string' ? color : `#${(color >>> 0).toString(16).padStart(6, '0')}`);
     o.setDepth(900000);
     o.setPosition(wx, wy);
@@ -126,7 +135,12 @@ export function createFx(scene, world, opts) {
     t.x = wx;
     t.y = wy;
     t.life = 0;
-    t.max = 1.05;
+    // A damage number is a glance, not a label: short life and a small rise, so
+    // it is gone before the next swing lands and never queues up a column of
+    // stale digits over a unit.
+    t.max = small ? 0.72 : 1.05;
+    t.rise = small ? 19 : 26;
+    t.alpha = small ? 0.9 : 1;
     texts.push(t);
   }
 
@@ -302,14 +316,37 @@ export function createFx(scene, world, opts) {
   const offs = [];
   const on = (ev, fn) => offs.push(world.events.on(ev, fn));
 
+  // One number per target per DAMAGE_TEXT_GAP seconds. Without this a
+  // twenty-a-side melee stacks eight numbers on top of each other over the same
+  // three tiles and the screen turns into a spreadsheet — the numbers stop being
+  // information about *this* hit and become a texture. Rate-limited, they read
+  // as punctuation on the fight.
+  const DAMAGE_TEXT_GAP = 0.32;
+  const lastNumberAt = new Map();
+  let numberClock = 0;
+
   on(EV.DAMAGE, (p) => {
     const t = p && p.target;
     if (!t || t.dead) return;
     if (!litEntity(t)) return;
     sparks(t.x, t.y, t.kind === 'building' ? 3 : 4, t.kind === 'building' ? 0xd8c9a0 : 0xffd27a);
-    if (p.amount >= 1 && texts.length < MAX_TEXTS - 6) {
-      floatText(`-${Math.round(p.amount)}`, wx(t.x, t.y), wy(t.x, t.y) + entityAnchorY(t), 0xff8f8f);
+    // A puff of dust at the feet on every landed blow. Sparks alone say "metal
+    // hit metal"; the dust is what makes it land on the ground the fight is
+    // standing on.
+    if (t.kind !== 'resource' && Math.random() < 0.7) {
+      dust(t.x, t.y, 1, t.kind === 'building' ? 0xbdae94 : 0xc9bda3);
     }
+    if (p.amount < 1) return;
+    const prev = lastNumberAt.get(t.id);
+    if (prev !== undefined && numberClock - prev < DAMAGE_TEXT_GAP) return;
+    lastNumberAt.set(t.id, numberClock);
+    if (texts.length >= MAX_TEXTS - 6) return;
+    // Red for something of yours being hurt, warm white for damage you are
+    // dealing: in a mixed melee that is the difference between "I am winning"
+    // and "I am losing" at a glance, without reading a single digit.
+    const mine = t.player === PLAYER;
+    floatText(`-${Math.round(p.amount)}`, wx(t.x, t.y), wy(t.x, t.y) + entityAnchorY(t),
+      mine ? 0xff8f8f : 0xffe9c9, false, true);
   });
 
   on(EV.GATHER_TICK, (p) => {
@@ -370,14 +407,30 @@ export function createFx(scene, world, opts) {
     const x = wx(e.x, e.y);
     const y = wy(e.x, e.y);
     if (e.kind === 'unit') {
-      // A corpse that tips over and fades — the player sees who died and where.
-      spawn(unitFrame(e.type, e.player, false), x, y, {
-        life: 1.1,
-        vy: -4,
-        s0: 1, s1: 0.92,
-        a0: 0.95, a1: 0,
+      // A death in three beats: the stagger, the fall, and the body lying there
+      // long enough to be seen before it goes.
+      //
+      // The two death poses do the work a rotation cannot — knees folding,
+      // weapon dropping — and the rotation does the work a pose cannot, which
+      // is the actual topple. Together they read as a man going down. The body
+      // then holds at full opacity for most of its life and fades at the end,
+      // so a fight leaves a field of casualties for a couple of seconds rather
+      // than a series of blinks.
+      const pl = e.player === 1 ? 1 : 0;
+      // Fall away from whatever killed it when the killer is known, so a line
+      // of troops cut down by one volley all tip the same way.
+      const k = p.killer;
+      const away = k ? Math.sign((e.x - k.x) + (e.y - k.y)) : 1;
+      spawn(unitFrame(e.type, pl, false, 'd0'), x, y, {
+        life: 1.9,
+        vy: -3,
+        s0: 1, s1: 0.96,
+        a0: 1, a1: 0,
+        hold: 0.62,
         rot: 0,
-        vr: 70,
+        vr: (away >= 0 ? 46 : -46),
+        swapAt: 0.22,
+        swapFrame: unitFrame(e.type, pl, false, 'd1'),
         depth: depthOf(e.x, e.y, -4),
       });
       dust(e.x, e.y, 5, 0xb8a689);
@@ -454,6 +507,9 @@ export function createFx(scene, world, opts) {
   let dustTimer = 0;
 
   function update(dt) {
+    numberClock += dt;
+    if (lastNumberAt.size > 96) lastNumberAt.clear();
+
     for (let i = parts.length - 1; i >= 0; i--) {
       const p = parts[i];
       p.life += dt;
@@ -470,9 +526,16 @@ export function createFx(scene, world, opts) {
       p.y += p.vy * dt;
       p.rot += p.vr * dt;
       const s = p.spr;
+      if (!p.swapped && p.swapAt >= 0 && p.life >= p.swapAt) {
+        p.swapped = true;
+        s.setTexture(ATLAS, p.swapFrame);
+        const o = origins && origins.get(p.swapFrame);
+        s.setOrigin(o ? o.ox : 0.5, o ? o.oy : 0.5);
+      }
       s.setPosition(p.x, p.y);
       s.setScale(p.s0 + (p.s1 - p.s0) * t);
-      s.setAlpha(p.a0 + (p.a1 - p.a0) * t);
+      const at = p.hold ? Math.max(0, (t - p.hold) / (1 - p.hold)) : t;
+      s.setAlpha(p.a0 + (p.a1 - p.a0) * at);
       if (p.vr) s.setAngle(p.rot);
     }
 
@@ -486,9 +549,10 @@ export function createFx(scene, world, opts) {
         textPool.push(tx);
         continue;
       }
-      tx.y -= 26 * dt;
+      tx.y -= (tx.rise || 26) * dt;
+      const a = tx.alpha === undefined ? 1 : tx.alpha;
       tx.obj.setPosition(tx.x, tx.y);
-      tx.obj.setAlpha(t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4);
+      tx.obj.setAlpha(a * (t < 0.6 ? 1 : 1 - (t - 0.6) / 0.4));
       // Keep world-space text a constant size on screen at any zoom.
       tx.obj.setScale(1 / camera.zoom);
     }

@@ -17,6 +17,7 @@ import { EV } from '../core/events.js';
 
 import { createRenderer } from '../gfx/render.js';
 import { updateEconomy } from '../systems/economy.js';
+import { updateAllocation } from '../systems/allocation.js';
 import { updateUnits, commandUnits } from '../systems/unitAI.js';
 import { updateCombat } from '../systems/combat.js';
 import { createEnemyAI } from '../systems/enemyAI.js';
@@ -94,6 +95,11 @@ export class GameScene extends Phaser.Scene {
     }
 
     reindex(world);
+    // Before the units move, not after: the allocation manager issues ordinary
+    // gather orders, and an order given at the top of a step is walked in the
+    // same step — exactly as a player's tap is (see commandUnits). Ticking it
+    // afterwards would cost every re-task a step of standing still.
+    updateAllocation(world, dt);
     updateUnits(world, dt);
     updateCombat(world, dt);
     updateEconomy(world, dt);

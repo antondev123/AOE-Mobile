@@ -25,25 +25,117 @@ import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
 import {
   buildTextures, ATLAS, TILE_TEX_W, TILE_TEX_H, TILE_TEX_OFF_X, TILE_TEX_OFF_Y,
-  terrainFrame, unitFrame, buildingFrame, foundationFrame, resourceFrame,
-  markerFrame, farmFrame, farmFoundationFrame, wallFrame, gateFrame,
-  oceanFrame, edgeBlendFrame, shoreFrame, BLOB_FRAME,
-  TERRAIN_VARIANTS, RESOURCE_VARIANTS,
+  terrainFrame, unitFrame, unitAnim, buildingFrame, foundationFrame, resourceFrame,
+  markerFrame, farmFrame, farmFoundationFrame, wallFrame, gateFrame, scaffoldFrame,
+  oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME,
+  TERRAIN_VARIANTS, RESOURCE_VARIANTS, DETAIL_VARIANTS, DETAIL_BOX, detailFrame,
   TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
+  CLIFF_H, CLIFF_VARIANTS,
 } from './textures.js';
 import { createFx } from './fx.js';
+import { EV } from '../core/events.js';
 
 // Facing index -> { back, flip }. See DIRS in iso.js: 0=S 1=SW 2=W 3=NW 4=N
 // 5=NE 6=E 7=SE on screen.
 const FACE_BACK = [false, false, false, true, true, true, false, false];
 const FACE_FLIP = [false, true, true, true, false, false, false, false];
 
+// --- animation --------------------------------------------------------------
+//
+// The pose *set* lives in textures.js (it has to: it decides which frames get
+// baked). What lives here is the clock — which pose of the set is showing this
+// frame, and what drives it.
+//
+// Walks are driven by wall time scaled by the unit's own speed, so a scout's
+// legs go round faster than a spearman's without a second table to keep in
+// step with UNIT_STATS. Work loops run slowly on purpose: a villager chopping
+// at 9Hz reads as a blur of pixels at phone size, and at 3Hz you can see the
+// axe come down.
+const ANIM_FPS = { gather: 3.2, build: 4.2 };
+// Seconds a swing lasts, matching SWING_MAX in systems/combat.js. `attackAnim`
+// counts *down* from the instant the blow lands, so a high value means the
+// follow-through is still showing and a spent one means the unit is back on
+// guard waiting out its cooldown. Nothing breaks if combat.js retunes it: the
+// value is only used to normalise, and it is clamped.
+const SWING_TIME = 0.4;
+// How long a unit stays washed out after being hit. Two frames at 60Hz is
+// invisible; a quarter of a second reads as a flinch without turning a melee
+// into a strobe.
+const HIT_FLASH = 0.16;
+const HIT_FLASH_TINT = 0xffd9d0;
+
 const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa7b4 };
+
+// How big a unit's ground ellipse and selection ring are, relative to a
+// villager's. This is footprint, not importance: a horse and a siege engine
+// stand on more ground than a man does, and a ring that does not match what the
+// player sees on the floor reads as a targeting error.
+const MARKER_SCALE = {
+  militia: 1.12, spearman: 1.08, archer: 1.05, scout: 1.34, ram: 1.42,
+};
+
+// Selection colours by relationship. Own units are the warm gold the HUD uses
+// for "yours"; hostiles are red; anything else (a neutral, an ally in a future
+// team game) is blue. Colour, not just presence, so a tap on an enemy in a
+// melee is not mistaken for having selected him.
+const SEL_OWN = 0xffe45c;
+const SEL_ENEMY = 0xff6b6b;
+const SEL_OTHER = 0x7fd0ff;
+
+const animCache = new Map();
+function animOf(type) {
+  let a = animCache.get(type);
+  if (!a) {
+    a = unitAnim(type);
+    animCache.set(type, a);
+  }
+  return a;
+}
+
+/**
+ * Which pose a unit is showing this frame.
+ *
+ * Everything is driven off state the simulation already keeps, so no animation
+ * state lives on the entity and nothing has to be reset when an order changes:
+ * a unit that stops walking is simply asked for a different list next frame.
+ */
+function poseOf(u, t, phase) {
+  const set = animOf(u.type);
+  const state = u.state || 'idle';
+  if (state === 'attack') {
+    const seq = set.attack || set.idle;
+    if (seq.length < 2) return seq[0];
+    // High attackAnim = the blow just landed, so show the follow-through;
+    // spent = back on guard for the rest of the cooldown.
+    const f = Math.min(1, (u.attackAnim || 0) / SWING_TIME);
+    return f > 0.45 ? seq[1] : seq[0];
+  }
+  const seq = set[state] || set.idle;
+  if (seq.length < 2) return seq[0];
+  // A stride is a distance, not a duration: scaling the walk clock by the
+  // unit's speed keeps feet from skating for the fast units and from
+  // sewing-machining for the slow ones.
+  const fps = (state === 'move' || state === 'deposit')
+    ? 7 * (u.speed || 1.2)
+    : (ANIM_FPS[state] || 6);
+  return seq[Math.floor(t * fps + phase) % seq.length];
+}
 
 // How far outside the camera an entity may be before we stop drawing it.
 const CULL_PAD = 140;
 
 const TERRAIN_CHUNK = 512;
+
+// Which ground decals suit which terrain. Grass takes flowers, tussocks, stones
+// and fallen wood; dirt takes pebbles, stones and dead brush; sand takes
+// pebbles and brush and nothing green. Index 6 (reeds) is never picked from
+// here — the bake places those only where land meets water.
+const DETAIL_FOR_TERRAIN = [
+  [1, 2, 2, 0, 3],
+  [4, 0, 5, 3],
+  [],
+  [4, 5, 4, 0],
+];
 
 // --- Fog of war -------------------------------------------------------------
 //
@@ -166,7 +258,15 @@ export function createRenderer(scene, world) {
   const fogState = fog ? fog.state : null;
   const visMask = fogState ? fogState.visible : null;
 
+  // --- cliffs --------------------------------------------------------------
+  // Terrain the player cannot cross, and the only thing on the map with real
+  // height that is not a building. Placement belongs to mapgen (see
+  // HANDOFF-art.md); everything here works off `world.cliff`, a byte per tile,
+  // and does nothing at all when there isn't one.
+  let cliffs = buildCliffList(world);
+
   // --- pools ---------------------------------------------------------------
+  const cliffPool = makePool(() => mkImage(scene, cliffFrame(0, 0), -1));
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
   const unitPool = makePool(() => mkImage(scene, unitFrame('villager', 0, false), -1));
   const bldPool = makePool(() => mkImage(scene, buildingFrame('house', 0), -1));
@@ -188,6 +288,26 @@ export function createRenderer(scene, world) {
   let dragBox = null;    // screen-space { x, y, w, h }
   let wallRun = null;    // { type, segments: [{ tx, ty, mask, valid }] }
   let t = 0;
+
+  // --- combat feedback ------------------------------------------------------
+  // Two facts, both read straight off the damage event: which units were hit
+  // just now (so they can flash), and whether anything is happening at all (so
+  // health bars can come up across the army and go away again when it is over).
+  const hitFlash = new Map(); // entity id -> renderer time of the last hit
+  let lastCombat = -1e9;
+  let barsWanted = false;
+  let sinceFlashPrune = 0;
+  const evOffs = [];
+  evOffs.push(world.events.on(EV.DAMAGE, (p) => {
+    const tgt = p && p.target;
+    if (!tgt) return;
+    hitFlash.set(tgt.id, t);
+    // Only the player's own fights raise everyone's bars. An AI skirmish on the
+    // far side of the map is not a reason to redraw the player's whole economy
+    // with health bars over it.
+    const src = p.entity;
+    if (tgt.player === PLAYER || (src && src.player === PLAYER)) lastCombat = t;
+  }));
 
   // The live "12 segments — 60 stone" readout that follows the finger while a
   // wall is being drawn. A Phaser text pinned to the screen rather than a HUD
@@ -217,9 +337,15 @@ export function createRenderer(scene, world) {
   const has = (frame) => origins.has(frame);
   /** Clamp an owner id into the range we generated colours for. */
   const pi = (player) => (player === 1 ? 1 : 0);
-  function unitFrameFor(type, player, back) {
-    const f = unitFrame(type, player, back);
-    return has(f) ? f : unitFrame('villager', player, back);
+  function unitFrameFor(type, player, back, pose = 'i') {
+    let f = unitFrame(type, player, back, pose);
+    if (has(f)) return f;
+    // A type with art but no such pose (a soldier asked to "gather") falls back
+    // to its own idle before it falls back to somebody else's body.
+    f = unitFrame(type, player, back, 'i');
+    if (has(f)) return f;
+    f = unitFrame('villager', player, back, pose);
+    return has(f) ? f : unitFrame('villager', player, back, 'i');
   }
   function buildingFrameFor(type, player, b) {
     if (type === 'farm') return farmFrame(player, farmStage(b));
@@ -378,6 +504,17 @@ export function createRenderer(scene, world) {
 
     refreshCamMap();
 
+    // Bars stay up for a few seconds after the last blow, so they do not
+    // flicker out between swings in a running fight.
+    barsWanted = t - lastCombat < 5;
+    sinceFlashPrune += dt;
+    if (sinceFlashPrune > 2) {
+      sinceFlashPrune = 0;
+      for (const [id, at] of hitFlash) {
+        if (t - at > HIT_FLASH) hitFlash.delete(id);
+      }
+    }
+
     // Visible world rect (exact, straight off the camera transform).
     screenToWorld(0, 0, _tmpA);
     screenToWorld(camera.width, camera.height, _tmpB);
@@ -390,6 +527,7 @@ export function createRenderer(scene, world) {
     // on top of it; see bakeTerrain for why this is not done up front.
     terrain.ensure(viewRect);
 
+    cliffPool.reset();
     markerPool.reset();
     unitPool.reset();
     bldPool.reset();
@@ -403,6 +541,7 @@ export function createRenderer(scene, world) {
     // them unreadable. sqrt splits the difference.
     const invZ = 1 / Math.sqrt(camera.zoom);
 
+    drawCliffs();
     drawResources();
     drawBuildings(invZ);
     drawUnits(alpha, invZ);
@@ -410,6 +549,7 @@ export function createRenderer(scene, world) {
     drawGhost();
     drawWallRun();
 
+    cliffPool.trim();
     markerPool.trim();
     unitPool.trim();
     bldPool.trim();
@@ -463,6 +603,27 @@ export function createRenderer(scene, world) {
       if (visMask[indices[i]]) return true;
     }
     return false;
+  }
+
+  /**
+   * Cliffs. Sprites rather than part of the terrain bake, because they have
+   * height: a unit walking past the foot of one has to pass in front of it and
+   * a unit behind it has to be hidden by it, and that is a depth sort, which
+   * baked ground cannot take part in.
+   *
+   * They are not fog-gated. A cliff is terrain, and terrain you have seen once
+   * stays on your map — the fog overlay darkens it along with everything else,
+   * which is exactly the treatment the ground under it gets.
+   */
+  function drawCliffs() {
+    for (let i = 0; i < cliffs.length; i++) {
+      const c = cliffs[i];
+      if (!visible(c.wx, c.wy)) continue;
+      const s = cliffPool.get();
+      setFrame(s, c.frame, origins);
+      s.setPosition(c.wx, c.wy);
+      s.setDepth(c.depth);
+    }
   }
 
   function drawResources() {
@@ -538,14 +699,11 @@ export function createRenderer(scene, world) {
         if (s.isCropped) s.setCrop();
         s.setAlpha(1);
       } else {
-        // The building rises out of its foundation as it is built.
-        const shown = Math.max(0.02, progress);
-        s.setCrop(0, o.h * (1 - shown), o.w, o.h * shown);
-        s.setAlpha(0.55 + 0.45 * progress);
+        constructionStage(b, s, o, wx, wy, depth, progress);
       }
 
       const selected = world.selection.has(b.id);
-      if (selected) footprintOutline(b, 0xffe45c);
+      if (selected) footprintOutline(b, b.player === PLAYER ? SEL_OWN : SEL_ENEMY);
 
       // Bar sits just above the sprite's own top edge, whatever its height.
       // While building, it tracks the visible (cropped) top so it rises with
@@ -561,30 +719,191 @@ export function createRenderer(scene, world) {
         );
       }
 
-      // Rally point flag, for the player's own production buildings.
+      // Rally point, for the player's own production buildings.
       if (selected && b.rally && typeof b.rally.x === 'number') {
-        const rx = (b.rally.x - b.rally.y) * HALF_W;
-        const ry = (b.rally.x + b.rally.y) * HALF_H;
-        overlay.lineStyle(2 * invZ, 0x9ad8ff, 0.85);
-        overlay.beginPath();
-        overlay.moveTo(wx, wy);
-        overlay.lineTo(rx, ry);
-        overlay.strokePath();
-        overlay.fillStyle(0x9ad8ff, 0.9);
-        overlay.fillCircle(rx, ry, 4 * invZ);
+        rallyLine(b, wx, wy, invZ);
       }
     }
   }
 
+  /**
+   * Four visible stages of construction out of one building sprite.
+   *
+   * The building is revealed bottom-up by a crop, which in this projection is
+   * exactly the order a building is actually built in: platform, then walls,
+   * then the roof last. Two more things carry the read that a crop alone
+   * cannot. The masonry is tinted toward bare, unpainted stone early and warms
+   * to full colour as it finishes, so a half-built house is not just a
+   * *shorter* house. And a timber scaffold stands in front of it until the
+   * work is nearly done — an open cage of poles and planks that is instantly
+   * legible as "site" at any zoom, and whose disappearance (with the pop from
+   * fx.js) is what makes completion an event.
+   *
+   * Stages, in the player's terms: bare foundation and scaffold, walls rising
+   * inside the cage, walls up and roof going on, scaffold struck and the
+   * building finished.
+   */
+  function constructionStage(b, s, o, wx, wy, depth, progress) {
+    const shown = Math.max(0.001, Math.min(1, (progress - 0.05) / 0.8));
+    s.setCrop(0, o.h * (1 - shown), o.w, o.h * shown);
+    s.setAlpha(progress < 0.05 ? 0 : 1);
+    // Bare, unpainted material early; full colour by the time it is finished.
+    s.setTint(mixColor(0x9c9484, 0xffffff, Math.min(1, progress * 1.5)));
+
+    // The scaffold. Not over a farm (a field is not built on a frame) and not
+    // over a wall segment, whose whole footprint is smaller than the poles.
+    if (progress < 0.97 && b.type !== 'farm' && !isWallType(b.type)) {
+      const scFrame = scaffoldFrame(footprintFrameWidth(b.fw));
+      if (has(scFrame)) {
+        const sc = bldPool.get();
+        setFrame(sc, scFrame, origins);
+        sc.setPosition(wx, wy);
+        sc.setDepth(depth + 0.5);
+        sc.setAlpha(progress < 0.8 ? 1 : Math.max(0, 1 - (progress - 0.8) / 0.17));
+      }
+    }
+  }
+
+  /**
+   * The line from a production building to where its units will walk.
+   *
+   * An arc rather than a straight line, and dashes that march along it rather
+   * than a static stroke: on a map this dense a plain line between two points
+   * is read as a wall, a road or a border before it is read as an instruction.
+   * A curve that leaves the roof, rises and comes down on a marked spot is
+   * unmistakably a *path*, and the direction of travel is in the motion so the
+   * player never has to work out which end is the destination.
+   */
+  function rallyLine(b, wx, wy, invZ) {
+    const rx = (b.rally.x - b.rally.y) * HALF_W;
+    const ry = (b.rally.x + b.rally.y) * HALF_H;
+    const dx = rx - wx;
+    const dy = ry - wy;
+    const len = Math.hypot(dx, dy) || 1;
+    const lift = Math.min(80, len * 0.24);
+    const N = Math.max(8, Math.min(36, Math.round(len / 16)));
+    const px = (k) => wx + dx * k;
+    const py = (k) => wy + dy * k - Math.sin(Math.PI * k) * lift;
+
+    // The whole arc, faint, so the connection survives even where a dash is
+    // currently in a gap.
+    overlay.lineStyle(4 * invZ, 0x06121b, 0.32);
+    overlay.beginPath();
+    overlay.moveTo(px(0), py(0));
+    for (let i = 1; i <= N; i++) overlay.lineTo(px(i / N), py(i / N));
+    overlay.strokePath();
+
+    // Marching dashes. Long gaps: a dash pattern that is more ink than air
+    // reads as a solid line with texture on it, and the whole point of the
+    // dashes is that they are visibly *travelling* toward the far end.
+    const phase = (t * 0.5) % 1;
+    overlay.lineStyle(3.2 * invZ, 0x9ad8ff, 0.95);
+    for (let i = 0; i < N; i++) {
+      const k = i / N;
+      if (((k - phase) % 0.3 + 0.3) % 0.3 > 0.13) continue;
+      overlay.beginPath();
+      overlay.moveTo(px(k), py(k));
+      overlay.lineTo(px(k + 1 / N), py(k + 1 / N));
+      overlay.strokePath();
+    }
+
+    // The endpoint: a flag standing on a ring on the ground, so the target is a
+    // place on the map and not a floating dot.
+    const ring = 1 + Math.sin(t * 3.4) * 0.08;
+    overlay.lineStyle(3 * invZ, 0x06121b, 0.45);
+    overlay.strokeEllipse(rx, ry, 26 * invZ * ring, 13 * invZ * ring);
+    overlay.lineStyle(2 * invZ, 0x9ad8ff, 0.95);
+    overlay.strokeEllipse(rx, ry, 26 * invZ * ring, 13 * invZ * ring);
+    const flag = selPool.get();
+    setFrame(flag, 'fx_flag', origins);
+    flag.setPosition(rx, ry);
+    flag.setDepth(depthFor(b.rally.x, b.rally.y, 500));
+    flag.setTint(0xbfe6ff);
+    flag.setScale(invZ);
+  }
+
+  /**
+   * The ring under a selected unit.
+   *
+   * Two sprites: a solid ring that breathes, and a second ring that swells and
+   * fades out of it once a second. The moving one is what makes a selection
+   * findable on a busy phone screen — a static ring disappears into a crowd of
+   * ground ellipses, and a *moving* one is the only thing on the ground plane
+   * that changes shape, so the eye lands on it without being told to.
+   */
+  function selectionRing(pool, wx, wy, depth, owner, type) {
+    const scale = MARKER_SCALE[type] || 1;
+    const tint = owner === PLAYER ? SEL_OWN
+      : (owner === undefined || owner === null) ? SEL_OTHER : SEL_ENEMY;
+
+    const ring = pool.get();
+    setFrame(ring, 'mk_sel', origins);
+    ring.setPosition(wx, wy);
+    ring.setDepth(depth);
+    ring.setTint(tint);
+    ring.setScale(scale * (1 + Math.sin(t * 4.5) * 0.04));
+
+    // The swell. One period per second, and it spends most of it small and
+    // faint, so a screenful of selected villagers does not pulse in unison
+    // loudly enough to be the loudest thing on screen.
+    const f = (t * 1.1) % 1;
+    if (f < 0.55) {
+      const k = f / 0.55;
+      const halo = pool.get();
+      setFrame(halo, 'mk_sel_halo', origins);
+      halo.setPosition(wx, wy);
+      halo.setDepth(depth - 0.01);
+      halo.setTint(tint);
+      halo.setScale(scale * (0.86 + k * 0.5));
+      halo.setAlpha(0.55 * (1 - k));
+    }
+  }
+
+  /**
+   * A selected building's footprint.
+   *
+   * A building cannot wear the unit ring — it does not stand on a point, it
+   * covers ground — so the selection is the ground it covers, outlined, with a
+   * bracket pulled out from each of the four corners. The brackets breathe in
+   * and out by a couple of pixels, which is what distinguishes "this is
+   * selected" from the several other diamonds the renderer draws on the floor
+   * (placement ghosts, wall previews, tile highlights).
+   */
   function footprintOutline(b, color) {
     const hw = (b.fw + b.fh) * HALF_W * 0.5;
     const hh = (b.fw + b.fh) * HALF_H * 0.5;
     const wx = (b.x - b.y) * HALF_W;
     const wy = (b.x + b.y) * HALF_H;
-    overlay.lineStyle(3 / camera.zoom, 0x000000, 0.45);
+    const lw = 1 / camera.zoom;
+    overlay.lineStyle(3 * lw, 0x000000, 0.5);
     strokeDiamond(overlay, wx, wy, hw, hh);
-    overlay.lineStyle(2 / camera.zoom, color, 1);
+    overlay.lineStyle(2 * lw, color, 1);
     strokeDiamond(overlay, wx, wy, hw, hh);
+
+    const out = 3 + Math.sin(t * 4.5) * 2;
+    const arm = Math.min(14, hw * 0.34);
+    const corners = [
+      [0, -hh, 0, -1], [hw, 0, 1, 0], [0, hh, 0, 1], [-hw, 0, -1, 0],
+    ];
+    for (const [ox, oy, nx, ny] of corners) {
+      const cx = wx + ox + nx * out;
+      const cy = wy + oy + ny * out * (HALF_H / HALF_W);
+      // Two strokes out of the corner, along the two diamond edges.
+      const ax = nx !== 0 ? -nx * arm : arm;
+      const ay = nx !== 0 ? -arm * (HALF_H / HALF_W) : -ny * arm * (HALF_H / HALF_W);
+      overlay.lineStyle(3.4 * lw, 0x000000, 0.5);
+      overlay.beginPath();
+      overlay.moveTo(cx + ax, cy + ay);
+      overlay.lineTo(cx, cy);
+      overlay.lineTo(cx + (nx !== 0 ? ax : -ax), cy + (nx !== 0 ? -ay : ay));
+      overlay.strokePath();
+      overlay.lineStyle(2.2 * lw, color, 1);
+      overlay.beginPath();
+      overlay.moveTo(cx + ax, cy + ay);
+      overlay.lineTo(cx, cy);
+      overlay.lineTo(cx + (nx !== 0 ? ax : -ax), cy + (nx !== 0 ? -ay : ay));
+      overlay.strokePath();
+    }
   }
 
   function drawUnits(alpha, invZ) {
@@ -613,60 +932,53 @@ export function createRenderer(scene, world) {
       setFrame(m, markerFrame(player), origins);
       m.setPosition(wx, wy);
       m.setDepth(depth);
-      m.setScale(u.type === 'militia' ? 1.12 : 1);
+      m.setScale(MARKER_SCALE[u.type] || 1);
 
-      if (selected) {
-        const sel = selPool.get();
-        setFrame(sel, 'mk_sel', origins);
-        sel.setPosition(wx, wy);
-        sel.setDepth(depth + 0.1);
-        // Gentle pulse so the selection reads even against a busy background.
-        sel.setScale(1 + Math.sin(t * 5) * 0.05);
-      }
+      if (selected) selectionRing(selPool, wx, wy, depth + 0.1, u.player, u.type);
 
-      // 2. body
+      // 2. body, in whichever pose the unit's current action calls for
       const face = u.facing | 0;
       const back = FACE_BACK[face & 7];
       const flip = FACE_FLIP[face & 7];
-      const uFrame = unitFrameFor(u.type, player, back);
+      const phase = (u.id % 32) * 0.63;
+      const uFrame = unitFrameFor(u.type, player, back, poseOf(u, t, phase));
       const s = unitPool.get();
       setFrame(s, uFrame, origins);
       s.setFlipX(flip);
       s.setDepth(depth + 0.2);
       const uo = origins.get(uFrame);
 
+      // The poses carry the limb motion; this is only the whole-body travel
+      // that a drawn frame cannot express — the rise and fall of a stride, and
+      // the slow breath of a unit standing still.
       let bob = 0;
-      let rot = 0;
-      const phase = (u.id % 32) * 0.63;
-      switch (u.state) {
-        case 'move':
-        case 'deposit':
-          bob = -Math.abs(Math.sin(t * 9 + phase)) * 2.6;
-          break;
-        case 'gather':
-          rot = Math.sin(t * 7 + phase) * 0.34 - 0.1;
-          break;
-        case 'build':
-          rot = Math.sin(t * 9 + phase) * 0.28 - 0.08;
-          break;
-        case 'attack':
-          rot = Math.sin(t * 11 + phase) * 0.26;
-          break;
-        default:
-          bob = Math.sin(t * 2.2 + phase) * 0.7;
-          break;
+      if (u.state === 'move' || u.state === 'deposit') {
+        bob = -Math.abs(Math.sin(t * 9 + phase)) * 1.2;
+      } else if (u.state === 'idle') {
+        bob = Math.sin(t * 2.2 + phase) * 0.6;
       }
       s.setPosition(wx, wy + bob);
-      s.setRotation(flip ? -rot : rot);
+
+      // A wash of light over anything hit in the last fraction of a second.
+      // Cheap (a tint, no extra sprite) and it is the single clearest way to
+      // say "that landed" without shaking the screen.
+      const hitAt = hitFlash.get(u.id);
+      if (hitAt !== undefined) {
+        if (t - hitAt < HIT_FLASH) s.setTint(HIT_FLASH_TINT);
+        else hitFlash.delete(u.id);
+      }
 
       const top = wy - uo.h * uo.oy;
 
-      // 3. health bar — only when hurt, or when selected.
+      // 3. health bar. Always for a damaged unit, always for a selected one,
+      //    and for everything in a fight — see barsWanted: during a battle the
+      //    question "who is about to die" is the only question, and answering
+      //    it only for units that have already been hit answers it too late.
       const hurt = u.hp < u.maxHp;
-      if (hurt || selected) {
-        bar(
-          overlay, wx, top - 5 * invZ, 18 * invZ, 3.6 * invZ, u.hp / u.maxHp,
-          player === PLAYER ? 0x4ade80 : 0xf05252, invZ,
+      if (hurt || selected || (barsWanted && u.player === PLAYER)) {
+        healthBar(
+          overlay, wx, top - 6 * invZ, u.hp / u.maxHp,
+          u.player === PLAYER ? 0x4ade80 : 0xf05252, invZ,
         );
       }
 
@@ -875,11 +1187,37 @@ export function createRenderer(scene, world) {
     screenG.strokeRect(_tmpA.x, _tmpA.y, w, h);
   }
 
+  /**
+   * Stand cliffs on a list of tiles and block them, for tests and for the
+   * console.
+   *
+   * This exists because the renderer can be finished for cliffs long before
+   * mapgen (someone else's file) places any: without it there is no way to look
+   * at the feature, and art nobody has looked at is art nobody has made. It is
+   * also the honest way to prove the pathfinding integration — the tiles it
+   * writes are BLOCK_TERRAIN, the same value water uses, so A* refuses them
+   * through the code path it already had.
+   */
+  function debugCliffs(tiles) {
+    if (!world.cliff) world.cliff = new Uint8Array(MAP_W * MAP_H);
+    for (const [tx, ty] of tiles) {
+      if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
+      const i = ty * MAP_W + tx;
+      world.cliff[i] = 1;
+      world.blocked[i] = 2;
+    }
+    cliffs = buildCliffList(world);
+    return cliffs.length;
+  }
+
   function destroy() {
     // The scene is torn down and relaunched on "Play again"; a surviving
     // listener would pile up one dead renderer per game.
     if (scaler) scaler.off('resize', onResize);
+    for (const off of evOffs) off();
+    evOffs.length = 0;
     fx.destroy();
+    cliffPool.destroy();
     markerPool.destroy();
     unitPool.destroy();
     bldPool.destroy();
@@ -904,6 +1242,7 @@ export function createRenderer(scene, world) {
     setDragBox,
     setWallPreview,
     setWallReadout,
+    debugCliffs,
     // Extras other systems may find useful; not part of the required contract.
     fx,
     atlas: ATLAS,
@@ -1013,15 +1352,47 @@ function makePool(create) {
 /** Health / progress bar in world space, pre-scaled to hold its screen size. */
 function bar(g, wx, wy, w, h, frac, color, invZ) {
   const f = frac < 0 ? 0 : frac > 1 ? 1 : frac;
-  const pad = 1.2 * invZ;
-  g.fillStyle(0x0b0906, 0.8);
+  const pad = 1.4 * invZ;
+  // Two rings of dark around the bar, not one. On grass at 0.7 zoom a single
+  // hairline outline is the same value as the ground behind it and the bar's
+  // ends dissolve; a solid black surround is what makes a 20px bar read as an
+  // object rather than as a smear of colour.
+  g.fillStyle(0x000000, 0.55);
+  g.fillRect(wx - w / 2 - pad * 2, wy - pad * 2, w + pad * 4, h + pad * 4);
+  g.fillStyle(0x0b0906, 0.95);
   g.fillRect(wx - w / 2 - pad, wy - pad, w + pad * 2, h + pad * 2);
   g.fillStyle(0x3a3630, 1);
   g.fillRect(wx - w / 2, wy, w, h);
   g.fillStyle(color, 1);
   g.fillRect(wx - w / 2, wy, w * f, h);
-  g.fillStyle(0xffffff, 0.25);
-  g.fillRect(wx - w / 2, wy, w * f, h * 0.4);
+  g.fillStyle(0xffffff, 0.3);
+  g.fillRect(wx - w / 2, wy, w * f, h * 0.42);
+}
+
+/**
+ * A unit's health bar. Wider and taller than it used to be, and drawn at a
+ * fixed screen size: 24 x 5 CSS pixels at the default zoom on a 390px phone,
+ * which is the smallest bar this pass could still read the fraction off at
+ * arm's length. The old 18 x 3.6 was legible only if you already knew it was
+ * there. The colour crosses to amber and then red as the unit dies, so a
+ * glance at a melee sorts it into "fine / hurt / about to die" without
+ * measuring any lengths.
+ */
+function healthBar(g, wx, wy, frac, ownColor, invZ) {
+  const f = frac < 0 ? 0 : frac > 1 ? 1 : frac;
+  const color = ownColor === 0x4ade80
+    ? (f > 0.6 ? 0x4ade80 : f > 0.3 ? 0xf0b429 : 0xf05252)
+    : ownColor;
+  bar(g, wx, wy, 24 * invZ, 5 * invZ, f, color, invZ);
+}
+
+/** Blend two packed RGB colours. Used for the "unpainted masonry" tint. */
+function mixColor(a, b, k) {
+  const f = k < 0 ? 0 : k > 1 ? 1 : k;
+  const r = ((a >> 16) & 255) + (((b >> 16) & 255) - ((a >> 16) & 255)) * f;
+  const g = ((a >> 8) & 255) + (((b >> 8) & 255) - ((a >> 8) & 255)) * f;
+  const bl = (a & 255) + ((b & 255) - (a & 255)) * f;
+  return (Math.round(r) << 16) | (Math.round(g) << 8) | Math.round(bl);
 }
 
 function strokeDiamond(g, cx, cy, hw, hh) {
@@ -1347,6 +1718,35 @@ function buildTerrainOps(world) {
     }
   }
 
+  // --- 4b. scattered ground detail -----------------------------------------
+  // Roughly one tile in thirteen gets one decal, jittered off the tile centre
+  // by up to half a tile. Both numbers matter: denser than this and the map
+  // reads as noise rather than as ground with things on it, and without the
+  // jitter every rock in the world sits dead centre of a diamond and the grid
+  // becomes visible through the decoration meant to hide it.
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      const id = world.terrain[ty * W + tx];
+      if (id === 2) continue; // never on water
+      const h = tileHash(tx * 3 + 11, ty * 5 + 7);
+      if (h % 13 !== 0) continue;
+      const choices = DETAIL_FOR_TERRAIN[id] || DETAIL_FOR_TERRAIN[0];
+      let d = choices[(h >>> 5) % choices.length];
+      // Reeds only where the land meets water, which is the one place a stand
+      // of them is not a mistake.
+      const nearWater =
+        terrainAt(tx + 1, ty) === 2 || terrainAt(tx - 1, ty) === 2 ||
+        terrainAt(tx, ty + 1) === 2 || terrainAt(tx, ty - 1) === 2;
+      if (nearWater && (h >>> 11) % 3 !== 0) d = 6;
+      else if (d === 6) d = 2;
+      if (d >= DETAIL_VARIANTS) continue;
+      tilePos(tx, ty, p);
+      p.x += TILE_TEX_W / 2 - DETAIL_BOX.ax + (((h >>> 13) % 21) - 10);
+      p.y += TILE_TEX_H / 2 - DETAIL_BOX.ay + (((h >>> 18) % 11) - 5);
+      push(detailFrame(d), 1, undefined);
+    }
+  }
+
   // --- 5. map-scale mottling ------------------------------------------------
   // Six tiles apart with hashed jitter: far coarser than a tile, so it reads
   // as ground shading rather than as more quilting.
@@ -1365,6 +1765,46 @@ function buildTerrainOps(world) {
   }
 
   return ops;
+}
+
+/**
+ * Flatten `world.cliff` into a draw list, once.
+ *
+ * Each entry carries its world position, its frame and its depth, all of which
+ * are fixed for the life of the map — so the per-frame cost of cliffs is a walk
+ * over this array and a rectangle test, with no grid lookups and no string
+ * building.
+ *
+ * All four neighbours go into the mask, not just the two whose faces the camera
+ * can see. The +x and +y bits decide which walls are drawn; the -x and -y bits
+ * decide whether the *top* edge on that side is outlined. Miss the second pair
+ * and every interior tile of a plateau outlines its own northern edges, which
+ * draws the tile grid across the rock in black — the exact failure this frame
+ * set exists to avoid.
+ */
+function buildCliffList(world) {
+  const grid = world.cliff;
+  const out = [];
+  if (!grid) return out;
+  const W = world.width;
+  const H = world.height;
+  const at = (tx, ty) => (tx < 0 || ty < 0 || tx >= W || ty >= H ? 0 : grid[ty * W + tx]);
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      if (!grid[ty * W + tx]) continue;
+      const mask =
+        (at(tx + 1, ty) ? 1 : 0) | (at(tx, ty + 1) ? 2 : 0) |
+        (at(tx - 1, ty) ? 4 : 0) | (at(tx, ty - 1) ? 8 : 0);
+      const h = tileHash(tx, ty);
+      out.push({
+        wx: (tx - ty) * HALF_W,
+        wy: (tx + ty + 1) * HALF_H,
+        frame: cliffFrame(h % CLIFF_VARIANTS, mask),
+        depth: depthFor(tx + 0.5, ty + 0.5, 0.6),
+      });
+    }
+  }
+  return out;
 }
 
 /** Well-mixed per-tile hash — a weak one leaves visible stripes of variants. */

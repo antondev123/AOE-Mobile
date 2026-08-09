@@ -38,7 +38,7 @@ import {
 } from './pathfinding.js';
 import {
   gatherTick, depositCarry, buildTick, nearestDropoff, isGatherableBuilding,
-  acceptsDropoff,
+  acceptsDropoff, nextQueuedSite,
 } from './economy.js';
 import {
   inRange, canAttack, attackReach, stanceOf, setStance, isGarrisoned,
@@ -1331,8 +1331,10 @@ function routeToDropoff(world, u, t, ctx, immediate) {
 function tickBuild(world, u, dt, ctx) {
   const t = u.task;
   const b = t.building;
+  // A site that vanished under us (cancelled, destroyed) is not a finished one:
+  // there is no next-in-the-batch to walk to, only work to find.
   if (!b || b.dead) { onJobFinished(world, u, ctx); return; }
-  if (b.complete) { onJobFinished(world, u, ctx); return; }
+  if (b.complete) { onJobFinished(world, u, ctx, b); return; }
 
   if (edgeDist(b, u.x, u.y) <= BUILD_REACH) {
     t.tries = 0;
@@ -1340,12 +1342,14 @@ function tickBuild(world, u, dt, ctx) {
     u.state = 'build';
     u.facing = dirIndex(b.x - u.x, b.y - u.y);
     const done = buildTick(world, u, b, dt);
-    if (done) onJobFinished(world, u, ctx);
+    if (done) onJobFinished(world, u, ctx, b);
     return;
   }
 
   if (!u.dest) {
     if ((t.tries = (t.tries || 0) + 1) > MAX_APPROACH_TRIES) {
+      // Could not get to it at all — leave the batch alone rather than skipping
+      // to the next site, which would only walk into the same wall.
       onJobFinished(world, u, ctx);
       return;
     }
@@ -1363,12 +1367,30 @@ function tickBuild(world, u, dt, ctx) {
 /**
  * AoE2 behaviour: a villager that finishes a building does not stand around,
  * it walks to the nearest resource and starts working.
+ *
+ * ...unless the site it just finished was one of a batch the player queued, in
+ * which case the next site in that batch outranks the nearest tree. That is the
+ * whole contract of batch placement: you tap out a row of houses once and the
+ * builders work through it without another order. It is deliberately gated on
+ * the queue rather than on "is there any foundation nearby" — a villager must
+ * not wander off to help with a building the player never asked *these* people
+ * to build, and the enemy AI (which places foundations constantly and never
+ * queues) keeps the behaviour it has always had.
  */
-function onJobFinished(world, u, ctx) {
+function onJobFinished(world, u, ctx, finished = null) {
   u.task = null;
   clearMovement(u);
   u.state = 'idle';
   if (u.type !== 'villager') return;
+
+  if (finished && finished.queued) {
+    const next = nextQueuedSite(world, u.player, u.x, u.y, finished);
+    if (next) {
+      orderBuild(world, [u], { type: 'build', target: next }, ctx);
+      return;
+    }
+  }
+
   const preferred = u.aiMemory ? u.aiMemory.resourceType : null;
   const node = findWorkNode(world, u, u.x, u.y, FOLLOWUP_WORK_RADIUS, preferred);
   if (node) beginGatherTask(world, u, node, ctx, pickStand(world, u, node));
@@ -1633,7 +1655,7 @@ function onBuilt(world, building) {
   for (const u of world.units) {
     if (u.dead || !u.task || u.task.type !== 'build') continue;
     if (u.task.building !== building) continue;
-    onJobFinished(world, u, ctx);
+    onJobFinished(world, u, ctx, building);
   }
   adoptNewDropoff(world, building, ctx);
 }

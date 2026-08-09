@@ -158,7 +158,14 @@ function econState(world) {
   if (!world._economy) {
     world._economy = {
       popNag: world.players.map(() => 0), // seconds until we may nag again
+      // Ordered lists of foundation ids the player asked for in one breath —
+      // see the build queue section below.
+      buildQueue: world.players.map(() => []),
     };
+  }
+  // Older worlds (and the odd hand-built test fixture) predate the queue.
+  if (!world._economy.buildQueue) {
+    world._economy.buildQueue = world.players.map(() => []);
   }
   return world._economy;
 }
@@ -767,6 +774,105 @@ export function cancelFoundation(world, building, { giveBack = true } = {}) {
   if (giveBack && s) refund(world, building.player, s.cost, `cancel:${building.type}`);
   removeEntity(world, building);
   return true;
+}
+
+// --- The build queue --------------------------------------------------------
+//
+// Placing a building on a phone is four gestures: open the menu, pick the type,
+// aim, lift. Three of those are the same three every time, which is why a base
+// on a touch screen ends up smaller and worse laid out than one on a desktop —
+// not because the player wants fewer houses, but because the fifth house costs
+// the same four gestures as the first.
+//
+// The queue is the answer: arm a type once, tap as many places as you like, and
+// each tap puts a foundation down and remembers the order you asked for them in.
+// Two things ride on remembering that order.
+//
+//   * The player can see and undo it. A queue of six sites you can read and take
+//     back one at a time is a plan; six foundations scattered across the map
+//     that you have to find and select individually is a mess.
+//   * A villager that finishes a queued site walks to the *next* one instead of
+//     going back to a tree (see onJobFinished in unitAI.js). That is the whole
+//     point of a batch: you place the row of houses and then stop thinking about
+//     it, exactly as the wall drag already lets you do with a run of palisade.
+//
+// It is a list of ids rather than of buildings so a site that is destroyed,
+// finished or cancelled by any other route simply drops out on the next read —
+// there is no second bookkeeping path to keep in step with world.removeEntity.
+
+/** Add a freshly placed foundation to the back of the player's build queue. */
+export function enqueueFoundation(world, building) {
+  if (!building || building.kind !== 'building' || building.complete) return false;
+  const q = econState(world).buildQueue[building.player];
+  if (!q || q.includes(building.id)) return false;
+  q.push(building.id);
+  building.queued = true;
+  return true;
+}
+
+/**
+ * The player's queued sites, oldest first, pruned of anything that has since
+ * been finished, cancelled or destroyed. This is the read the HUD draws and the
+ * unit AI asks — both get the same list, so what the strip shows is what the
+ * builders are working through.
+ */
+export function buildQueue(world, playerId) {
+  const st = econState(world);
+  const q = st.buildQueue[playerId];
+  if (!q || !q.length) return [];
+  const out = [];
+  const live = [];
+  for (const id of q) {
+    const b = world.entities.get(id);
+    if (!b || b.dead || b.kind !== 'building' || b.complete) continue;
+    live.push(id);
+    out.push(b);
+  }
+  if (live.length !== q.length) st.buildQueue[playerId] = live;
+  return out;
+}
+
+/**
+ * The next queued site for a builder standing at (gx, gy), nearest first.
+ *
+ * Nearest rather than strictly first-in: the queue records what the player asked
+ * for, not a route, and a villager that has just finished the house at the north
+ * end should not walk the length of the base because that house happened to be
+ * tapped last. Ties go to the older entry, so a row of houses placed left to
+ * right does get built left to right.
+ */
+export function nextQueuedSite(world, playerId, gx, gy, exclude = null) {
+  let best = null;
+  let bestD = Infinity;
+  const list = buildQueue(world, playerId);
+  for (const b of list) {
+    if (b === exclude) continue;
+    const d = edgeDist2(b, gx, gy);
+    if (d < bestD) {
+      bestD = d;
+      best = b;
+    }
+  }
+  return best;
+}
+
+/** Take one entry back off the queue and refund it. Index into buildQueue(). */
+export function cancelQueued(world, playerId, index) {
+  const list = buildQueue(world, playerId);
+  const b = list[index];
+  if (!b) return null;
+  const type = b.type;
+  if (!cancelFoundation(world, b)) return null;
+  return type;
+}
+
+/** Take the whole queue back, refunding every site. Returns how many went. */
+export function clearBuildQueue(world, playerId) {
+  const list = buildQueue(world, playerId);
+  let n = 0;
+  for (const b of list) if (cancelFoundation(world, b)) n++;
+  econState(world).buildQueue[playerId] = [];
+  return n;
 }
 
 /**

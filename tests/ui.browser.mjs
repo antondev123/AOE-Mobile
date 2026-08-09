@@ -1614,7 +1614,28 @@ async function placementGhostRun() {
       !!placed.site && placed.wood === placed.woodBefore - 25,
       placed.site ? `${placed.woodBefore} -> ${placed.wood} wood` : 'no foundation');
     if (!placed.site) return;
-    check('placement mode is spent once it is used', placed.armed === null, String(placed.armed));
+
+    // Placement is a BATCH now: one arming, as many sites as you tap. It used
+    // to be spent by the first tap, which made a row of five houses five trips
+    // through the build menu. So the contract this checks is the new one — the
+    // mode survives the tap, the bar counts what has been placed and offers
+    // Done, and Done is what ends it.
+    check('placement stays armed for the next site', placed.armed === 'house',
+      String(placed.armed));
+    const bar = await page.evaluate(() => ({
+      text: document.getElementById('place-bar').textContent,
+      hidden: document.getElementById('place-bar').hidden,
+      placed: window.__game.hud.placedThisArm(),
+      queue: document.querySelectorAll('#build-queue .bq-chip').length,
+    }));
+    check('and the bar says how many are down and offers Done',
+      !bar.hidden && bar.placed === 1 && /Done/.test(bar.text), `${bar.placed}: ${bar.text}`);
+    check('the site joins the visible build queue', bar.queue === 1, `${bar.queue} chip(s)`);
+
+    await page.locator('#place-bar button').click();
+    check('Done ends the batch',
+      await page.evaluate(() => window.__game.hud.getPlacementType() === null &&
+        document.getElementById('place-bar').hidden));
 
     // --- Cancelling the site you regret. -------------------------------------
     const p2 = await aim(page, placed.site.x, placed.site.y);
