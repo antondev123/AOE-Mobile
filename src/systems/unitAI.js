@@ -26,17 +26,28 @@
 // that a farm is a building, so distances to it use edgeDist().
 
 import { dirIndex } from '../core/iso.js';
-import { forEachNear, edgeDist, edgeDist2, findNearestGlobal } from '../core/world.js';
+import {
+  UNIT_STATS, ARMOR_CLASS, STANCE, FORMATION, DEFAULT_FORMATION,
+  FORMATION_SPACING, SPREAD_SPACING,
+} from '../core/constants.js';
+import {
+  forEachNear, edgeDist, edgeDist2, findNearestGlobal, snapshotUnits,
+} from '../core/world.js';
 import { EV } from '../core/events.js';
+import { perfBegin, perfEnd } from '../core/perf.js';
 import {
   findPath, findAdjacentStandTile, isWalkable, nearestWalkable, hasLineOfSight,
   isSealedFrom, isPocket,
 } from './pathfinding.js';
 import {
   gatherTick, depositCarry, buildTick, nearestDropoff, isGatherableBuilding,
-  acceptsDropoff,
+  acceptsDropoff, nextQueuedSite,
 } from './economy.js';
-import { inRange, canAttack, attackReach } from './combat.js';
+import {
+  inRange, canAttack, attackReach, stanceOf, setStance, isGarrisoned,
+  garrisonUnit, garrisonRefusal, garrisonCount, garrisonCapacity,
+  nearestShelter, ungarrisonUnit,
+} from './combat.js';
 
 // --- Tuning -----------------------------------------------------------------
 
@@ -136,8 +147,16 @@ const SEP_DEADBAND = 0.02;
 const HEAD_ON_DOT = -0.5;
 const SIDESTEP_MIN = 0.35;
 
-// Formation spacing for group orders, in tiles.
-const FORMATION_SPACING = 1.0;
+// How close a unit has to get to a building before it can step inside it. The
+// same order of magnitude as BUILD_REACH — you garrison from the doorstep, not
+// from across the square — with a little more slack because a group of eight
+// walking into one Town Center will not all reach the same tile.
+const GARRISON_REACH = 1.6;
+
+// Seconds between hammer blows on a building site (EV.BUILD_TICK). Slower than
+// a real hammer on purpose: at 0.45s a lone villager reads as somebody working
+// steadily, and a crew of six reads as a building site rather than as static.
+const HAMMER_PERIOD = 0.45;
 
 // How far a villager will walk to find replacement work.
 const RETASK_RADIUS = 24;
@@ -254,7 +273,13 @@ function rallyOrder(world, unit, r) {
  * Issue an order to a group of units.
  *
  * `order` = { type, gx, gy, target } where type is
- * 'move' | 'attackMove' | 'gather' | 'attack' | 'build' | 'stop' | 'patrol'.
+ * 'move' | 'attackMove' | 'gather' | 'attack' | 'build' | 'stop' | 'patrol' |
+ * 'garrison' | 'ungarrison' | 'stance' | 'formation'.
+ *
+ * The last four are settings rather than journeys: 'stance' and 'formation'
+ * change how every *subsequent* order is carried out and are the two things a
+ * phone player sets once and forgets, which is exactly why they are unit state
+ * and not order flags.
  *
  * 'attackMove' is a 'move' whose task carries `attackMove: true`; combat.js
  * reads that flag (isAttackMoving) to keep acquiring while the unit walks, and
@@ -266,7 +291,11 @@ function rallyOrder(world, unit, r) {
  */
 export function commandUnits(world, units, order) {
   if (!order) return;
-  const list = normalizeUnits(world, units);
+  const all = normalizeUnits(world, units);
+  // A unit inside a building is not on the map and cannot be given a journey.
+  // Coming back out is the one thing it *can* be told to do, so that order is
+  // the single exception rather than a check in every branch below.
+  const list = order.type === 'ungarrison' ? all : all.filter((u) => !isGarrisoned(u));
   if (list.length === 0) return;
   const ctx = getCtx(world);
   ctx.orderSearches = IMMEDIATE_SEARCHES_PER_ORDER;
@@ -303,6 +332,24 @@ export function commandUnits(world, units, order) {
       orderAttack(world, list, order, ctx);
       return;
 
+    // Go and stand inside something. See the garrison notes in combat.js.
+    case 'garrison':
+      orderGarrison(world, list, order, ctx);
+      return;
+
+    case 'ungarrison':
+      for (const u of list) ungarrisonUnit(world, u);
+      return;
+
+    case 'stance':
+      for (const u of list) setStance(u, order.stance);
+      return;
+
+    case 'formation':
+      if (!isFormation(order.formation)) return;
+      for (const u of list) u.formation = order.formation;
+      return;
+
     default:
       // Unknown verb with a position still reads as "go there".
       if (order.gx !== undefined) orderMove(world, list, order, ctx);
@@ -310,24 +357,37 @@ export function commandUnits(world, units, order) {
 }
 
 /** One fixed simulation step of unit behaviour. Called from GameScene.simStep. */
+// Reused by updateUnits, which is not re-entrant. Module scope rather than
+// per-world state: two worlds never step at the same time, and the contents do
+// not outlive the call.
+const STEP_SCRATCH = [];
+
 export function updateUnits(world, dt) {
   const ctx = getCtx(world);
   ctx.searches = SEARCHES_PER_STEP;
   ctx.orderSearches = 0;
 
-  const units = world.units;
+  // Snapshot: a unit stepping into a Town Center splices itself out of
+  // world.units mid-loop, and iterating the live array would silently skip its
+  // neighbour. combat.js takes the same copy for the same reason. The buffer is
+  // reused between steps — see snapshotUnits.
+  const units = snapshotUnits(world, STEP_SCRATCH);
+  const _tStep = perfBegin('sim.units.act');
   for (let i = 0; i < units.length; i++) {
     const u = units[i];
-    if (!u || u.dead) continue;
+    if (!u || u.dead || u.garrisonedIn) continue;
     stepUnit(world, u, dt, ctx);
   }
+  perfEnd('sim.units.act', _tStep);
   // Separation runs after every unit has moved, so pushes are computed against
   // this step's positions and the result is symmetric.
+  const _tSep = perfBegin('sim.units.separate');
   for (let i = 0; i < units.length; i++) {
     const u = units[i];
-    if (!u || u.dead) continue;
+    if (!u || u.dead || u.garrisonedIn) continue;
     separate(world, u, dt);
   }
+  perfEnd('sim.units.separate', _tSep);
 }
 
 /**
@@ -337,6 +397,11 @@ export function updateUnits(world, dt) {
  */
 export function isIdle(unit) {
   if (!unit || unit.dead || unit.kind !== 'unit') return false;
+  // A garrisoned villager is not idle, it is somewhere specific on purpose.
+  // ownedBy() still returns it (it is still yours and still costs population),
+  // so without this the idle-villager button would count the six villagers the
+  // player deliberately sheltered from a raid and nag them about it.
+  if (unit.garrisonedIn) return false;
   if (unit.task) return false;
   if (unit.target) return false;
   if (unit.dest) return false;
@@ -397,7 +462,7 @@ function orderMove(world, list, order, ctx) {
   const gx = order.gx !== undefined ? order.gx : order.target ? order.target.x : null;
   const gy = order.gy !== undefined ? order.gy : order.target ? order.target.y : null;
   if (gx === null || gy === null) return;
-  const slots = assignSlots(world, list, gx, gy);
+  const slots = assignSlots(world, list, gx, gy, order.formation);
   const attackMove = !!order.attackMove;
   for (let i = 0; i < list.length; i++) {
     const u = list[i];
@@ -410,7 +475,7 @@ function orderPatrol(world, list, order, ctx) {
   const gx = order.gx;
   const gy = order.gy;
   if (gx === undefined || gy === undefined) return;
-  const slots = assignSlots(world, list, gx, gy);
+  const slots = assignSlots(world, list, gx, gy, order.formation);
   for (let i = 0; i < list.length; i++) {
     const u = list[i];
     const s = slots[i];
@@ -586,6 +651,31 @@ function orderAttack(world, list, order, ctx) {
 }
 
 /**
+ * Walk into a building and disappear inside it.
+ *
+ * `order.target` names the building; without one, every unit heads for its own
+ * nearest shelter with room, which is what the HUD's one-tap "Garrison" does
+ * and what the enemy AI does when its town is raided. A group larger than the
+ * building can hold is not refused here — the ones that arrive to find it full
+ * simply stop, which is both cheaper and more honest than pre-allocating places
+ * to units that may die on the way.
+ */
+function orderGarrison(world, list, order, ctx) {
+  for (const u of list) {
+    const b = (order.target && order.target.kind === 'building')
+      ? order.target
+      : nearestShelter(world, u, order.gx !== undefined ? order.gx : u.x,
+        order.gy !== undefined ? order.gy : u.y);
+    if (!b) continue;
+    // Already on the doorstep: no need to plan a walk for a step.
+    if (edgeDist(b, u.x, u.y) <= GARRISON_REACH && garrisonUnit(world, u, b)) continue;
+    const stand = findAdjacentStandTile(world, b, u.x, u.y, { maxRing: 2 });
+    const p = stand || { x: b.x, y: b.y };
+    setTask(world, u, { type: 'garrison', building: b, stand: stand || null }, ctx, p.x, p.y);
+  }
+}
+
+/**
  * Where to walk to hit `target`. combat.attackReach() is the authoritative
  * stop distance, so an archer walks to the near edge of its range instead of
  * marching into the enemy's face and backing off.
@@ -631,61 +721,169 @@ function beginGatherTask(world, u, node, ctx, stand) {
   else setTask(world, u, task, ctx, node.x, node.y);
 }
 
+// --- Formations -------------------------------------------------------------
+//
+// A formation here decides one thing and one thing only: which unit walks to
+// which square when a group is given a destination. There is no per-frame
+// formation keeping, no facing lock, no rotation while marching. That is a
+// deliberate ceiling on the cost — the whole feature is O(n log n) once per
+// order and *zero* per step, which is what makes it safe with a hundred and
+// fifty units on a phone. What the player sees is the thing they asked for: a
+// group that arrives in ranks rather than as a blob.
+//
+// The three shapes, all built in a local frame whose +forward axis points the
+// way the group is travelling and whose +right axis is ninety degrees off it,
+// then rotated into the world:
+//
+//   Line    a wide, shallow block. Roughly three times as wide as it is deep,
+//           which is what "line" means in every RTS: everybody's weapon bears,
+//           and nobody is queueing behind a friend.
+//   Box     a rectangle with the tough units on the perimeter and the ranged
+//           and siege inside it. The one formation that is a *tactic* rather
+//           than a shape — it is the answer to cavalry going round the side.
+//   Spread  the Line, at more than twice the spacing, so one mangonel shot or
+//           one burning ram cannot reach two bodies.
+
+export function isFormation(f) {
+  return f === FORMATION.LINE || f === FORMATION.BOX || f === FORMATION.SPREAD;
+}
+
+/** The formation a group is in: whatever most of it is set to. */
+function groupFormation(list) {
+  let best = DEFAULT_FORMATION;
+  let bestN = 0;
+  const counts = new Map();
+  for (const u of list) {
+    const f = isFormation(u.formation) ? u.formation : DEFAULT_FORMATION;
+    const n = (counts.get(f) || 0) + 1;
+    counts.set(f, n);
+    if (n > bestN) { bestN = n; best = f; }
+  }
+  return best;
+}
+
 /**
- * Destination slots for a group order: a loose block centred on the tap, so a
- * dozen units arrive as a formation instead of a conga line fighting over one
- * tile. Slots are matched to units nearest-first, which keeps the group's
- * relative layout and stops units from crossing through each other.
+ * Does this unit belong in the middle of a Box?
+ *
+ * Anything that shoots, and anything too slow or too fragile to be on the
+ * outside of a fight: archers, siege, and any villager caught up in the group.
+ * Everything else is the wall.
  */
-function assignSlots(world, list, gx, gy) {
+function prefersInside(u) {
+  const s = UNIT_STATS[u.type];
+  if (!s) return false;
+  if (s.projectile) return true;
+  if (s.armorClass === ARMOR_CLASS.SIEGE) return true;
+  return u.type === 'villager';
+}
+
+/**
+ * Local (right, forward) cell offsets for a formation, one per unit, paired
+ * with the index of the unit that should take it. Pure arithmetic — no world
+ * access, no walkability, no allocation beyond the result.
+ */
+function formationCells(list, formation) {
+  const n = list.length;
+  const cells = [];
+
+  if (formation === FORMATION.BOX) {
+    const cols = Math.max(2, Math.ceil(Math.sqrt(n)));
+    const rows = Math.max(2, Math.ceil(n / cols));
+    const perimeter = [];
+    const interior = [];
+    for (let r = 0; r < rows; r++) {
+      for (let c = 0; c < cols; c++) {
+        const cell = { r: c - (cols - 1) / 2, f: -(r - (rows - 1) / 2) };
+        if (c === 0 || c === cols - 1 || r === 0 || r === rows - 1) perimeter.push(cell);
+        else interior.push(cell);
+      }
+    }
+    // Fill the inside with as many of the units that want it as will fit, and
+    // let the rest of both groups spill into whatever is left. A box of four
+    // archers has no inside, and that is fine — it is a box of four archers.
+    const wantIn = list.filter(prefersInside).length;
+    const inside = Math.min(wantIn, interior.length, n);
+    const outside = Math.min(n - inside, perimeter.length);
+    for (let i = 0; i < outside; i++) cells.push({ ...perimeter[i], inside: false });
+    for (let i = 0; i < inside; i++) cells.push({ ...interior[i], inside: true });
+    // Anything still unplaced (a huge group in a small box) goes behind.
+    for (let i = cells.length, back = 0; i < n; i++, back++) {
+      cells.push({ r: (back % cols) - (cols - 1) / 2, f: -(rows - 1) / 2 - 1 - Math.floor(back / cols), inside: false });
+    }
+    return cells;
+  }
+
+  // Line and Spread share their shape and differ only in spacing.
+  const cols = Math.max(1, Math.round(Math.sqrt(n * 3)));
+  for (let i = 0; i < n; i++) {
+    const c = i % cols;
+    const rank = Math.floor(i / cols);
+    // The last rank is centred on its own width rather than on the full one, so
+    // a group of seven in ranks of five ends up centred, not left-aligned.
+    const wide = Math.min(cols, n - rank * cols);
+    cells.push({ r: c - (wide - 1) / 2, f: -rank, inside: false });
+  }
+  return cells;
+}
+
+/**
+ * Destination slots for a group order, in formation, so a dozen units arrive as
+ * a body instead of a conga line fighting over one tile.
+ *
+ * Units are matched to slots by where they already are along the formation's
+ * own axes: the leftmost unit takes the leftmost slot, the one nearest the
+ * front takes the front rank. That is a sort rather than the old greedy nearest
+ * pass — O(n log n) instead of O(n²), and it *keeps the group's layout*, which
+ * is what stops units walking through each other on the way.
+ */
+function assignSlots(world, list, gx, gy, formation) {
   const n = list.length;
   if (n === 1) {
     // Fall back to the raw point when nothing near it is free: findPath slides
     // the goal onto walkable ground anyway, and refusing the order is worse.
     return [walkablePoint(world, gx, gy) || { x: gx, y: gy }];
   }
-  const slots = [];
-  const spacing = FORMATION_SPACING;
-  for (let ring = 0; slots.length < n && ring < 14; ring++) {
-    if (ring === 0) {
-      const p = walkablePoint(world, gx, gy);
-      if (p) slots.push(p);
-      continue;
-    }
-    const count = Math.max(6, ring * 6);
-    for (let i = 0; i < count && slots.length < n; i++) {
-      const a = (i / count) * Math.PI * 2 + ring * 0.5;
-      const px = gx + Math.cos(a) * ring * spacing;
-      const py = gy + Math.sin(a) * ring * spacing;
-      const p = walkablePoint(world, px, py);
-      if (!p) continue;
-      let tooClose = false;
-      for (const s of slots) {
-        const dx = s.x - p.x;
-        const dy = s.y - p.y;
-        if (dx * dx + dy * dy < spacing * spacing * 0.64) { tooClose = true; break; }
-      }
-      if (!tooClose) slots.push(p);
-    }
-  }
-  while (slots.length < n) slots.push({ x: gx, y: gy });
+  const form = isFormation(formation) ? formation : groupFormation(list);
+  const spacing = form === FORMATION.SPREAD ? SPREAD_SPACING : FORMATION_SPACING;
 
-  // Greedy nearest assignment, centre slot first.
-  const out = new Array(n).fill(null);
-  const taken = new Array(n).fill(false);
-  for (let si = 0; si < slots.length && si < n; si++) {
-    let best = -1;
-    let bestD = Infinity;
-    for (let ui = 0; ui < n; ui++) {
-      if (taken[ui]) continue;
-      const dx = list[ui].x - slots[si].x;
-      const dy = list[ui].y - slots[si].y;
-      const d = dx * dx + dy * dy;
-      if (d < bestD) { bestD = d; best = ui; }
-    }
-    if (best >= 0) { taken[best] = true; out[best] = slots[si]; }
+  // The frame: +forward is the way the group is going, +right is across it.
+  let cx = 0;
+  let cy = 0;
+  for (const u of list) { cx += u.x; cy += u.y; }
+  cx /= n;
+  cy /= n;
+  let fx = gx - cx;
+  let fy = gy - cy;
+  const fl = Math.hypot(fx, fy);
+  if (fl < 1e-3) { fx = 0; fy = 1; } else { fx /= fl; fy /= fl; }
+  const rx = -fy;
+  const ry = fx;
+
+  const cells = formationCells(list, form);
+
+  // Order the units the same way the cells are ordered, so the assignment is a
+  // zip. Box keeps its two classes apart first — a knight must not be handed an
+  // interior slot because it happened to be standing on the left.
+  const order = list.map((u, i) => ({
+    i,
+    inside: form === FORMATION.BOX ? prefersInside(u) : false,
+    r: (u.x - cx) * rx + (u.y - cy) * ry,
+    f: (u.x - cx) * fx + (u.y - cy) * fy,
+  }));
+  const cellOrder = cells.map((c, i) => ({ i, ...c }));
+  const rank = (a, b) =>
+    (a.inside === b.inside ? 0 : a.inside ? 1 : -1) ||
+    (b.f - a.f) || (a.r - b.r);
+  order.sort(rank);
+  cellOrder.sort(rank);
+
+  const out = new Array(n);
+  for (let k = 0; k < n; k++) {
+    const cell = cellOrder[k];
+    const px = gx + rx * cell.r * spacing + fx * cell.f * spacing;
+    const py = gy + ry * cell.r * spacing + fy * cell.f * spacing;
+    out[order[k].i] = walkablePoint(world, px, py) || { x: px, y: py };
   }
-  for (let i = 0; i < n; i++) if (!out[i]) out[i] = { x: gx, y: gy };
   return out;
 }
 
@@ -777,6 +975,7 @@ function stepUnit(world, u, dt, ctx) {
       case 'gather': tickGather(world, u, dt, ctx); break;
       case 'build': tickBuild(world, u, dt, ctx); break;
       case 'attack': tickAttack(world, u, dt, ctx); break;
+      case 'garrison': tickGarrison(world, u, dt, ctx); break;
       default: u.task = null; u.state = 'idle';
     }
   } else if (u.state !== 'idle') {
@@ -1150,21 +1349,37 @@ function routeToDropoff(world, u, t, ctx, immediate) {
 function tickBuild(world, u, dt, ctx) {
   const t = u.task;
   const b = t.building;
+  // A site that vanished under us (cancelled, destroyed) is not a finished one:
+  // there is no next-in-the-batch to walk to, only work to find.
   if (!b || b.dead) { onJobFinished(world, u, ctx); return; }
-  if (b.complete) { onJobFinished(world, u, ctx); return; }
+  if (b.complete) { onJobFinished(world, u, ctx, b); return; }
 
   if (edgeDist(b, u.x, u.y) <= BUILD_REACH) {
     t.tries = 0;
     clearMovement(u);
     u.state = 'build';
     u.facing = dirIndex(b.x - u.x, b.y - u.y);
+    // The hammer beat. Construction is continuous — buildTick advances progress
+    // every one of the twenty steps a second — but a *blow* is not, and the beat
+    // belongs in the simulation rather than in whatever happens to be listening
+    // for it, so the sound and any future spark agree about when the hammer
+    // lands. Emitting per step instead would put four hundred dispatches a
+    // second through the bus with twenty builders working, and every one of them
+    // copies its handler list.
+    u.buildBeat = (u.buildBeat || 0) + dt;
+    if (u.buildBeat >= HAMMER_PERIOD) {
+      u.buildBeat = 0;
+      world.events.emit(EV.BUILD_TICK, { unit: u, building: b });
+    }
     const done = buildTick(world, u, b, dt);
-    if (done) onJobFinished(world, u, ctx);
+    if (done) onJobFinished(world, u, ctx, b);
     return;
   }
 
   if (!u.dest) {
     if ((t.tries = (t.tries || 0) + 1) > MAX_APPROACH_TRIES) {
+      // Could not get to it at all — leave the batch alone rather than skipping
+      // to the next site, which would only walk into the same wall.
       onJobFinished(world, u, ctx);
       return;
     }
@@ -1182,15 +1397,80 @@ function tickBuild(world, u, dt, ctx) {
 /**
  * AoE2 behaviour: a villager that finishes a building does not stand around,
  * it walks to the nearest resource and starts working.
+ *
+ * ...unless the site it just finished was one of a batch the player queued, in
+ * which case the next site in that batch outranks the nearest tree. That is the
+ * whole contract of batch placement: you tap out a row of houses once and the
+ * builders work through it without another order. It is deliberately gated on
+ * the queue rather than on "is there any foundation nearby" — a villager must
+ * not wander off to help with a building the player never asked *these* people
+ * to build, and the enemy AI (which places foundations constantly and never
+ * queues) keeps the behaviour it has always had.
  */
-function onJobFinished(world, u, ctx) {
+function onJobFinished(world, u, ctx, finished = null) {
   u.task = null;
   clearMovement(u);
   u.state = 'idle';
   if (u.type !== 'villager') return;
+
+  if (finished && finished.queued) {
+    const next = nextQueuedSite(world, u.player, u.x, u.y, finished);
+    if (next) {
+      orderBuild(world, [u], { type: 'build', target: next }, ctx);
+      return;
+    }
+  }
+
   const preferred = u.aiMemory ? u.aiMemory.resourceType : null;
   const node = findWorkNode(world, u, u.x, u.y, FOLLOWUP_WORK_RADIUS, preferred);
   if (node) beginGatherTask(world, u, node, ctx, pickStand(world, u, node));
+}
+
+/**
+ * Walk to the shelter and step inside it.
+ *
+ * The task ends three ways: the unit gets in (combat.garrisonUnit lifts it out
+ * of world.units and this loop never sees it again), the building refuses it
+ * for good — destroyed, filled up while we walked, someone else's — or the walk
+ * cannot be served. Every one of them puts the unit back to idle rather than
+ * leaving it pacing outside a full Town Center, which is the failure a player
+ * reads as "the button did nothing".
+ */
+function tickGarrison(world, u, dt, ctx) {
+  const t = u.task;
+  const b = t.building;
+  if (!b || b.dead) { u.task = null; clearMovement(u); u.state = 'idle'; return; }
+
+  if (edgeDist(b, u.x, u.y) <= GARRISON_REACH) {
+    clearMovement(u);
+    u.facing = dirIndex(b.x - u.x, b.y - u.y);
+    if (garrisonUnit(world, u, b)) return;
+    // Refused at the door. A full building is worth waiting a beat for —
+    // somebody may step out — but anything structural (not ours, still a
+    // foundation, holds nobody at all) is not.
+    if (!garrisonRefusal(world, u, b) || garrisonCount(b) < garrisonCapacity(b)) {
+      u.task = null;
+      u.state = 'idle';
+      return;
+    }
+    t.waited = (t.waited || 0) + dt;
+    if (t.waited > 3) { u.task = null; u.state = 'idle'; }
+    return;
+  }
+
+  if (!u.dest) {
+    if ((t.tries = (t.tries || 0) + 1) > MAX_APPROACH_TRIES) {
+      u.task = null;
+      clearMovement(u);
+      u.state = 'idle';
+      return;
+    }
+    const stand = findAdjacentStandTile(world, b, u.x, u.y, { maxRing: 2 });
+    t.stand = stand || null;
+    const p = stand || { x: b.x, y: b.y };
+    requestPath(world, u, p.x, p.y, ctx, false);
+  }
+  u.state = 'move';
 }
 
 function tickAttack(world, u, dt, ctx) {
@@ -1216,6 +1496,18 @@ function tickAttack(world, u, dt, ctx) {
     u.target = target;
     u.state = 'attack';
     u.facing = dirIndex(target.x - u.x, target.y - u.y);
+    return;
+  }
+
+  // Stand Ground never takes a step for a fight it picked itself: the target
+  // walked out of reach, so it stops being a target. An attack order the player
+  // gave is a different thing entirely and still walks — telling a unit to kill
+  // that is telling it to go there — which is why this only fires on `auto`.
+  if (t.auto && stanceOf(u) === STANCE.STAND_GROUND) {
+    u.target = null;
+    u.task = null;
+    clearMovement(u);
+    u.state = 'idle';
     return;
   }
 
@@ -1393,7 +1685,40 @@ function onBuilt(world, building) {
   for (const u of world.units) {
     if (u.dead || !u.task || u.task.type !== 'build') continue;
     if (u.task.building !== building) continue;
-    onJobFinished(world, u, ctx);
+    onJobFinished(world, u, ctx, building);
+  }
+  adoptNewDropoff(world, building, ctx);
+}
+
+/**
+ * A drop-off just went up. Anyone already walking a load somewhere further away
+ * turns and uses it instead.
+ *
+ * Every trip picks its drop-off fresh (routeToDropoff calls nearestDropoff), so
+ * without this a new Lumber Camp still pays for itself — from the *next* trip.
+ * That is one full round trip of nothing happening, which on a fifteen-tile haul
+ * is half a minute, and the player who just spent 100 wood watching their
+ * villagers walk past the new building is entitled to think it is broken. So the
+ * moment the camp is finished, anyone whose current errand it shortens is
+ * re-routed mid-walk.
+ *
+ * Deliberately narrow: only villagers already heading for a drop-off are
+ * touched, and only when the new building is genuinely closer to where they are
+ * standing right now. Nobody working a node is interrupted, and nobody is sent
+ * backwards past a load they have almost delivered.
+ */
+function adoptNewDropoff(world, building, ctx) {
+  if (!building.complete || !building.dropoff || !building.dropoff.length) return;
+  for (const u of world.units) {
+    if (u.dead || u.player !== building.player) continue;
+    const t = u.task;
+    if (!t || t.type !== 'gather' || t.stage !== 'toDrop') continue;
+    const type = u.carrying ? u.carrying.type : null;
+    if (!type || !building.dropoff.includes(type)) continue;
+    const old = t.building;
+    if (old === building) continue;
+    if (old && !old.dead && edgeDist(old, u.x, u.y) <= edgeDist(building, u.x, u.y)) continue;
+    routeToDropoff(world, u, t, ctx, false);
   }
 }
 
@@ -1702,29 +2027,61 @@ function separate(world, u, dt) {
   let py = 0;
   let n = 0;
 
-  forEachNear(world, u.x, u.y, SEP_RADIUS, (e) => {
-    if (e === u || e.dead || e.kind !== 'unit') return;
-    let dx = u.x - e.x;
-    let dy = u.y - e.y;
-    const d2 = dx * dx + dy * dy;
-    const min = (u.radius + e.radius) * 1.15;
-    if (d2 > min * min) return;
-    let d = Math.sqrt(d2);
-    if (d < 1e-4) {
-      // Exactly stacked (two units spawned on one spot): break the tie by id so
-      // the result is deterministic and the pair never chases itself. Uses the
-      // id rather than world.rng, which belongs to the seeded simulation.
-      const a = u.id * 2.3999632;
-      dx = Math.cos(a);
-      dy = Math.sin(a);
-      d = 1;
+  // Walked inline over the units-only index rather than through forEachNear.
+  // This is the hottest function in the simulation — 150 units times 20 steps a
+  // second — and the callback form cost it twice over: a closure capturing four
+  // mutable locals, allocated fresh on every call, and a walk over every tree
+  // and building sharing the cells with the fight. Neither is visible in a
+  // profile as a line of its own; both showed up as `separate` being the single
+  // most expensive JavaScript function in the frame.
+  const cs = world._unitCell;
+  const cols = world._unitCols;
+  const buckets = world._unitBuckets;
+  // The sweep is SEP_RADIUS wide and no wider. forEachNear pads its query by two
+  // whole tiles because a building's centre can sit that far from the edge the
+  // caller is really asking about — but every candidate here is a unit, which is
+  // a point, so nothing outside a tile of the query can possibly qualify and
+  // every cell that pad added was scanned only to reject everything in it. In a
+  // melee, where the cells around a fight hold thirty units each, that was most
+  // of the work this function did.
+  const pad = SEP_RADIUS;
+  const bx0 = Math.max(0, Math.floor((u.x - pad) / cs));
+  const bx1 = Math.min(cols - 1, Math.floor((u.x + pad) / cs));
+  const by0 = Math.max(0, Math.floor((u.y - pad) / cs));
+  const by1 = Math.min(world._unitRows - 1, Math.floor((u.y + pad) / cs));
+  const near2 = SEP_RADIUS * SEP_RADIUS;
+
+  for (let by = by0; by <= by1; by++) {
+    for (let bx = bx0; bx <= bx1; bx++) {
+      const list = buckets[by * cols + bx];
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        if (e === u || e.dead) continue;
+        let dx = u.x - e.x;
+        let dy = u.y - e.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > near2) continue;
+        const min = (u.radius + e.radius) * 1.15;
+        if (d2 > min * min) continue;
+        let d = Math.sqrt(d2);
+        if (d < 1e-4) {
+          // Exactly stacked (two units spawned on one spot): break the tie by
+          // id so the result is deterministic and the pair never chases itself.
+          // Uses the id rather than world.rng, which belongs to the seeded
+          // simulation.
+          const a = u.id * 2.3999632;
+          dx = Math.cos(a);
+          dy = Math.sin(a);
+          d = 1;
+        }
+        const weight = e.dest ? 1 : STATIONARY_WEIGHT;
+        const push = ((min - d) / min) * weight;
+        px += (dx / d) * push;
+        py += (dy / d) * push;
+        n++;
+      }
     }
-    const weight = e.dest ? 1 : STATIONARY_WEIGHT;
-    const push = ((min - d) / min) * weight;
-    px += (dx / d) * push;
-    py += (dy / d) * push;
-    n++;
-  });
+  }
 
   if (n === 0) return;
   const mag = Math.hypot(px, py);

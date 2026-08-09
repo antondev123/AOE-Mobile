@@ -71,10 +71,39 @@ export const EV = {
 
   // { building, unitType } — training finished, unit spawned
   TRAINED: 'trained',
+
+  // { building, unit, player } — a unit stepped inside a building. It is gone
+  // from world.units at this point but still in world.entities and still counts
+  // for population; see the garrison notes in systems/combat.js.
+  GARRISON: 'garrison',
+  // { building, unit, player } — a unit stepped back out and is on the map again
+  UNGARRISON: 'ungarrison',
+
+  // { player, building, tech, name } — a research was paid for and queued
+  RESEARCH_START: 'researchStart',
+  // { player, building, tech, name } — a research finished. The effect is
+  // already live on the player when this fires; `building` may be null for a
+  // completion granted by something other than a queue.
+  RESEARCH_DONE: 'researchDone',
+  // { player, age } — this player reached a new age (AGE.FEUDAL | AGE.CASTLE in
+  // systems/tech.js). Fired after the age's building-hitpoint scaling has been
+  // applied, so a listener always sees the new world, not the old one.
+  AGE_ADVANCE: 'ageAdvance',
+
+  // { player, side, resource, amount, gold, price } — a Market trade went
+  // through. `side` is 'buy' or 'sell', `gold` is what actually changed hands
+  // (commission already taken off a sale), and `price` is the *new* price of
+  // that resource, after the trade moved it. See systems/market.js.
+  TRADE: 'trade',
+
   // { building } — construction finished
   BUILT: 'built',
   // { building, builder } — foundation placed
   FOUNDATION: 'foundation',
+  // { unit, building } — a villager landed a blow on a building site. Emitted
+  // on a fixed beat (see HAMMER_PERIOD in systems/unitAI.js), NOT once per sim
+  // step: construction progress is continuous, a hammer blow is not.
+  BUILD_TICK: 'buildTick',
 
   // { ids } — the player's selection changed
   SELECTION: 'selection',

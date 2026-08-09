@@ -11,27 +11,64 @@
 import {
   RES, CARRY_CAPACITY, GATHER_RATE, BUILD_RATE,
   UNIT_STATS, BUILDING_STATS, TERRAIN, MAX_POP_CAP, PLAYER,
+  isWallType, isGateType,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import {
   spawnUnit, spawnBuilding, removeEntity, canPlace, isBlocked, inBounds,
-  applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy,
+  applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy, forEachNear,
+  onBuildingComplete, setGateOpen, isHostile,
 } from '../core/world.js';
 import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
+// tech.js imports the three stockpile primitives back out of this module, so
+// the pair is a deliberate (and shallow) import cycle — see the note at the top
+// of tech.js. Research is production, so it ticks on this module's beat.
+import {
+  updateResearch, gatherMultiplier, lockReason, applyAgeHp,
+} from './tech.js';
 
 // --- Tuning (local to this module; constants.js is read-only for me) --------
 //
 // GATHER_RATE in constants.js is AoE2's real-time pace (~0.5/sec), which makes
-// a 10-unit trip take ~20 seconds — far too slow to read as a *loop* on a phone
-// in a 10-minute skirmish. Scaling by GATHER_SPEED compresses the harvest leg
-// to ~3 seconds, so with a 3-4 tile walk each way a full round trip lands
-// around 8-10 seconds: long enough to see the villager work, short enough that
-// the food counter visibly ticks up.
-export const GATHER_SPEED = 6.0;
+// a 10-unit trip take ~20 seconds. GATHER_SPEED is the one dial that sets how
+// compressed this skirmish is against that.
+//
+// It used to be 6.0, which put the harvest leg at ~3 seconds. That was too fast
+// to be a strategy game: a villager finished a pack before you could finish
+// reading the HUD, the whole opening was over in ninety seconds, and there was
+// never a moment where nothing needed tapping. 2.5 is the AoE2 rhythm at
+// skirmish length — measured beside a Town Center, a full pack now takes 7.3s
+// on berries, 8.0s on wood, 8.9s on gold and 9.5s on stone, and with a 3-4 tile
+// walk each way (villagers move at 1.35 tiles/s) a round trip measures 12-14
+// seconds. That is roughly 0.75 resources/second per villager, so a villager
+// pays for the next villager in about a minute of its own work: slow enough to
+// have to choose what to build, fast enough that the counter never looks stuck.
+//
+// If you change this, change the train and build times in constants.js with it.
+// The two are a matched pair — halving income without lengthening production
+// does not slow the game down, it just makes the Town Center idle.
+export const GATHER_SPEED = 2.5;
 
-/** Effective units/second for a resource type, after tuning. */
-export function gatherRateFor(resourceType) {
-  return (GATHER_RATE[resourceType] || 0.5) * GATHER_SPEED;
+/**
+ * Effective units/second for a resource type, after tuning and after whichever
+ * economic upgrades the gathering player has finished.
+ *
+ * `world` and `playerId` are optional and default to "nobody, so no upgrades".
+ * They are trailing arguments rather than leading ones on purpose: the rate is
+ * a property of the *resource* first and of the player second, every existing
+ * caller reads the same way it always did, and a caller that forgets to pass a
+ * player gets the un-upgraded base rate — which is wrong but never a crash, and
+ * shows up immediately as "my Bow Saw did nothing" rather than as a NaN.
+ *
+ * The multiplier is applied here rather than inside gatherTick so that anything
+ * *predicting* income — the HUD, the AI's "is this walk worth it" arithmetic,
+ * the round-trip test in tests/economy.test.mjs — asks one function and gets
+ * the number the villager will actually gather at.
+ */
+export function gatherRateFor(resourceType, world = null, playerId = null) {
+  const base = (GATHER_RATE[resourceType] || 0.5) * GATHER_SPEED;
+  if (!world || playerId === null || playerId === undefined) return base;
+  return base * gatherMultiplier(world, playerId, resourceType);
 }
 
 /** Longest a training queue may get (AoE2 uses 5 per building tab). */
@@ -121,12 +158,22 @@ function econState(world) {
   if (!world._economy) {
     world._economy = {
       popNag: world.players.map(() => 0), // seconds until we may nag again
+      // Ordered lists of foundation ids the player asked for in one breath —
+      // see the build queue section below.
+      buildQueue: world.players.map(() => []),
     };
+  }
+  // Older worlds (and the odd hand-built test fixture) predate the queue.
+  if (!world._economy.buildQueue) {
+    world._economy.buildQueue = world.players.map(() => []);
   }
   return world._economy;
 }
 
-const RES_KEYS = [RES.FOOD, RES.WOOD, RES.GOLD];
+// Every resource the stockpile knows about. canAfford, pay, refund and
+// addResource all iterate this, so a resource that is not listed here can be
+// gathered into a villager's pack and then silently vanish on deposit.
+const RES_KEYS = [RES.FOOD, RES.WOOD, RES.GOLD, RES.STONE];
 
 function playerOf(world, playerId) {
   return world.players[playerId] || null;
@@ -246,7 +293,8 @@ export function gatherTick(world, unit, node, dt) {
     unit.gatherProgress = unit.gatherProgress || 0;
   }
 
-  unit.gatherProgress = (unit.gatherProgress || 0) + gatherRateFor(type) * dt;
+  unit.gatherProgress =
+    (unit.gatherProgress || 0) + gatherRateFor(type, world, unit.player) * dt;
 
   // Bank whole units only — the renderer draws one "chip" per EV.GATHER_TICK.
   let guard = 64;
@@ -304,6 +352,20 @@ export function acceptsDropoff(building, resourceType) {
 
 /**
  * Nearest completed building of `playerId` that accepts `resourceType`.
+ *
+ * "Nearest" is by *edge* distance, not centre distance, because a 3x3 Town
+ * Center is reached a tile and a half before its middle and a 2x2 Lumber Camp
+ * is not — comparing centres would send villagers past a camp they were
+ * standing next to. Every building the player owns is considered, not just the
+ * Town Center: that is the whole reason a Lumber Camp is worth 100 wood.
+ *
+ * This is deliberately re-evaluated on every trip (unitAI's routeToDropoff calls
+ * it each time a villager fills its pack), so a camp planted mid-game shortens
+ * the round trip of every villager already working that woodline without the
+ * player re-tasking a single one. The scan is a linear pass over one player's
+ * buildings and happens once per full pack — around once every ten seconds per
+ * villager — which is nothing.
+ *
  * Exported because "where do I drop this off" is an economy rule, but the
  * walking to it is the unit AI's job.
  */
@@ -372,8 +434,21 @@ const TRAP_EXIT_MSG = 'That would seal in your Town Center';
 function placementTrapReason(world, playerId, type, gx, gy) {
   const s = BUILDING_STATS[type];
   if (!s) return null;
-  const tiles = footprintTiles(gx, gy, s.fw, s.fh);
+  return tilesTrapReason(world, playerId, footprintTiles(gx, gy, s.fw, s.fh));
+}
 
+/**
+ * The same question asked about an arbitrary set of tiles rather than one
+ * building's footprint — which is what a wall run is.
+ *
+ * Asking it once for the whole run is not merely faster than asking it forty
+ * times (it is: each call floods a bounded region per owned unit, and forty of
+ * those inside a drag handler is a visible stutter on a phone). It is also the
+ * more honest question. The segment that seals your base is only sealing it
+ * because the thirty-nine before it went down; testing them one at a time asks
+ * "does *this* brick trap anyone", which is never the thing the player did.
+ */
+export function tilesTrapReason(world, playerId, tiles) {
   const units = ownedBy(world, playerId, 'unit');
   if (units.length && pointsSealedBy(world, tiles, units).length > 0) return TRAP_UNITS_MSG;
 
@@ -402,6 +477,11 @@ function placementTrapReason(world, playerId, type, gx, gy) {
 export function placementRefusal(world, playerId, type, gx, gy) {
   const s = BUILDING_STATS[type];
   if (!s) return 'Cannot build there';
+  // Age first, and before the geometry: "Stone Wall needs the Feudal Age" is
+  // the true answer wherever you point at, and a ghost that only goes red on
+  // *some* tiles would teach the player that the tile was the problem.
+  const locked = lockReason(world, playerId, type);
+  if (locked) return locked;
   if (!canPlace(world, gx, gy, s.fw, s.fh)) return 'Cannot build there';
   return placementTrapReason(world, playerId, type, gx, gy);
 }
@@ -422,32 +502,262 @@ export function canPlaceReachable(world, playerId, type, gx, gy) {
  * Validate, charge and place a construction site. Returns the new building or
  * null (emitting EV.INSUFFICIENT or EV.TOAST to say why).
  */
-export function placeFoundation(world, playerId, type, gx, gy) {
+export function placeFoundation(world, playerId, type, gx, gy, opts = {}) {
   const s = BUILDING_STATS[type];
   if (!s) return null;
+  // `quiet` suppresses the per-refusal announcements. Only the wall-line placer
+  // uses it: forty segments across a treeline would otherwise be forty toasts
+  // and forty "not enough resources" flashes saying one thing.
+  const quiet = opts.quiet === true;
 
-  if (!canPlace(world, gx, gy, s.fw, s.fh)) {
-    world.events.emit(EV.TOAST, { text: `Cannot build there`, tone: 'warn' });
+  const locked = lockReason(world, playerId, type);
+  if (locked) {
+    if (!quiet && playerId === PLAYER) {
+      world.events.emit(EV.TOAST, { text: locked, tone: 'warn' });
+    }
     return null;
   }
-  const trap = placementTrapReason(world, playerId, type, gx, gy);
+  if (!canPlace(world, gx, gy, s.fw, s.fh)) {
+    if (!quiet) world.events.emit(EV.TOAST, { text: `Cannot build there`, tone: 'warn' });
+    return null;
+  }
+  // skipTrap: the wall-line placer has already asked this question once about
+  // the finished run, which is both the cheaper and the more honest form of it
+  // (see tilesTrapReason). Every intermediate state of the run blocks a subset
+  // of the tiles that final test approved, so if the finished wall traps nobody
+  // then neither does any segment on the way to it.
+  const trap = opts.skipTrap ? null : placementTrapReason(world, playerId, type, gx, gy);
   if (trap) {
     // Only the human is told: the enemy AI places dozens of buildings a match
     // and "that would trap your villagers" about someone else's villagers is a
     // lie on the player's screen.
-    if (playerId === PLAYER) world.events.emit(EV.TOAST, { text: trap, tone: 'warn' });
+    if (!quiet && playerId === PLAYER) {
+      world.events.emit(EV.TOAST, { text: trap, tone: 'warn' });
+    }
     return null;
   }
   if (!canAfford(world, playerId, s.cost)) {
-    world.events.emit(EV.INSUFFICIENT, { player: playerId, playerId, cost: s.cost });
+    if (!quiet) world.events.emit(EV.INSUFFICIENT, { player: playerId, playerId, cost: s.cost });
     return null;
   }
   if (!pay(world, playerId, s.cost, `build:${type}`)) return null;
 
   const b = spawnBuilding(world, type, playerId, gx, gy, { complete: false });
+  // A building started in the Castle Age is a Castle Age building from the
+  // first shovel, not a Dark Age one that gets a retroactive top-up when the
+  // next age lands. world.js stamps the base hitpoints; this restates them at
+  // the owner's age scale, and it is idempotent so it is safe to call anywhere.
+  applyAgeHp(world, b);
   b.state = 'foundation';
   world.events.emit(EV.FOUNDATION, { building: b, builder: null });
   return b;
+}
+
+// --- Wall lines -------------------------------------------------------------
+//
+// A wall is drawn, not placed. The player drags from one tile to another and
+// gets a whole run of foundations at once — see the wall-drawing mode in
+// ui/input.js, which is the touch half of this.
+//
+// THE SHAPE OF THE RUN is an L along the two grid axes, longer leg first. Two
+// other shapes were tried and both are wrong here:
+//
+//   * a straight line between the endpoints, Bresenham style. In an isometric
+//     projection a grid-diagonal line renders as a *vertical* column of tiles
+//     that touch only at their corners, so the segments do not share an edge,
+//     the neighbour mask comes out 0 for every one of them, and the run draws as
+//     a stack of loose posts. It also is not a wall: units walk diagonally
+//     between two tiles that only meet at a point.
+//   * a free-form path following the drag. Unreadable under a finger, and
+//     impossible to predict before you commit.
+//
+// The L is what AoE2 does and it is the only shape that is always four-connected,
+// which is exactly what the sprite variants and the block grid both want. Longer
+// leg first because that is the leg the player was aiming along: the corner then
+// lands where they stopped pulling, not where they started.
+
+/** The tiles an L-shaped wall run from (ax,ay) to (bx,by) covers, in order. */
+export function wallLineTiles(ax, ay, bx, by) {
+  const x0 = Math.floor(ax);
+  const y0 = Math.floor(ay);
+  const x1 = Math.floor(bx);
+  const y1 = Math.floor(by);
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const sx = dx === 0 ? 0 : dx > 0 ? 1 : -1;
+  const sy = dy === 0 ? 0 : dy > 0 ? 1 : -1;
+  const out = [];
+  let x = x0;
+  let y = y0;
+  out.push([x, y]);
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    while (x !== x1) { x += sx; out.push([x, y]); }
+    while (y !== y1) { y += sy; out.push([x, y]); }
+  } else {
+    while (y !== y1) { y += sy; out.push([x, y]); }
+    while (x !== x1) { x += sx; out.push([x, y]); }
+  }
+  return out;
+}
+
+/** How many segments a run may be. Long enough to wall a base side in one drag. */
+export const MAX_WALL_RUN = 40;
+
+/**
+ * Cost, count and per-segment verdict for a proposed run, without spending
+ * anything. The drag preview asks for this on every tile the finger crosses, so
+ * it is a pure read — and it is the same predicate placeWallLine() then applies,
+ * so a segment the preview drew green is a segment that gets built.
+ *
+ * Affordability is evaluated *cumulatively along the run*, because that is how
+ * it is charged: with 12 stone in the bank the first two segments of a five-tile
+ * stone wall are affordable and the last three are not, and a preview that drew
+ * all five green would be lying about four of them.
+ */
+export function planWallLine(world, playerId, type, tiles) {
+  const s = BUILDING_STATS[type];
+  const out = {
+    segments: [], count: 0, cost: {}, refused: 0, reason: null, trapped: null,
+  };
+  if (!s) return out;
+  const locked = lockReason(world, playerId, type);
+  const p = playerOf(world, playerId);
+  const purse = {};
+  for (const k of RES_KEYS) purse[k] = p ? (p.resources[k] || 0) : 0;
+
+  const run = tiles.slice(0, MAX_WALL_RUN);
+  const buildable = [];
+  for (const [tx, ty] of run) {
+    const gx = tx + s.fw / 2;
+    const gy = ty + s.fh / 2;
+    let why = locked;
+    if (!why && !canPlace(world, gx, gy, s.fw, s.fh)) why = 'Cannot build there';
+    if (!why) {
+      for (const k of RES_KEYS) {
+        if ((s.cost[k] || 0) > purse[k]) { why = 'Not enough resources'; break; }
+      }
+    }
+    if (why) {
+      out.refused++;
+      if (!out.reason) out.reason = why;
+      out.segments.push({ tx, ty, gx, gy, valid: false, reason: why });
+      continue;
+    }
+    for (const k of RES_KEYS) {
+      const need = s.cost[k] || 0;
+      if (!need) continue;
+      purse[k] -= need;
+      out.cost[k] = (out.cost[k] || 0) + need;
+    }
+    out.count++;
+    buildable.push([tx, ty]);
+    out.segments.push({ tx, ty, gx, gy, valid: true, reason: null });
+  }
+
+  // One enclosure test for the whole run — see tilesTrapReason. A run that would
+  // seal the player in is refused entire: nineteen good segments and a twentieth
+  // that shuts the door is one wall, and it is the wall the player drew.
+  if (buildable.length) {
+    const trap = tilesTrapReason(world, playerId, buildable);
+    if (trap) {
+      out.trapped = trap;
+      out.reason = trap;
+      out.refused = out.segments.length;
+      out.count = 0;
+      out.cost = {};
+      for (const seg of out.segments) { seg.valid = false; seg.reason = trap; }
+    }
+  }
+  return out;
+}
+
+/**
+ * Place every segment of a run that can be placed, charging for exactly those.
+ *
+ * Refused segments are skipped rather than aborting the run: a wall drawn across
+ * a tree the player did not notice should be a wall with a gap in it, not a wall
+ * that silently did nothing. Returns { placed: [buildings], refused, reason }.
+ *
+ * The reachability rules re-run per segment as the run is laid, which matters:
+ * the segment that would seal your villagers in is only sealing them because the
+ * nineteen before it went down first, and it is the twentieth that has to be
+ * refused.
+ */
+export function placeWallLine(world, playerId, type, tiles) {
+  const s = BUILDING_STATS[type];
+  const result = { placed: [], refused: 0, reason: null };
+  if (!s) return result;
+
+  // The plan is the rule. Running it here rather than re-deriving the verdict
+  // per segment is what guarantees that what the preview drew is what gets
+  // built — including the whole-run enclosure test, which no per-segment call
+  // could reproduce.
+  const plan = planWallLine(world, playerId, type, tiles);
+  result.reason = plan.reason;
+  for (const seg of plan.segments) {
+    if (!seg.valid) { result.refused++; continue; }
+    // Quiet: the plan has already decided, and forty separate refusals would be
+    // forty toasts saying one thing. The caller summarises once at the end.
+    const b = placeFoundation(world, playerId, type, seg.gx, seg.gy, {
+      quiet: true, skipTrap: true,
+    });
+    if (b) result.placed.push(b);
+    else result.refused++;
+  }
+  return result;
+}
+
+// --- Gates ------------------------------------------------------------------
+//
+// A gate stands open when its owner's people are about and shuts otherwise, the
+// way an AoE2 gate does. Two things ride on that single boolean: the sprite, and
+// — because the block grid is the only passability model the movement step has —
+// whether a unit can physically walk onto the tile this step.
+//
+// The radii are small on purpose. GATE_FRIEND_RADIUS is a little over one tile
+// from the gate's edge, so the gate opens as a villager arrives at it rather
+// than when one wanders past ten tiles away; GATE_ENEMY_RADIUS is wider, because
+// a gate that is still swinging shut as the raider reaches it is a gate that
+// does not work. A hostile inside that ring always wins the argument: your own
+// soldier standing on the wall does not hold the door open for the man
+// attacking it.
+const GATE_FRIEND_RADIUS = 2.2;
+const GATE_ENEMY_RADIUS = 3.5;
+
+/**
+ * Open and shut every gate. One pass over the gates (not over the units), and
+ * each one asks the spatial index for what is near it — so the cost is
+ * proportional to how many gates exist, which on a walled-in base is a handful.
+ */
+export function updateGates(world) {
+  for (const b of world.buildings) {
+    if (b.dead || !isGateType(b.type)) continue;
+    if (!b.complete) { setGateOpen(world, b, false); continue; }
+
+    let friend = false;
+    let hostile = false;
+    forEachNear(world, b.x, b.y, GATE_ENEMY_RADIUS, (e) => {
+      if (e.kind !== 'unit' || e.dead) return;
+      if (e.player === b.player) {
+        if (edgeDist2(b, e.x, e.y) <= GATE_FRIEND_RADIUS * GATE_FRIEND_RADIUS) friend = true;
+      } else if (isHostile(b, e)) {
+        hostile = true;
+      }
+    });
+
+    // Never shut a gate on somebody standing in the doorway: they would be
+    // entombed inside a one-tile pocket and have to be evicted by the path
+    // planner, which looks exactly like a bug.
+    const tx = Math.floor(b.x);
+    const ty = Math.floor(b.y);
+    let occupied = false;
+    forEachNear(world, b.x, b.y, 0.9, (e) => {
+      if (e.kind === 'unit' && !e.dead &&
+          Math.floor(e.x) === tx && Math.floor(e.y) === ty) occupied = true;
+    });
+
+    setGateOpen(world, b, occupied || (friend && !hostile));
+  }
 }
 
 /**
@@ -464,6 +774,105 @@ export function cancelFoundation(world, building, { giveBack = true } = {}) {
   if (giveBack && s) refund(world, building.player, s.cost, `cancel:${building.type}`);
   removeEntity(world, building);
   return true;
+}
+
+// --- The build queue --------------------------------------------------------
+//
+// Placing a building on a phone is four gestures: open the menu, pick the type,
+// aim, lift. Three of those are the same three every time, which is why a base
+// on a touch screen ends up smaller and worse laid out than one on a desktop —
+// not because the player wants fewer houses, but because the fifth house costs
+// the same four gestures as the first.
+//
+// The queue is the answer: arm a type once, tap as many places as you like, and
+// each tap puts a foundation down and remembers the order you asked for them in.
+// Two things ride on remembering that order.
+//
+//   * The player can see and undo it. A queue of six sites you can read and take
+//     back one at a time is a plan; six foundations scattered across the map
+//     that you have to find and select individually is a mess.
+//   * A villager that finishes a queued site walks to the *next* one instead of
+//     going back to a tree (see onJobFinished in unitAI.js). That is the whole
+//     point of a batch: you place the row of houses and then stop thinking about
+//     it, exactly as the wall drag already lets you do with a run of palisade.
+//
+// It is a list of ids rather than of buildings so a site that is destroyed,
+// finished or cancelled by any other route simply drops out on the next read —
+// there is no second bookkeeping path to keep in step with world.removeEntity.
+
+/** Add a freshly placed foundation to the back of the player's build queue. */
+export function enqueueFoundation(world, building) {
+  if (!building || building.kind !== 'building' || building.complete) return false;
+  const q = econState(world).buildQueue[building.player];
+  if (!q || q.includes(building.id)) return false;
+  q.push(building.id);
+  building.queued = true;
+  return true;
+}
+
+/**
+ * The player's queued sites, oldest first, pruned of anything that has since
+ * been finished, cancelled or destroyed. This is the read the HUD draws and the
+ * unit AI asks — both get the same list, so what the strip shows is what the
+ * builders are working through.
+ */
+export function buildQueue(world, playerId) {
+  const st = econState(world);
+  const q = st.buildQueue[playerId];
+  if (!q || !q.length) return [];
+  const out = [];
+  const live = [];
+  for (const id of q) {
+    const b = world.entities.get(id);
+    if (!b || b.dead || b.kind !== 'building' || b.complete) continue;
+    live.push(id);
+    out.push(b);
+  }
+  if (live.length !== q.length) st.buildQueue[playerId] = live;
+  return out;
+}
+
+/**
+ * The next queued site for a builder standing at (gx, gy), nearest first.
+ *
+ * Nearest rather than strictly first-in: the queue records what the player asked
+ * for, not a route, and a villager that has just finished the house at the north
+ * end should not walk the length of the base because that house happened to be
+ * tapped last. Ties go to the older entry, so a row of houses placed left to
+ * right does get built left to right.
+ */
+export function nextQueuedSite(world, playerId, gx, gy, exclude = null) {
+  let best = null;
+  let bestD = Infinity;
+  const list = buildQueue(world, playerId);
+  for (const b of list) {
+    if (b === exclude) continue;
+    const d = edgeDist2(b, gx, gy);
+    if (d < bestD) {
+      bestD = d;
+      best = b;
+    }
+  }
+  return best;
+}
+
+/** Take one entry back off the queue and refund it. Index into buildQueue(). */
+export function cancelQueued(world, playerId, index) {
+  const list = buildQueue(world, playerId);
+  const b = list[index];
+  if (!b) return null;
+  const type = b.type;
+  if (!cancelFoundation(world, b)) return null;
+  return type;
+}
+
+/** Take the whole queue back, refunding every site. Returns how many went. */
+export function clearBuildQueue(world, playerId) {
+  const list = buildQueue(world, playerId);
+  let n = 0;
+  for (const b of list) if (cancelFoundation(world, b)) n++;
+  econState(world).buildQueue[playerId] = [];
+  return n;
 }
 
 /**
@@ -488,8 +897,15 @@ export function buildTick(world, unit, building, dt) {
   if (building.buildProgress >= total) {
     building.buildProgress = total;
     building.complete = true;
+    // Cheap and idempotent; it only does anything for a site that was placed
+    // before an age-up and finished after one.
+    applyAgeHp(world, building);
     building.hp = building.maxHp;
     building.state = 'idle';
+    // Tile-grid facts that only become true on completion: a gate starts being
+    // a gate rather than a building site, and a wall joins up with its
+    // neighbours. See onBuildingComplete in core/world.js.
+    onBuildingComplete(world, building);
     // A finished Farm is a food node from this instant, so the villager that
     // built it can turn round and start harvesting without a new order.
     initProvider(building);
@@ -626,11 +1042,20 @@ function completeTraining(world, building, entry) {
 // --- Per-step update --------------------------------------------------------
 
 /**
- * Advance training queues and keep population figures honest.
- * Called once per fixed sim step from GameScene.
+ * Advance training queues and research queues, and keep population figures
+ * honest. Called once per fixed sim step from GameScene.
+ *
+ * Research rides along here rather than being a system of its own: it is
+ * production — a queue on a building that ticks down and then pays out — and
+ * putting it on the same beat as training means the two can never drift by a
+ * step, which is what a separate updateTech() in the scene would have risked.
  */
 export function updateEconomy(world, dt) {
   const st = econState(world);
+  updateResearch(world, dt);
+  // Gates ride here for the same reason research does: it is a per-step pass
+  // over one list of buildings, and the scene's system list stays as it is.
+  updateGates(world);
 
   for (let i = 0; i < world.players.length; i++) {
     if (st.popNag[i] > 0) st.popNag[i] -= dt;
@@ -667,6 +1092,35 @@ export function updateEconomy(world, dt) {
   }
 
   for (let i = 0; i < world.players.length; i++) recomputePop(world, i);
+}
+
+// --- Save and load ----------------------------------------------------------
+//
+// Two things: the population nag timers (so a reloaded game does not shout
+// "population capped" the instant it starts) and the build queue, which is an
+// ordered list of foundation ids and therefore the one piece of economy state
+// that cannot be re-derived from the world. Everything else this module owns —
+// stockpiles, training queues, farm stocks, build progress — lives on the
+// players and the entities and is saved with them.
+
+export function serializeEconomy(world) {
+  const st = econState(world);
+  return {
+    popNag: st.popNag.slice(),
+    buildQueue: st.buildQueue.map((q) => q.slice()),
+  };
+}
+
+export function restoreEconomy(world, data) {
+  const st = econState(world);
+  if (!data) return;
+  for (let i = 0; i < st.popNag.length; i++) {
+    st.popNag[i] = Number.isFinite(data.popNag && data.popNag[i]) ? data.popNag[i] : 0;
+    const q = data.buildQueue && data.buildQueue[i];
+    // Ids only, and pruned on read (see buildQueue) — a site that finished or
+    // was destroyed between the save and the load simply drops out.
+    st.buildQueue[i] = Array.isArray(q) ? q.filter((id) => world.entities.has(id)) : [];
+  }
 }
 
 // --- Read-only helpers for the HUD / AI -------------------------------------

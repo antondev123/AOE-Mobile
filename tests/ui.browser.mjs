@@ -35,6 +35,24 @@ function check(name, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : ' FAIL '} ${name}${detail ? `  (${detail})` : ''}`);
 }
 
+/**
+ * Measure a control's touch target.
+ *
+ * Read inside one synchronous `evaluate` rather than through
+ * `locator.boundingBox()`, which resolves the selector and then measures in two
+ * steps: the command panel re-renders whenever its signature changes — a unit
+ * finishing training is enough — and a node replaced between those two steps
+ * measures as null. That was a 1-in-4 flake on a claim that has nothing to do
+ * with timing.
+ */
+const targetBox = (page, selector) => page.evaluate((sel) => {
+  const n = document.querySelector(sel);
+  if (!n) return null;
+  const r = n.getBoundingClientRect();
+  return { width: r.width, height: r.height };
+}, selector);
+
+
 /** Centre the camera on a grid point and return its CSS coordinates. */
 async function aim(page, gx, gy) {
   return page.evaluate(([x, y]) => {
@@ -163,8 +181,8 @@ async function rallyRun() {
       (id) => (window.__game.world.entities.get(id).queue || []).length, spot.tc.id);
     check('the Town Center takes the training order', queued > 0, `${queued} in queue`);
 
-    // 8s of build time at 20Hz, plus slack for the walk out.
-    await step(page, 200);
+    // 16s of build time at 20Hz, plus slack for the walk out.
+    await step(page, 400);
     const rallied = await page.evaluate(() => {
       const w = window.__game.world;
       const v = w.units.filter((u) => u.player === 0 && u.type === 'villager');
@@ -781,7 +799,7 @@ async function attackMoveRun() {
 
     const btn = page.locator('#cmd-panel .cbtn.attack');
     check('an attack-move button is offered', await btn.count() > 0);
-    const box = await btn.first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.attack');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
 
@@ -929,7 +947,7 @@ async function demolishRun() {
       await page.evaluate((id) => window.__game.world.selection.has(id), house.id));
 
     check('a demolish button is offered for it', await demolishBtn(page).count() > 0);
-    const box = await demolishBtn(page).first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.demolish');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
     check('and it does not look like the other, harmless, buttons',
@@ -1614,7 +1632,28 @@ async function placementGhostRun() {
       !!placed.site && placed.wood === placed.woodBefore - 25,
       placed.site ? `${placed.woodBefore} -> ${placed.wood} wood` : 'no foundation');
     if (!placed.site) return;
-    check('placement mode is spent once it is used', placed.armed === null, String(placed.armed));
+
+    // Placement is a BATCH now: one arming, as many sites as you tap. It used
+    // to be spent by the first tap, which made a row of five houses five trips
+    // through the build menu. So the contract this checks is the new one — the
+    // mode survives the tap, the bar counts what has been placed and offers
+    // Done, and Done is what ends it.
+    check('placement stays armed for the next site', placed.armed === 'house',
+      String(placed.armed));
+    const bar = await page.evaluate(() => ({
+      text: document.getElementById('place-bar').textContent,
+      hidden: document.getElementById('place-bar').hidden,
+      placed: window.__game.hud.placedThisArm(),
+      queue: document.querySelectorAll('#build-queue .bq-chip').length,
+    }));
+    check('and the bar says how many are down and offers Done',
+      !bar.hidden && bar.placed === 1 && /Done/.test(bar.text), `${bar.placed}: ${bar.text}`);
+    check('the site joins the visible build queue', bar.queue === 1, `${bar.queue} chip(s)`);
+
+    await page.locator('#place-bar button').click();
+    check('Done ends the batch',
+      await page.evaluate(() => window.__game.hud.getPlacementType() === null &&
+        document.getElementById('place-bar').hidden));
 
     // --- Cancelling the site you regret. -------------------------------------
     const p2 = await aim(page, placed.site.x, placed.site.y);
@@ -1630,7 +1669,7 @@ async function placementGhostRun() {
     check('the panel offers a Cancel for it, and not a Demolish',
       panel.cancels === 1 && panel.demolish === 0,
       `${panel.cancels} cancel, ${panel.demolish} demolish — note: ${panel.note}`);
-    const box = await page.locator('#cmd-panel .cbtn.danger').first().boundingBox();
+    const box = await targetBox(page, '#cmd-panel .cbtn.danger');
     check('its touch target is at least 44x44', !!box && box.width >= 44 && box.height >= 44,
       box ? `${Math.round(box.width)}x${Math.round(box.height)}` : 'no box');
 

@@ -12,17 +12,29 @@
 
 import {
   PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
+  MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
+  FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
+  isWallType, isGateType,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js';
 
 import * as economy from '../systems/economy.js';
 import * as unitAI from '../systems/unitAI.js';
+import * as tech from '../systems/tech.js';
+import * as alloc from '../systems/allocation.js';
+import * as market from '../systems/market.js';
+import {
+  stanceOf, garrisonCapacity, garrisonCount, isGarrisoned, nearestShelter,
+  ungarrisonAll,
+} from '../systems/combat.js';
 
 import { createMinimap, miniToGrid } from './minimap.js';
+import { createPortraits } from './portraits.js';
 import {
   selectedEntities, setSelection, clearSelection, selectionSignature,
 } from './selection.js';
+import { perfBegin, perfEnd } from '../core/perf.js';
 
 const MINIMAP_HZ = 10;
 const TOAST_MS = 2400;
@@ -52,17 +64,43 @@ const DEMOLISH_ARM_MS = 4000;
 // worse than no HUD at all.
 const RALLY_SNAP = 1.5;
 
+// The text fallback behind every chip and queue slot.
+//
+// It used to be the whole of the HUD's vocabulary for the roster — see the
+// header of ui/portraits.js for why that was the loudest prototype signal in
+// the game — and it is now what a type shows only when the atlas has no art for
+// it. Kept, rather than deleted, precisely because that case is a roster entry
+// somebody has added without a sprite yet, and a chip with nothing in it is
+// worse than a chip with three letters in it. The near-collisions the review
+// found (MIL militia against MLL mill against MIN mining camp) no longer matter
+// on a screen where every one of them is a picture.
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
+  spearman: 'SPR', scout: 'CAV', ram: 'RAM',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
-  berry: 'BSH', tree: 'TRE', gold: 'GLD',
+  lumbercamp: 'LMB', miningcamp: 'MIN', market: 'MKT',
+  berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
 };
-const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold' };
+// The build menu lists the whole tech tree, locked entries included, and on a
+// 390px screen that is a lot of buttons. Grouping them under their age turns a
+// scrolling wall into three short shelves, and the shelf heading is also the
+// answer to "when do I get this".
+const AGE_HEADINGS = ['Dark Age', 'Feudal Age', 'Castle Age'];
+const RES_LABEL = { food: 'food', wood: 'wood', gold: 'gold', stone: 'stone' };
+// Display order for costs, the resource bar and "not enough X" flashes. One
+// list, so the four resources can never appear in a different order in two
+// places on the same screen.
+const RES_ORDER = ['food', 'wood', 'gold', 'stone'];
 // Resource nodes have no stats block, so they need their own display names —
 // "berry" in the selection header reads like a bug, "Berry Bush" reads like AoE.
-const NODE_NAME = { berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein' };
+const NODE_NAME = {
+  berry: 'Berry Bush', tree: 'Tree', gold: 'Gold Vein', stone: 'Stone Mine',
+};
 
-const MILITARY = new Set(['militia', 'archer']);
+// Derived from UNIT_STATS rather than written out, so a unit added to the roster
+// is a soldier here — selectable by "select all military", eligible for
+// attack-move, counted in the stance panel — the moment it declares itself one.
+const MILITARY = new Set(MILITARY_TYPES);
 export function isMilitary(u) { return u.kind === 'unit' && MILITARY.has(u.type); }
 
 function statsOf(e) {
@@ -111,7 +149,9 @@ function affordable(world, playerId, cost) {
 /** Which resource is short, for a precise "Not enough wood" toast. */
 function missingResource(world, playerId, cost) {
   const r = world.players[playerId].resources;
-  for (const k of ['wood', 'food', 'gold']) {
+  // Wood first: it is the resource almost everything you can place costs, so
+  // naming it before food gives the right answer for the common case.
+  for (const k of ['wood', 'food', 'gold', 'stone']) {
     if ((cost && cost[k] || 0) > (r[k] || 0)) return k;
   }
   return null;
@@ -201,7 +241,7 @@ export function rallyText(world, producers, rally) {
 function costNode(cost) {
   const box = el('span', 'cost');
   let any = false;
-  for (const k of ['food', 'wood', 'gold']) {
+  for (const k of RES_ORDER) {
     const v = cost && cost[k];
     if (!v) continue;
     any = true;
@@ -214,8 +254,19 @@ function costNode(cost) {
   return box;
 }
 
-export function createHud(scene, world) {
+export function createHud(scene, world, audio = null) {
   const doc = document;
+  /**
+   * The click of a HUD control.
+   *
+   * Every control in this file goes through one of three doors — cmdButton(),
+   * a dock button, or a sheet's own buttons — so this is called in three places
+   * rather than sixty, and a control added tomorrow gets its click for free by
+   * using the same helpers. It is a no-op with no engine and a no-op while the
+   * context is locked, which is the state the browser harness plays the whole
+   * match in.
+   */
+  const click = () => { if (audio) audio.play('buttonTap'); };
   // If the overlay markup is missing, fall back to a detached root so a broken
   // page still boots into a playable (if chrome-less) game rather than throwing.
   const root = doc.getElementById('hud') || doc.createElement('div');
@@ -224,14 +275,17 @@ export function createHud(scene, world) {
     food: doc.getElementById('res-food'),
     wood: doc.getElementById('res-wood'),
     gold: doc.getElementById('res-gold'),
+    stone: doc.getElementById('res-stone'),
     pop: doc.getElementById('res-pop'),
+    age: doc.getElementById('res-age'),
     toasts: doc.getElementById('toasts'),
     selPanel: doc.getElementById('sel-panel'),
     cmdPanel: doc.getElementById('cmd-panel'),
-    idleWrap: doc.getElementById('idle-vill'),
-    idleBtn: doc.getElementById('btn-idle'),
-    idleCount: doc.getElementById('idle-count'),
-    menuBtn: doc.getElementById('btn-menu'),
+    jobNote: doc.getElementById('job-note'),
+    stack: doc.getElementById('hud-stack'),
+    sheets: doc.getElementById('hud-sheets'),
+    dock: doc.getElementById('hud-dock'),
+    buildQueue: doc.getElementById('build-queue'),
     minimap: doc.getElementById('minimap'),
     minimapWrap: doc.getElementById('minimap-wrap'),
   };
@@ -243,6 +297,18 @@ export function createHud(scene, world) {
     demolishArm: null,       // { key, at } — demolish armed for exactly this set
     buildMenuOpen: false,
     menuOpen: false,
+    helpOpen: false,
+    resignArm: 0,           // performance.now() of the first Resign tap
+    allocOpen: false,
+    marketOpen: false,
+    marketSig: '',
+    liveMarket: null,        // { rows } — the trade sheet
+    placedThisArm: 0,        // foundations put down since the type was armed
+    bqSig: '',               // build-queue strip signature
+    allocSig: '',            // allocation readout signature
+    idleLast: -1,            // id of the idle villager the button last showed
+    liveJob: null,           // { list, node } — the "where is this going" line
+    liveGarrison: null,      // { list, node } — the "how many are inside" line
     selSig: '',
     cmdSig: '',
     resSig: '',
@@ -258,23 +324,55 @@ export function createHud(scene, world) {
     liveCosts: [],           // { el, cost } — command panel
     liveBuild: [],           // { el, cost } — build menu sheet
     liveQueue: null,         // { building, bar, label }
+    liveAlloc: null,         // { rows, tally, toggle } — the allocation sheet
+    liveResearch: null,      // { building, fill, label, slots } — research bar
     liveBars: [],            // { kind, list, bar, fill, text } — hp and stock rows
     destroyed: false,
   };
 
   // --- Extra markup (owned here, not in index.html) -------------------------
+  //
+  // The transient sheets all live in one container inside the thumb stack, so
+  // they stack with the build queue, the minimap and the dock rather than being
+  // positioned against the bottom of the screen one at a time. Before this they
+  // each carried their own copy of `bottom: calc(safe-b + hud-h + 8px)`, which
+  // is four places to forget when anything below them changes height.
 
-  const modeChip = el('button', 'mode-chip tappable');
-  modeChip.id = 'mode-chip';
-  modeChip.setAttribute('aria-label', 'One-finger gesture mode');
-  root.appendChild(modeChip);
+  const sheets = dom.sheets || root;
 
   const buildMenu = el('div', 'build-menu');
   buildMenu.id = 'build-menu';
   buildMenu.hidden = true;
-  root.appendChild(buildMenu);
+  sheets.appendChild(buildMenu);
 
-  const placeBar = el('div', 'place-bar');
+  const allocSheet = el('div', 'alloc-sheet');
+  allocSheet.id = 'alloc-sheet';
+  allocSheet.hidden = true;
+  sheets.appendChild(allocSheet);
+
+  const marketSheet = el('div', 'market-sheet');
+  marketSheet.id = 'market-sheet';
+  marketSheet.hidden = true;
+  sheets.appendChild(marketSheet);
+
+  // The placement bar lives at the TOP, not in the thumb stack with the other
+  // sheets — the only control in the HUD that does.
+  //
+  // It was measured sitting exactly on top of the thing it describes. Placement
+  // opens with the ghost at screen y=422 and the bar occupied y=387..445: an
+  // opaque panel with a gold border, its centre six pixels from the ghost's.
+  // And it is worse than a one-frame collision, because the ghost tracks
+  // finger.y - 62 for the whole gesture, so the only band in which a player can
+  // both hold the phone and see what they are placing was the sixty pixels
+  // between the bar and the dock — higher and the ghost is behind the bar,
+  // lower and the finger is on the minimap, which teleports the camera.
+  //
+  // Everything in the bar is read, not aimed: a name, a count, a hint and a
+  // Cancel. The top strip is already the read-never-tapped region of this HUD
+  // (see the note in index.html), which is exactly what this is, and moving it
+  // there hands back 58px of contiguous map in the middle of the screen —
+  // measured HUD coverage while placing drops from 48.8% to 42.0%.
+  const placeBar = el('div', 'place-bar place-top');
   placeBar.id = 'place-bar';
   placeBar.hidden = true;
   root.appendChild(placeBar);
@@ -284,12 +382,59 @@ export function createHud(scene, world) {
   const attackBar = el('div', 'place-bar attack');
   attackBar.id = 'attack-bar';
   attackBar.hidden = true;
-  root.appendChild(attackBar);
+  sheets.appendChild(attackBar);
 
   const menuSheet = el('div', 'menu-sheet');
   menuSheet.id = 'menu-sheet';
   menuSheet.hidden = true;
-  root.appendChild(menuSheet);
+  sheets.appendChild(menuSheet);
+
+  // The rules. Same shell as the menu sheet — it is the same kind of thing, a
+  // scrolling column of text over the map — and a sheet rather than a modal so
+  // that the player can still see the game they are reading about.
+  const helpSheet = el('div', 'menu-sheet help-sheet');
+  helpSheet.id = 'help-sheet';
+  helpSheet.hidden = true;
+  sheets.appendChild(helpSheet);
+
+  // --- The dock -------------------------------------------------------------
+  //
+  // Four equal targets across the bottom of the map, in the arc a right thumb
+  // sweeps without the hand moving. Built here rather than in index.html
+  // because three of the four are stateful (the drag mode, the idle count, the
+  // allocation manager's on/off) and the fourth opens a sheet this module owns.
+
+  function dockButton(id, glyph, label, aria) {
+    const b = el('button', 'dock-btn');
+    b.id = id;
+    b.type = 'button';
+    b.setAttribute('aria-label', aria || label);
+    b.appendChild(el('span', 'glyph', glyph));
+    b.appendChild(el('span', 'lbl', label));
+    if (dom.dock) dom.dock.appendChild(b);
+    return b;
+  }
+
+  const modeChip = el('button', 'mode-chip dock-btn');
+  modeChip.id = 'mode-chip';
+  modeChip.type = 'button';
+  modeChip.setAttribute('aria-label', 'One-finger gesture mode');
+  if (dom.dock) dom.dock.appendChild(modeChip);
+
+  const idleBtn = dockButton('btn-idle', '', 'Idle', 'Idle villagers — tap to visit the next one');
+  idleBtn.classList.add('idle');
+  idleBtn.textContent = '';
+  const idleCount = el('span', 'count', '0');
+  idleBtn.appendChild(idleCount);
+  idleBtn.appendChild(el('span', 'lbl', 'Idle'));
+
+  const jobsBtn = dockButton('btn-jobs', '⚖', 'Jobs', 'Villager jobs — set what share works each resource');
+  const menuBtn = dockButton('btn-menu', '☰', 'Menu', 'Menu');
+
+  dom.idleBtn = idleBtn;
+  dom.idleCount = idleCount;
+  dom.jobsBtn = jobsBtn;
+  dom.menuBtn = menuBtn;
 
   // The floating controls (mode chip, idle button, build menu, placement bar)
   // sit just above the bottom bar. Its height depends on what is selected, so
@@ -304,9 +449,44 @@ export function createHud(scene, world) {
     sizeObserver.observe(bottomBar);
   }
 
+  // The top bar is measured for the same reason: the resource bar wraps to a
+  // second line once the stockpiles get big enough (see .res-bar in hud.css),
+  // and the toast stack is positioned directly under it. A fixed offset would
+  // put a toast over the food counter for the second half of a long match.
+  let topObserver = null;
+  const topBar = root.querySelector('.hud-top');
+  if (topBar && typeof ResizeObserver === 'function') {
+    topObserver = new ResizeObserver((entries) => {
+      const h = Math.round(entries[0].contentRect.height + 14);
+      root.style.setProperty('--topbar-h', `${h}px`);
+      // Also on the document element, because the end card lives outside the
+      // HUD overlay and its "Results" pill has to tuck under the same bar.
+      doc.documentElement.style.setProperty('--topbar-h', `${h}px`);
+    });
+    topObserver.observe(topBar);
+  }
+
   // --- Minimap --------------------------------------------------------------
 
   const minimap = dom.minimap ? createMinimap(dom.minimap, world) : null;
+
+  // --- Portraits ------------------------------------------------------------
+
+  const portraits = createPortraits(scene);
+
+  /**
+   * The picture of a type, for a chip or a queue slot — or its three letters
+   * when there is no picture to be had.
+   *
+   * `cls` is the class the text fallback wears, because the two callers style
+   * their fallback differently ('badge' in the selection panel, 'ab' in the
+   * queues) and the portrait itself is styled once, by its own class.
+   */
+  function typeIcon(kind, type, player, cls) {
+    const art = portraits.element(kind, type, player);
+    if (art) return art;
+    return el('span', cls, ABBR[type] || type.slice(0, 3).toUpperCase());
+  }
 
   // --- Camera helpers -------------------------------------------------------
 
@@ -419,6 +599,76 @@ export function createHud(scene, world) {
     return rec;
   }
 
+  /**
+   * The age-up card.
+   *
+   * Advancing the age used to be the quietest event in the game. It went out as
+   * a plain `info` toast — the same styling as "Halted" and "Sound on" — while
+   * "Population capped" got a red border, so the single most important
+   * strategic milestone in a match was quieter than a routine nag. And nothing
+   * said what had just happened: Stone Walls, a Watch Tower, a Market and four
+   * blacksmith upgrades flip from grey to live in the build menu at that
+   * instant, and a player who does not open the menu in the next minute never
+   * finds out.
+   *
+   * So it borrows the under-attack alert's shape — full width, its own colour,
+   * a heading and a sub-line — in gold rather than red, and it lists what
+   * opened. The list is derived from the same two tables the build menu and the
+   * research panel read (ageForBuilding, TECHS[].age), so it cannot go stale
+   * when a building or an upgrade is added.
+   *
+   * Four seconds rather than the alert's five and a bit: it is news, not a
+   * summons, and there is nothing to reach for.
+   */
+  const AGE_CARD_MS = 4000;
+
+  function ageUnlocks(age) {
+    const out = [];
+    for (const type of BUILDABLE) {
+      const s = BUILDING_STATS[type];
+      if (!s) continue;
+      if (tech.ageForBuilding(type) === age) out.push(s.name);
+    }
+    let techs = 0;
+    for (const id of Object.keys(tech.TECHS)) {
+      const t = tech.TECHS[id];
+      // The next age-up is not an unlock, it is the next rung of the same
+      // ladder, and listing it here reads as though it were free.
+      if (t.advancesTo !== undefined) continue;
+      if (t.age === age) techs++;
+    }
+    return { buildings: out, techs };
+  }
+
+  function ageCard(age) {
+    if (!dom.toasts) return null;
+    const now = performance.now();
+    // The card supersedes the chatter the way the alert does — an age-up
+    // arrives in the middle of "Training Villager" and should not queue behind
+    // it — but never an alert. Being raided while advancing is still the more
+    // urgent of the two facts.
+    for (const t of state.toasts.slice()) if (!t.alert) killToast(t);
+
+    const { buildings, techs } = ageUnlocks(age);
+    const node = el('div', 'toast agecard');
+    node.setAttribute('role', 'status');
+    const line = el('span', 'line');
+    line.appendChild(el('span', 'crest', '⌂'));
+    line.appendChild(doc.createTextNode(`${tech.ageName(age)}`));
+    node.appendChild(line);
+    const bits = [];
+    if (buildings.length) bits.push(buildings.join(', '));
+    if (techs) bits.push(`${techs} new upgrade${techs === 1 ? '' : 's'}`);
+    node.appendChild(el('span', 'sub',
+      bits.length ? `Now available: ${bits.join(' · ')}` : 'Every building of yours is tougher'));
+
+    dom.toasts.appendChild(node);
+    dom.toasts.classList.add('wide');
+    const rec = { node, at: now, ttl: AGE_CARD_MS, alert: true, milestone: true };
+    pushToast(rec);
+    return rec;
+  }
+
   function pushToast(rec) {
     state.toasts.push(rec);
     // Over budget: retire the oldest *routine* toast first. An alert must never
@@ -436,6 +686,12 @@ export function createHud(scene, world) {
     state.toasts.splice(i, 1);
     rec.node.classList.add('out');
     setTimeout(() => rec.node.remove(), 280);
+    // The stack goes back to being a narrow corner box the moment the last
+    // full-width card leaves it, or every toast for the rest of the match
+    // covers half the map.
+    if (rec.milestone && dom.toasts && !state.toasts.some((t) => t.milestone)) {
+      dom.toasts.classList.remove('wide');
+    }
   }
 
   function tickToasts(now) {
@@ -445,6 +701,106 @@ export function createHud(scene, world) {
     if (state.alarmUntil && now > state.alarmUntil) {
       state.alarmUntil = 0;
       if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
+    portraits.destroy();
+    }
+  }
+
+  // --- The coach ------------------------------------------------------------
+  //
+  // Four lines, fired off world time, that carry a new player through the first
+  // ninety seconds of a match.
+  //
+  // This exists because of a measurement, not a hunch: starting a match and
+  // giving no input for sixty simulated seconds used to change nothing at all —
+  // no resource moved, no toast fired, three villagers sat idle and the screen
+  // at t=60s was pixel-identical to the screen at t=0. The starting villagers
+  // now work (see putToWork in core/mapgen.js), which fixes the *economy*; this
+  // fixes the silence. Between them a player who does nothing sees a game that
+  // is visibly running and is told, in order, the four things that stop it
+  // running out.
+  //
+  // Two rules, both of which the lines below obey:
+  //
+  //   It never fires on a resumed match. Somebody twelve minutes into a game
+  //   does not need to be told what a villager is, and the save carries no
+  //   record of what they were told the first time. `fresh` is decided once,
+  //   here, from the clock the restored world came back with.
+  //
+  //   It never tells the player to do something they have already done. Every
+  //   line carries a `still` predicate that is asked at the moment it would
+  //   fire, so a player who queued villagers at eight seconds is not told to
+  //   train villagers at fifteen, and one who is already in the Feudal Age is
+  //   not told to advance to it.
+  //
+  // Tone follows the rest of the HUD's vocabulary: teaching is 'info', and the
+  // only line that earns 'warn' is the one that is a problem right now.
+  const COACH = [
+    {
+      at: 3,
+      text: 'Tap a villager, then tap the berries',
+      tone: 'info',
+      // Only worth saying while the player has issued no orders of their own.
+      // The selection being empty is the honest test for "has not touched
+      // anything yet" — the first thing any tap on this game does is select.
+      still: () => world.selection.size === 0,
+    },
+    {
+      at: 15,
+      text: 'Select the Town Center to train more villagers',
+      tone: 'info',
+      still: () => {
+        const tcs = ownedBy(world, PLAYER, 'building', 'towncenter');
+        // Already training, or already past the three you started with: the
+        // player has worked it out and does not need the hint.
+        if (tcs.some((b) => (b.queue || []).length > 0)) return false;
+        return ownedBy(world, PLAYER, 'unit', 'villager').length <= 3;
+      },
+    },
+    {
+      at: 40,
+      text: 'Population capped — tap Build and put down a house',
+      tone: 'warn',
+      still: () => {
+        const p = world.players[PLAYER];
+        if (p.pop < p.popCap) return false;
+        // A house already going up is the answer to this line; saying it
+        // anyway is nagging somebody who is mid-fix.
+        return ownedBy(world, PLAYER, 'building', 'house').length === 0;
+      },
+    },
+    {
+      at: 90,
+      text: 'Select the Town Center and advance the age',
+      tone: 'info',
+      still: () => {
+        if (tech.currentAge(world, PLAYER) > 0) return false;
+        return !ownedBy(world, PLAYER, 'building', 'towncenter')
+          .some((b) => (b.research || []).length > 0);
+      },
+    },
+  ];
+
+  // A resumed match comes back with its clock, so a non-zero time at the moment
+  // the HUD is built means this player has been here before.
+  const coachFresh = world.time < 0.5;
+  let coachAt = 0;
+
+  function tickCoach() {
+    if (!coachFresh || world.over) return;
+    while (coachAt < COACH.length && world.time >= COACH[coachAt].at) {
+      const line = COACH[coachAt];
+      coachAt++;
+      let wanted = true;
+      try {
+        wanted = line.still();
+      } catch (_) {
+        // A predicate that throws is a bug in the predicate, not a reason to
+        // withhold the whole coach — but it is also not a reason to shout.
+        wanted = false;
+      }
+      if (!wanted) continue;
+      toast(line.text, line.tone);
+      return; // never two coaching lines in one frame
     }
   }
 
@@ -458,17 +814,26 @@ export function createHud(scene, world) {
 
   function updateResources() {
     const p = world.players[PLAYER];
-    const sig = `${p.resources.food | 0}/${p.resources.wood | 0}/${p.resources.gold | 0}/${p.pop}/${p.popCap}`;
+    const age = tech.currentAge(world, PLAYER);
+    let sig = '';
+    for (const k of RES_ORDER) sig += `${p.resources[k] | 0}/`;
+    sig += `${p.pop}/${p.popCap}/${age}`;
     if (sig === state.resSig) return;
     state.resSig = sig;
-    setRes(dom.food, String(Math.floor(p.resources.food)));
-    setRes(dom.wood, String(Math.floor(p.resources.wood)));
-    setRes(dom.gold, String(Math.floor(p.resources.gold)));
+    for (const k of RES_ORDER) setRes(dom[k], String(Math.floor(p.resources[k] || 0)));
     setRes(dom.pop, `${p.pop}/${p.popCap}`);
     if (dom.pop) dom.pop.classList.toggle('low', p.pop >= p.popCap);
+    if (dom.age) {
+      setRes(dom.age, tech.AGE_SHORT[age] || tech.AGE_SHORT[0]);
+      dom.age.title = tech.ageName(age);
+      dom.age.dataset.age = String(age);
+    }
   }
 
-  const RES_NODE = { food: () => dom.food, wood: () => dom.wood, gold: () => dom.gold };
+  const RES_NODE = {
+    food: () => dom.food, wood: () => dom.wood,
+    gold: () => dom.gold, stone: () => dom.stone,
+  };
 
   function flashRes(kinds) {
     for (const k of kinds) {
@@ -489,6 +854,8 @@ export function createHud(scene, world) {
     if (!panel) return;
     panel.textContent = '';
     state.liveBars = [];
+    state.liveJob = null;
+    state.liveGarrison = null;
 
     const sel = selectedEntities(world);
     if (sel.length === 0) {
@@ -523,7 +890,7 @@ export function createHud(scene, world) {
     for (const g of groups.values()) {
       const own = g.player === PLAYER;
       const chip = el('button', `chip ${own ? '' : g.player == null ? 'neutral' : 'foe'}`);
-      chip.appendChild(el('span', 'badge', ABBR[g.type] || g.type.slice(0, 3).toUpperCase()));
+      chip.appendChild(typeIcon(g.list[0].kind, g.type, g.player, 'badge'));
       // The header already names a lone selection — do not say it twice.
       if (groups.size > 1 || g.list.length > 1) {
         chip.appendChild(el('span', 'n', `×${g.list.length}`));
@@ -547,7 +914,87 @@ export function createHud(scene, world) {
     const stocked = sel.filter((e) => stockOf(e));
     if (stocked.length) addBar(panel, 'stock', stocked);
 
+    // Where this villager's load is going. See jobNoteText: the drop-off is
+    // chosen for the player by the sim, so the HUD has to say which one it
+    // picked or the Lumber Camp they just paid 100 wood for is invisible.
+    //
+    // The line itself lives outside this panel, across the full width of the
+    // bottom bar (see #job-note in index.html) — inside a 151px column it had
+    // to ellipsise the destination, which is the only part of the sentence
+    // worth printing.
+    const workers = sel.filter((e) => e.player === PLAYER && e.type === 'villager');
+    if (workers.length && dom.jobNote) {
+      state.liveJob = { list: workers, node: dom.jobNote };
+    } else if (dom.jobNote) {
+      dom.jobNote.hidden = true;
+    }
+
+    // How many bodies are inside, and how many more will fit. This is the only
+    // way the player can see a garrison at all — the units are off the map by
+    // design — so it is a live row rather than a line drawn once.
+    const shelters = sel.filter((e) => e.player === PLAYER && garrisonCapacity(e) > 0);
+    if (shelters.length) {
+      const note = el('div', 'garrison-note');
+      panel.appendChild(note);
+      state.liveGarrison = { list: shelters, node: note };
+    }
+
     refreshBars();
+  }
+
+  /**
+   * One line naming what the selected villagers are doing and, crucially, where
+   * they are banking it.
+   *
+   * The drop-off is the one decision in the economy the game makes on the
+   * player's behalf every single trip (economy.nearestDropoff), and it is the
+   * decision a Lumber Camp or a Mining Camp exists to change. Without this line
+   * the only evidence that a new camp did anything is that the wood counter goes
+   * up slightly faster, which nobody can see. Returns '' when there is nothing
+   * worth saying, and the caller hides the row.
+   */
+  function jobNoteText(list) {
+    const live = list.filter((u) => !u.dead);
+    if (!live.length) return '';
+
+    // Every drop-off the group is currently routed to, named once each.
+    const drops = [];
+    for (const u of live) {
+      const t = u.task;
+      const b = t && t.type === 'gather' ? t.building : null;
+      if (!b || b.dead) continue;
+      const name = displayName(b);
+      if (!drops.includes(name)) drops.push(name);
+    }
+
+    if (live.length === 1) {
+      const u = live[0];
+      const t = u.task;
+      const carrying = u.carrying && u.carrying.amount > 0 ? u.carrying : null;
+      if (t && t.type === 'build' && t.building && !t.building.dead) {
+        return `Building the ${displayName(t.building)}`;
+      }
+      if (t && t.type === 'gather') {
+        if (t.stage === 'toDrop' && drops.length) {
+          const load = carrying
+            ? `${Math.floor(carrying.amount)} ${RES_LABEL[carrying.type] || carrying.type}`
+            : 'a load';
+          return `Hauling ${load} to the ${drops[0]}`;
+        }
+        const res = (t.node && t.node.resourceType) || (carrying && carrying.type);
+        const what = res ? RES_LABEL[res] || res : 'resources';
+        // Name the drop-off it *will* use, not the one it used last, by asking
+        // the same function the villager will ask when its pack fills.
+        const drop = res ? economy.nearestDropoff(world, PLAYER, u.x, u.y, res) : null;
+        return drop ? `Gathering ${what} → ${displayName(drop)}` : `Gathering ${what}`;
+      }
+      return carrying
+        ? `Carrying ${Math.floor(carrying.amount)} ${RES_LABEL[carrying.type] || carrying.type}`
+        : '';
+    }
+
+    if (!drops.length) return '';
+    return `Dropping off at: ${drops.join(', ')}`;
   }
 
   function addBar(panel, kind, list) {
@@ -587,6 +1034,27 @@ export function createHud(scene, world) {
         ? `${Math.ceil(val)} / ${Math.ceil(max)} ${res && res !== 'mixed' ? RES_LABEL[res] || res : 'resources'} left`
         : `${Math.ceil(val)} / ${Math.ceil(max)} hp`;
     }
+
+    if (state.liveJob) {
+      const text = jobNoteText(state.liveJob.list);
+      if (state.liveJob.node.textContent !== text) state.liveJob.node.textContent = text;
+      state.liveJob.node.hidden = text === '';
+    }
+
+    if (state.liveGarrison) {
+      let inside = 0;
+      let cap = 0;
+      for (const b of state.liveGarrison.list) {
+        if (b.dead) continue;
+        inside += garrisonCount(b);
+        cap += garrisonCapacity(b);
+      }
+      const text = `Garrison ${inside} / ${cap}`;
+      const node = state.liveGarrison.node;
+      if (node.textContent !== text) node.textContent = text;
+      node.classList.toggle('manned', inside > 0);
+      node.classList.toggle('full', cap > 0 && inside >= cap);
+    }
   }
 
   // --- Command panel --------------------------------------------------------
@@ -603,7 +1071,9 @@ export function createHud(scene, world) {
       b.appendChild(el('span', 'cost', sub));
     }
     if (disabled) b.disabled = true;
-    if (onTap) b.addEventListener('click', (ev) => { ev.stopPropagation(); onTap(); });
+    if (onTap) {
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); click(); onTap(); });
+    }
     return b;
   }
 
@@ -613,6 +1083,7 @@ export function createHud(scene, world) {
     panel.textContent = '';
     state.liveCosts = [];
     state.liveQueue = null;
+    state.liveResearch = null;
 
     const sel = selectedEntities(world);
     const own = sel.filter((e) => e.player === PLAYER);
@@ -640,10 +1111,19 @@ export function createHud(scene, world) {
     }
 
     // Villagers: build.
+    //
+    // Full width, because it is the only verb a villager has. Measured on a
+    // 390px phone, selecting one villager put Build at 50x44 — the smallest
+    // button on the screen — under a hundred and fifty pixels of stance
+    // buttons belonging to a unit whose default stance is No Attack and which
+    // never fights. The stances now come off entirely for a villager-only
+    // selection (see below) and the button that opens the whole build tree
+    // takes the row it was always worth.
     if (villagers.length) {
       panel.appendChild(cmdButton('Build', {
-        cls: 'primary',
-        sub: `${villagers.length} vill`,
+        cls: 'primary wide',
+        sub: `${villagers.length} villager${villagers.length === 1 ? '' : 's'}`,
+        aria: `Open the build menu for ${villagers.length} villagers.`,
         onTap: () => toggleBuildMenu(),
       }));
     }
@@ -663,6 +1143,28 @@ export function createHud(scene, world) {
       renderRallyNote(panel, trainer);
     }
 
+    // The Market. A sheet rather than six buttons in this panel: a trade is two
+    // numbers and two decisions per resource, which is three rows of controls,
+    // and the command panel is already the most crowded 150px on the screen.
+    const stall = buildings.find((b) => b.type === 'market');
+    if (stall) {
+      panel.appendChild(cmdButton('Trade', {
+        cls: 'primary market',
+        sub: 'buy and sell',
+        aria: 'Open the market. Buy and sell resources for gold.',
+        onTap: () => toggleMarket(true),
+      }));
+    }
+
+    // Research. Preferring the building that also trains keeps the Town
+    // Center's age-up and the Barracks' blacksmith line on the same panel as
+    // the units they are for; a Mill or a Lumber Camp trains nothing and is
+    // picked up by the fallback.
+    const researcher =
+      (trainer && tech.techsAt(trainer.type).length ? trainer : null) ||
+      buildings.find((b) => tech.techsAt(b.type).length > 0);
+    if (researcher) renderResearch(panel, researcher);
+
     // Attack-move: the one order a phone had no way to give. It arms the next
     // tap on the map rather than asking for a second gesture nobody would find.
     if (military.length) {
@@ -674,6 +1176,66 @@ export function createHud(scene, world) {
         onTap: () => setAttackArmed(!state.attackArmed),
       }));
     }
+
+    // Garrison. AoE2 gives this to a right-click on a building; a phone has no
+    // right-click and no modifier, so it is a button that means "go inside the
+    // nearest shelter of yours that has room". That is the order a player
+    // actually wants under fire — they are not choosing *which* Town Center,
+    // they are getting their villagers off the field before the scouts arrive.
+    if (units.length) {
+      // First unit that has somewhere to go decides whether the button exists;
+      // the order itself re-asks per unit, so a mixed group still each find
+      // their own nearest shelter.
+      let shelter = null;
+      for (const u of units) {
+        shelter = nearestShelter(world, u);
+        if (shelter) break;
+      }
+      if (shelter) {
+        panel.appendChild(cmdButton('Garrison', {
+          cls: 'garrison',
+          sub: `${units.length} in`,
+          aria: `Send ${units.length} units into the nearest ${displayName(shelter)}.`,
+          onTap: () => {
+            command(units, { type: 'garrison' });
+            toast(`Garrisoning ${units.length}`, 'info');
+          },
+        }));
+      }
+    }
+
+    // ...and the way back out, on the building. One tap empties it: picking
+    // individuals out of a building you cannot see inside is a menu nobody
+    // wants on a 390px screen, and "everybody out" is what an alarm calls for.
+    const shelters = buildings.filter((b) => garrisonCount(b) > 0);
+    if (shelters.length) {
+      const inside = shelters.reduce((n, b) => n + garrisonCount(b), 0);
+      panel.appendChild(cmdButton('Ungarrison', {
+        cls: 'garrison out',
+        sub: `${inside} out`,
+        aria: `Turn out all ${inside} units garrisoned here.`,
+        onTap: () => {
+          let n = 0;
+          for (const b of shelters) n += ungarrisonAll(world, b);
+          toast(n ? `${n} came out` : 'Nowhere to stand', n ? 'info' : 'warn');
+          state.cmdSig = '';
+        },
+      }));
+    }
+
+    // Stance and formation. Both are unit *settings* rather than orders, which
+    // is why they sit below the verbs: you set them once and every order after
+    // that obeys them.
+    //
+    // Not for a selection that is nothing but villagers. Four segments over
+    // ~150px of a 390px screen is the largest block in the panel, and for a
+    // villager every one of them is a setting about fighting: it opens on No
+    // Attack, it has no attack worth the name, and a player who moves it off No
+    // Attack has made their economy worse. There is one case where a villager's
+    // stance genuinely matters — mixed in with soldiers, where the group order
+    // has to mean one thing — and that case still shows the row.
+    if (units.length && units.length !== villagers.length) renderStances(panel, units);
+    if (military.length > 1) renderFormations(panel, military);
 
     // Stop always available to units.
     if (units.length) {
@@ -705,6 +1267,78 @@ export function createHud(scene, world) {
     if (buildings.length) renderDemolish(panel, buildings);
 
     refreshAffordability();
+  }
+
+  // --- Stance and formation --------------------------------------------------
+  //
+  // Two rows of segmented buttons, the live one lit. They are rows rather than a
+  // single cycling button on purpose: a cycler hides three of the four choices
+  // and makes "put these on Stand Ground" a game of tap-and-check, which is
+  // exactly the interaction a player is trying to avoid in the second before a
+  // raid lands. Every segment is a full 44px tall (see .segrow in hud.css), so
+  // four of them still fit across a 390px phone.
+  //
+  // Mixed selections show nothing lit and set all of them on the first tap,
+  // which is the only unambiguous answer to "what is this group's stance".
+
+  function segRow(panel, { title, options, current, onPick }) {
+    const wrap = el('div', 'segrow');
+    wrap.setAttribute('role', 'group');
+    wrap.setAttribute('aria-label', title);
+    for (const o of options) {
+      const on = o.id === current;
+      const b = el('button', `seg ${on ? 'on' : ''}`);
+      b.type = 'button';
+      b.appendChild(el('span', 'label', o.label));
+      b.appendChild(el('span', 'blurb', o.blurb || ''));
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      b.setAttribute('aria-label', `${title}: ${o.label}. ${o.blurb || ''}`.trim());
+      b.title = o.blurb || o.label;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); onPick(o.id); });
+      wrap.appendChild(b);
+    }
+    panel.appendChild(wrap);
+  }
+
+  /** The one value shared by every unit in the list, or null when they differ. */
+  function shared(list, read) {
+    let v = null;
+    for (const u of list) {
+      const x = read(u);
+      if (v === null) v = x;
+      else if (v !== x) return null;
+    }
+    return v;
+  }
+
+  function renderStances(panel, units) {
+    segRow(panel, {
+      title: 'Stance',
+      current: shared(units, stanceOf),
+      options: STANCE_ORDER.map((id) => ({
+        id, label: STANCE_LABEL[id], blurb: STANCE_BLURB[id],
+      })),
+      onPick: (id) => {
+        command(units, { type: 'stance', stance: id });
+        toast(`${STANCE_LABEL[id]}: ${STANCE_BLURB[id].toLowerCase()}`, 'info');
+        state.cmdSig = '';
+      },
+    });
+  }
+
+  function renderFormations(panel, units) {
+    segRow(panel, {
+      title: 'Formation',
+      current: shared(units, (u) => u.formation || DEFAULT_FORMATION),
+      options: FORMATION_ORDER.map((id) => ({
+        id, label: FORMATION_LABEL[id], blurb: FORMATION_BLURB[id],
+      })),
+      onPick: (id) => {
+        command(units, { type: 'formation', formation: id });
+        toast(`${FORMATION_LABEL[id]} formation`, 'info');
+        state.cmdSig = '';
+      },
+    });
   }
 
   // --- Cancel a foundation ---------------------------------------------------
@@ -823,8 +1457,31 @@ export function createHud(scene, world) {
     return Math.max(0, Math.min(1, (b.buildProgress || 0) / total));
   }
 
+  // --- Training queue ---------------------------------------------------------
+  //
+  // A production building answers three questions and the old row answered one
+  // of them. "What is coming out of here" is the question a player asks while
+  // deciding whether to tap Militia again, and a progress bar with no name on it
+  // cannot answer it; "how many are behind it" is the question that decides
+  // whether the answer is worth waiting for; and the queue entries have to be
+  // cancellable with a thumb, which 26px squares are not.
+  //
+  // Cancelling refunds in full (economy.cancelTrain), so — unlike Demolish —
+  // one tap does it. There is nothing to protect the player from: the cost is
+  // back before the toast has faded, and the alternative, an arm-then-confirm on
+  // a button pressed mostly by accident-correction, is two taps to undo one.
+
   function renderQueue(panel, b) {
     const row = el('div', 'queue');
+    const head = el('div', 'qhead');
+    const what = el('span', 'what');
+    const behind = el('span', 'behind');
+    const eta = el('span', 'eta');
+    head.appendChild(what);
+    head.appendChild(behind);
+    head.appendChild(eta);
+    row.appendChild(head);
+
     const prog = el('div', 'qprog');
     const fill = el('i');
     prog.appendChild(fill);
@@ -833,7 +1490,7 @@ export function createHud(scene, world) {
     const slots = el('div', 'qslots');
     row.appendChild(slots);
     panel.appendChild(row);
-    state.liveQueue = { building: b, fill, slots, drawn: -1 };
+    state.liveQueue = { building: b, fill, slots, what, behind, eta, drawn: -1, drawnType: '' };
     refreshQueue();
   }
 
@@ -844,24 +1501,199 @@ export function createHud(scene, world) {
     const p = typeof economy.trainProgress === 'function' ? economy.trainProgress(q.building) : 0;
     q.fill.style.width = `${(p * 100).toFixed(1)}%`;
 
-    if (q.drawn !== queue.length) {
+    const head = queue[0];
+    const name = head ? (UNIT_STATS[head.type] ? UNIT_STATS[head.type].name : head.type) : '';
+    const whatText = head ? `Training ${name}` : 'Not training';
+    if (q.what.textContent !== whatText) q.what.textContent = whatText;
+    const behindText = queue.length > 1
+      ? `+${queue.length - 1} waiting`
+      : head ? 'last in the queue' : '';
+    if (q.behind.textContent !== behindText) q.behind.textContent = behindText;
+    const etaText = head ? `${Math.max(0, Math.ceil(head.remaining))}s` : '';
+    if (q.eta.textContent !== etaText) q.eta.textContent = etaText;
+
+    // Rebuild the chips only when the queue actually changes shape — this runs
+    // every frame, and the head's type matters as well as the length (cancel the
+    // Militia at the front of Militia/Archer and the count is unchanged).
+    const type = queue.map((e) => e.type).join(',');
+    if (q.drawn !== queue.length || q.drawnType !== type) {
       q.drawn = queue.length;
+      q.drawnType = type;
       q.slots.textContent = '';
       queue.forEach((entry, i) => {
-        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`,
-          ABBR[entry.type] ? ABBR[entry.type].slice(0, 1) : entry.type.slice(0, 1).toUpperCase());
-        s.title = `Cancel ${entry.type}`;
+        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`);
+        const uname = UNIT_STATS[entry.type] ? UNIT_STATS[entry.type].name : entry.type;
+        s.appendChild(typeIcon('unit', entry.type, PLAYER, 'ab'));
+        s.appendChild(el('span', 'x', '×'));
+        s.title = `Cancel ${uname} — cost refunded`;
+        s.setAttribute('aria-label', `Cancel ${uname}, number ${i + 1} in the queue. The cost is refunded.`);
         s.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          if (typeof economy.cancelTrain === 'function') {
-            economy.cancelTrain(world, q.building, i);
-            toast('Cancelled', 'info');
+          if (typeof economy.cancelTrain !== 'function') return;
+          if (economy.cancelTrain(world, q.building, i)) {
+            toast(`${uname} cancelled — cost refunded`, 'info');
             state.cmdSig = ''; // force a re-render
           }
         });
         q.slots.appendChild(s);
       });
-      if (queue.length === 0) q.slots.appendChild(el('span', 'cmd-note', 'idle'));
+      if (queue.length === 0) {
+        q.slots.appendChild(el('span', 'qempty', 'Nothing queued — tap a unit above'));
+      }
+    }
+  }
+
+  // --- Research ---------------------------------------------------------------
+  //
+  // A research button has to answer three questions at a glance — what is it,
+  // what does it cost, what does it *do* — and the third one is the one every
+  // RTS on a small screen drops. "Bow Saw, 150 food 100 wood" tells a player
+  // nothing; "+20% wood gathering" tells them everything, and is the difference
+  // between an upgrade tab that gets used and one that gets ignored. So every
+  // button carries its effect line, and the greyed ones carry the reason they
+  // are grey instead of it — an upgrade you cannot buy raises exactly one
+  // question, and it is "why not".
+
+  /** Word the sub-line under a research button for its current status. */
+  function researchSub(opt) {
+    if (opt.status === 'done') return 'researched';
+    if (opt.status === 'active') return 'researching…';
+    return opt.reason || opt.blurb || '';
+  }
+
+  function renderResearch(panel, b) {
+    const all = tech.researchOptions(world, PLAYER, b);
+    if (!all.length) return;
+
+    // Later tiers of a line the player has not started are folded away — see
+    // the note on `gate` in tech.js. Four full-width buttons is already most of
+    // a phone panel; eight was two thirds of the screen.
+    const options = all.filter((o) => o.gate !== 'prereq');
+    const folded = all.length - options.length;
+
+    // In-progress first, with its own bar: it is the thing that is happening.
+    if ((b.research || []).length) renderResearchQueue(panel, b);
+
+    for (const opt of options) {
+      const usable = opt.status === 'ready' || opt.status === 'poor';
+      const isAge = opt.tech && opt.tech.advancesTo !== undefined;
+      const btn = el('button',
+        `cbtn research is-${opt.status}${isAge ? ' is-age' : ''}${opt.status === 'poor' ? ' off' : ''}`);
+      btn.appendChild(el('span', 'label', opt.name));
+      // The effect line goes on anything the player could actually buy — which
+      // includes the ones they cannot afford *yet*, because "+20% wood" is
+      // precisely the argument for saving up for it. A button that is grey for
+      // a structural reason (done, running, wrong age) prints that reason
+      // instead: there is only one question left about it and it is not "what
+      // does this do".
+      if (usable) btn.appendChild(el('span', 'blurb', opt.blurb || ''));
+      if (usable) {
+        btn.appendChild(costNode(opt.cost));
+        // Only 'poor' entries join the live affordability refresh; 'ready' ones
+        // are re-evaluated by it too, so a button un-greys the instant the food
+        // lands rather than on the next panel re-render.
+        state.liveCosts.push({ el: btn, cost: opt.cost });
+      } else {
+        btn.appendChild(el('span', 'cost', researchSub(opt)));
+      }
+      if (usable && opt.blurb && opt.status === 'poor') {
+        btn.title = `${opt.blurb} — ${opt.reason}`;
+      } else if (opt.blurb) {
+        btn.title = opt.blurb;
+      }
+      btn.setAttribute('aria-label',
+        `${opt.name}. ${opt.blurb || ''} ${researchSub(opt)}`.trim());
+
+      if (!usable) {
+        // Not disabled — tapped, it explains itself. A dead button on a phone
+        // is indistinguishable from a missed tap.
+        btn.classList.add('off');
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          toast(`${opt.name}: ${researchSub(opt)}`, opt.status === 'done' ? 'info' : 'warn');
+        });
+      } else {
+        btn.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          startResearch(b, opt);
+        });
+      }
+      panel.appendChild(btn);
+    }
+
+    // Say that the folded ones exist. Without this line a player who finishes
+    // Forging is surprised by a button appearing, and one who never finishes it
+    // never learns the line goes further.
+    if (folded > 0) {
+      panel.appendChild(el('div', 'cmd-note research-more',
+        folded === 1
+          ? 'One further upgrade unlocks behind these'
+          : `${folded} further upgrades unlock behind these`));
+    }
+  }
+
+  function startResearch(building, opt) {
+    if (!affordable(world, PLAYER, opt.cost)) {
+      const miss = missingResource(world, PLAYER, opt.cost);
+      toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
+      flashRes(miss ? [miss] : RES_ORDER);
+      return;
+    }
+    if (typeof tech.queueResearch !== 'function') return;
+    // tech.queueResearch raises its own toast on both success and refusal, so
+    // this only has to force the panel to redraw with the new queue.
+    if (tech.queueResearch(world, building, opt.id)) state.cmdSig = '';
+  }
+
+  function renderResearchQueue(panel, b) {
+    const row = el('div', 'queue research-queue');
+    // Same shell as the training queue — name on top, bar under it, cancellable
+    // chips below — so a player learns one pattern and reads both.
+    const head = el('div', 'qhead');
+    const label = el('span', 'qlabel');
+    head.appendChild(label);
+    row.appendChild(head);
+    const prog = el('div', 'qprog');
+    const fill = el('i');
+    prog.appendChild(fill);
+    row.appendChild(prog);
+    const slots = el('div', 'qslots');
+    row.appendChild(slots);
+    panel.appendChild(row);
+    state.liveResearch = { building: b, fill, label, slots, drawn: -1 };
+    refreshResearchQueue();
+  }
+
+  function refreshResearchQueue() {
+    const q = state.liveResearch;
+    if (!q || !q.building || q.building.dead) return;
+    const queue = q.building.research || [];
+    q.fill.style.width = `${(tech.researchProgress(q.building) * 100).toFixed(1)}%`;
+    const head = queue[0];
+    const name = head && tech.TECHS[head.id]
+      ? `Researching ${tech.TECHS[head.id].name}` : '';
+    if (q.label.textContent !== name) q.label.textContent = name;
+
+    if (q.drawn !== queue.length) {
+      q.drawn = queue.length;
+      q.slots.textContent = '';
+      queue.forEach((entry, i) => {
+        const t = tech.TECHS[entry.id];
+        const s = el('button', `qslot ${i === 0 ? 'head' : ''}`);
+        s.appendChild(el('span', 'ab', (t ? t.name : entry.id).slice(0, 3).toUpperCase()));
+        s.appendChild(el('span', 'x', '×'));
+        s.title = `Cancel ${t ? t.name : entry.id} — full refund`;
+        s.setAttribute('aria-label', `Cancel ${t ? t.name : entry.id}. The cost is refunded.`);
+        s.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          if (typeof tech.cancelResearch !== 'function') return;
+          if (tech.cancelResearch(world, q.building, i)) {
+            toast(`${t ? t.name : 'Research'} cancelled — cost refunded`, 'info');
+            state.cmdSig = '';
+          }
+        });
+        q.slots.appendChild(s);
+      });
     }
   }
 
@@ -880,7 +1712,7 @@ export function createHud(scene, world) {
     if (!affordable(world, PLAYER, s.cost)) {
       const miss = missingResource(world, PLAYER, s.cost);
       toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-      flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
+      flashRes(miss ? [miss] : RES_ORDER);
       return;
     }
     if (typeof economy.queueTrain !== 'function') return;
@@ -900,63 +1732,274 @@ export function createHud(scene, world) {
     const open = force === undefined ? !state.buildMenuOpen : force;
     state.buildMenuOpen = open;
     buildMenu.hidden = !open;
-    if (open) renderBuildMenu();
-    else state.liveBuild = []; // stop refreshing buttons nobody can see
+    if (open) {
+      // One sheet at a time. They share the same slot above the dock, and two
+      // of them open at once is 60% of the screen with the map behind it.
+      toggleAlloc(false);
+      toggleMenu(false);
+      toggleMarket(false);
+      closeHelp();
+      renderBuildMenu();
+      markCut(buildMenu);
+    } else {
+      state.liveBuild = []; // stop refreshing buttons nobody can see
+    }
   }
 
+  /**
+   * The build menu, grouped by age, with the locked entries *shown* rather than
+   * hidden.
+   *
+   * Hiding them is the obvious implementation and it is the wrong one. The
+   * whole reason a player spends 400 food on the Feudal Age is the things it
+   * buys, and a menu that only reveals those things afterwards asks them to
+   * make that decision blind — the age-up reads as a tax rather than a
+   * purchase. So every building in the game is listed from the first minute,
+   * greyed, with the age it needs printed where its cost would go, and tapping
+   * one says so out loud. That is also the cheapest possible tutorial for the
+   * tech tree: the menu *is* the tree.
+   *
+   * Types with no entry in BUILDING_STATS are skipped, so the forward-declared
+   * names in BUILDABLE cost nothing until the buildings behind them exist.
+   */
   function renderBuildMenu() {
     buildMenu.textContent = '';
     state.liveBuild = [];
-    buildMenu.appendChild(el('div', 'title', 'Build'));
+    const myAge = tech.currentAge(world, PLAYER);
+
+    // Bucket by required age, keeping BUILDABLE's order inside each bucket.
+    const shelves = [[], [], []];
     for (const type of BUILDABLE) {
       const s = BUILDING_STATS[type];
       if (!s) continue;
-      const ok = affordable(world, PLAYER, s.cost);
-      const b = el('button', `cbtn ${ok ? '' : 'off'}`);
-      state.liveBuild.push({ el: b, cost: s.cost });
-      b.appendChild(el('span', 'label', s.name));
-      b.appendChild(costNode(s.cost));
-      b.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        if (!affordable(world, PLAYER, s.cost)) {
-          const miss = missingResource(world, PLAYER, s.cost);
-          toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-          flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
-          return;
-        }
-        setPlacementMode(type);
-      });
-      buildMenu.appendChild(b);
+      const need = tech.ageForBuilding(type);
+      (shelves[need] || shelves[0]).push({ type, s, need });
     }
+
+    // Bottom-anchored sheet, so the shelves are laid out bottom-up.
+    //
+    // The menu grows upward from just above the dock, which means the LAST row
+    // in the document is the one nearest the thumb and the first row is the one
+    // furthest from it. It used to be written top-down like a page: House, Farm
+    // and Mill — the three buildings a player puts down in the first two
+    // minutes and keeps putting down for the rest of the match — sat at the top,
+    // the hardest place on a 390x844 phone to reach, and Close, which is
+    // pressed once and never matters, sat at the bottom under the thumb.
+    //
+    // Reversed, the Dark Age shelf lands in the thumb's arc, each later age is
+    // one shelf further away in the same order it becomes relevant, and Close
+    // goes to the top where it is still perfectly findable and no longer in the
+    // way. The headings keep the reading order sensible on the way up.
     const cancel = el('button', 'cbtn danger');
     cancel.appendChild(el('span', 'label', 'Close'));
     cancel.addEventListener('click', (ev) => { ev.stopPropagation(); toggleBuildMenu(false); });
     buildMenu.appendChild(cancel);
+
+    for (let age = shelves.length - 1; age >= 0; age--) {
+      const shelf = shelves[age];
+      if (!shelf.length) continue;
+      const locked = age > myAge;
+      const title = el('div', `title ${locked ? 'locked' : ''}`,
+        locked ? `${AGE_HEADINGS[age]} — locked` : AGE_HEADINGS[age]);
+      buildMenu.appendChild(title);
+      for (const entry of shelf) buildMenu.appendChild(buildButton(entry, locked));
+    }
+    // Scroll to the bottom, where the Dark Age shelf now is. A scroller that
+    // opens at the top would put the reachable end off screen, which is the
+    // whole problem this reordering is solving.
+    buildMenu.scrollTop = buildMenu.scrollHeight;
+  }
+
+  function buildButton({ type, s, need }, locked) {
+    const b = el('button', `cbtn ${locked ? 'locked' : ''}`);
+    b.appendChild(el('span', 'label', s.name));
+    if (locked) {
+      // The age replaces the cost, not joins it: what a Castle costs is not the
+      // question you have while you cannot build one.
+      // "Castle — CASTLE" reads like a stutter; "Castle — CASTLE AGE" reads as
+      // the tier it is waiting for, which is the question being answered.
+      b.appendChild(el('span', 'cost need',
+        tech.AGE_SHORT[need] ? `${tech.AGE_SHORT[need]} Age` : 'later'));
+      b.setAttribute('aria-label', `${s.name}. Locked until the ${tech.ageName(need)}.`);
+      b.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        toast(tech.lockReason(world, PLAYER, type) || `${s.name} is locked`, 'warn');
+        flashAge();
+      });
+      return b;
+    }
+    // Only unlocked buttons join the affordability refresh — a locked one is
+    // already grey for a different and more important reason.
+    state.liveBuild.push({ el: b, cost: s.cost });
+    b.classList.toggle('off', !affordable(world, PLAYER, s.cost));
+    b.appendChild(costNode(s.cost));
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      if (!affordable(world, PLAYER, s.cost)) {
+        const miss = missingResource(world, PLAYER, s.cost);
+        toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
+        flashRes(miss ? [miss] : RES_ORDER);
+        return;
+      }
+      setPlacementMode(type);
+    });
+    return b;
+  }
+
+  /** Point at the age chip, the way flashRes points at a resource counter. */
+  function flashAge() {
+    if (!dom.age) return;
+    dom.age.classList.remove('flash');
+    void dom.age.offsetWidth;
+    dom.age.classList.add('flash');
+    setTimeout(() => dom.age.classList.remove('flash'), 1000);
+  }
+
+  // --- Build queue strip ------------------------------------------------------
+  //
+  // What the batch looks like once it is down. See the build queue section in
+  // economy.js for why the order is remembered at all; this is the half the
+  // player can see and undo.
+
+  function refreshBuildQueue() {
+    const strip = dom.buildQueue;
+    if (!strip || typeof economy.buildQueue !== 'function') return;
+    const list = economy.buildQueue(world, PLAYER);
+    // Progress is in the signature so the "42%" on the leading chip stays live,
+    // rounded to 5% so the strip is not rebuilt sixty times a second.
+    // The length leads the signature so that an empty queue is "0|" and not the
+    // empty string — which is also the sentinel the events use to force a
+    // rebuild, and the collision left the strip on screen holding chips for
+    // sites that had already been built.
+    const sig = `${list.length}|` + list
+      .map((b) => `${b.id}:${Math.round(progressOf(b) * 20)}`)
+      .join(',');
+    if (sig === state.bqSig) return;
+    state.bqSig = sig;
+
+    strip.textContent = '';
+    strip.hidden = list.length === 0;
+    if (!list.length) return;
+
+    strip.appendChild(el('div', 'qtitle', `Build queue · tap to cancel`));
+    list.forEach((b, i) => {
+      const name = displayName(b);
+      const chip = el('button', `bq-chip ${i === 0 ? 'head' : ''}`);
+      chip.appendChild(typeIcon('building', b.type, PLAYER, 'ab'));
+      chip.appendChild(el('span', 'n', `${Math.round(progressOf(b) * 100)}%`));
+      chip.appendChild(el('span', 'x', '×'));
+      chip.title = `Cancel the queued ${name} — cost refunded`;
+      chip.setAttribute('aria-label',
+        `Cancel the queued ${name}, number ${i + 1} of ${list.length}. The cost is refunded.`);
+      chip.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (typeof economy.cancelQueued !== 'function') return;
+        if (economy.cancelQueued(world, PLAYER, i)) {
+          toast(`${name} cancelled — cost refunded`, 'info');
+          state.bqSig = '';
+          state.cmdSig = '';
+          state.selSig = '';
+        }
+      });
+      strip.appendChild(chip);
+    });
+
+    if (list.length > 1) {
+      const clear = el('button', 'clear', 'Clear');
+      clear.setAttribute('aria-label',
+        `Cancel all ${list.length} queued sites. Every cost is refunded.`);
+      clear.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        const n = economy.clearBuildQueue(world, PLAYER);
+        if (n) toast(`${n} sites cancelled — costs refunded`, 'info');
+        state.bqSig = '';
+        state.cmdSig = '';
+        state.selSig = '';
+      });
+      strip.appendChild(clear);
+    }
   }
 
   // --- Placement mode -------------------------------------------------------
+  //
+  // BATCH BY DEFAULT. Arming a type used to be spent by the first tap, so a row
+  // of five houses was five trips through Build -> House -> aim -> lift: twenty
+  // gestures, fifteen of which were the same three. It now stays armed until the
+  // player says otherwise, every tap puts another foundation down and joins the
+  // build queue, and the builders work through that queue by themselves (see
+  // onJobFinished in unitAI.js). The bar counts what has been placed and its
+  // button becomes Done once there is something to be done with — "Cancel" is
+  // the wrong word for a button that cannot take back the four houses you have
+  // already paid for, and the strip below it is where those are undone.
+  //
+  // This is the same contract the wall drag already had — one arming, many
+  // foundations — so the two now read as one feature rather than as a special
+  // case for walls.
+
+  function renderPlaceBar() {
+    const type = state.placement;
+    if (!type) {
+      placeBar.hidden = true;
+      placeBar.textContent = '';
+      root.classList.remove('placing');
+      root.style.removeProperty('--placebar-h');
+      return;
+    }
+    const s = BUILDING_STATS[type];
+    const name = s ? s.name : type;
+    const n = state.placedThisArm;
+    placeBar.textContent = '';
+    const txt = el('div', 'txt', n
+      ? `${name} ×${n} placed`
+      : `Place ${name}`);
+    // A gate is a wall piece but not a run: it goes down one at a time (see
+    // wallType in ui/input.js), so it must not be advertised as draggable.
+    txt.appendChild(el('small', null, isWallType(type) && !isGateType(type)
+      ? 'Drag to draw a run — two fingers to cancel'
+      : n
+        ? 'Keep tapping to queue more'
+        : 'Drag to aim — lift to place'));
+    placeBar.appendChild(txt);
+    const done = el('button', n ? 'primary' : 'danger', n ? 'Done' : 'Cancel');
+    done.setAttribute('aria-label', n
+      ? `Stop placing. ${n} ${name} already queued.`
+      : `Stop placing the ${name}.`);
+    done.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
+    placeBar.appendChild(done);
+    placeBar.hidden = false;
+    root.classList.add('placing');
+    // The toast stack sits directly under the resource bar and the bar has just
+    // taken that space, so it is measured and handed over rather than guessed
+    // at — the bar is one line tall for a house and two for a wall run.
+    root.style.setProperty('--placebar-h', `${placeBar.offsetHeight + 6}px`);
+  }
 
   function setPlacementMode(typeOrNull) {
-    state.placement = typeOrNull || null;
+    const next = typeOrNull || null;
+    const changed = next !== state.placement;
+    state.placement = next;
+    if (changed) state.placedThisArm = 0;
     toggleBuildMenu(false);
     // Placement also claims the next tap, so it cannot coexist with an armed
     // attack-move. (Only when arming: setPlacementMode(null) must not recurse.)
     if (state.placement) setAttackArmed(false, { quiet: true });
-    if (!state.placement) {
-      placeBar.hidden = true;
-      placeBar.textContent = '';
-      return;
+    renderPlaceBar();
+    if (state.placement && changed) {
+      const s = BUILDING_STATS[state.placement];
+      toast(`Placing ${s ? s.name : state.placement}`, 'info');
     }
-    const s = BUILDING_STATS[state.placement];
-    placeBar.textContent = '';
-    const txt = el('div', 'txt', `Place ${s ? s.name : state.placement}`);
-    txt.appendChild(el('small', null, 'Drag to aim — lift to place'));
-    placeBar.appendChild(txt);
-    const cancel = el('button', 'danger', 'Cancel');
-    cancel.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
-    placeBar.appendChild(cancel);
-    placeBar.hidden = false;
-    toast(`Placing ${s ? s.name : state.placement}`, 'info');
+  }
+
+  /**
+   * The input layer telling us a foundation went down. Called once per site —
+   * including once per segment of a wall run — so the bar's count and the queue
+   * strip agree with what is actually on the ground.
+   */
+  function onFoundationPlaced(n = 1) {
+    state.placedThisArm += n;
+    state.bqSig = '';
+    renderPlaceBar();
+    refreshBuildQueue();
   }
 
   function getPlacementType() { return state.placement; }
@@ -1011,15 +2054,44 @@ export function createHud(scene, world) {
     return out;
   }
 
+  /**
+   * The idle count, live — and quiet rather than absent when it is zero.
+   *
+   * The button used to be hidden at zero. A control that appears and vanishes
+   * under a thumb is worse than one that dims: it is the neighbouring buttons
+   * that suffer, because they slide sideways to fill the gap and the next tap
+   * lands on whatever moved into that spot. It also throws away the one piece
+   * of information a well-run economy most wants confirmed — that the answer is
+   * still nought. So it keeps its place in the dock, loses the pulse and the
+   * gold, and says "none".
+   */
   function updateIdle() {
     const list = idleVillagers();
     const sig = String(list.length);
     if (sig === state.idleSig) return;
     state.idleSig = sig;
-    if (dom.idleCount) dom.idleCount.textContent = sig;
-    if (dom.idleWrap) dom.idleWrap.hidden = list.length === 0;
+    if (dom.idleCount) dom.idleCount.textContent = list.length ? sig : '0';
+    if (dom.idleBtn) {
+      dom.idleBtn.classList.toggle('is-zero', list.length === 0);
+      const lbl = dom.idleBtn.querySelector('.lbl');
+      if (lbl) lbl.textContent = list.length === 1 ? 'idle' : list.length ? 'idle' : 'none idle';
+      dom.idleBtn.setAttribute('aria-label', list.length
+        ? `${list.length} idle villager${list.length === 1 ? '' : 's'} — tap to visit the next one`
+        : 'No idle villagers');
+    }
   }
 
+  /**
+   * Visit the next idle villager: select it and put the camera on it.
+   *
+   * The cursor is the *id of the last one shown*, not an index into the list.
+   * An index is wrong the moment the list changes underneath it, which is
+   * constantly — the villager you just looked at stops being idle the instant
+   * you give it a job, every other entry shifts down one, and tapping the button
+   * three times shows you the same two villagers. Anchoring on the id means the
+   * cycle continues from where it was however much the list has churned, and
+   * falls back to the front when the anchor has gone.
+   */
   function cycleIdle() {
     const list = idleVillagers();
     if (!list.length) {
@@ -1027,48 +2099,528 @@ export function createHud(scene, world) {
       return;
     }
     list.sort((a, b) => a.id - b.id);
-    state.idleCycle = (state.idleCycle + 1) % list.length;
-    const v = list[state.idleCycle];
+    const at = list.findIndex((u) => u.id === state.idleLast);
+    const v = list[(at + 1) % list.length];
+    state.idleLast = v.id;
     setSelection(world, [v]);
     centerOnGrid(v.x, v.y);
+    if (list.length > 1) {
+      toast(`Idle villager ${((at + 1) % list.length) + 1} of ${list.length}`, 'info');
+    }
   }
 
   // --- Menu sheet -----------------------------------------------------------
 
   function renderMenuSheet() {
     menuSheet.textContent = '';
-    const add = (label, fn) => {
-      const b = el('button', null, label);
+    const add = (label, fn, cls) => {
+      const b = el('button', cls || null, label);
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
+        click();
         fn();
         toggleMenu(false);
       });
       menuSheet.appendChild(b);
+      return b;
     };
+    // First row, above everything, because a player who has opened this menu
+    // looking for help has nowhere else to look. The rules were written on the
+    // boot card and became unreachable the instant the match started — the one
+    // screen in the game that explains the game was behind a collapsed
+    // <details> a player saw once and never again.
+    add('How to play', () => openHelp(), 'menu-help');
     add('Centre on Town Center', () => {
       const tc = ownedBy(world, PLAYER, 'building', 'towncenter')[0];
       if (tc) { centerOnGrid(tc.x, tc.y); setSelection(world, [tc]); }
       else toast('No Town Center left', 'warn');
     });
+    // ownedBy() still returns garrisoned units — they are yours and they still
+    // cost population — but they are not on the map, so selecting them would
+    // put a panel full of units the player cannot see or order in front of them.
     add('Select all villagers', () => {
-      const v = ownedBy(world, PLAYER, 'unit', 'villager');
+      const v = ownedBy(world, PLAYER, 'unit', 'villager').filter((u) => !isGarrisoned(u));
       if (v.length) { setSelection(world, v); toast(`${v.length} villagers`, 'info'); }
       else toast('No villagers', 'warn');
     });
     add('Select all military', () => {
-      const m = ownedBy(world, PLAYER, 'unit').filter(isMilitary);
+      const m = ownedBy(world, PLAYER, 'unit').filter((u) => isMilitary(u) && !isGarrisoned(u));
       if (m.length) { setSelection(world, m); toast(`${m.length} soldiers`, 'info'); }
       else toast('No soldiers yet', 'warn');
     });
     add('Clear selection', () => clearSelection(world));
+    renderSoundControls();
+    renderResign();
+  }
+
+  /**
+   * Resign, last in the sheet and armed before it fires.
+   *
+   * The same arm-then-confirm Demolish uses, for the same reason and with the
+   * same wording, because this is the most destructive button in the game: it
+   * ends the match. It is last rather than first so that a thumb reaching for
+   * "Clear selection" cannot land on it, and it does not close the sheet on the
+   * first tap — the confirm has to be somewhere the player is already looking.
+   */
+  function renderResign() {
+    menuSheet.appendChild(el('div', 'menu-head', 'Match'));
+    const b = el('button', 'menu-resign');
+    const paint = () => {
+      const armed = state.resignArm && performance.now() - state.resignArm < DEMOLISH_ARM_MS;
+      b.textContent = armed ? 'Confirm — resign the match' : 'Resign';
+      b.classList.toggle('armed', !!armed);
+      b.setAttribute('aria-label', armed
+        ? 'Confirm resignation. The match ends now and counts as a defeat.'
+        : 'Resign the match. Asks to confirm.');
+    };
+    paint();
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      click();
+      if (!(state.resignArm && performance.now() - state.resignArm < DEMOLISH_ARM_MS)) {
+        state.resignArm = performance.now();
+        paint();
+        toast('Resign the match? Tap again', 'warn');
+        return;
+      }
+      state.resignArm = 0;
+      toggleMenu(false);
+      if (scene && typeof scene.resign === 'function') scene.resign();
+    });
+    menuSheet.appendChild(b);
+  }
+
+  /**
+   * The rules, in a sheet, cloned from the boot card's list.
+   *
+   * Cloned rather than restated: index.html owns the words, this owns where
+   * they appear, and the day somebody adds a line about walls there is exactly
+   * one place to add it. The boot card is hidden but still in the document
+   * during a match, so the source list is always there to copy.
+   */
+  function openHelp() {
+    helpSheet.textContent = '';
+    const head = el('div', 'menu-head', 'How to play');
+    helpSheet.appendChild(head);
+    const src = doc.getElementById('help-list');
+    if (src) {
+      helpSheet.appendChild(src.cloneNode(true)).removeAttribute('id');
+    } else {
+      helpSheet.appendChild(el('div', 'cmd-note', 'The rules are on the start screen.'));
+    }
+    const close = el('button', 'primary', 'Got it');
+    close.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      click();
+      closeHelp();
+    });
+    helpSheet.appendChild(close);
+    helpSheet.hidden = false;
+    state.helpOpen = true;
+    markCut(helpSheet);
+  }
+
+  function closeHelp() {
+    helpSheet.hidden = true;
+    helpSheet.textContent = '';
+    state.helpOpen = false;
+  }
+
+  // --- Sound ------------------------------------------------------------------
+  //
+  // Mute and two volumes, in the menu sheet, because that is where a player
+  // looks for a setting and because the dock has no room for a fifth button.
+  //
+  // Mute is a full-width toggle with a state word on it, exactly like the
+  // allocation manager's on/off — a control that silences the game has to be
+  // findable in one glance and reversible in one tap. The two sliders sit under
+  // it and are separate on purpose: "the music is too loud" and "the game is too
+  // loud" are different complaints, and a single volume answers neither of them.
+  //
+  // Nothing here has to be persisted by hand. The engine writes mute and all
+  // three volumes to localStorage on every setter (see the preferences note in
+  // src/audio/README.md), so a player who turns the music down finds it down
+  // tomorrow.
+
+  function soundSlider(label, aria, get, set) {
+    const row = el('div', 'sound-row');
+    row.appendChild(el('span', 'who', label));
+    const slider = doc.createElement('input');
+    slider.type = 'range';
+    slider.min = '0';
+    slider.max = '100';
+    slider.step = '5';
+    slider.value = String(Math.round(get() * 100));
+    slider.setAttribute('aria-label', aria);
+    const pct = el('span', 'pct', `${slider.value}%`);
+    slider.addEventListener('input', (ev) => {
+      ev.stopPropagation();
+      const v = Number(slider.value);
+      set(v / 100);
+      slider.style.setProperty('--fill', `${v}%`);
+      pct.textContent = `${v}%`;
+    });
+    // The slider owns its own drag outright, exactly as the job sliders do.
+    for (const t of ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove']) {
+      slider.addEventListener(t, (ev) => ev.stopPropagation());
+    }
+    slider.style.setProperty('--fill', `${slider.value}%`);
+    row.appendChild(slider);
+    row.appendChild(pct);
+    return row;
+  }
+
+  function renderSoundControls() {
+    if (!audio) return;
+    menuSheet.appendChild(el('div', 'menu-head', 'Sound'));
+
+    const mute = el('button', 'alloc-toggle sound-mute');
+    mute.appendChild(el('span', null, 'Sound'));
+    const stateLbl = el('span', 'state');
+    mute.appendChild(stateLbl);
+    const paint = () => {
+      const off = audio.isMuted();
+      stateLbl.textContent = off ? 'MUTED' : 'ON';
+      mute.classList.toggle('on', !off);
+      mute.setAttribute('aria-pressed', off ? 'true' : 'false');
+      mute.setAttribute('aria-label', off ? 'Sound is muted. Tap to unmute.' : 'Sound is on. Tap to mute.');
+    };
+    paint();
+    mute.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const off = audio.toggleMuted();
+      paint();
+      // The click plays *after* the toggle, so unmuting is confirmed by the
+      // sound of the button that unmuted it and muting is confirmed by silence.
+      if (!off) click();
+      toast(off ? 'Sound off' : 'Sound on', 'info');
+    });
+    menuSheet.appendChild(mute);
+
+    menuSheet.appendChild(soundSlider('Effects', 'Sound effects volume',
+      () => audio.getSfxVolume(), (v) => audio.setSfxVolume(v)));
+    menuSheet.appendChild(soundSlider('Music', 'Music volume',
+      () => audio.getMusicVolume(), (v) => audio.setMusicVolume(v)));
   }
 
   function toggleMenu(force) {
     const open = force === undefined ? !state.menuOpen : force;
     state.menuOpen = open;
     menuSheet.hidden = !open;
-    if (open) renderMenuSheet();
+    if (open) {
+      toggleAlloc(false);
+      toggleBuildMenu(false);
+      toggleMarket(false);
+      closeHelp();
+      // A resignation armed in a previous visit to this sheet must not still be
+      // armed when it is opened again — the arm is a promise about the *next*
+      // tap, and reopening the menu is not that tap.
+      state.resignArm = 0;
+      renderMenuSheet();
+      markCut(menuSheet);
+    }
+  }
+
+  // --- Villager allocation manager --------------------------------------------
+  //
+  // The sliders. The algorithm behind them is systems/allocation.js; everything
+  // here is about making four percentages draggable with a thumb and making the
+  // result visible enough to trust.
+  //
+  // Three things earn their space. The on/off is first and full width, because a
+  // system that moves your villagers without being asked has to be one tap from
+  // being stopped. Each row carries a live "4 / 5" beside its percentage — the
+  // number actually working against the number the split asks for — which is the
+  // only way to see the manager working without counting villagers on the map,
+  // and it is what makes the deadband legible rather than looking like a bug
+  // ("it says 4 of 5 and nothing is happening" is answered by the note at the
+  // bottom). And a resource the map can no longer offer is greyed with its share
+  // struck through, so "my stone slider does nothing" has an answer on screen.
+
+  const ALLOC_LABEL = { food: 'Food', wood: 'Wood', gold: 'Gold', stone: 'Stone' };
+
+  function renderAllocSheet() {
+    allocSheet.textContent = '';
+    state.allocSig = '';
+    const rows = [];
+
+    const head = el('div', 'head');
+    head.appendChild(el('span', null, 'Villager jobs'));
+    const tally = el('span', 'tally');
+    head.appendChild(tally);
+    allocSheet.appendChild(head);
+
+    const toggle = el('button', 'alloc-toggle');
+    toggle.appendChild(el('span', null, 'Assign villagers for me'));
+    const stateLbl = el('span', 'state', 'OFF');
+    toggle.appendChild(stateLbl);
+    toggle.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const on = alloc.setAllocationOn(world, PLAYER, !alloc.isAllocationOn(world, PLAYER));
+      toast(on
+        ? 'Villagers will be assigned to match the split'
+        : 'Manual control — villagers stay where they are', 'info');
+      state.allocSig = '';
+      refreshAlloc();
+    });
+    allocSheet.appendChild(toggle);
+
+    for (const res of alloc.ALLOC_ORDER) {
+      const row = el('div', 'alloc-row');
+      row.dataset.res = res;
+      const who = el('span', 'who');
+      who.appendChild(el('i', `ico ico-${res}`));
+      who.appendChild(doc.createTextNode(ALLOC_LABEL[res]));
+      row.appendChild(who);
+
+      const slider = doc.createElement('input');
+      slider.type = 'range';
+      slider.min = '0';
+      slider.max = '100';
+      // Fives, not ones. A thumb cannot resolve one percent on a 150px track,
+      // and nobody has ever wanted 37% of their villagers on gold — snapping to
+      // fives makes every drag land on a number the player meant.
+      slider.step = '5';
+      slider.id = `alloc-${res}`;
+      slider.setAttribute('aria-label', `${ALLOC_LABEL[res]} share of villagers`);
+      slider.addEventListener('input', (ev) => {
+        ev.stopPropagation();
+        alloc.setSplit(world, PLAYER, res, Number(slider.value));
+        state.allocSig = '';
+        refreshAlloc();
+      });
+      // The slider owns its own drag outright; nothing about it may reach the
+      // map underneath (the map's handler is on the canvas, but the pointerup
+      // listener is on window, so stopping propagation here is belt and braces).
+      for (const t of ['pointerdown', 'pointermove', 'pointerup', 'touchstart', 'touchmove']) {
+        slider.addEventListener(t, (ev) => ev.stopPropagation());
+      }
+      row.appendChild(slider);
+
+      const pct = el('span', 'pct');
+      const pctNum = doc.createTextNode('0%');
+      pct.appendChild(pctNum);
+      const count = el('small');
+      pct.appendChild(count);
+      row.appendChild(pct);
+
+      allocSheet.appendChild(row);
+      rows.push({ res, row, slider, pct, pctNum, count });
+    }
+
+    const why = el('div', 'why',
+      'Idle villagers are placed first, then whoever is nearest the work. ' +
+      'A line that is one villager out is left alone — walking someone across ' +
+      'the base costs more than it earns.');
+    allocSheet.appendChild(why);
+
+    const foot = el('div', 'foot');
+    const reset = el('button', null, 'Even split');
+    reset.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      // 25/25/25/25 rather than the opening ratio: "Even" is the one split a
+      // player can predict before tapping it, and the opening ratio is already
+      // where they started.
+      for (const res of alloc.ALLOC_ORDER) alloc.setSplit(world, PLAYER, res, 25);
+      state.allocSig = '';
+      refreshAlloc();
+    });
+    const close = el('button', null, 'Close');
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); toggleAlloc(false); });
+    foot.appendChild(reset);
+    foot.appendChild(close);
+    allocSheet.appendChild(foot);
+
+    state.liveAlloc = { rows, tally, toggle, stateLbl };
+    refreshAlloc();
+  }
+
+  function refreshAlloc() {
+    const live = state.liveAlloc;
+    if (!live || allocSheet.hidden) return;
+    const c = alloc.allocationCounts(world, PLAYER);
+    const sig = `${c.on}|${JSON.stringify(c.split)}|${JSON.stringify(c.assigned)}|` +
+      `${JSON.stringify(c.desired)}|${c.idle}|${c.total}|${c.available.join('')}`;
+    if (sig === state.allocSig) return;
+    state.allocSig = sig;
+
+    live.tally.textContent = c.idle
+      ? `${c.total} villagers · ${c.idle} idle`
+      : `${c.total} villagers`;
+    live.toggle.classList.toggle('on', c.on);
+    live.stateLbl.textContent = c.on ? 'ON' : 'OFF';
+
+    for (const r of live.rows) {
+      const gone = !c.available.includes(r.res);
+      const pctv = c.split[r.res];
+      if (Number(r.slider.value) !== pctv) r.slider.value = String(pctv);
+      r.slider.style.setProperty('--fill', `${pctv}%`);
+      r.pctNum.textContent = `${pctv}%`;
+      r.count.textContent = gone ? 'none left' : `${c.assigned[r.res]} / ${c.desired[r.res]}`;
+      r.pct.classList.toggle('short', !gone && c.assigned[r.res] < c.desired[r.res]);
+      r.row.classList.toggle('gone', gone);
+    }
+  }
+
+  function toggleAlloc(force) {
+    const open = force === undefined ? !state.allocOpen : force;
+    state.allocOpen = open;
+    allocSheet.hidden = !open;
+    if (dom.jobsBtn) dom.jobsBtn.classList.toggle('on', open);
+    if (open) {
+      toggleMenu(false);
+      toggleBuildMenu(false);
+      toggleMarket(false);
+      closeHelp();
+      renderAllocSheet();
+    }
+  }
+
+  // --- The Market -------------------------------------------------------------
+  //
+  // Three rows, one per tradeable resource, each carrying the two numbers that
+  // decide the trade — what a hundred of it costs to buy, and what a hundred of
+  // it fetches to sell — and two large buttons a long way apart.
+  //
+  // THE MIS-TAP PROBLEM. Buy and Sell are opposites with the same shape, sitting
+  // next to each other, operated by a thumb that covers both. Four things keep
+  // them apart, and they are all in service of the same rule: a stray tap must
+  // either do nothing, or do something the player can see they did not mean.
+  //
+  //   * They are on opposite sides of the row with a gap between them wide
+  //     enough that a thumb centred on one cannot reach the other.
+  //   * They are different colours and different words — Buy is the cool one and
+  //     names a *cost*, Sell is the gold one and names a *gain* — and each
+  //     prints its own gold figure, so the button says what it is about to do
+  //     rather than which direction it points.
+  //   * A trade that cannot happen is disabled outright rather than merely
+  //     greyed, so tapping it is a no-op rather than a refusal toast.
+  //   * Every trade that does happen raises a toast naming both sides of it, so
+  //     a mis-tap is legible the instant it lands rather than three minutes
+  //     later when the gold is gone.
+
+  const MARKET_LABEL = { food: 'Food', wood: 'Wood', stone: 'Stone' };
+
+  function renderMarketSheet() {
+    marketSheet.textContent = '';
+    state.marketSig = '';
+    const rows = [];
+
+    const head = el('div', 'head');
+    head.appendChild(el('span', null, 'Market'));
+    const gold = el('span', 'gold');
+    head.appendChild(gold);
+    marketSheet.appendChild(head);
+
+    for (const res of market.TRADED) {
+      const row = el('div', 'market-row');
+      row.dataset.res = res;
+
+      const who = el('span', 'who');
+      who.appendChild(el('i', `ico ico-${res}`));
+      who.appendChild(el('b', null, MARKET_LABEL[res] || res));
+      const stock = el('small', 'stock');
+      who.appendChild(stock);
+      row.appendChild(who);
+
+      // Buy on the left, sell on the right, with the price between them: the
+      // number both buttons are about, in the one place a thumb never covers.
+      const buy = el('button', 'trade buy');
+      buy.type = 'button';
+      buy.appendChild(el('span', 'verb', 'Buy'));
+      const buyCost = el('span', 'gold');
+      buy.appendChild(buyCost);
+      buy.addEventListener('click', (ev) => { ev.stopPropagation(); click(); trade('buy', res); });
+      row.appendChild(buy);
+
+      const mid = el('span', 'lot');
+      mid.appendChild(el('b', null, `${market.TRADE_LOT}`));
+      mid.appendChild(el('small', null, MARKET_LABEL[res] || res));
+      row.appendChild(mid);
+
+      const sell = el('button', 'trade sell');
+      sell.type = 'button';
+      sell.appendChild(el('span', 'verb', 'Sell'));
+      const sellGold = el('span', 'gold');
+      sell.appendChild(sellGold);
+      sell.addEventListener('click', (ev) => { ev.stopPropagation(); click(); trade('sell', res); });
+      row.appendChild(sell);
+
+      marketSheet.appendChild(row);
+      rows.push({ res, row, buy, sell, buyCost, sellGold, stock });
+    }
+
+    marketSheet.appendChild(el('div', 'why',
+      `Selling drops a price by ${market.PRICE_STEP} gold and buying raises it. ` +
+      `A sale pays ${Math.round(market.COMMISSION * 100)}% less than the price — ` +
+      'that commission is the market’s cut, and it is why trading is the ' +
+      'expensive way to get a resource.'));
+
+    const foot = el('div', 'foot');
+    const close = el('button', null, 'Close');
+    close.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMarket(false); });
+    foot.appendChild(close);
+    marketSheet.appendChild(foot);
+
+    state.liveMarket = { rows, gold };
+    refreshMarket();
+  }
+
+  function refreshMarket() {
+    const live = state.liveMarket;
+    if (!live || marketSheet.hidden) return;
+    const opts = market.tradeOptions(world, PLAYER);
+    const purse = Math.floor(world.players[PLAYER].resources.gold || 0);
+    const sig = `${purse}|` + opts.map((o) =>
+      `${o.res}:${o.cost}:${o.value}:${o.have}:${o.canBuy ? 1 : 0}${o.canSell ? 1 : 0}`).join(',');
+    if (sig === state.marketSig) return;
+    state.marketSig = sig;
+
+    live.gold.textContent = `${purse} gold`;
+    for (const r of live.rows) {
+      const o = opts.find((x) => x.res === r.res);
+      if (!o) continue;
+      r.buyCost.textContent = `${o.cost}g`;
+      r.sellGold.textContent = `+${o.value}g`;
+      r.stock.textContent = `${o.have} in store`;
+      r.buy.disabled = !o.canBuy;
+      r.sell.disabled = !o.canSell;
+      r.buy.setAttribute('aria-label',
+        `Buy ${o.lot} ${MARKET_LABEL[o.res]} for ${o.cost} gold.` +
+        (o.buyRefusal ? ` ${o.buyRefusal}.` : ''));
+      r.sell.setAttribute('aria-label',
+        `Sell ${o.lot} ${MARKET_LABEL[o.res]} for ${o.value} gold.` +
+        (o.sellRefusal ? ` ${o.sellRefusal}.` : ''));
+      r.row.classList.toggle('rich', o.have >= market.TRADE_LOT);
+    }
+  }
+
+  function trade(side, res) {
+    const before = market.tradeOptions(world, PLAYER).find((o) => o.res === res);
+    const ok = side === 'buy' ? market.buy(world, PLAYER, res) : market.sell(world, PLAYER, res);
+    if (!ok) return;
+    const name = (MARKET_LABEL[res] || res).toLowerCase();
+    toast(side === 'buy'
+      ? `Bought ${market.TRADE_LOT} ${name} for ${before.cost} gold`
+      : `Sold ${market.TRADE_LOT} ${name} for ${before.value} gold`, 'info');
+    state.marketSig = '';
+    state.resSig = '';
+    refreshMarket();
+  }
+
+  function toggleMarket(force) {
+    const open = force === undefined ? !state.marketOpen : force;
+    state.marketOpen = open;
+    marketSheet.hidden = !open;
+    if (open) {
+      toggleAlloc(false);
+      toggleMenu(false);
+      toggleBuildMenu(false);
+      closeHelp();
+      renderMarketSheet();
+    } else {
+      state.liveMarket = null;
+    }
   }
 
   // --- Gesture-mode chip ----------------------------------------------------
@@ -1083,7 +2635,7 @@ export function createHud(scene, world) {
     modeChip.dataset.sig = sig;
     modeChip.textContent = '';
     modeChip.appendChild(el('span', 'glyph', eff === 'box' ? '⬚' : '✥'));
-    modeChip.appendChild(el('span', 'txt', eff === 'box' ? 'Select' : 'Pan'));
+    modeChip.appendChild(el('span', 'lbl', eff === 'box' ? 'Select' : 'Pan'));
     if (pref === 'auto') modeChip.appendChild(el('span', 'auto', 'AUTO'));
     modeChip.classList.toggle('is-box', eff === 'box');
   }
@@ -1105,7 +2657,7 @@ export function createHud(scene, world) {
     if (p && p.player !== undefined && p.player !== PLAYER) return;
     const miss = p && p.cost ? missingResource(world, PLAYER, p.cost) : null;
     toast(miss ? `Not enough ${RES_LABEL[miss]}` : 'Not enough resources', 'warn');
-    flashRes(miss ? [miss] : ['food', 'wood', 'gold']);
+    flashRes(miss ? [miss] : RES_ORDER);
   }));
 
   off.push(world.events.on(EV.POP_CAPPED, (p) => {
@@ -1127,22 +2679,54 @@ export function createHud(scene, world) {
     // An arm belongs to the buildings that were in hand when it was armed;
     // changing the selection must never carry it over to something else.
     state.demolishArm = null;
-    if (world.selection.size === 0) toggleBuildMenu(false);
+    if (world.selection.size === 0) {
+      toggleBuildMenu(false);
+      toggleMarket(false);
+    }
+  }));
+
+  // An age-up changes the whole build menu (three shelves' worth of locked
+  // buttons become live) as well as the command panel, so it is the one event
+  // that forces both to redraw regardless of what is selected.
+  off.push(world.events.on(EV.AGE_ADVANCE, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
+    state.resSig = '';
+    if (state.buildMenuOpen) renderBuildMenu();
+    flashAge();
+    ageCard(p && p.age !== undefined ? p.age : tech.currentAge(world, PLAYER));
+  }));
+  off.push(world.events.on(EV.RESEARCH_DONE, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
+  }));
+  off.push(world.events.on(EV.RESEARCH_START, (p) => {
+    if (p && p.player !== undefined && p.player !== PLAYER) return;
+    state.cmdSig = '';
   }));
 
   off.push(world.events.on(EV.FOUNDATION, () => { state.cmdSig = ''; }));
   off.push(world.events.on(EV.BUILT, () => { state.cmdSig = ''; }));
   off.push(world.events.on(EV.TRAINED, () => { state.cmdSig = ''; }));
 
+  // A foundation finishing, being cancelled or being destroyed all change the
+  // build queue strip, and none of them changes the selection.
+  off.push(world.events.on(EV.BUILT, () => { state.bqSig = ''; }));
+  off.push(world.events.on(EV.REMOVED, () => { state.bqSig = ''; }));
+
   // Buttons.
-  const onIdle = (ev) => { ev.stopPropagation(); cycleIdle(); };
+  const onIdle = (ev) => { ev.stopPropagation(); click(); cycleIdle(); };
   if (dom.idleBtn) dom.idleBtn.addEventListener('click', onIdle);
 
-  const onMenu = (ev) => { ev.stopPropagation(); toggleMenu(); };
+  const onMenu = (ev) => { ev.stopPropagation(); click(); toggleMenu(); };
   if (dom.menuBtn) dom.menuBtn.addEventListener('click', onMenu);
+
+  const onJobs = (ev) => { ev.stopPropagation(); click(); toggleAlloc(); };
+  if (dom.jobsBtn) dom.jobsBtn.addEventListener('click', onJobs);
 
   const onChip = (ev) => {
     ev.stopPropagation();
+    click();
     if (state.input && state.input.cycleDragPreference) {
       const next = state.input.cycleDragPreference();
       toast(next === 'auto' ? 'Drag: automatic' : next === 'box' ? 'Drag: box-select' : 'Drag: pan camera', 'info');
@@ -1171,6 +2755,7 @@ export function createHud(scene, world) {
     ev.preventDefault();
     ev.stopPropagation();
     miniDragging = true;
+    click();
     if (dom.minimap.setPointerCapture) {
       try { dom.minimap.setPointerCapture(ev.pointerId); } catch (_) { /* fine */ }
     }
@@ -1193,10 +2778,14 @@ export function createHud(scene, world) {
   // Tapping the map (never the HUD) closes any transient sheet.
   const gameRoot = doc.getElementById('game-root');
   const onDocDown = (ev) => {
-    if (menuSheet.hidden && buildMenu.hidden) return;
+    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden && marketSheet.hidden
+      && helpSheet.hidden) return;
     if (!gameRoot || !gameRoot.contains(ev.target)) return;
     toggleMenu(false);
     toggleBuildMenu(false);
+    toggleAlloc(false);
+    toggleMarket(false);
+    closeHelp();
   };
   document.addEventListener('pointerdown', onDocDown, true);
 
@@ -1205,10 +2794,12 @@ export function createHud(scene, world) {
   function update(dt) {
     if (state.destroyed) return;
     const now = performance.now();
+    const _tDom = perfBegin('hud.dom');
 
     updateResources();
     updateIdle();
     tickToasts(now);
+    tickCoach();
 
     // A demolish arm that was never confirmed lapses back to safe on its own.
     if (state.demolishArm && now - state.demolishArm.at > DEMOLISH_ARM_MS) {
@@ -1231,19 +2822,68 @@ export function createHud(scene, world) {
       state.cmdSig = csig;
       renderCommands();
       if (state.buildMenuOpen) renderBuildMenu();
+      // The panels just changed shape, which is the only moment their "there is
+      // more below" state can change without somebody scrolling.
+      markAllCut();
     } else {
       refreshQueue();
+      refreshResearchQueue();
     }
     refreshAffordability();
+    refreshBuildQueue();
+    refreshAlloc();
+    refreshMarket();
 
     renderModeChip();
+    perfEnd('hud.dom', _tDom);
 
     state.minimapAcc += dt;
     if (minimap && state.minimapAcc >= 1 / MINIMAP_HZ) {
       state.minimapAcc = 0;
+      const _t = perfBegin('hud.minimap');
       minimap.draw(camera());
+      perfEnd('hud.minimap', _t);
     }
   }
+
+  // --- Scroll fades -----------------------------------------------------------
+  //
+  // Three panels in this HUD scroll — the command panel, the build menu and the
+  // menu sheet — and none of them said so. Measured on a Barracks with the
+  // blacksmith line available, the command panel held 479px of buttons in
+  // 336px of box: the bottom row was cut off mid-button with no scrollbar (iOS
+  // does not paint one until you touch it), no fade and no gradient, so it read
+  // as a panel that had been clipped rather than one that had more in it. A
+  // player who never scrolls never finds Fletching.
+  //
+  // The fade is a sticky pseudo-element (see .is-cut in hud.css) and it is
+  // toggled rather than always on, because a permanent gradient over the last
+  // row would dim the bottom button of a panel that is *already* fully shown —
+  // which is most panels, most of the time. The measurement it needs
+  // (scrollHeight against clientHeight) forces layout, so it is taken when the
+  // panel is rebuilt and when it is scrolled, never per frame.
+  const SCROLLERS = [];
+
+  function watchScroller(node) {
+    if (!node) return;
+    SCROLLERS.push(node);
+    node.addEventListener('scroll', () => markCut(node), { passive: true });
+  }
+
+  function markCut(node) {
+    if (!node) return;
+    const cut = node.scrollHeight - node.scrollTop - node.clientHeight > 4;
+    node.classList.toggle('is-cut', cut);
+  }
+
+  function markAllCut() {
+    for (const n of SCROLLERS) markCut(n);
+  }
+
+  watchScroller(dom.cmdPanel);
+  watchScroller(buildMenu);
+  watchScroller(menuSheet);
+  watchScroller(helpSheet);
 
   function commandSignature() {
     const sel = selectedEntities(world);
@@ -1255,24 +2895,47 @@ export function createHud(scene, world) {
       if (e.player !== PLAYER) { types.add(`x${e.kind}`); continue; }
       types.add(`${e.kind}:${e.type}:${e.complete === false ? 'f' : 'c'}`);
       n++;
+      // Stance and formation decide which segment is lit, and both change
+      // without the selection changing — a unit dropped to No Attack by an
+      // order, a group whose formation was just set. Cheap: two string reads
+      // per selected unit, and the panel only re-renders when they differ.
+      if (e.kind === 'unit') q += `|${stanceOf(e)}${e.formation || ''}`;
       // The rally is in here so the note that names what it will do refreshes
       // the moment the player moves it.
       if (e.kind === 'building') {
         q += `|${e.id}:${(e.queue || []).length}`;
+        // The research queue length is in here for the same reason the training
+        // queue is: starting or cancelling one changes which buttons the panel
+        // must draw, and there is no event for "the queue got shorter".
+        q += `r${(e.research || []).length}`;
         q += e.rally ? `@${e.rally.x.toFixed(1)},${e.rally.y.toFixed(1)}` : '@-';
+        // The Ungarrison button appears and disappears with the garrison.
+        q += `g${garrisonCount(e)}`;
       }
     }
-    return `${n}/${Array.from(types).sort().join(',')}${q}` +
+    // The age and the number of finished techs both change what the research
+    // buttons say (locked -> ready, ready -> researched), and both change
+    // without the selection changing.
+    const t = `+a${tech.currentAge(world, PLAYER)}` +
+      `t${tech.researchedTechs(world, PLAYER).length}`;
+    return `${n}/${Array.from(types).sort().join(',')}${q}${t}` +
       `${state.attackArmed ? '+am' : ''}${state.demolishArm ? '+dm' : ''}`;
   }
 
   function destroy() {
     state.destroyed = true;
     if (sizeObserver) sizeObserver.disconnect();
+    if (topObserver) topObserver.disconnect();
     root.style.removeProperty('--hud-h');
+    root.style.removeProperty('--topbar-h');
+    root.style.removeProperty('--placebar-h');
+    root.classList.remove('placing');
+    if (dom.toasts) dom.toasts.classList.remove('wide');
+    doc.documentElement.style.removeProperty('--topbar-h');
     for (const fn of off) { try { fn(); } catch (_) { /* already gone */ } }
     if (dom.idleBtn) dom.idleBtn.removeEventListener('click', onIdle);
     if (dom.menuBtn) dom.menuBtn.removeEventListener('click', onMenu);
+    if (dom.jobsBtn) dom.jobsBtn.removeEventListener('click', onJobs);
     modeChip.removeEventListener('click', onChip);
     if (dom.minimap) {
       dom.minimap.removeEventListener('pointerdown', onMiniDown);
@@ -1282,9 +2945,13 @@ export function createHud(scene, world) {
     }
     document.removeEventListener('pointerdown', onDocDown, true);
     if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
-    for (const n of [modeChip, buildMenu, placeBar, attackBar, menuSheet]) n.remove();
+    for (const n of [modeChip, idleBtn, jobsBtn, menuBtn,
+      buildMenu, allocSheet, marketSheet, placeBar, attackBar, menuSheet,
+      helpSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
+    if (dom.jobNote) { dom.jobNote.textContent = ''; dom.jobNote.hidden = true; }
+    if (dom.buildQueue) { dom.buildQueue.textContent = ''; dom.buildQueue.hidden = true; }
     for (const rec of state.toasts.slice()) rec.node.remove();
     state.toasts.length = 0;
   }
@@ -1300,9 +2967,19 @@ export function createHud(scene, world) {
     isAttackArmed,
     isDemolishArmed: () => !!state.demolishArm &&
       performance.now() - state.demolishArm.at <= DEMOLISH_ARM_MS,
+    // The input layer reports every foundation it lands so the placement bar's
+    // count and the queue strip stay honest without polling.
+    onFoundationPlaced,
+    placedThisArm: () => state.placedThisArm,
+    toggleAlloc,
+    toggleMenu,
+    toggleMarket,
     cycleIdle,
     flashRes,
     underAttackAlert,
+    // The age-up card, for tests/touchui.browser.mjs's layout sweep: it is the
+    // only full-width thing the toast stack ever holds and it must be measured.
+    _ageCard: ageCard,
     alertCount: () => state.alerts,
     attachInput(input) { state.input = input; modeChip.dataset.sig = ''; },
     _dom: dom,
@@ -1311,9 +2988,12 @@ export function createHud(scene, world) {
 
   // First paint.
   updateResources();
+  updateIdle();
   renderSelection();
   renderCommands();
+  refreshBuildQueue();
   renderModeChip();
+  markAllCut();
   if (minimap) minimap.draw(camera());
 
   return api;

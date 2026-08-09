@@ -7,10 +7,20 @@
 import {
   MAP_W, MAP_H, TERRAIN, RES, STARTING_RESOURCES, MAX_POP_CAP,
   UNIT_STATS, BUILDING_STATS, NODE_AMOUNT, PLAYER, ENEMY,
+  isWallType, isGateType,
 } from './constants.js';
 import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
 import { dist2 } from './iso.js';
+import { createVision } from '../systems/vision.js';
+
+// Side of one spatial bucket, in tiles. Four is what forEachNear's typical
+// query radius (1-5 tiles) wants: small enough that a lookup touches a handful
+// of cells, large enough that the bucket array stays small. It scales with the
+// map rather than being a fixed grid — see createWorld.
+const BUCKET_SIZE = 4;
+// Side of one bucket in the units-only index. See _unitBuckets below.
+const UNIT_BUCKET_SIZE = 2;
 
 export function createWorld(seed = 12345) {
   const rng = makeRng(seed);
@@ -32,10 +42,14 @@ export function createWorld(seed = 12345) {
     width: MAP_W,
     height: MAP_H,
     terrain: new Uint8Array(MAP_W * MAP_H),
-    // 0 = walkable, 1 = blocked by a static object, 2 = blocked by terrain
+    // See BLOCK_* below: 0 walkable, 1 static object, 2 terrain, 3 closed gate.
     blocked: new Uint8Array(MAP_W * MAP_H),
     // Entity id occupying each tile (0 = none). Lets units find what blocks them.
     occupant: new Int32Array(MAP_W * MAP_H),
+    // Who owns the gate on each tile, as playerId + 1 (0 = no gate here). This
+    // is the whole of the per-player passability model — see the note on
+    // BLOCK_GATE below and isWalkable() in systems/pathfinding.js.
+    gateOwner: new Uint8Array(MAP_W * MAP_H),
 
     entities: new Map(),
     units: [],       // live unit entities (dense array, rebuilt on removal)
@@ -50,14 +64,46 @@ export function createWorld(seed = 12345) {
     // { x, y, tx, ty, target, damage, owner, speed, elapsed, duration }
     projectiles: [],
 
-    // Spatial buckets for proximity queries, rebuilt each sim step.
-    _cellSize: 4,
-    _cols: Math.ceil(MAP_W / 4),
-    _rows: Math.ceil(MAP_H / 4),
+    // Spatial buckets for proximity queries, rebuilt each sim step. The grid is
+    // derived from the map size rather than written out, so a 96x96 map gets
+    // 24x24 buckets instead of silently reusing a 12x12 grid sized for 48x48 and
+    // putting sixteen tiles of entities in every cell.
+    _cellSize: BUCKET_SIZE,
+    _cols: Math.ceil(MAP_W / BUCKET_SIZE),
+    _rows: Math.ceil(MAP_H / BUCKET_SIZE),
     _buckets: null,
+    // A second index holding units only, on a finer grid.
+    //
+    // Separation steering asks "which units are within a tile of me" once per
+    // unit per step — 200 queries at 20Hz — and it is the hottest loop in the
+    // simulation by measurement. Two things made it expensive against the mixed
+    // index. It walked the ~1700 trees and the buildings sharing those cells and
+    // rejected them one at a time; and the cells are four tiles across, sized
+    // for forEachNear's one-to-five-tile queries, so a one-tile question dragged
+    // in a twelve-by-twelve tile neighbourhood — which in a melee is a hundred
+    // and fifty units to reject for every one that qualifies.
+    //
+    // Two-tile cells make the same query a two-by-two sweep of four tiles each.
+    // The cost is 2304 empty arrays to clear per step instead of 576, which is a
+    // length assignment apiece and does not register.
+    _unitCell: UNIT_BUCKET_SIZE,
+    _unitCols: Math.ceil(MAP_W / UNIT_BUCKET_SIZE),
+    _unitRows: Math.ceil(MAP_H / UNIT_BUCKET_SIZE),
+    _unitBuckets: null,
   };
 
   world._buckets = Array.from({ length: world._cols * world._rows }, () => []);
+  world._unitBuckets = Array.from(
+    { length: world._unitCols * world._unitRows }, () => [],
+  );
+
+  // Fog of war. Built here rather than in the scene so that every world — the
+  // real one and every headless test world — carries the same masks, and so
+  // that the memory of static objects can subscribe to EV.REMOVED before
+  // anything has had a chance to die. It costs nothing until the game loop
+  // starts calling world.vision.update(): see systems/vision.js.
+  world.vision = createVision(world);
+
   return world;
 }
 
@@ -74,6 +120,48 @@ function makePlayer(id) {
     defeated: false,
   };
 }
+
+// --- The block grid ---------------------------------------------------------
+//
+// `world.blocked` is one byte per tile and every system reads it directly — A*'s
+// inner loop, the line-of-sight sampler, the flood fills. It is the hottest data
+// structure in the game, so what it can say has to stay cheap to ask.
+//
+//   0 BLOCK_FREE     nothing here
+//   1 BLOCK_SOLID    a building, a resource node
+//   2 BLOCK_TERRAIN  water
+//   3 BLOCK_GATE     a closed gate belonging to world.gateOwner[i] - 1
+//
+// GATES AND PER-PLAYER PASSABILITY. A gate is walkable by its owner and solid
+// to everyone else, which the old grid — one global byte, no notion of who is
+// asking — could not express. Three approaches were on the table:
+//
+//   * a Map from tile to owner, consulted per walkability test. Rejected
+//     outright: isWalkable is called five times per line-of-sight *sample*, and
+//     a hash lookup on that path is not affordable.
+//   * one blocked grid per player, so the reader picks an array and the inner
+//     loop is unchanged. Correct and fast, but every setBlocked then writes N
+//     arrays and the two grids can drift apart, which is a bug class nobody
+//     would ever see coming.
+//   * this one: keep the single grid, spend a *distinct value* on the case, and
+//     put the owner in a parallel byte array read only when that value appears.
+//
+// The third wins on the only measurement that matters. A free tile costs the
+// same single compare it always did (`blocked[i] !== 0` short-circuits), a
+// blocked tile costs one more compare, and only an actual gate tile — of which
+// there are a handful on a 9216-tile map — reaches the gateOwner read. No
+// allocation, no lookup, no second grid to keep honest.
+//
+// Callers that know who is walking pass the player through (`opts.player` on
+// findPath, a trailing argument on isWalkable); callers that do not get the safe
+// answer, which is that a gate is a wall. Safe, because the worst case is a unit
+// walking the long way round its own gate, whereas the other default would let
+// an enemy stroll through it. See HANDOFF-walls.md for the call sites that
+// should start passing a player.
+export const BLOCK_FREE = 0;
+export const BLOCK_SOLID = 1;
+export const BLOCK_TERRAIN = 2;
+export const BLOCK_GATE = 3;
 
 // --- Tile helpers -----------------------------------------------------------
 
@@ -118,10 +206,114 @@ export function footprintTiles(gx, gy, fw, fh) {
 export function canPlace(world, gx, gy, fw, fh) {
   for (const [tx, ty] of footprintTiles(gx, gy, fw, fh)) {
     if (!inBounds(world, tx, ty)) return false;
-    if (world.blocked[ty * world.width + tx] !== 0) return false;
-    if (world.terrain[ty * world.width + tx] === TERRAIN.WATER) return false;
+    const i = ty * world.width + tx;
+    if (world.blocked[i] !== 0) return false;
+    // An *open* gate reads as free ground in the block grid — that is the whole
+    // trick that lets its owner walk through it — so the occupancy test is what
+    // stops a player dropping a house on top of their own open gate. Every other
+    // occupied tile is already blocked, so this costs one array read and only
+    // ever changes the answer for gates.
+    if (world.occupant[i] !== 0) return false;
+    if (world.terrain[i] === TERRAIN.WATER) return false;
   }
   return true;
+}
+
+// --- Walls ------------------------------------------------------------------
+//
+// A wall segment is a 1x1 building whose *sprite* depends on its neighbours: a
+// lone post, a straight run along either grid axis, one of four corners, one of
+// four tees, or a cross. That is sixteen cases, and they are addressed by a
+// four-bit mask of which axis neighbours are also walls — which is exactly the
+// shape of the question, so there is no lookup table and no special-casing.
+//
+// Bit order is the same one the terrain edge-blends use (see gfx/textures.js):
+// 0 = north (-y), 1 = east (+x), 2 = south (+y), 3 = west (-x). Keep it, or a
+// wall and the ground under it will disagree about which way north is.
+export const WALL_N = 1;
+export const WALL_E = 2;
+export const WALL_S = 4;
+export const WALL_W = 8;
+
+/** Does the wall at (tx,ty) owned by `player` join up with a piece here? */
+function wallNeighbour(world, tx, ty, player) {
+  if (!inBounds(world, tx, ty)) return false;
+  const id = world.occupant[ty * world.width + tx];
+  if (!id) return false;
+  const e = world.entities.get(id);
+  // Foundations count. A run that only joins up once the last segment is
+  // finished spends the whole build looking like a row of loose posts, which is
+  // precisely the reading this system exists to prevent.
+  return !!(e && !e.dead && e.kind === 'building' && e.player === player && isWallType(e.type));
+}
+
+/**
+ * The neighbour mask for a wall at (tx,ty) belonging to `player`.
+ *
+ * `extra` is an optional Set of "tx,ty" keys to treat as walls that are not
+ * there yet — the drag-to-draw preview passes the run it is about to place, so
+ * the ghost joins up exactly the way the finished wall will.
+ */
+export function wallMaskAt(world, tx, ty, player, extra = null) {
+  const at = (x, y) =>
+    (extra && extra.has(`${x},${y}`)) || wallNeighbour(world, x, y, player);
+  let m = 0;
+  if (at(tx, ty - 1)) m |= WALL_N;
+  if (at(tx + 1, ty)) m |= WALL_E;
+  if (at(tx, ty + 1)) m |= WALL_S;
+  if (at(tx - 1, ty)) m |= WALL_W;
+  return m;
+}
+
+/** Recompute one wall's own mask. Cheap: four tile reads. */
+export function refreshWallMask(world, b) {
+  if (!b || b.dead || !isWallType(b.type)) return;
+  const tx = Math.floor(b.x);
+  const ty = Math.floor(b.y);
+  b.wallMask = wallMaskAt(world, tx, ty, b.player);
+}
+
+/**
+ * Recompute the masks of the four walls around a tile, and of the wall on it.
+ * Called whenever a wall piece appears or disappears — which is the only time
+ * any of these answers can change, so nothing recomputes per frame.
+ */
+export function refreshWallsAround(world, tx, ty) {
+  const spots = [[tx, ty], [tx, ty - 1], [tx + 1, ty], [tx, ty + 1], [tx - 1, ty]];
+  for (const [x, y] of spots) {
+    if (!inBounds(world, x, y)) continue;
+    const id = world.occupant[y * world.width + x];
+    if (!id) continue;
+    const e = world.entities.get(id);
+    if (e && !e.dead && e.kind === 'building' && isWallType(e.type)) refreshWallMask(world, e);
+  }
+}
+
+/**
+ * Open or shut a completed gate.
+ *
+ * Open is BLOCK_FREE, which is what lets the owner's units walk through it under
+ * today's pathfinding calls, none of which say who is asking. Shut is BLOCK_GATE
+ * plus the owner in `gateOwner`, which the player-aware calls read. The occupant
+ * is left alone in both states so the gate stays tappable, targetable and
+ * findable while it is standing open.
+ */
+export function setGateOpen(world, b, open) {
+  if (!b || b.dead || !isGateType(b.type)) return;
+  const tx = Math.floor(b.x);
+  const ty = Math.floor(b.y);
+  if (!inBounds(world, tx, ty)) return;
+  const i = ty * world.width + tx;
+  b.gateOpen = !!open;
+  if (!b.complete) {
+    // A gate under construction is a building site: solid to everybody,
+    // including the villager who is standing next to it hammering.
+    world.blocked[i] = BLOCK_SOLID;
+    world.gateOwner[i] = 0;
+    return;
+  }
+  world.gateOwner[i] = b.player + 1;
+  world.blocked[i] = open ? BLOCK_FREE : BLOCK_GATE;
 }
 
 // --- Entity creation --------------------------------------------------------
@@ -214,17 +406,66 @@ export function spawnBuilding(world, type, player, gx, gy, { complete = true } =
     rally: null,
     state: complete ? 'idle' : 'foundation',
     dead: false,
+
+    // --- State a defensive building mutates -----------------------------------
+    // The *numbers* a Castle or a Watch Tower shoots with (attack, attackRange,
+    // attackCooldown, garrisonCapacity) stay in BUILDING_STATS and are read from
+    // there by systems/combat.js, which owns both the volley and the garrison.
+    // What is stamped here is only the mutable state those systems tick, so that
+    // every building carries it from birth and no loop has to guard for
+    // undefined: the swing timer, the swing pose, and the array of bodies
+    // sheltering inside.
+    cooldown: 0,
+    attackAnim: 0,
+    garrison: [],
+
+    // Wall pieces: which neighbours to draw a join to, and whether a gate is
+    // standing open. Filled in below for the pieces that have them.
+    wallMask: 0,
+    gateOpen: false,
   };
 
   for (const [tx, ty] of e.tiles) setBlocked(world, tx, ty, 1, e.id);
   register(world, e);
+  if (isWallType(type)) {
+    refreshWallsAround(world, Math.floor(e.x), Math.floor(e.y));
+    if (isGateType(type)) setGateOpen(world, e, false);
+  }
   if (complete) applyPopBonus(world, player);
   return e;
 }
 
+/**
+ * Everything that has to happen the instant a building finishes.
+ *
+ * economy.js calls this from buildTick. It lives here because both of the things
+ * it does are facts about the tile grid, which is this module's to own: a gate
+ * only becomes passable when it is a gate rather than a building site, and a
+ * finished wall joins up with what is already standing.
+ */
+export function onBuildingComplete(world, b) {
+  if (!b || b.dead || b.kind !== 'building') return b;
+  if (isWallType(b.type)) {
+    refreshWallsAround(world, Math.floor(b.x), Math.floor(b.y));
+    if (isGateType(b.type)) setGateOpen(world, b, false);
+  }
+  return b;
+}
+
+// What a node type actually pays out. Kept as a table rather than a chain of
+// ternaries: with four resources the chain quietly turned every unrecognised
+// node into gold, which is exactly the kind of bug that only shows up as "why
+// is my stone mine giving me coins".
+const NODE_RESOURCE = {
+  tree: RES.WOOD,
+  berry: RES.FOOD,
+  gold: RES.GOLD,
+  stone: RES.STONE,
+};
+
 export function spawnResource(world, type, gx, gy) {
-  const resourceType =
-    type === 'tree' ? RES.WOOD : type === 'berry' ? RES.FOOD : RES.GOLD;
+  const resourceType = NODE_RESOURCE[type];
+  if (!resourceType) throw new Error(`unknown resource node type: ${type}`);
   const tx = Math.floor(gx);
   const ty = Math.floor(gy);
   const e = {
@@ -259,7 +500,11 @@ export function removeEntity(world, e) {
   } else if (e.kind === 'building') {
     const i = world.buildings.indexOf(e);
     if (i >= 0) world.buildings.splice(i, 1);
-    for (const [tx, ty] of e.tiles) setBlocked(world, tx, ty, 0);
+    for (const [tx, ty] of e.tiles) {
+      setBlocked(world, tx, ty, 0);
+      if (inBounds(world, tx, ty)) world.gateOwner[ty * world.width + tx] = 0;
+    }
+    if (isWallType(e.type)) refreshWallsAround(world, Math.floor(e.x), Math.floor(e.y));
   } else if (e.kind === 'resource') {
     const i = world.resources.indexOf(e);
     if (i >= 0) world.resources.splice(i, 1);
@@ -315,16 +560,58 @@ export function recomputePop(world, playerId) {
 
 /** Rebuild the spatial buckets. Called once per sim step by the game loop. */
 export function reindex(world) {
-  for (const b of world._buckets) b.length = 0;
+  const buckets = world._buckets;
+  const unitBuckets = world._unitBuckets;
+  for (let i = 0; i < buckets.length; i++) buckets[i].length = 0;
+  for (let i = 0; i < unitBuckets.length; i++) unitBuckets[i].length = 0;
   const cs = world._cellSize;
-  const push = (e) => {
-    const cx = Math.min(world._cols - 1, Math.max(0, Math.floor(e.x / cs)));
-    const cy = Math.min(world._rows - 1, Math.max(0, Math.floor(e.y / cs)));
-    world._buckets[cy * world._cols + cx].push(e);
+  const cols = world._cols;
+  const maxX = cols - 1;
+  const maxY = world._rows - 1;
+  const cell = (e) => {
+    let cx = Math.floor(e.x / cs);
+    let cy = Math.floor(e.y / cs);
+    if (cx < 0) cx = 0; else if (cx > maxX) cx = maxX;
+    if (cy < 0) cy = 0; else if (cy > maxY) cy = maxY;
+    return cy * cols + cx;
   };
-  for (const e of world.units) push(e);
-  for (const e of world.buildings) push(e);
-  for (const e of world.resources) push(e);
+  const ucs = world._unitCell;
+  const ucols = world._unitCols;
+  const umaxX = ucols - 1;
+  const umaxY = world._unitRows - 1;
+  const units = world.units;
+  for (let i = 0; i < units.length; i++) {
+    const u = units[i];
+    buckets[cell(u)].push(u);
+    let cx = Math.floor(u.x / ucs);
+    let cy = Math.floor(u.y / ucs);
+    if (cx < 0) cx = 0; else if (cx > umaxX) cx = umaxX;
+    if (cy < 0) cy = 0; else if (cy > umaxY) cy = umaxY;
+    unitBuckets[cy * ucols + cx].push(u);
+  }
+  const blds = world.buildings;
+  for (let i = 0; i < blds.length; i++) buckets[cell(blds[i])].push(blds[i]);
+  const res = world.resources;
+  for (let i = 0; i < res.length; i++) buckets[cell(res[i])].push(res[i]);
+}
+
+/**
+ * Copy the live unit list into a caller-owned array.
+ *
+ * Both updateUnits and updateCombat have to iterate a snapshot rather than the
+ * live array, because a kill or a garrison splices an entry out from under the
+ * loop. They took `world.units.slice()` for it, which is a fresh two-hundred
+ * element array twice per step — forty of them a second, purely so that a loop
+ * could have a stable view of a list it already owns. Handing in a scratch
+ * array the caller keeps costs nothing and makes the steady state allocate
+ * nothing at all.
+ */
+export function snapshotUnits(world, out) {
+  const src = world.units;
+  const n = src.length;
+  for (let i = 0; i < n; i++) out[i] = src[i];
+  out.length = n;
+  return out;
 }
 
 /**

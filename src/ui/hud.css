@@ -110,7 +110,11 @@ body {
 }
 .hud button[disabled]:active, .hud button.off:active { transform: none; filter: grayscale(0.7); }
 
-/* --- Top row: resources + menu --------------------------------------------- */
+/* --- Top row: the standing numbers ------------------------------------------
+   Read-only. Nothing here is tappable any more — see the note in index.html —
+   which is what finally settles the old fight between the resource bar and the
+   menu button for the last 40px of a 390px row. There is no button to push off
+   the screen, so the bar may take the whole width and wrap as it pleases. */
 
 .hud-top {
   position: absolute;
@@ -124,12 +128,33 @@ body {
   pointer-events: auto;
 }
 
+/* Six things live in this bar now — four resources, the population and the age.
+   At 390px that is more than fits once the stockpiles reach four digits: the
+   six measure ~384px against 326 of row. Two things answer it, in this order.
+   First the padding, gaps and pip size below, trimmed to buy back ~55px, which
+   is enough for everything up to four-digit food and wood on one line — the
+   state a match is in for most of its length. Then, for the late-game bank that
+   still does not fit, the bar WRAPS rather than clipping: the old behaviour
+   shoved the last counter out under the menu button where it could not be read,
+   and the last counter is now the age. The toasts move down to match, because
+   the HUD measures this bar into --topbar-h. The alternative — shrinking the
+   numbers to 11px so it never wraps — trades a rare second line for a
+   permanently harder-to-read counter, which is the wrong way round. */
 .res-bar {
   pointer-events: auto;
   display: flex;
-  gap: 2px;
-  flex: 0 1 auto;
-  padding: 4px 6px;
+  flex-wrap: wrap;
+  gap: 0;
+  /* 1 1 auto, not 0 1 auto: it is the only thing in the row now, so it takes the
+     row. Wrapping is the overflow behaviour and `overflow: hidden` is the
+     backstop for the pathological case (four five-digit stockpiles and a
+     three-digit population), so nothing inside can ever paint past the edge of
+     the screen however wide the numbers get. */
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 4px 5px;
   min-height: 34px;
   align-items: center;
   background: var(--panel);
@@ -141,8 +166,9 @@ body {
 .res {
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 2px 6px;
+  gap: 3px;
+  padding: 2px 2px;
+  flex: 0 0 auto;
   font-variant-numeric: tabular-nums;
   font-weight: 700;
   font-size: 13px;
@@ -151,6 +177,11 @@ body {
   transition: background-color 140ms linear, color 140ms linear;
 }
 .res span { min-width: 1.6em; }
+/* One pixel smaller than everywhere else the pips are used. It is not a style
+   choice: five of them sit in a row that is 14px short of fitting a late-game
+   stockpile, and 5px of icon is 5px the numbers do not have to give up. The
+   numbers stay at 13px, because they are the thing being read. */
+.res .ico { width: 12px; height: 12px; }
 
 .res.flash {
   background: var(--danger);
@@ -175,14 +206,44 @@ body {
 .ico-food { border-radius: 50%; background: radial-gradient(circle at 34% 30%, #ff9a8a, #9e2318); }
 .ico-wood { border-radius: 2px; background: linear-gradient(90deg, #6a3f1d, #b07c42 45%, #5d3717); }
 .ico-gold { border-radius: 50%; background: radial-gradient(circle at 34% 28%, #ffeaa0, #bd8c17); }
+/* Stone sits directly beside gold in the bar, so it has to differ in two ways at
+   once or a glance reads them as the same pip: cool slate against gold's warm
+   yellow, and a squared-off block with a chipped corner against gold's circle.
+   The clip-path is what carries it at 13px, where the hue difference alone
+   washes out on a phone in daylight. */
+.ico-stone {
+  border-radius: 2px;
+  background: linear-gradient(150deg, #b7c2ce 8%, #7b8896 52%, #4e5865);
+  clip-path: polygon(0 22%, 26% 0, 100% 0, 100% 78%, 74% 100%, 0 100%);
+}
 .ico-pop  { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #e2d4b4 45%, #8d7f63 46%); }
 .ico-vill { border-radius: 50% 50% 40% 40%; background: linear-gradient(180deg, #9fd0ff 45%, var(--team-you) 46%); }
+/* The age. Deliberately the one entry in this bar with no pip: it is not a
+   quantity, and giving it a little coloured icon like the others would file it
+   as a sixth counter — which is exactly what a glance must not read. What sets
+   it apart instead is a hairline rule, its own colour, and the fact that it
+   says a word. Dropping the pip also bought the 16px that keeps the whole row
+   on one line at ordinary stockpile sizes, which is the difference between the
+   bar wrapping most of a match and wrapping almost never. It brightens with
+   each age so the Castle Age looks like an achievement. */
+.res.age {
+  font-variant-numeric: normal;
+  letter-spacing: 0.2px;
+  font-size: 12px;
+  border-left: 1px solid var(--edge-soft);
+  margin-left: 3px;
+  padding-left: 6px;
+  color: var(--parch-dim);
+}
+.res.age span { min-width: 0; }
+.res.age[data-age="1"] { color: var(--parch); }
+.res.age[data-age="2"] { color: var(--gold); }
+.res.age[data-age="2"] .ico-age { box-shadow: 0 0 6px rgba(217, 171, 79, 0.7); }
 
 .icon-btn {
   min-width: var(--tap);
   min-height: var(--tap);
   flex: none;
-  margin-left: auto;
   font-size: 18px;
   display: inline-flex;
   align-items: center;
@@ -191,12 +252,101 @@ body {
 }
 .icon-btn.wide { padding: 0 12px; }
 
+/* --- The thumb stack --------------------------------------------------------
+   Everything between the map and the bottom bar, in one bottom-anchored flex
+   column: transient sheets, the build queue strip, the minimap, and the dock.
+
+   WHY IT IS DOWN HERE AT ALL. Measured from a right-thumb pivot at (330, 800)
+   on a 390x844 phone, the old top-right minimap centre was 690px away and the
+   old top-right menu button 774px — both roughly twice a comfortable reach, on
+   a 96x96 map where every camera jump goes through the minimap and where the
+   menu is the only door to "centre on Town Center". Those are the two most-used
+   navigation controls in the game and they were in the one corner a one-handed
+   player has to re-grip to touch. Down here the minimap centre is ~180px from
+   the same pivot and every dock button is under 120px.
+
+   A column rather than four absolutely positioned boxes because they have to
+   give way to each other: a build queue that appears pushes the minimap up
+   rather than landing on top of it, and the whole stack rides on --hud-h, which
+   the HUD measures off the bottom bar. */
+
+.hud-stack {
+  position: absolute;
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 6px);
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  /* The column itself is a layout device and must never eat a tap meant for the
+     map; each child opts back in. */
+  pointer-events: none;
+}
+.hud-stack > * { pointer-events: auto; }
+.hud-sheets:empty { display: none; }
+
+/* --- Dock -------------------------------------------------------------------
+   The four things a thumb reaches for without looking: what a drag does, idle
+   villagers, the allocation manager, and the menu. One row, four equal targets
+   ~90px wide and 50px tall on a 390px phone — every one of them far above the
+   44px floor, because these are the controls pressed while something else is
+   happening on screen. */
+
+.hud-dock {
+  display: flex;
+  gap: 5px;
+  align-items: stretch;
+}
+
+.dock-btn {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 50px;
+  padding: 3px 4px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  line-height: 1.1;
+}
+.dock-btn .glyph { font-size: 16px; line-height: 1; }
+.dock-btn .lbl {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+  color: var(--parch-dim);
+}
+.dock-btn.on .lbl, .dock-btn.on .glyph { color: var(--gold); }
+.dock-btn.on { border-color: var(--gold); }
+
+/* The idle-villager button. It never disappears — a control that vanishes and
+   reappears under the thumb is worse than one that dims, because the button
+   beside it moves and the next tap lands on the wrong thing. At zero it goes
+   quiet: no pulse, no gold, and it says so. */
+.dock-btn.idle .count {
+  font-size: 15px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+  color: var(--gold);
+}
+.dock-btn.idle { border-color: var(--gold-dim); animation: idlepulse 1.8s ease-in-out infinite; }
+.dock-btn.idle.is-zero {
+  animation: none;
+  border-color: var(--edge);
+  opacity: 0.62;
+}
+.dock-btn.idle.is-zero .count { color: var(--parch-dim); }
+
 /* --- Minimap --------------------------------------------------------------- */
 
 .hud-minimap {
-  position: absolute;
-  top: calc(var(--safe-t) + 48px);
-  right: calc(var(--safe-r) + 6px);
+  align-self: flex-end;
   padding: 3px;
   background: var(--panel);
   border: 1px solid var(--edge);
@@ -209,8 +359,10 @@ body {
 
 #minimap {
   display: block;
-  width: 116px;
-  height: 116px;
+  /* 108, down from 116. The eight pixels pay for the dock underneath it, and at
+     96x96 the map still gets more than a pixel a tile. */
+  width: 108px;
+  height: 108px;
   border-radius: 5px;
   /* Mirrors OCEAN_DEEP (gfx/textures.js), which the minimap bakes as its
      out-of-map sea — this only shows for the frame before the first draw. */
@@ -227,7 +379,7 @@ body {
    hid the Town Center an alert was telling the player to look at. */
 .hud-toasts {
   position: absolute;
-  top: calc(var(--safe-t) + 48px);
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
   left: calc(var(--safe-l) + 8px);
   width: min(46vw, 182px);
   display: flex;
@@ -281,6 +433,52 @@ body {
   animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
   cursor: pointer;
 }
+/* The age-up card. The alert's shape — full width, a heading and a sub-line,
+   loud enough to interrupt — in gold instead of red, because it is the best
+   news a player gets in a match and it used to arrive as a plain grey toast
+   identical to "Sound on". It is not tappable: there is nowhere to go, only
+   something to know. */
+.toast.agecard {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 6px 9px;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: #fff6e0;
+  background: linear-gradient(180deg, rgba(163, 118, 32, 0.97), rgba(83, 57, 12, 0.97));
+  border: 1px solid #f0cd7d;
+  border-left: 4px solid var(--gold);
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(217, 171, 79, 0.42);
+  animation: alertin 170ms ease-out, agepulse 1100ms ease-in-out 170ms 3;
+}
+.toast.agecard .crest { margin-right: 5px; color: #ffe6a8; }
+.toast.agecard .sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: #f6e3bb;
+  letter-spacing: 0.2px;
+}
+/* Three pulses and then still. An alert pulses until it is dealt with because
+   it is a summons; this is an announcement, and something that never stops
+   glowing stops meaning anything. */
+@keyframes agepulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(217, 171, 79, 0.35); }
+  50%      { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 22px rgba(240, 205, 125, 0.95); }
+}
+/* The stack is a narrow corner box by default (see .hud-toasts); a card that is
+   the width of a phone needs the width of the phone. The class is set by the
+   HUD rather than matched with :has(), so this does not quietly stop working on
+   a browser that has not shipped it. */
+.hud-toasts.wide { width: calc(100vw - 16px - var(--safe-l) - var(--safe-r)); }
+
 .toast.alert .siren { margin-right: 5px; }
 .toast.alert .sub {
   display: block;
@@ -311,48 +509,21 @@ body {
 }
 
 /* --- Gesture mode chip ------------------------------------------------------
-   Removes all doubt about what a one-finger drag will do right now. */
+   Removes all doubt about what a one-finger drag will do right now. It is a
+   dock button like the other three: it was a floating pill at the bottom-left
+   before, which is the far corner from a right thumb and the one place on the
+   screen a left-handed player's hand covers. */
 
-.mode-chip {
-  position: absolute;
-  left: calc(var(--safe-l) + 8px);
-  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
-  min-width: var(--tap);
-  min-height: 36px;
-  padding: 0 10px;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.3px;
-  opacity: 0.92;
-}
-.mode-chip .glyph { font-size: 14px; line-height: 1; }
-.mode-chip .auto {
-  font-size: 9px;
+.mode-chip.dock-btn .auto {
+  font-size: 8px;
   color: var(--gold);
   border: 1px solid var(--gold-dim);
   border-radius: 4px;
   padding: 0 3px;
 }
-.mode-chip.is-box { border-color: var(--gold); color: var(--gold); }
+.mode-chip.is-box { border-color: var(--gold); }
+.mode-chip.is-box .glyph, .mode-chip.is-box .lbl { color: var(--gold); }
 
-/* --- Idle villager button --------------------------------------------------- */
-
-.idle-vill {
-  position: absolute;
-  right: calc(var(--safe-r) + 8px);
-  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
-}
-.idle-vill .icon-btn {
-  margin: 0;
-  min-height: var(--tap);
-  font-weight: 800;
-  font-size: 14px;
-  border-color: var(--gold-dim);
-  animation: idlepulse 1.8s ease-in-out infinite;
-}
 @keyframes idlepulse {
   0%, 100% { box-shadow: var(--shadow); }
   50%      { box-shadow: 0 0 0 3px rgba(217, 171, 79, 0.28), var(--shadow); }
@@ -367,14 +538,25 @@ body {
   bottom: 0;
   padding: 6px calc(var(--safe-r) + 6px) calc(var(--safe-b) + 6px) calc(var(--safe-l) + 6px);
   display: flex;
-  gap: 6px;
-  align-items: stretch;
+  flex-direction: column;
+  gap: 4px;
   pointer-events: auto;
   background: linear-gradient(180deg, rgba(15, 11, 7, 0) 0%, rgba(15, 11, 7, 0.72) 42%, rgba(15, 11, 7, 0.95) 100%);
 }
 
+.hud-panels {
+  display: flex;
+  gap: 6px;
+  align-items: stretch;
+}
+
 .sel-panel, .cmd-panel {
   pointer-events: auto;
+  /* Both are flex items in a row that is exactly the width of the screen. With
+     the automatic minimum size in force, one long unbreakable label inside
+     either of them shoves the other off the edge — so neither is allowed to
+     claim more than its share, whatever it is holding. */
+  min-width: 0;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
@@ -384,7 +566,61 @@ body {
 }
 
 .sel-panel { flex: 0 0 40%; max-width: 168px; overflow: hidden; }
-.cmd-panel { flex: 1 1 auto; display: flex; flex-wrap: wrap; align-content: flex-start; gap: 5px; }
+/* Capped and scrolling. A Barracks in the Castle Age offers four upgrades on
+   top of two units, a queue row and a rally line, and without a ceiling the
+   bottom bar grew until it owned two thirds of the screen — which is the one
+   thing the whole HUD budget exists to prevent. 40vh is about as tall as this
+   panel may get before the map stops being the game. */
+.cmd-panel {
+  flex: 1 1 auto;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 5px;
+  max-height: 40vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* "3 further upgrades unlock behind these" — a full-width footnote, never a
+   button, so it can never be mistaken for something to tap. */
+.research-more { flex: 1 1 100%; font-size: 10px; opacity: 0.8; }
+
+/* --- "there is more below" -----------------------------------------------------
+   A sticky gradient at the foot of any panel that is scrolled part-way. A
+   Barracks command panel measured 479px of buttons inside 336px of box with no
+   scrollbar, no fade and nothing else to say so — it simply looked cut off, and
+   a player who does not scroll never sees the blacksmith upgrades.
+
+   Toggled by the HUD (see watchScroller in ui/hud.js) rather than left on: a
+   permanent fade would dim the last row of every panel that fits, which is most
+   of them. The pseudo-element is a full-width flex item pulled back over the
+   row above it, so it costs no layout of its own. */
+.cmd-panel.is-cut::after,
+.build-menu.is-cut::after,
+.menu-sheet.is-cut::after {
+  content: "";
+  position: sticky;
+  bottom: -1px;
+  height: 26px;
+  margin-top: -26px;
+  pointer-events: none;
+  /* A chevron sitting in the fade, because a gradient on its own reads as a
+     shadow and a shadow is not an instruction — it says "this panel is dark at
+     the bottom", not "keep going". An inline SVG so it needs no asset and no
+     glyph from a font that may not have one. */
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='9' viewBox='0 0 16 9'%3E%3Cpath d='M1 1l7 6 7-6' fill='none' stroke='%23d9ab4f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/%3E%3C/svg%3E"),
+    linear-gradient(180deg, rgba(29, 21, 14, 0) 0%, rgba(29, 21, 14, 0.94) 80%);
+  background-repeat: no-repeat, no-repeat;
+  background-position: center calc(100% - 4px), center;
+}
+/* The two flow directions need different flex settings, and getting this wrong
+   is invisible rather than broken: `flex: 1 1 100%` means "take a whole row" in
+   the wrapping row panels and "be as tall as the whole scroller" in the column
+   sheet, where it silently swallowed the fade. */
+.cmd-panel.is-cut::after,
+.build-menu.is-cut::after { flex: 1 1 100%; }
+.menu-sheet.is-cut::after { flex: 0 0 26px; align-self: stretch; }
 
 .sel-empty {
   color: var(--parch-dim);
@@ -392,6 +628,31 @@ body {
   padding: 6px 2px;
 }
 .sel-hint { display: block; margin-top: 5px; font-size: 11px; opacity: 0.75; }
+
+/* "Gathering wood -> Lumber Camp".
+   Quiet — it is a status line, not a control — but the full width of the bottom
+   bar, which is the whole fix. Inside the selection panel it had 137px of
+   client width for a 193px sentence and rendered "Gathering wood -> L...",
+   ellipsising away the destination. The destination is the entire payload:
+   naming which drop-off the sim picked is the only evidence a player gets that
+   the Lumber Camp they paid 100 wood for did anything at all. At 366px it fits
+   with room to spare, and the ellipsis stays only as a backstop for the
+   many-villagers case ("Dropping off at: Town Center, Mill, Lumber Camp"). */
+.job-note {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #cbbf9a;
+  background: rgba(28, 20, 13, 0.82);
+  border: 1px solid var(--edge-soft);
+  border-left: 3px solid var(--gold-dim);
+  border-radius: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.job-note[hidden] { display: none; }
 
 .sel-head {
   display: flex;
@@ -406,12 +667,17 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* Clear-selection. It used to be pinned to 30x30 with !important — the one
+   control in the file that ignored the 44px floor everything else honours, and
+   it is pressed in a hurry, with a thumb, to get an accidental selection off
+   the panel. It is now a full target like everything else; the glyph stays
+   small so it still reads as a dismiss rather than as a command. */
 .sel-clear {
   margin-left: auto;
-  min-width: 30px !important;
-  min-height: 30px !important;
+  min-width: var(--tap);
+  min-height: var(--tap);
   flex: none;
-  font-size: 15px;
+  font-size: 16px;
   line-height: 1;
   padding: 0;
   display: inline-flex;
@@ -421,10 +687,13 @@ body {
 
 .sel-chips { display: flex; flex-wrap: wrap; gap: 4px; }
 
+/* A selection group. It is a button — it narrows the selection to that type —
+   so it takes the same 44px floor as everything else that can be tapped; three
+   of them still fit across the selection panel. */
 .chip {
   position: relative;
-  min-width: 40px;
-  min-height: 40px;
+  min-width: var(--tap);
+  min-height: var(--tap);
   padding: 2px 4px 5px;
   display: inline-flex;
   flex-direction: column;
@@ -447,6 +716,38 @@ body {
 .chip.foe .badge { background: var(--team-foe); color: #fff; }
 .chip.neutral .badge { background: #9c8a63; }
 .chip .n { font-size: 11px; }
+
+/* --- Portraits ----------------------------------------------------------------
+   The actual sprite, cut out of the atlas the map is drawn from (see
+   ui/portraits.js). It replaces the three-letter code in the selection chips,
+   the training queue and the build queue.
+
+   The tinted plate behind it is doing real work and is not decoration: the
+   sprite already carries the player's colours, but at 24px on a wooden panel a
+   militia and an enemy militia are two brown smudges. A flat team-coloured
+   backing behind the picture is what keeps "mine" and "theirs" readable at chip
+   size, and it is the same blue and red the ground ellipses under the units
+   use. */
+.portrait {
+  display: block;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  background-repeat: no-repeat;
+  background-position: center bottom;
+  background-size: contain;
+  background-color: rgba(61, 139, 253, 0.30);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+.chip.foe .portrait { background-color: rgba(224, 49, 49, 0.32); }
+.chip.neutral .portrait { background-color: rgba(156, 138, 99, 0.28); }
+/* The queues only ever show your own things, and the strip is busy enough
+   without a row of blue plates in it. */
+.qslot .portrait, .bq-chip .portrait {
+  width: 24px;
+  height: 24px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
 
 .hpbar {
   margin-top: 5px;
@@ -500,6 +801,17 @@ body {
 .cbtn.primary { border-color: var(--gold); }
 .cbtn.danger  { border-color: #7d2b1e; }
 .cbtn .short { display: none; }
+/* A button that is the only verb its selection has takes the whole row rather
+   than shrinking to its label. Laid out as a row, not a stack, so the width
+   goes into the target and not into the height. */
+.cbtn.wide {
+  flex: 1 1 100%;
+  flex-direction: row;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
 
 .cmd-note { font-size: 11px; color: var(--parch-dim); padding: 4px 2px; }
 
@@ -549,6 +861,92 @@ body {
 .cbtn.demolish.armed .label::before { content: "⚠ "; }
 .cbtn.demolish.armed .cost { color: #ffc0b2; }
 
+/* Garrison. Blue-edged rather than red: stepping inside is the one defensive
+   order in the panel, and it must not read as an attack verb at thumb speed. */
+.cbtn.garrison { border-color: #2f5f86; }
+.cbtn.garrison .label { color: #b9d8f0; }
+.cbtn.garrison .label::before { content: "⌂ "; }
+.cbtn.garrison.out .label::before { content: "↥ "; }
+
+/* How many are inside, on the selection panel. The garrisoned units are off the
+   map by design, so this line is the *only* evidence they exist — it is bright
+   when the building is manned and gold when it is full, because "no more will
+   fit" is the thing a player needs to know before tapping Garrison again. */
+.garrison-note {
+  flex: 1 1 100%;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--parch-dim);
+  padding: 2px 2px 0;
+  font-variant-numeric: tabular-nums;
+}
+.garrison-note::before { content: "⌂ "; }
+.garrison-note.manned { color: var(--parch); }
+.garrison-note.full { color: var(--gold); }
+
+/* Segmented rows: stance and formation.
+   A row of choices with the live one lit, rather than one button that cycles.
+   A cycler hides three of four options and turns "put these on Stand Ground"
+   into tap-and-check, which is precisely the interaction a player does not have
+   time for while a raid lands.
+
+   TWO BY TWO, not four across. The command panel is 207px of content on a 390px
+   phone, and four segments in one row works out at 49px each against a
+   55px-wide unbreakable word ("Aggressive"): the row overflowed its panel by
+   23px and pushed No Attack's label off the right of the screen — the stance a
+   player reaches for to stop their villagers suiciding into a raid, clipped at
+   exactly the moment it is wanted. Wrapping to a 2x2 block costs one row of
+   height in a panel that already scrolls and gives every segment ~101px, which
+   fits the longest label and its blurb with room over. A row of three (the
+   formations) becomes two and one, and the odd one out spans the row. */
+.segrow {
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 2px;
+}
+.segrow .seg {
+  flex: 1 1 calc(50% - 2px);
+  min-width: 0;
+  min-height: var(--tap);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 3px 2px;
+  border: 1px solid var(--edge);
+  border-radius: 6px;
+  background: var(--panel-btn);
+  color: var(--parch-dim);
+  font-weight: 800;
+  font-size: 10px;
+  line-height: 1.1;
+  text-align: center;
+}
+.segrow .seg .label { white-space: normal; }
+/* The one-line explanation of what the segment does. It is the difference
+   between a row of four words nobody dares tap and a control that teaches
+   itself, so it is hidden only when there is genuinely no room for it. */
+.segrow .seg .blurb {
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 0;
+  opacity: 0.72;
+  white-space: normal;
+}
+.segrow .seg.on {
+  border-color: var(--gold);
+  background: linear-gradient(180deg, #5c4a24 0%, #2e2413 100%);
+  color: var(--parch);
+}
+@media (max-width: 360px) {
+  .segrow .seg .blurb { display: none; }
+}
+
 /* Rally line under a production building: what the next unit out of it will do.
    Full width so it never squeezes a train button below 44px. */
 .rally-note {
@@ -565,12 +963,50 @@ body {
 .rally-note.is-build { color: #cbd9a8; }
 .rally-note.is-hint { opacity: 0.85; }
 
-/* Training queue */
-.queue { flex: 1 1 100%; display: flex; align-items: center; gap: 5px; }
+/* --- Training queue ---------------------------------------------------------
+   Three questions, in the order a player asks them: what is coming out of this
+   building, how far along is it, and what is behind it. The old row answered
+   only the second — a bare progress bar and a strip of 26px squares with one
+   letter in them, which is neither readable nor tappable at phone size and
+   never said what was training at all.
+
+   It is now a titled block: a headline naming the unit and the seconds left, a
+   full-width bar under it, and a row of 44px chips for everything queued. Each
+   chip is a cancel button, and it says so — the cost comes straight back
+   (economy.cancelTrain refunds in full), so this is the safest button on the
+   panel and does not need the arm-then-confirm demolish gets. */
+.queue {
+  flex: 1 1 100%;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 5px;
+  border: 1px solid var(--edge-soft);
+  border-radius: 7px;
+  background: rgba(20, 15, 10, 0.45);
+}
+.qhead {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 800;
+}
+.qhead .what { color: var(--gold); }
+.qhead .eta {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--parch-dim);
+  font-variant-numeric: tabular-nums;
+}
+.qhead .behind { font-size: 10px; font-weight: 700; color: var(--parch-dim); }
 .qprog {
-  flex: 1 1 auto;
-  height: 10px;
-  border-radius: 5px;
+  flex: 1 1 100%;
+  height: 8px;
+  border-radius: 4px;
   background: #16100a;
   border: 1px solid #000;
   overflow: hidden;
@@ -580,22 +1016,99 @@ body {
   background: linear-gradient(180deg, var(--gold), var(--gold-dim));
   transition: width 90ms linear;
 }
-.qslots { display: flex; gap: 3px; }
+.qslots { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px; }
 .qslot {
-  min-width: 26px; min-height: 26px;
-  padding: 0;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  padding: 1px 4px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
   font-size: 10px; font-weight: 900;
-  border-radius: 5px;
+  border-radius: 6px;
 }
+.qslot .x { font-size: 12px; line-height: 1; color: #e8a394; }
 .qslot.head { border-color: var(--gold); }
+.qslot.head .x { color: #f0c07a; }
+.qempty { font-size: 10.5px; color: var(--parch-dim); padding: 2px 2px; }
+
+/* The research queue reuses the shell but keeps its cooler colour and its
+   one-line label — a tech has no "3 behind it" to report. */
+.research-queue .qprog > i { background: linear-gradient(180deg, #9ac0e8, #4a6f9c); }
+
+/* --- Research ---------------------------------------------------------------
+   Upgrade buttons carry three lines — name, what it does, what it costs —
+   because "what it does" is the line every small-screen RTS drops and it is
+   the one that decides whether the tab gets used. Two per row: a third would
+   put the effect line below 9px, and a full-width one would make a Mill's four
+   upgrades a scroll. */
+.cbtn.research {
+  flex: 1 1 calc(50% - 3px);
+  min-width: 108px;
+  align-items: flex-start;
+  text-align: left;
+  padding: 5px 8px;
+  border-color: #5c6b8c;               /* cool edge: not a unit, not a building */
+}
+.cbtn.research .label { white-space: normal; line-height: 1.15; }
+.cbtn.research .blurb {
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: #a8c6e6;
+}
+.cbtn.research .cost { justify-content: flex-start; }
+
+/* The age-up. It is the most consequential button on the panel and it costs
+   more than everything around it, so it gets the gold edge the game already
+   uses for "this is the important one" and takes the full row. */
+.cbtn.research.is-age {
+  flex: 1 1 100%;
+  border-color: var(--gold);
+}
+.cbtn.research.is-age .label { color: var(--gold); }
+.cbtn.research.is-age .blurb { color: #e0c88a; }
+
+/* Already ours, permanently. Green and un-tappable-looking, but still tappable
+   — it says so when you tap it. */
+.cbtn.research.is-done {
+  border-color: #46652f;
+  opacity: 0.55;
+  filter: none;                        /* not greyscale: "done" is not "broken" */
+}
+.cbtn.research.is-done .label { color: #bcd6a2; }
+.cbtn.research.is-done .label::before { content: "✓ "; }
+
+/* Under way at this building right now. */
+.cbtn.research.is-active {
+  border-color: var(--gold);
+  opacity: 1;
+  filter: none;
+}
+.cbtn.research.is-active .label { color: var(--gold); }
+
+/* Wrong age, or a prerequisite missing. */
+.cbtn.research.is-locked .label::before { content: "🔒 "; font-size: 9px; }
+
+/* Every research button does something when tapped — the greyed ones say why
+   they are greyed — so none of them may sit dead under the global .off rule
+   that kills the press animation. A tap with no response reads as a missed tap. */
+.cbtn.research.off:active { transform: translateY(1px); filter: brightness(1.25); }
+
+.research-queue .qlabel {
+  font-size: 10.5px;
+  font-weight: 800;
+  color: #bcd6f0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 /* --- Build menu sheet -------------------------------------------------------- */
 
 .build-menu {
-  position: absolute;
-  left: calc(var(--safe-l) + 6px);
-  right: calc(var(--safe-r) + 6px);
-  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
   padding: 7px;
   display: flex;
   flex-wrap: wrap;
@@ -619,15 +1132,53 @@ body {
   color: var(--parch-dim);
 }
 .build-menu .cbtn { flex: 1 1 0; min-width: 62px; }
+/* Close is the first row in the document and the menu opens scrolled to the
+   bottom (see renderBuildMenu: the shelves run bottom-up so the Dark Age lands
+   under the thumb), so without this it would be scrolled off the top of a long
+   tech tree. Sticky keeps it on screen at no layout cost, and opaque so the
+   shelves pass under it rather than through it. */
+.build-menu .cbtn.danger {
+  flex: 1 1 100%;
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  background: linear-gradient(180deg, #4a2a1f 0%, #2f1a14 100%);
+}
 .build-menu .cbtn .label { white-space: normal; line-height: 1.1; text-align: center; }
+
+/* The menu is capped and scrolls rather than growing: it now lists the whole
+   tech tree, and a sheet tall enough for three shelves of buildings would cover
+   the base the player is standing in. */
+.build-menu { max-height: 46vh; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+
+/* Age shelves. The locked heading is the label doing the teaching, so it keeps
+   its full contrast even though everything under it is dimmed. */
+.build-menu .title.locked { color: var(--gold-dim); }
+.build-menu .title.locked::after { content: " 🔒"; font-size: 9px; }
+
+/* A locked building. Dimmed, but not with the greyscale the "cannot afford"
+   state uses — the two mean different things and must not look the same, or a
+   player waits for wood that was never the problem. Locked is a cool, flat
+   wash; unaffordable stays desaturated. */
+.build-menu .cbtn.locked {
+  opacity: 0.5;
+  filter: none;
+  border-color: #3d4a5c;
+  border-style: dashed;
+}
+.build-menu .cbtn.locked .label { color: #9fb0c4; }
+.build-menu .cbtn.locked:active { transform: translateY(1px); filter: brightness(1.35); }
+.build-menu .cbtn .cost.need {
+  color: #9fb0c4;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  font-size: 9px;
+}
 
 /* --- Placement bar ----------------------------------------------------------- */
 
 .place-bar {
-  position: absolute;
-  left: calc(var(--safe-l) + 6px);
-  right: calc(var(--safe-r) + 6px);
-  bottom: calc(var(--safe-b) + var(--hud-h, 108px) + 8px);
   padding: 6px 8px;
   display: flex;
   align-items: center;
@@ -639,6 +1190,26 @@ body {
   pointer-events: auto;
   animation: sheetin 140ms ease-out;
 }
+/* Pinned under the resource bar while placement is armed. See the note beside
+   placeBar in ui/hud.js: this bar used to sit in the bottom stack, dead centre
+   of the band the placement ghost lives in. It is text and a Cancel button, so
+   it does not need the thumb zone — and the middle of the screen, which is
+   where a player is aiming, is now clear. */
+.place-bar.place-top {
+  position: absolute;
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  z-index: 12;
+}
+/* The toast stack normally starts right under the resource bar. While the
+   placement bar is up it starts under that instead, so a "Cannot build there"
+   warning — which is exactly the toast a placing player needs — is not drawn
+   underneath the bar explaining what they are placing. */
+.hud.placing .hud-toasts {
+  top: calc(var(--safe-t) + var(--topbar-h, 48px) + var(--placebar-h, 64px));
+}
+
 .place-bar .txt { flex: 1 1 auto; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
 .place-bar .txt small { display: block; font-weight: 600; color: var(--parch-dim); font-size: 10.5px; }
 .place-bar button { min-height: var(--tap); min-width: var(--tap); padding: 0 10px; font-weight: 800; font-size: 12px; }
@@ -655,10 +1226,6 @@ body {
 /* --- Menu sheet -------------------------------------------------------------- */
 
 .menu-sheet {
-  position: absolute;
-  top: calc(var(--safe-t) + 52px);
-  right: calc(var(--safe-r) + 6px);
-  width: 190px;
   padding: 6px;
   display: flex;
   flex-direction: column;
@@ -668,7 +1235,6 @@ body {
   border-radius: var(--r);
   box-shadow: var(--shadow);
   pointer-events: auto;
-  z-index: 3;
   animation: sheetin 140ms ease-out;
 }
 .menu-sheet button {
@@ -678,6 +1244,443 @@ body {
   text-align: left;
   padding: 0 10px;
 }
+/* The menu sheet grows sections once sound lives in it, so it needs a heading
+   and a scroller. 52vh is the same ceiling the other two sheets use — the map
+   underneath has to stay more than half visible whatever is open over it. */
+.menu-sheet {
+  max-height: 52vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* The rules sheet. Same shell as the menu, but it is prose rather than a column
+   of buttons, so the list gets its own type and the sheet gets more of the
+   screen — 52vh of eleven bullet points is two bullet points and a scrollbar. */
+/* Taller than the other sheets, because eleven bullet points inside 52vh is two
+   bullet points and a scrollbar — but capped in absolute pixels as well as in
+   vh. The sheet stack is anchored to the *bottom* of the screen and grows
+   upwards, so a percentage of the viewport is only half the constraint: with a
+   Market selected the bottom bar is at its tallest and 62vh put the top of this
+   sheet 76px above the top of the phone. The layout sweep in
+   tests/touchui.browser.mjs is what caught it. */
+.help-sheet {
+  max-height: min(52vh, 400px);
+  font-size: 12.5px;
+  color: var(--parch-dim);
+}
+.help-sheet ul { margin: 0; padding: 0 0 4px 18px; }
+.help-sheet li { margin: 6px 0; line-height: 1.45; }
+.help-sheet b { color: var(--parch); }
+/* Sticky, so the way out is always under the thumb however far down the list
+   the player has read — and opaque, because a translucent button with eleven
+   bullet points sliding under it is unreadable in both directions. */
+.help-sheet button.primary {
+  position: sticky;
+  bottom: -6px;
+  /* Above the scroll fade, which is also pinned to the bottom of this scroller
+     and would otherwise wash over the one button in the sheet. */
+  z-index: 2;
+  margin-top: 2px;
+  background: linear-gradient(180deg, #4a351f 0%, #2f2114 100%);
+  box-shadow: 0 -10px 14px -6px rgba(20, 15, 10, 0.95), var(--shadow);
+}
+
+/* Resign. Red like Demolish, and it turns fully red once armed, because the two
+   are the same gesture and must not need learning twice. */
+.menu-sheet .menu-resign {
+  border-color: var(--danger);
+  color: #ffc9bf;
+}
+.menu-sheet .menu-resign.armed {
+  color: #fff;
+  background: linear-gradient(180deg, #b93020, #7a1d12);
+  border-color: #ff7a5e;
+  font-weight: 800;
+}
+
+.menu-head {
+  margin-top: 4px;
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.sound-mute { text-align: left; }
+.sound-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: var(--tap);
+}
+.sound-row .who {
+  flex: 0 0 52px;
+  font-size: 11.5px;
+  font-weight: 800;
+}
+.sound-row .pct {
+  flex: 0 0 40px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+/* Same slider as the job splits, and deliberately so: a phone should only ever
+   have to learn one slider. See the note on .alloc-row input[type="range"]. */
+.sound-row input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--tap);
+  margin: 0;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+.sound-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--gold-dim) 0%, var(--gold-dim) var(--fill, 0%), #1b140d var(--fill, 0%), #1b140d 100%);
+  border: 1px solid #000;
+}
+.sound-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c);
+  border: 1px solid #5d4315;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+.sound-row input[type="range"]::-moz-range-track {
+  height: 8px; border-radius: 4px; background: #1b140d; border: 1px solid #000;
+}
+.sound-row input[type="range"]::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c); border: 1px solid #5d4315;
+}
+
+/* --- Build queue strip -------------------------------------------------------
+   The foundations the player tapped out in one breath, in the order they asked
+   for them. It is the only place a batch is visible as a batch: once they are
+   down, six sites are six buildings scattered across a 96x96 map, and finding
+   the one you regret means hunting for it.
+
+   Every chip is a 44px cancel button with a full refund behind it, which is why
+   a single tap is allowed to do it: nothing has been built yet, nothing is
+   destroyed, and the wood is back in the bank before the toast has faded. */
+
+.build-queue {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 6px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  animation: sheetin 140ms ease-out;
+}
+.build-queue .qtitle {
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+  line-height: 1.15;
+  max-width: 74px;
+}
+.bq-chip {
+  flex: 0 0 auto;
+  min-width: var(--tap);
+  min-height: var(--tap);
+  padding: 2px 5px;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  font-size: 10px;
+  font-weight: 900;
+  border-radius: 7px;
+}
+.bq-chip .n { font-size: 9px; color: var(--parch-dim); font-weight: 700; }
+.bq-chip .x { font-size: 11px; line-height: 1; color: #e8a394; }
+/* The one being built right now leads the strip and is lit, so the queue reads
+   as a queue rather than as a pile. */
+.bq-chip.head { border-color: var(--gold); }
+.bq-chip.head .n { color: var(--gold); }
+.build-queue .clear { flex: 0 0 auto; min-height: var(--tap); padding: 0 9px; font-size: 11px; font-weight: 800; border-color: #7d2b1e; }
+
+/* --- Villager allocation sheet ----------------------------------------------
+   Four sliders that always total 100%, and a live count of who is actually
+   working what. The count is the important half: a slider that promises 40% on
+   wood and a bar that says "9 / 9" beside it is the only way a player can tell
+   the manager is doing its job without counting villagers on the map. */
+
+.alloc-sheet {
+  padding: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  max-height: 52vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  animation: sheetin 140ms ease-out;
+}
+.alloc-sheet .head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.alloc-sheet .head .tally {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  font-variant-numeric: tabular-nums;
+}
+/* The on/off. Full width and unmistakable, because a system that quietly moves
+   your villagers about must be one tap from being switched off — a player who
+   wants to place their own people should never have to work out what is
+   fighting them. */
+.alloc-toggle {
+  min-height: var(--tap);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  font-weight: 800;
+}
+.alloc-toggle .state { font-size: 11px; color: var(--parch-dim); }
+.alloc-toggle.on { border-color: var(--gold); background: linear-gradient(180deg, #5c4a24 0%, #2e2413 100%); }
+.alloc-toggle.on .state { color: var(--gold); }
+
+.alloc-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: var(--tap);
+}
+.alloc-row .who {
+  flex: 0 0 58px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  font-weight: 800;
+}
+.alloc-row .pct {
+  flex: 0 0 58px;
+  text-align: right;
+  font-size: 12px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+.alloc-row .pct small {
+  display: block;
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--parch-dim);
+}
+/* Short of its share, so the manager is still walking people over. */
+.alloc-row .pct.short small { color: #f0d98a; }
+.alloc-row.gone .who, .alloc-row.gone .pct { opacity: 0.5; }
+
+/* The slider itself. 44px of vertical hit area with a 26px thumb: the track is
+   drawn thin because a thin track reads as a scale, but the input is the full
+   height of the row, so the thumb can be grabbed anywhere near it.
+   `touch-action: none` hands the drag to the input outright — the map's own
+   gesture handler lives on the canvas and never sees these events, so the two
+   cannot fight, and this only stops the browser guessing at a scroll the page
+   does not have. */
+.alloc-row input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: var(--tap);
+  margin: 0;
+  background: transparent;
+  pointer-events: auto;
+  touch-action: none;
+}
+.alloc-row input[type="range"]::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, var(--gold-dim) 0%, var(--gold-dim) var(--fill, 0%), #1b140d var(--fill, 0%), #1b140d 100%);
+  border: 1px solid #000;
+}
+.alloc-row input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 26px;
+  height: 26px;
+  margin-top: -10px;
+  border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c);
+  border: 1px solid #5d4315;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.6);
+}
+.alloc-row input[type="range"]::-moz-range-track {
+  height: 8px; border-radius: 4px; background: #1b140d; border: 1px solid #000;
+}
+.alloc-row input[type="range"]::-moz-range-thumb {
+  width: 26px; height: 26px; border-radius: 50%;
+  background: linear-gradient(180deg, #f0cd7d, #b98c2c); border: 1px solid #5d4315;
+}
+.alloc-sheet .foot { display: flex; gap: 5px; }
+.alloc-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
+.alloc-sheet .why { font-size: 10px; line-height: 1.3; color: var(--parch-dim); }
+
+/* --- The market trade sheet ---------------------------------------------------
+
+   Same shell as the allocation sheet — a phone should only have to learn one
+   kind of sheet — with one rule of its own: Buy and Sell are the two most
+   confusable buttons in the game, so they are pushed to opposite edges of the
+   row with the lot size between them, coloured differently, and each prints its
+   own gold figure. The gap in the middle is not decoration; it is the thing
+   that stops a thumb aimed at one landing on the other. */
+
+.market-sheet {
+  padding: 7px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: var(--r);
+  box-shadow: var(--shadow);
+  max-height: 52vh;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  animation: sheetin 140ms ease-out;
+}
+.market-sheet .head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+}
+.market-sheet .head .gold {
+  margin-left: auto;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+
+.market-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 52px;
+}
+.market-row .who {
+  flex: 0 0 66px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-size: 11.5px;
+  font-weight: 800;
+  line-height: 1.15;
+}
+.market-row .who .ico { margin-right: 3px; vertical-align: -1px; }
+.market-row .who .stock {
+  font-size: 9.5px;
+  font-weight: 700;
+  color: var(--parch-dim);
+  font-variant-numeric: tabular-nums;
+}
+/* The row lights up once there is a full lot to sell — the one fact that turns
+   the sheet from a price list into a decision. */
+.market-row.rich .who .stock { color: var(--gold); }
+
+/* The lot size, dead centre, between the two buttons. It is the subject of both
+   of them, and the only place on the row a thumb never covers. */
+.market-row .lot {
+  flex: 0 0 46px;
+  text-align: center;
+  line-height: 1.05;
+  font-variant-numeric: tabular-nums;
+}
+.market-row .lot b { display: block; font-size: 14px; font-weight: 900; color: var(--parch); }
+.market-row .lot small { font-size: 9px; font-weight: 700; color: var(--parch-dim); }
+
+.market-row .trade {
+  flex: 1 1 0;
+  min-width: 62px;
+  min-height: 52px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  padding: 0 4px;
+  border-radius: 9px;
+  font-variant-numeric: tabular-nums;
+}
+.market-row .trade .verb {
+  font-size: 12.5px;
+  font-weight: 900;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.market-row .trade .gold { font-size: 12px; font-weight: 800; }
+
+/* Buy spends: cool, and its figure is the cost. */
+.market-row .trade.buy {
+  border-color: #3f5a78;
+  background: linear-gradient(180deg, #2b3c4f 0%, #172230 100%);
+  color: #cfe0f0;
+}
+.market-row .trade.buy .gold { color: #9fc4e6; }
+/* Sell earns: gold, and its figure is the gain. */
+.market-row .trade.sell {
+  border-color: #7a5a1c;
+  background: linear-gradient(180deg, #5c4a24 0%, #2e2413 100%);
+  color: #f0dfae;
+}
+.market-row .trade.sell .gold { color: var(--gold); }
+
+/* A trade that cannot happen is dead, not merely dim: a disabled button eats
+   the tap instead of raising a refusal the player has to read and dismiss. */
+.market-row .trade:disabled {
+  opacity: 0.34;
+  filter: grayscale(0.7);
+  pointer-events: none;
+}
+
+.market-sheet .why { font-size: 10px; line-height: 1.35; color: var(--parch-dim); }
+.market-sheet .foot { display: flex; gap: 5px; }
+.market-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
+
+/* A capped, scrolling sheet must SCROLL, not squeeze.
+   All three sheets are flex columns with `max-height: 52vh; overflow-y: auto`,
+   and a flex item's default `flex-shrink: 1` means that once the content passes
+   that cap the rows are compressed instead — which took the market sheet's Close
+   button to 43.99px and tripped the 44px floor in tests/touchui.browser.mjs. It
+   is worth fixing on all three: the same latent squeeze is one added row away in
+   each of them, and a control that is 43px on a tall phone and 44px on a short
+   one is the hardest kind of layout bug to see. */
+.market-sheet > *, .alloc-sheet > *, .menu-sheet > * { flex: 0 0 auto; }
 
 /* --- Landscape --------------------------------------------------------------- */
 
@@ -686,16 +1689,28 @@ body {
   .hud-bottom { padding: 4px calc(var(--safe-r) + 6px) calc(var(--safe-b) + 4px) calc(var(--safe-l) + 6px); }
   .sel-head { margin-bottom: 2px; }
   .hpbar { margin-top: 3px; }
-  .mode-chip { min-height: 32px; font-size: 11px; }
   .sel-panel { flex: 0 0 156px; }
   .chip { min-width: 34px; min-height: 34px; }
   .chip .badge { width: 18px; height: 18px; font-size: 9px; }
   .hp-text { display: none; }
   .sel-empty { font-size: 11px; }
   .place-bar { flex-wrap: nowrap; }
-  .hud-minimap { top: calc(var(--safe-t) + 6px); right: calc(var(--safe-r) + 56px); }
+  /* Landscape has 500px of height and the stack wants 290 of it, so the minimap
+     leaves the column and goes back to a corner. It is fixed rather than
+     absolute because the stack it is escaping is itself positioned. The dock
+     stays where it is: a thumb is no better at reaching the top of a landscape
+     screen than a portrait one. */
+  .hud-minimap {
+    position: fixed;
+    top: calc(var(--safe-t) + 6px);
+    right: calc(var(--safe-r) + 6px);
+    align-self: auto;
+  }
   #minimap { width: 92px; height: 92px; }
-  .hud-toasts { top: calc(var(--safe-t) + 44px); width: min(34vw, 182px); }
+  .hud-dock { gap: 4px; }
+  .dock-btn { min-height: 44px; font-size: 9.5px; }
+  .alloc-sheet { max-height: 62vh; }
+  .hud-toasts { top: calc(var(--safe-t) + var(--topbar-h, 44px)); width: min(34vw, 182px); }
   .cbtn { font-size: 10.5px; }
   .cbtn .cost { font-size: 9.5px; }
 }
@@ -762,6 +1777,26 @@ body {
   touch-action: manipulation;
 }
 .start-btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #5d4315; }
+/* Two buttons on the boot card need a gap, and the second of them needs to stop
+   competing with the first. `.secondary` keeps the full 52px target — it is
+   still a button a thumb has to hit — and gives up only the gold. */
+.start-btn + .start-btn { margin-top: 10px; }
+.start-btn.secondary {
+  color: var(--parch);
+  background: linear-gradient(180deg, #37301f, #241e13);
+  border-color: #574a2c;
+  box-shadow: 0 3px 0 #17120a, var(--shadow);
+  font-weight: 700;
+}
+.start-btn.secondary:active { box-shadow: 0 1px 0 #17120a; }
+.start-btn .sub {
+  display: block;
+  margin-top: 1px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  opacity: 0.75;
+}
 
 .boot-help {
   margin-top: 14px;
@@ -769,9 +1804,16 @@ body {
   font-size: 12.5px;
   color: var(--parch-dim);
 }
+/* A real touch target, not a link. It is 35px tall at this font size with the
+   padding it had, which is under the 44px floor every other control in the game
+   holds to — and it is the only control on the first screen a player ever
+   sees. */
 .boot-help summary {
   cursor: pointer;
-  padding: 10px 0;
+  display: flex;
+  align-items: center;
+  min-height: var(--tap);
+  padding: 4px 0;
   font-weight: 700;
   color: var(--parch);
   list-style: none;
@@ -785,6 +1827,64 @@ body {
 
 .boot-build { margin: 14px 0 0; font-size: 10px; color: #6d6047; }
 .endcard-inner p { color: var(--parch-dim); font-size: 13.5px; margin: 6px 0 16px; }
+
+/* --- End card figures ---------------------------------------------------------
+   Three rows of label-and-number. A definition list rather than a table because
+   that is what it is, and because a table would need a width to stop the
+   numbers drifting into the middle of a 390px card. */
+.end-stats {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 10px;
+  text-align: left;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--edge-soft);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.end-stats dt { color: var(--parch-dim); }
+.end-stats dd {
+  margin: 0;
+  text-align: right;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--parch);
+}
+
+/* Looking at the finished map. The card gets out of the way completely —
+   background, blocker and all — leaving one pill to bring the figures back.
+
+   It sits top-right, which is the one place in this HUD that is deliberately
+   out of thumb reach (see the note in index.html) and is exactly right here:
+   the match is over, the player has asked to look at the battlefield, and every
+   comfortable part of the screen belongs to that. Bottom-centre put it across
+   the selection panel, and the two places a thumb likes on this layout — the
+   dock and the minimap — are both still live. Top-left is the toast stack. */
+.endcard.peek { background: none; pointer-events: none; }
+.endcard.peek .endcard-inner { display: none; }
+.end-peek {
+  position: absolute;
+  right: calc(var(--safe-r) + 8px);
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
+  min-height: var(--tap);
+  min-width: 110px;
+  padding: 0 20px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  color: #1d1409;
+  background: linear-gradient(180deg, #f0cd7d, #c08f2c);
+  border: 1px solid #7a5a1c;
+  border-radius: 11px;
+  box-shadow: 0 3px 0 #5d4315, var(--shadow);
+  pointer-events: auto;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.end-peek:active { transform: translateY(2px); box-shadow: 0 1px 0 #5d4315; }
 
 @media (prefers-reduced-motion: reduce) {
   .hud *, .boot *, .endcard * { animation: none !important; transition: none !important; }

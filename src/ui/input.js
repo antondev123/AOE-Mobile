@@ -36,6 +36,13 @@
 // attack-move. Both say so with a bar across the bottom of the screen, both
 // are cancellable, and neither survives being used.
 //
+// One armed mode takes the *drag* rather than the tap: a wall. With a wall type
+// armed, a one-finger drag draws the whole run of segments under the finger and
+// lifting buys them (see the wall-drawing section below). It is its own pointer
+// mode, so it never has to argue with pan or box-select about who owns a drag,
+// and two fingers still pan and zoom exactly as they always did — which doubles
+// as the way to abandon a run half-drawn.
+//
 // The player can lock either mode from the chip, and a long press always gets
 // a box even when the rule says pan — so no situation is unreachable. Adding a
 // second finger mid-gesture always cancels a box and becomes a pinch, which
@@ -45,11 +52,11 @@
 import {
   TAP_SLOP, TAP_TIME_MS, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS,
   ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
-  PLAYER, BUILDING_STATS,
+  PLAYER, BUILDING_STATS, isWallType, isGateType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { screenDist, worldToGrid } from '../core/iso.js';
-import { canPlace } from '../core/world.js';
+import { canPlace, wallMaskAt } from '../core/world.js';
 
 import * as unitAI from '../systems/unitAI.js';
 import * as economy from '../systems/economy.js';
@@ -82,7 +89,12 @@ const SAMPLE_KEEP = 8;
 const REST_MS = 200;
 const MAX_FLING = 4200;       // world px/s
 
-const MILITARY = new Set(['militia', 'archer']);
+// Derived from the roster, never written out. When this was a hand-written
+// pair the spearman, scout and ram were silently excluded from attack-move and
+// from double-tap "select every soldier like this one" the day they shipped —
+// the kind of omission that reads as a broken command rather than a missing
+// unit, because the units exist and simply refuse the order.
+const MILITARY = new Set(MILITARY_TYPES);
 
 export function createInput(scene, world, renderer, hud) {
   const game = scene.game;
@@ -110,6 +122,7 @@ export function createInput(scene, world, renderer, hud) {
     lastTap: null,
     ghost: null,             // { type, gx, gy, valid }
     placeType: null,
+    wall: null,              // { tx0, ty0, tx1, ty1, plan, tiles } while drawing
     driving: false,
     destroyed: false,
   };
@@ -117,6 +130,27 @@ export function createInput(scene, world, renderer, hud) {
   // Camera centre in world pixels — this module owns it.
   let cx = camera.midPoint ? camera.midPoint.x : 0;
   let cy = camera.midPoint ? camera.midPoint.y : 0;
+
+  // --- Audio ----------------------------------------------------------------
+  //
+  // The engine lives on the scene (see GameScene.create) rather than being
+  // passed in, so that a page booted without one — or a test that swaps it —
+  // costs nothing here but a null check.
+
+  let musicStarted = false;
+
+  function unlockAudio() {
+    const audio = scene.audio;
+    if (!audio) return;
+    if (!audio.unlock()) return;
+    // Only once the context is genuinely running: startMusic() is a no-op while
+    // locked, and calling it every pointer-down until it took would be a silent
+    // way of never noticing it had not.
+    if (!musicStarted) {
+      musicStarted = true;
+      audio.startMusic();
+    }
+  }
 
   // ---------------------------------------------------------------- geometry
 
@@ -648,8 +682,17 @@ export function createInput(scene, world, renderer, hud) {
     if (!s) return null;
     const g = toGrid(sx, sy - GHOST_LIFT);
     // Snap exactly the way spawnBuilding() will, so the ghost never lies.
-    const gx = Math.floor(g.x - s.fw / 2) + s.fw / 2;
-    const gy = Math.floor(g.y - s.fh / 2) + s.fh / 2;
+    //
+    // The nudge is not cosmetic. Aiming at a tile corner inverts to a grid
+    // coordinate a fraction of an ulp below the integer, and floor() then
+    // charges that whole error to the tile: aim at exactly 5 and the footprint
+    // lands on 4. A finger rarely hits a corner to the pixel, but the placement
+    // bar's centre-screen ghost does it every time it opens, so the building
+    // you are shown before you move your thumb was consistently one tile up
+    // and left of the one you were aiming at.
+    const EPS = 1e-6;
+    const gx = Math.floor(g.x + EPS - s.fw / 2) + s.fw / 2;
+    const gy = Math.floor(g.y + EPS - s.fh / 2) + s.fh / 2;
     // Being broke outranks the ground being wrong, as it always has: it is the
     // thing the player has to fix first, and it is true of every tile.
     const reason = canAffordType(type) ? refusalFor(type, gx, gy) : 'Not enough resources';
@@ -690,21 +733,246 @@ export function createInput(scene, world, renderer, hud) {
     const f = economy.placeFoundation(world, PLAYER, gh.type, gh.gx, gh.gy);
     if (!f) return; // economy already explained why
 
-    let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
-    if (!builders.length) {
-      // Nothing selected? Send the nearest villager rather than doing nothing.
-      let best = null;
-      let bd = Infinity;
-      for (const u of world.units) {
-        if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
-        const d = (u.x - f.x) ** 2 + (u.y - f.y) ** 2;
-        if (d < bd) { bd = d; best = u; }
-      }
-      if (best) builders = [best];
-    }
-    command(builders, { type: 'build', gx: f.x, gy: f.y, target: f });
+    if (typeof economy.enqueueFoundation === 'function') economy.enqueueFoundation(world, f);
     fx(f.x, f.y, 'build');
-    hud.setPlacementMode(null);
+
+    // Only send builders when nobody is already building. A batch is placed
+    // faster than it is built, and re-ordering the same crew onto every new
+    // site as it lands would walk them off the half-finished house to the one
+    // you just tapped, over and over — the fifth tap would leave four
+    // foundations standing and one villager sprinting. They work the queue
+    // through instead (onJobFinished in unitAI.js), and the only thing this has
+    // to guarantee is that *somebody* starts.
+    if (!anyBuilding()) {
+      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      if (!builders.length) {
+        // Nothing selected? Send the nearest villager rather than doing nothing.
+        let best = null;
+        let bd = Infinity;
+        for (const u of world.units) {
+          if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+          const d = (u.x - f.x) ** 2 + (u.y - f.y) ** 2;
+          if (d < bd) { bd = d; best = u; }
+        }
+        if (best) builders = [best];
+      }
+      command(builders, { type: 'build', gx: f.x, gy: f.y, target: f });
+    }
+
+    // Placement stays armed: the next tap places the next one. `Done` on the
+    // placement bar (or Escape, or the build menu) is what ends the batch.
+    if (hud && typeof hud.onFoundationPlaced === 'function') hud.onFoundationPlaced(1);
+    syncPlacement();
+  }
+
+  /** Is any villager of ours already on a construction site? */
+  function anyBuilding() {
+    for (const u of world.units) {
+      if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+      if (u.task && u.task.type === 'build') return true;
+    }
+    return false;
+  }
+
+  // ------------------------------------------------------- wall drawing mode
+  //
+  // A wall is not placed, it is *drawn*: press on the tile the run starts at,
+  // pull, and the whole line of foundations appears under the finger with a
+  // live count and cost; lift to buy the lot.
+  //
+  // HOW IT AVOIDS FIGHTING THE OTHER GESTURES. It is a mode of its own
+  // (`st.mode === 'wallDraw'`), entered on pointerdown only while the HUD has a
+  // wall type armed, and it never consults `effectiveDragMode()` — so it cannot
+  // be turned into a box-select by having units in hand, and it cannot be turned
+  // into a camera pan by not having any. The two-finger gestures are untouched
+  // and stay reachable, because a second pointer goes down the same way it
+  // always did and beginPinch() now cancels the run on its way past. That
+  // doubles as the cancel gesture: a wall you have started drawing and do not
+  // want is abandoned by putting a second finger down, which is also the gesture
+  // for "let me look somewhere else first", and those are the same intention.
+  //
+  // There is no drag threshold. A press and release without moving is a one-tile
+  // run, which places exactly one segment — so tapping still works and the two
+  // behaviours are the same code path rather than two rules that have to agree.
+
+  /**
+   * The type currently armed, if it is a wall you draw a run of.
+   *
+   * A GATE IS NOT ONE. Gates carry `wall: true` because they join up with a
+   * wall's sprite mask and sit in the same block grid, and that made them fall
+   * into the drag-draw path with everything else — so pulling a Palisade Gate
+   * across twelve tiles bought twelve palisade gates for 240 wood, which is not
+   * a thing any player has ever wanted. A gate is a *door*: there is exactly one
+   * of it in a stretch of wall, and AoE2 places them one at a time.
+   *
+   * Refusing them here is the whole fix, because a type that is not a wall for
+   * this purpose falls through to ordinary tap placement — which is already
+   * single-tile, already stays armed for the next one, and already runs
+   * refreshWallsAround so the gate joins the wall either side of it.
+   */
+  function wallType() {
+    if (!st.placeType || !isWallType(st.placeType)) return null;
+    return isGateType(st.placeType) ? null : st.placeType;
+  }
+
+  /** Tile under the touch, lifted clear of the finger the way the ghost is. */
+  function tileUnder(sx, sy) {
+    const g = toGrid(sx, sy - GHOST_LIFT);
+    return {
+      tx: Math.max(0, Math.min(MAP_W - 1, Math.floor(g.x))),
+      ty: Math.max(0, Math.min(MAP_H - 1, Math.floor(g.y))),
+    };
+  }
+
+  function beginWallRun(sx, sy) {
+    const start = tileUnder(sx, sy);
+    st.mode = 'wallDraw';
+    st.ghost = null;
+    pushGhost();
+    st.wall = { tx0: start.tx, ty0: start.ty, tx1: start.tx, ty1: start.ty, plan: null };
+    updateWallRun(sx, sy, true);
+  }
+
+  /**
+   * Recompute the run for the tile now under the finger.
+   *
+   * The plan is only rebuilt when the *end tile* changes, not on every pointer
+   * event. planWallLine walks the run and does one bounded enclosure test over
+   * it, which is cheap per tile and not cheap sixty times a second — and the
+   * answer cannot change between two events that land on the same tile.
+   */
+  function updateWallRun(sx, sy, force = false) {
+    const w = st.wall;
+    if (!w) return;
+    const type = wallType();
+    if (!type) { cancelWallRun(); return; }
+    const end = tileUnder(sx, sy);
+    if (!force && end.tx === w.tx1 && end.ty === w.ty1) {
+      pushWallReadout(sx, sy);
+      return;
+    }
+    w.tx1 = end.tx;
+    w.ty1 = end.ty;
+
+    const tiles = economy.wallLineTiles(w.tx0, w.ty0, w.tx1, w.ty1);
+    const plan = economy.planWallLine(world, PLAYER, type, tiles);
+    w.plan = plan;
+
+    // Every tile in the run counts as a wall when working out how the segments
+    // join, so the preview shows the finished shape — corners included — rather
+    // than sixteen lone posts that would only knit together after they are all
+    // built.
+    const pending = new Set();
+    for (const seg of plan.segments) pending.add(`${seg.tx},${seg.ty}`);
+    const shown = plan.segments.map((seg) => ({
+      tx: seg.tx,
+      ty: seg.ty,
+      valid: seg.valid,
+      mask: wallMaskAt(world, seg.tx, seg.ty, PLAYER, pending),
+    }));
+
+    if (renderer && typeof renderer.setWallPreview === 'function') {
+      renderer.setWallPreview(type, shown);
+    }
+    pushWallReadout(sx, sy);
+  }
+
+  /** The floating "12 walls — 60 stone" label that rides above the finger. */
+  function pushWallReadout(sx, sy) {
+    if (!renderer || typeof renderer.setWallReadout !== 'function') return;
+    const w = st.wall;
+    const plan = w && w.plan;
+    if (!plan) { renderer.setWallReadout(null); return; }
+    const total = plan.segments.length;
+    const name = BUILDING_STATS[st.placeType] ? BUILDING_STATS[st.placeType].name : 'wall';
+    let text;
+    if (plan.trapped) {
+      text = plan.trapped;
+    } else if (plan.count === 0) {
+      text = plan.reason || 'Cannot build there';
+    } else {
+      const cost = Object.keys(plan.cost)
+        .map((k) => `${plan.cost[k]} ${k}`)
+        .join(', ');
+      const head = plan.count === total
+        ? `${plan.count} ${name}${plan.count === 1 ? '' : 's'}`
+        : `${plan.count} of ${total}`;
+      text = cost ? `${head} — ${cost}` : head;
+    }
+    renderer.setWallReadout(text, sx, sy - GHOST_LIFT - 34);
+  }
+
+  function clearWallPreview() {
+    if (renderer && typeof renderer.setWallPreview === 'function') renderer.setWallPreview(null);
+    if (renderer && typeof renderer.setWallReadout === 'function') renderer.setWallReadout(null);
+  }
+
+  /** Abandon a run in progress without spending anything. */
+  function cancelWallRun(announce = false) {
+    if (!st.wall) return;
+    st.wall = null;
+    clearWallPreview();
+    if (announce) hud.toast('Wall cancelled', 'info');
+  }
+
+  /** Lift: buy every segment the plan approved. */
+  function commitWallRun() {
+    const w = st.wall;
+    const type = wallType();
+    st.wall = null;
+    clearWallPreview();
+    if (!w || !type || !w.plan) return;
+
+    const plan = w.plan;
+    if (plan.count === 0) {
+      hud.toast(plan.reason || 'Cannot build there', 'warn');
+      return; // stay armed — the player only has to move
+    }
+
+    const tiles = economy.wallLineTiles(w.tx0, w.ty0, w.tx1, w.ty1);
+    const res = economy.placeWallLine(world, PLAYER, type, tiles);
+    const n = res.placed.length;
+    if (!n) {
+      hud.toast(res.reason || 'Cannot build there', 'warn');
+      return;
+    }
+
+    const s = BUILDING_STATS[type];
+    const label = `${n} ${s ? s.name : 'wall'}${n === 1 ? '' : 's'}`;
+    if (res.refused) hud.toast(`${label} — ${res.refused} could not be placed`, 'warn');
+    else hud.toast(`${label} — villagers on the way`, 'info');
+
+    // The foundations are ordinary construction sites, so ordinary builders
+    // finish them — and they are now queued, in the order the run was drawn, so
+    // a villager that finishes one segment walks to the next along the line
+    // instead of going back to a tree. That is what HANDOFF-walls.md left open:
+    // the wall is still built from one end inwards, which is what makes it
+    // useful while it is going up, but the crew no longer has to be re-ordered
+    // segment by segment.
+    const first = res.placed[0];
+    if (typeof economy.enqueueFoundation === 'function') {
+      for (const b of res.placed) economy.enqueueFoundation(world, b);
+    }
+    if (!anyBuilding()) {
+      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      if (!builders.length) {
+        let best = null;
+        let bd = Infinity;
+        for (const u of world.units) {
+          if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
+          const d = (u.x - first.x) ** 2 + (u.y - first.y) ** 2;
+          if (d < bd) { bd = d; best = u; }
+        }
+        if (best) builders = [best];
+      }
+      command(builders, { type: 'build', gx: first.x, gy: first.y, target: first });
+    }
+    fx(first.x, first.y, 'build');
+
+    // Stays armed, exactly as tapped placement now does: the next drag draws the
+    // next run. Two fingers still abandons a run mid-draw, and Done on the
+    // placement bar ends the batch.
+    if (hud && typeof hud.onFoundationPlaced === 'function') hud.onFoundationPlaced(n);
     syncPlacement();
   }
 
@@ -713,6 +981,15 @@ export function createInput(scene, world, renderer, hud) {
     const want = (hud && typeof hud.getPlacementType === 'function') ? hud.getPlacementType() : null;
     if (want === st.placeType) return;
     st.placeType = want || null;
+    cancelWallRun();
+    if (wallType()) {
+      // Said once, when the mode opens: the placement bar has room for the
+      // building's name and nothing else, and "drag" is not a thing a player
+      // guesses about a build button. Not for a gate — a gate is placed one at
+      // a time (see wallType) and telling the player to drag one would be an
+      // instruction to do something the game now refuses.
+      hud.toast('Drag to draw a wall — two fingers to cancel', 'info');
+    }
     if (!st.placeType) {
       st.ghost = null;
       pushGhost();
@@ -740,6 +1017,9 @@ export function createInput(scene, world, renderer, hud) {
     const pair = twoPointers();
     if (!pair) return;
     clearBox();
+    // A second finger always means "look somewhere else", never "keep drawing".
+    // This is also the documented way to abandon a wall run mid-drag.
+    cancelWallRun(!!st.wall);
     const [a, b] = pair;
     const mx = (a.x + b.x) / 2;
     const my = (a.y + b.y) / 2;
@@ -819,6 +1099,12 @@ export function createInput(scene, world, renderer, hud) {
     if (st.destroyed) return;
     if (ev.pointerType === 'mouse' && ev.button !== 0) return;
     ev.preventDefault();
+    // Belt and braces on the mobile autoplay policy. The engine attaches its own
+    // one-shot document listeners, but this is the first *trusted* gesture the
+    // game itself sees, it costs a state check after the first success, and it
+    // is the moment the ambient bed should start — a player who has just touched
+    // the map is a player who is playing.
+    unlockAudio();
 
     const p = gamePoint(ev);
     const now = performance.now();
@@ -835,7 +1121,9 @@ export function createInput(scene, world, renderer, hud) {
       st.anchor = { x: p.x, y: p.y, t: now };
       sampleVelocity(p, now);
       syncPlacement();
-      if (st.placeType) {
+      if (wallType()) {
+        beginWallRun(p.x, p.y);
+      } else if (st.placeType) {
         st.mode = 'place';
         moveGhost(p.x, p.y);
       } else {
@@ -861,6 +1149,7 @@ export function createInput(scene, world, renderer, hud) {
     const a = st.anchor;
     const moved = Math.hypot(p.x - a.x, p.y - a.y);
 
+    if (st.mode === 'wallDraw') { updateWallRun(p.x, p.y); return; }
     if (st.mode === 'place') { moveGhost(p.x, p.y); return; }
 
     if (st.mode === 'tap') {
@@ -916,7 +1205,10 @@ export function createInput(scene, world, renderer, hud) {
 
     if (!wasPrimary) return;
 
-    if (st.mode === 'box') {
+    if (st.mode === 'wallDraw') {
+      updateWallRun(p.x, p.y);
+      commitWallRun();
+    } else if (st.mode === 'box') {
       finishBox();
     } else if (st.mode === 'pan') {
       sampleVelocity(p, now);
@@ -946,6 +1238,7 @@ export function createInput(scene, world, renderer, hud) {
     const i = st.order.indexOf(ev.pointerId);
     if (i >= 0) st.order.splice(i, 1);
     if (st.mode === 'box') clearBox();
+    if (st.mode === 'wallDraw') cancelWallRun();
     if (!st.order.length) {
       st.mode = 'none';
       st.driving = false;
@@ -963,7 +1256,8 @@ export function createInput(scene, world, renderer, hud) {
 
   function onKey(ev) {
     if (ev.key === 'Escape') {
-      if (st.placeType) { hud.setPlacementMode(null); syncPlacement(); }
+      if (st.wall) { cancelWallRun(true); st.mode = 'none'; }
+      else if (st.placeType) { hud.setPlacementMode(null); syncPlacement(); }
       else if (attackArmed()) disarmAttack();
       else clearSelection(world);
     }
@@ -1037,6 +1331,7 @@ export function createInput(scene, world, renderer, hud) {
   function destroy() {
     st.destroyed = true;
     clearBox();
+    cancelWallRun();
     st.ghost = null;
     pushGhost();
     canvas.removeEventListener('pointerdown', onDown);
@@ -1063,6 +1358,8 @@ export function createInput(scene, world, renderer, hud) {
     _pickRally: pickRallyAt,
     _toScreen: toScreen,
     _toGrid: toGrid,
+    _wallRun: () => st.wall,
+    _cancelWallRun: cancelWallRun,
   };
 
   if (hud && typeof hud.attachInput === 'function') hud.attachInput(api);
