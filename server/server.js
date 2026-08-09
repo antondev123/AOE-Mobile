@@ -37,6 +37,15 @@ const MIME = {
 
 const rooms = new Map();
 
+/**
+ * How long an empty room is kept before it is thrown away.
+ *
+ * Generous on purpose: a player whose phone dropped the connection mid-match
+ * has this long to come back to their seat. It is only ever reached by a room
+ * with nobody in it at all.
+ */
+const IDLE_REAP_MS = 5 * 60_000;
+
 /** Match ids are read aloud and typed by hand, so no l/1/O/0. */
 function makeMatchId(rng = Math.random) {
   const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
@@ -92,6 +101,17 @@ function createRoom(id, seed) {
   let expected = Date.now();
   room.timer = setInterval(() => {
     const now = Date.now();
+    // Reap rooms nobody is in. This is checked *before* the lobby gate below,
+    // and the ordering is the whole point: a room that never starts would
+    // otherwise never reach the reaper, and every "Play a friend" tap that was
+    // never followed through would leave a timer and a 96x96 world behind for
+    // the lifetime of the process. Which is the common case — people create an
+    // invite, get distracted, and close the tab.
+    if (room.clients.size === 0 && now - room.lastActivity > IDLE_REAP_MS) {
+      closeRoom(room);
+      return;
+    }
+
     if (!room.started) {
       // Hold the clock at the starting line rather than letting it drift, so
       // the first tick played is tick 0 however long the lobby took.
@@ -116,11 +136,13 @@ function createRoom(id, seed) {
       broadcast(room, { type: 'over', winner: match.over.winner });
       closeRoom(room);
     }
-    // Reap rooms nobody is in.
-    if (room.clients.size === 0 && Date.now() - room.lastActivity > 5 * 60_000) {
-      closeRoom(room);
-    }
   }, SIM_DT * 1000);
+
+  // A room's clock is not a reason to keep the process alive — the listening
+  // socket is. Without this an empty room holds the event loop open until the
+  // reaper gets to it, which is why the test suite used to sit for five silent
+  // minutes after its last assertion before node would exit.
+  if (typeof room.timer.unref === 'function') room.timer.unref();
 
   rooms.set(id, room);
   return room;
