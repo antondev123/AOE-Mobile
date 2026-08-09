@@ -436,6 +436,13 @@ const run = async () => {
         st.revision++;
         g.renderer.centerOn(gx, gy);
         g.renderer.camera.scrollY += 210;
+        // Every other section freezes the sim with world.over so its shots hold
+        // still, and this is the one section that needs it running: the fight is
+        // played by the real combat system rather than staged, so the shots
+        // catch what a player would see. Without this the melee is photographed
+        // against a stopped clock and nobody ever swings.
+        w.over = false;
+        w.winner = null;
       });
       // The fight is run by the real combat system rather than staged, so what
       // the shots catch is what a player would see: units acquiring, swinging,
