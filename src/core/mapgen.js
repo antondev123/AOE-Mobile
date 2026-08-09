@@ -7,6 +7,7 @@
 
 import { MAP_W, MAP_H, TERRAIN, PLAYER, ENEMY } from './constants.js';
 import { spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop } from './world.js';
+import { commandUnits } from '../systems/unitAI.js';
 
 // Distance of each Town Center from its map corner.
 //
@@ -38,10 +39,72 @@ export function generateMap(world) {
   scatterStone(world, bases);
   scatterBerries(world, bases);
 
-  for (const b of bases) buildBase(world, b);
+  for (const b of bases) {
+    const built = buildBase(world, b);
+    putToWork(world, b, built.villagers);
+  }
 
   for (const p of world.players) recomputePop(world, p.id);
   return { bases };
+}
+
+// How many of the three starting villagers open on wood rather than on food.
+//
+// AoE2 opens every villager on food and this does not, for a reason particular
+// to what the opening has to *teach* on a phone. A player who gives no input
+// for the first minute — which a measurement of this build found is exactly
+// what happens — should see the two halves of the economy running, because the
+// food counter and the wood counter both moving is the whole gather loop
+// stated without a word of text: villager walks to thing, thing becomes number,
+// number buys building. Three on berries would show that loop once; two and one
+// shows it twice with different scenery, and leaves the opening still weighted
+// toward food the way an AoE2 opening is.
+const OPENING_WOODCUTTERS = 1;
+
+/**
+ * Send the starting villagers to the nearest food and the nearest wood.
+ *
+ * This is the fix for a dead opening. Three villagers standing in `idle` next
+ * to a Town Center is not a neutral starting position, it is a screen with
+ * nothing happening on it: measured over sixty simulated seconds of no input,
+ * food went 250 -> 250, wood 250 -> 250 and every villager stayed idle, while
+ * the enemy AI — which has always opened its own villagers — went from three
+ * units to six. The player was losing the match during the tutorial.
+ *
+ * It runs for BOTH players, from mapgen rather than from the AI, so the two
+ * openings are identical and a seed replays the same way for each side.
+ *
+ * Orders go through commandUnits, not through hand-written task objects: the
+ * point is to put the villagers into exactly the state a player's tap would
+ * have put them in, so that everything downstream — the idle counter, the
+ * allocation manager, the job note, a save taken on the first frame — sees
+ * ordinary gatherers and not a special case.
+ */
+function putToWork(world, base, villagers) {
+  if (!villagers || !villagers.length) return;
+  const food = nearestNode(world, base.x, base.y, 'berry');
+  const wood = nearestNode(world, base.x, base.y, 'tree');
+  villagers.forEach((u, i) => {
+    // Ordered from the back so that the wood assignment lands on the villager
+    // furthest round the fan, which keeps the two jobs visually separated from
+    // the first frame instead of having all three set off along the same line.
+    const wantWood = i >= villagers.length - OPENING_WOODCUTTERS;
+    const node = (wantWood ? wood : food) || wood || food;
+    if (!node) return;
+    commandUnits(world, [u], { type: 'gather', target: node, gx: node.x, gy: node.y });
+  });
+}
+
+/** The closest live resource node of a type to a point. Linear; runs twice per base. */
+function nearestNode(world, x, y, type) {
+  let best = null;
+  let bestD = Infinity;
+  for (const e of world.resources) {
+    if (e.dead || e.type !== type || !(e.amount > 0)) continue;
+    const d = (e.x - x) ** 2 + (e.y - y) ** 2;
+    if (d < bestD) { bestD = d; best = e; }
+  }
+  return best;
 }
 
 /** Counts that should grow with the map, never below the original figure. */

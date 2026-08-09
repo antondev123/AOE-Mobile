@@ -1,5 +1,189 @@
 # Changelog
 
+## The first sixty seconds, the fog, and the roster the HUD could not draw
+
+A reviewer played the finished build on a 390x844 phone at DPR 2, measured
+everything, and produced a ranked list. This is that list, fixed, with the
+before and after numbers it was written from.
+
+### The opening was a dead screen
+
+**Measured:** start a match, give no input for sixty simulated seconds, and
+*nothing changes*. Food 250 -> 250, wood 250 -> 250, gold and stone untouched,
+zero toasts, three villagers sitting in `idle`, and the frame at t=60s pixel-
+identical to the frame at t=0. The enemy AI — which has always opened its own
+villagers — went from 3 units and 2 buildings to 6 and 4 in the same minute.
+The player was losing the match during the tutorial.
+
+Three changes, because it was three separate failures wearing one coat.
+
+**The starting villagers now go to work at spawn** (`putToWork` in
+`core/mapgen.js`), two on the nearest berries and one on the nearest wood, for
+*both* players, so the opening is symmetric and a seed replays the same way for
+each side. Orders go through `commandUnits` rather than hand-built task objects,
+so the idle counter, the allocation manager, the job note and a save taken on
+the first frame all see ordinary gatherers. Same sixty seconds now: food 250 ->
+390, wood 250 -> 300, three villagers in `gather`.
+
+**A four-line coach**, fired off world time, carries the first ninety seconds:
+tap a villager then tap the berries, select the Town Center to train more,
+population capped, advance the age. It never fires on a resumed match — the
+clock the restored world comes back with is the test — and every line carries a
+predicate asked at the moment it would fire, so a player who queued villagers at
+eight seconds is not told to train villagers at fifteen, and one already in the
+Feudal Age is not told to advance to it.
+
+**"How to play" is reachable during a match.** The rules were written on the
+boot card, inside a `<details>` collapsed by default, and became unreachable
+the instant the match started. The menu sheet's first row now *clones* that same
+list into a sheet, so index.html still owns the words and there is one place to
+edit them.
+
+### The placement bar was drawn on top of the placement ghost
+
+**Measured:** placement opens with the ghost at screen y=422; `.place-bar`
+occupied y 387..445 — an opaque gold-bordered panel whose centre was six pixels
+from the ghost's. Worse than a one-frame collision, because the ghost tracks
+`finger.y - 62` for the whole gesture: the only band in which a player could
+hold the phone *and* see what they were placing was the sixty pixels between the
+bar and the dock. HUD coverage while placing measured 48.8%.
+
+The bar is now pinned under the resource bar at the **top**, which is the
+read-never-tapped strip this HUD already reserves, and the toast stack steps
+down under it. It is text and a Cancel button; it does not need the thumb zone.
+Coverage while placing **48.8% -> 42.0%**, and 58px of contiguous map comes back
+in the middle of the screen. Cancel is still 67x44.
+
+### The HUD drew a fully-drawn roster as three-letter debug codes
+
+`VIL MIL SPR CAV RAM MLL MIN BSH TRE` — used in the selection chips, the
+training queue and the build queue, while `gfx/textures.js`, four thousand lines
+of generated art, sat twelve pixels above them on the map. Three of the codes
+near-collided (MIL militia, MLL mill, MIN mining camp) and CAV did not match its
+own label, "Scout Cavalry".
+
+New `ui/portraits.js` cuts each type out of the sprite atlas into a 32px canvas,
+cached one per type (there are about thirteen), and the chips wear it. A
+background-position crop was not available — the atlas is a runtime canvas
+texture with no URL and a shelf packer deciding its rectangles — and encoding it
+to a data URL would be a 2048x2048 PNG encode on a phone to draw thirteen small
+pictures. The three-letter table stays as the fallback for a roster entry with
+no art yet.
+
+### Fog of war left half the map window permanently black
+
+**Measured** over the map viewport, counting pixels below luma 28: **45.8% at
+t=0** and **46.1% at 210s** with the economy running normally. Two causes.
+
+*Unexplored ground was painted at luma 15.* It is now a very dark wash of the
+terrain average — a dun brown at luma 38 — ramped off the same blurred alpha
+byte the veil uses, so the colour change follows the soft fog edge instead of
+cutting across it. The explored veil is untouched: "seen and dark" and "never
+seen" are different statements and should not look the same.
+
+*And a circle in grid space is not a circle on screen.* `TILE_W/TILE_H` is 64/32,
+so r tiles of sight light an ellipse 90r wide and 45r tall — exactly twice as
+wide as tall, on a portrait phone, where the viewport is the other way round. A
+base in the middle of the view could never light the top or bottom of it.
+`systems/vision.js` now stamps an ellipse **dilated one tile along the gx+gy
+diagonal**, the axis that maps to screen vertical, which takes the on-screen
+aspect from 2.0 to about 1.6. It is deliberately a partial correction: a true
+screen circle needs a = 2r, which doubles the area every viewer reveals.
+
+**Blackness after: 0.2% at t=0, 5.1% at 210s.** Cost, on the 150-viewer stress in
+`tests/vision.test.mjs`: 68431 tile writes -> 83725, steady state
+**0.120ms/step -> 0.121ms**. The shape is baked into the cached row table, so
+there is no second pass.
+
+`ZOOM_DEFAULT` was left at 0.7. Dropping it to 0.6 was tried and screenshotted:
+it shows *more* unexplored ground, not less, and takes units from ~27x37 to
+~23x32 CSS px. It is the wrong direction for the finding it was suggested under.
+
+### Trees drew opaque over the fight happening behind them
+
+With forty units engaged at 0.7 zoom, half the combatants were behind canopies
+and a Market built inside a forest was invisible even with its selection diamond
+drawn over it. Any tree or cliff whose screen box overlaps something that sorts
+*behind* it now drops to 0.45 alpha for that frame — a per-sprite alpha reset by
+`setFrame` on the next frame, gathered by passes that were already walking those
+entities. Draw calls unchanged.
+
+Damage numbers are now coloured **by who swung**: green for a blow you landed,
+red for one you took, the old warm white for everything else. They were red over
+your own casualties and warm white over everything else, which reads as one
+colour at speed — a melee produced a cloud of pale digits and the only way to
+tell whether you were winning was to read them.
+
+Health bars keep their place but gain a two-pixel post down to the head of the
+unit they belong to. At 32 world pixels of vertical spacing against 53 pixels of
+sprite there is no height at which a bar is over nothing; the stem is what makes
+ownership unambiguous instead of merely probable. Drawing bars in the sprite
+pass — the actually-correct fix — is two more quads per bar and 400 objects on a
+900-object budget at 216 units.
+
+### Advancing the age was the quietest event in the game
+
+It went out as `tone: 'info'` — the plainest of three tones, identical in weight
+to "Halted" and "Sound on" — while "Population capped" got a red border. And
+nothing said what had just opened. It is now a gold, full-width, four-second
+card in the alert mould, listing the buildings and the count of upgrades the age
+unlocked, derived from the same two tables the build menu and the research panel
+read. `systems/tech.js` no longer raises a toast for it: only the HUD can name
+what a shelf of the build menu just gained.
+
+### No way out of a match, and a victory that was a mop-up
+
+Defeat required having **no buildings and no villagers**, so winning meant
+hunting the last enemy villager across a map that is 93% fog. A player now loses
+when they own nothing that trains a unit — no Town Center, no Barracks, no
+Castle, not even a foundation of one — which is the point at which the match is
+actually decided. **Resign** sits at the foot of the menu sheet behind the same
+arm-then-confirm Demolish uses, and routes through the same defeat flag rather
+than jumping to the end card, so resigning produces exactly the state losing
+produces.
+
+The end card reported a clock and nothing else. It now reports time, units
+killed, units lost and peak army, and **Look at the map** folds it away to a
+single pill so the player can scroll around the position they just won.
+
+### Smaller things
+
+* Selecting only villagers no longer shows four stance buttons over ~150px for a
+  unit whose default stance is No Attack and which never fights. Build — its one
+  real verb, and previously the smallest button on screen at 50x44 — takes the
+  full row. Coverage with a unit selected 39.9% -> 35.2%.
+* The command panel, the build menu and the menu sheet now show a bottom fade
+  and a chevron when they are scrolled part-way. A Barracks panel measured 479px
+  of buttons inside 336px of box with no scrollbar, no fade and nothing else to
+  say so — it simply looked cut off, and a player who does not scroll never sees
+  the blacksmith line.
+* Dragging with **Palisade Gate** armed built twelve gates for 240 wood. A gate
+  is a door, not a run: it is out of the drag-draw path and falls through to
+  ordinary tap placement, which is already single-tile and already joins the
+  wall either side of it.
+* The build menu's shelves are laid out **bottom-up**, because the sheet grows
+  upward from the dock: House, Farm and Mill land under the thumb and Close,
+  pressed once a match, goes to the top (sticky, so it never scrolls away).
+* The boot card no longer opens with "Phaser 3.90.0 ready". The engine version
+  moved to the build footer, where a bug report can still find it.
+
+### Tests
+
+The layout sweep in `tests/touchui.browser.mjs` grew five states — the rules
+sheet, an armed Resign, the age-up card, the end card and the end card folded
+away — and now audits `#endcard` alongside `#hud` and `#boot`. It caught the
+help sheet at 62vh hanging 76px off the top of the phone.
+
+One existing check had to be rewritten rather than kept. `a minute of play with
+no gesture plays nothing at all` was passing for the wrong reason: headless
+Chromium starts its AudioContext in `running`, so the premise was never true —
+what kept the counter at zero was that the player's three villagers stood idle
+for the whole minute and every enemy cue was out of earshot. Putting the
+villagers to work made the same silent run play thirteen cues. The check now
+measures the autoplay policy first and asserts the claim worth defending in each
+case: a suspended context must schedule nothing, a running one must carry the
+game's own events through to the mixer.
+
 ## Saves, the Market, sound, and two enemy AI defects
 
 ### Two enemy AI defects

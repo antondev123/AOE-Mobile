@@ -14,7 +14,7 @@ import {
   BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
   MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
   FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
-  isWallType,
+  isWallType, isGateType,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 // The local player's seat, as a live binding — see src/core/viewpoint.js for
@@ -34,6 +34,7 @@ import {
 
 import { createLocalBus } from '../net/bus.js';
 import { createMinimap, miniToGrid } from './minimap.js';
+import { createPortraits } from './portraits.js';
 import {
   selectedEntities, setSelection, clearSelection, selectionSignature,
 } from './selection.js';
@@ -67,6 +68,16 @@ const DEMOLISH_ARM_MS = 4000;
 // worse than no HUD at all.
 const RALLY_SNAP = 1.5;
 
+// The text fallback behind every chip and queue slot.
+//
+// It used to be the whole of the HUD's vocabulary for the roster — see the
+// header of ui/portraits.js for why that was the loudest prototype signal in
+// the game — and it is now what a type shows only when the atlas has no art for
+// it. Kept, rather than deleted, precisely because that case is a roster entry
+// somebody has added without a sprite yet, and a chip with nothing in it is
+// worse than a chip with three letters in it. The near-collisions the review
+// found (MIL militia against MLL mill against MIN mining camp) no longer matter
+// on a screen where every one of them is a picture.
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
   spearman: 'SPR', scout: 'CAV', ram: 'RAM',
@@ -293,6 +304,8 @@ export function createHud(scene, world, audio = null) {
     demolishArm: null,       // { key, at } — demolish armed for exactly this set
     buildMenuOpen: false,
     menuOpen: false,
+    helpOpen: false,
+    resignArm: 0,           // performance.now() of the first Resign tap
     allocOpen: false,
     marketOpen: false,
     marketSig: '',
@@ -349,10 +362,27 @@ export function createHud(scene, world, audio = null) {
   marketSheet.hidden = true;
   sheets.appendChild(marketSheet);
 
-  const placeBar = el('div', 'place-bar');
+  // The placement bar lives at the TOP, not in the thumb stack with the other
+  // sheets — the only control in the HUD that does.
+  //
+  // It was measured sitting exactly on top of the thing it describes. Placement
+  // opens with the ghost at screen y=422 and the bar occupied y=387..445: an
+  // opaque panel with a gold border, its centre six pixels from the ghost's.
+  // And it is worse than a one-frame collision, because the ghost tracks
+  // finger.y - 62 for the whole gesture, so the only band in which a player can
+  // both hold the phone and see what they are placing was the sixty pixels
+  // between the bar and the dock — higher and the ghost is behind the bar,
+  // lower and the finger is on the minimap, which teleports the camera.
+  //
+  // Everything in the bar is read, not aimed: a name, a count, a hint and a
+  // Cancel. The top strip is already the read-never-tapped region of this HUD
+  // (see the note in index.html), which is exactly what this is, and moving it
+  // there hands back 58px of contiguous map in the middle of the screen —
+  // measured HUD coverage while placing drops from 48.8% to 42.0%.
+  const placeBar = el('div', 'place-bar place-top');
   placeBar.id = 'place-bar';
   placeBar.hidden = true;
-  sheets.appendChild(placeBar);
+  root.appendChild(placeBar);
 
   // Same shape as the placement bar on purpose: the game already teaches "a bar
   // across the bottom means the next tap on the map is spoken for".
@@ -365,6 +395,14 @@ export function createHud(scene, world, audio = null) {
   menuSheet.id = 'menu-sheet';
   menuSheet.hidden = true;
   sheets.appendChild(menuSheet);
+
+  // The rules. Same shell as the menu sheet — it is the same kind of thing, a
+  // scrolling column of text over the map — and a sheet rather than a modal so
+  // that the player can still see the game they are reading about.
+  const helpSheet = el('div', 'menu-sheet help-sheet');
+  helpSheet.id = 'help-sheet';
+  helpSheet.hidden = true;
+  sheets.appendChild(helpSheet);
 
   // --- The dock -------------------------------------------------------------
   //
@@ -428,6 +466,9 @@ export function createHud(scene, world, audio = null) {
     topObserver = new ResizeObserver((entries) => {
       const h = Math.round(entries[0].contentRect.height + 14);
       root.style.setProperty('--topbar-h', `${h}px`);
+      // Also on the document element, because the end card lives outside the
+      // HUD overlay and its "Results" pill has to tuck under the same bar.
+      doc.documentElement.style.setProperty('--topbar-h', `${h}px`);
     });
     topObserver.observe(topBar);
   }
@@ -435,6 +476,24 @@ export function createHud(scene, world, audio = null) {
   // --- Minimap --------------------------------------------------------------
 
   const minimap = dom.minimap ? createMinimap(dom.minimap, world) : null;
+
+  // --- Portraits ------------------------------------------------------------
+
+  const portraits = createPortraits(scene);
+
+  /**
+   * The picture of a type, for a chip or a queue slot — or its three letters
+   * when there is no picture to be had.
+   *
+   * `cls` is the class the text fallback wears, because the two callers style
+   * their fallback differently ('badge' in the selection panel, 'ab' in the
+   * queues) and the portrait itself is styled once, by its own class.
+   */
+  function typeIcon(kind, type, player, cls) {
+    const art = portraits.element(kind, type, player);
+    if (art) return art;
+    return el('span', cls, ABBR[type] || type.slice(0, 3).toUpperCase());
+  }
 
   // --- Camera helpers -------------------------------------------------------
 
@@ -547,6 +606,76 @@ export function createHud(scene, world, audio = null) {
     return rec;
   }
 
+  /**
+   * The age-up card.
+   *
+   * Advancing the age used to be the quietest event in the game. It went out as
+   * a plain `info` toast — the same styling as "Halted" and "Sound on" — while
+   * "Population capped" got a red border, so the single most important
+   * strategic milestone in a match was quieter than a routine nag. And nothing
+   * said what had just happened: Stone Walls, a Watch Tower, a Market and four
+   * blacksmith upgrades flip from grey to live in the build menu at that
+   * instant, and a player who does not open the menu in the next minute never
+   * finds out.
+   *
+   * So it borrows the under-attack alert's shape — full width, its own colour,
+   * a heading and a sub-line — in gold rather than red, and it lists what
+   * opened. The list is derived from the same two tables the build menu and the
+   * research panel read (ageForBuilding, TECHS[].age), so it cannot go stale
+   * when a building or an upgrade is added.
+   *
+   * Four seconds rather than the alert's five and a bit: it is news, not a
+   * summons, and there is nothing to reach for.
+   */
+  const AGE_CARD_MS = 4000;
+
+  function ageUnlocks(age) {
+    const out = [];
+    for (const type of BUILDABLE) {
+      const s = BUILDING_STATS[type];
+      if (!s) continue;
+      if (tech.ageForBuilding(type) === age) out.push(s.name);
+    }
+    let techs = 0;
+    for (const id of Object.keys(tech.TECHS)) {
+      const t = tech.TECHS[id];
+      // The next age-up is not an unlock, it is the next rung of the same
+      // ladder, and listing it here reads as though it were free.
+      if (t.advancesTo !== undefined) continue;
+      if (t.age === age) techs++;
+    }
+    return { buildings: out, techs };
+  }
+
+  function ageCard(age) {
+    if (!dom.toasts) return null;
+    const now = performance.now();
+    // The card supersedes the chatter the way the alert does — an age-up
+    // arrives in the middle of "Training Villager" and should not queue behind
+    // it — but never an alert. Being raided while advancing is still the more
+    // urgent of the two facts.
+    for (const t of state.toasts.slice()) if (!t.alert) killToast(t);
+
+    const { buildings, techs } = ageUnlocks(age);
+    const node = el('div', 'toast agecard');
+    node.setAttribute('role', 'status');
+    const line = el('span', 'line');
+    line.appendChild(el('span', 'crest', '⌂'));
+    line.appendChild(doc.createTextNode(`${tech.ageName(age)}`));
+    node.appendChild(line);
+    const bits = [];
+    if (buildings.length) bits.push(buildings.join(', '));
+    if (techs) bits.push(`${techs} new upgrade${techs === 1 ? '' : 's'}`);
+    node.appendChild(el('span', 'sub',
+      bits.length ? `Now available: ${bits.join(' · ')}` : 'Every building of yours is tougher'));
+
+    dom.toasts.appendChild(node);
+    dom.toasts.classList.add('wide');
+    const rec = { node, at: now, ttl: AGE_CARD_MS, alert: true, milestone: true };
+    pushToast(rec);
+    return rec;
+  }
+
   function pushToast(rec) {
     state.toasts.push(rec);
     // Over budget: retire the oldest *routine* toast first. An alert must never
@@ -564,6 +693,12 @@ export function createHud(scene, world, audio = null) {
     state.toasts.splice(i, 1);
     rec.node.classList.add('out');
     setTimeout(() => rec.node.remove(), 280);
+    // The stack goes back to being a narrow corner box the moment the last
+    // full-width card leaves it, or every toast for the rest of the match
+    // covers half the map.
+    if (rec.milestone && dom.toasts && !state.toasts.some((t) => t.milestone)) {
+      dom.toasts.classList.remove('wide');
+    }
   }
 
   function tickToasts(now) {
@@ -573,6 +708,106 @@ export function createHud(scene, world, audio = null) {
     if (state.alarmUntil && now > state.alarmUntil) {
       state.alarmUntil = 0;
       if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
+    portraits.destroy();
+    }
+  }
+
+  // --- The coach ------------------------------------------------------------
+  //
+  // Four lines, fired off world time, that carry a new player through the first
+  // ninety seconds of a match.
+  //
+  // This exists because of a measurement, not a hunch: starting a match and
+  // giving no input for sixty simulated seconds used to change nothing at all —
+  // no resource moved, no toast fired, three villagers sat idle and the screen
+  // at t=60s was pixel-identical to the screen at t=0. The starting villagers
+  // now work (see putToWork in core/mapgen.js), which fixes the *economy*; this
+  // fixes the silence. Between them a player who does nothing sees a game that
+  // is visibly running and is told, in order, the four things that stop it
+  // running out.
+  //
+  // Two rules, both of which the lines below obey:
+  //
+  //   It never fires on a resumed match. Somebody twelve minutes into a game
+  //   does not need to be told what a villager is, and the save carries no
+  //   record of what they were told the first time. `fresh` is decided once,
+  //   here, from the clock the restored world came back with.
+  //
+  //   It never tells the player to do something they have already done. Every
+  //   line carries a `still` predicate that is asked at the moment it would
+  //   fire, so a player who queued villagers at eight seconds is not told to
+  //   train villagers at fifteen, and one who is already in the Feudal Age is
+  //   not told to advance to it.
+  //
+  // Tone follows the rest of the HUD's vocabulary: teaching is 'info', and the
+  // only line that earns 'warn' is the one that is a problem right now.
+  const COACH = [
+    {
+      at: 3,
+      text: 'Tap a villager, then tap the berries',
+      tone: 'info',
+      // Only worth saying while the player has issued no orders of their own.
+      // The selection being empty is the honest test for "has not touched
+      // anything yet" — the first thing any tap on this game does is select.
+      still: () => world.selection.size === 0,
+    },
+    {
+      at: 15,
+      text: 'Select the Town Center to train more villagers',
+      tone: 'info',
+      still: () => {
+        const tcs = ownedBy(world, PLAYER, 'building', 'towncenter');
+        // Already training, or already past the three you started with: the
+        // player has worked it out and does not need the hint.
+        if (tcs.some((b) => (b.queue || []).length > 0)) return false;
+        return ownedBy(world, PLAYER, 'unit', 'villager').length <= 3;
+      },
+    },
+    {
+      at: 40,
+      text: 'Population capped — tap Build and put down a house',
+      tone: 'warn',
+      still: () => {
+        const p = world.players[PLAYER];
+        if (p.pop < p.popCap) return false;
+        // A house already going up is the answer to this line; saying it
+        // anyway is nagging somebody who is mid-fix.
+        return ownedBy(world, PLAYER, 'building', 'house').length === 0;
+      },
+    },
+    {
+      at: 90,
+      text: 'Select the Town Center and advance the age',
+      tone: 'info',
+      still: () => {
+        if (tech.currentAge(world, PLAYER) > 0) return false;
+        return !ownedBy(world, PLAYER, 'building', 'towncenter')
+          .some((b) => (b.research || []).length > 0);
+      },
+    },
+  ];
+
+  // A resumed match comes back with its clock, so a non-zero time at the moment
+  // the HUD is built means this player has been here before.
+  const coachFresh = world.time < 0.5;
+  let coachAt = 0;
+
+  function tickCoach() {
+    if (!coachFresh || world.over) return;
+    while (coachAt < COACH.length && world.time >= COACH[coachAt].at) {
+      const line = COACH[coachAt];
+      coachAt++;
+      let wanted = true;
+      try {
+        wanted = line.still();
+      } catch (_) {
+        // A predicate that throws is a bug in the predicate, not a reason to
+        // withhold the whole coach — but it is also not a reason to shout.
+        wanted = false;
+      }
+      if (!wanted) continue;
+      toast(line.text, line.tone);
+      return; // never two coaching lines in one frame
     }
   }
 
@@ -662,7 +897,7 @@ export function createHud(scene, world, audio = null) {
     for (const g of groups.values()) {
       const own = g.player === PLAYER;
       const chip = el('button', `chip ${own ? '' : g.player == null ? 'neutral' : 'foe'}`);
-      chip.appendChild(el('span', 'badge', ABBR[g.type] || g.type.slice(0, 3).toUpperCase()));
+      chip.appendChild(typeIcon(g.list[0].kind, g.type, g.player, 'badge'));
       // The header already names a lone selection — do not say it twice.
       if (groups.size > 1 || g.list.length > 1) {
         chip.appendChild(el('span', 'n', `×${g.list.length}`));
@@ -883,10 +1118,19 @@ export function createHud(scene, world, audio = null) {
     }
 
     // Villagers: build.
+    //
+    // Full width, because it is the only verb a villager has. Measured on a
+    // 390px phone, selecting one villager put Build at 50x44 — the smallest
+    // button on the screen — under a hundred and fifty pixels of stance
+    // buttons belonging to a unit whose default stance is No Attack and which
+    // never fights. The stances now come off entirely for a villager-only
+    // selection (see below) and the button that opens the whole build tree
+    // takes the row it was always worth.
     if (villagers.length) {
       panel.appendChild(cmdButton('Build', {
-        cls: 'primary',
-        sub: `${villagers.length} vill`,
+        cls: 'primary wide',
+        sub: `${villagers.length} villager${villagers.length === 1 ? '' : 's'}`,
+        aria: `Open the build menu for ${villagers.length} villagers.`,
         onTap: () => toggleBuildMenu(),
       }));
     }
@@ -989,7 +1233,15 @@ export function createHud(scene, world, audio = null) {
     // Stance and formation. Both are unit *settings* rather than orders, which
     // is why they sit below the verbs: you set them once and every order after
     // that obeys them.
-    if (units.length) renderStances(panel, units);
+    //
+    // Not for a selection that is nothing but villagers. Four segments over
+    // ~150px of a 390px screen is the largest block in the panel, and for a
+    // villager every one of them is a setting about fighting: it opens on No
+    // Attack, it has no attack worth the name, and a player who moves it off No
+    // Attack has made their economy worse. There is one case where a villager's
+    // stance genuinely matters — mixed in with soldiers, where the group order
+    // has to mean one thing — and that case still shows the row.
+    if (units.length && units.length !== villagers.length) renderStances(panel, units);
     if (military.length > 1) renderFormations(panel, military);
 
     // Stop always available to units.
@@ -1278,7 +1530,7 @@ export function createHud(scene, world, audio = null) {
       queue.forEach((entry, i) => {
         const s = el('button', `qslot ${i === 0 ? 'head' : ''}`);
         const uname = UNIT_STATS[entry.type] ? UNIT_STATS[entry.type].name : entry.type;
-        s.appendChild(el('span', 'ab', ABBR[entry.type] || entry.type.slice(0, 3).toUpperCase()));
+        s.appendChild(typeIcon('unit', entry.type, PLAYER, 'ab'));
         s.appendChild(el('span', 'x', '×'));
         s.title = `Cancel ${uname} — cost refunded`;
         s.setAttribute('aria-label', `Cancel ${uname}, number ${i + 1} in the queue. The cost is refunded.`);
@@ -1495,7 +1747,9 @@ export function createHud(scene, world, audio = null) {
       toggleAlloc(false);
       toggleMenu(false);
       toggleMarket(false);
+      closeHelp();
       renderBuildMenu();
+      markCut(buildMenu);
     } else {
       state.liveBuild = []; // stop refreshing buttons nobody can see
     }
@@ -1531,7 +1785,26 @@ export function createHud(scene, world, audio = null) {
       (shelves[need] || shelves[0]).push({ type, s, need });
     }
 
-    for (let age = 0; age < shelves.length; age++) {
+    // Bottom-anchored sheet, so the shelves are laid out bottom-up.
+    //
+    // The menu grows upward from just above the dock, which means the LAST row
+    // in the document is the one nearest the thumb and the first row is the one
+    // furthest from it. It used to be written top-down like a page: House, Farm
+    // and Mill — the three buildings a player puts down in the first two
+    // minutes and keeps putting down for the rest of the match — sat at the top,
+    // the hardest place on a 390x844 phone to reach, and Close, which is
+    // pressed once and never matters, sat at the bottom under the thumb.
+    //
+    // Reversed, the Dark Age shelf lands in the thumb's arc, each later age is
+    // one shelf further away in the same order it becomes relevant, and Close
+    // goes to the top where it is still perfectly findable and no longer in the
+    // way. The headings keep the reading order sensible on the way up.
+    const cancel = el('button', 'cbtn danger');
+    cancel.appendChild(el('span', 'label', 'Close'));
+    cancel.addEventListener('click', (ev) => { ev.stopPropagation(); toggleBuildMenu(false); });
+    buildMenu.appendChild(cancel);
+
+    for (let age = shelves.length - 1; age >= 0; age--) {
       const shelf = shelves[age];
       if (!shelf.length) continue;
       const locked = age > myAge;
@@ -1540,11 +1813,10 @@ export function createHud(scene, world, audio = null) {
       buildMenu.appendChild(title);
       for (const entry of shelf) buildMenu.appendChild(buildButton(entry, locked));
     }
-
-    const cancel = el('button', 'cbtn danger');
-    cancel.appendChild(el('span', 'label', 'Close'));
-    cancel.addEventListener('click', (ev) => { ev.stopPropagation(); toggleBuildMenu(false); });
-    buildMenu.appendChild(cancel);
+    // Scroll to the bottom, where the Dark Age shelf now is. A scroller that
+    // opens at the top would put the reachable end off screen, which is the
+    // whole problem this reordering is solving.
+    buildMenu.scrollTop = buildMenu.scrollHeight;
   }
 
   function buildButton({ type, s, need }, locked) {
@@ -1622,7 +1894,7 @@ export function createHud(scene, world, audio = null) {
     list.forEach((b, i) => {
       const name = displayName(b);
       const chip = el('button', `bq-chip ${i === 0 ? 'head' : ''}`);
-      chip.appendChild(el('span', 'ab', ABBR[b.type] || b.type.slice(0, 3).toUpperCase()));
+      chip.appendChild(typeIcon('building', b.type, PLAYER, 'ab'));
       chip.appendChild(el('span', 'n', `${Math.round(progressOf(b) * 100)}%`));
       chip.appendChild(el('span', 'x', '×'));
       chip.title = `Cancel the queued ${name} — cost refunded`;
@@ -1680,6 +1952,8 @@ export function createHud(scene, world, audio = null) {
     if (!type) {
       placeBar.hidden = true;
       placeBar.textContent = '';
+      root.classList.remove('placing');
+      root.style.removeProperty('--placebar-h');
       return;
     }
     const s = BUILDING_STATS[type];
@@ -1689,7 +1963,9 @@ export function createHud(scene, world, audio = null) {
     const txt = el('div', 'txt', n
       ? `${name} ×${n} placed`
       : `Place ${name}`);
-    txt.appendChild(el('small', null, isWallType(type)
+    // A gate is a wall piece but not a run: it goes down one at a time (see
+    // wallType in ui/input.js), so it must not be advertised as draggable.
+    txt.appendChild(el('small', null, isWallType(type) && !isGateType(type)
       ? 'Drag to draw a run — two fingers to cancel'
       : n
         ? 'Keep tapping to queue more'
@@ -1702,6 +1978,11 @@ export function createHud(scene, world, audio = null) {
     done.addEventListener('click', (ev) => { ev.stopPropagation(); setPlacementMode(null); });
     placeBar.appendChild(done);
     placeBar.hidden = false;
+    root.classList.add('placing');
+    // The toast stack sits directly under the resource bar and the bar has just
+    // taken that space, so it is measured and handed over rather than guessed
+    // at — the bar is one line tall for a house and two for a wall run.
+    root.style.setProperty('--placebar-h', `${placeBar.offsetHeight + 6}px`);
   }
 
   function setPlacementMode(typeOrNull) {
@@ -1843,8 +2124,8 @@ export function createHud(scene, world, audio = null) {
 
   function renderMenuSheet() {
     menuSheet.textContent = '';
-    const add = (label, fn) => {
-      const b = el('button', null, label);
+    const add = (label, fn, cls) => {
+      const b = el('button', cls || null, label);
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
         click();
@@ -1852,7 +2133,14 @@ export function createHud(scene, world, audio = null) {
         toggleMenu(false);
       });
       menuSheet.appendChild(b);
+      return b;
     };
+    // First row, above everything, because a player who has opened this menu
+    // looking for help has nowhere else to look. The rules were written on the
+    // boot card and became unreachable the instant the match started — the one
+    // screen in the game that explains the game was behind a collapsed
+    // <details> a player saw once and never again.
+    add('How to play', () => openHelp(), 'menu-help');
     add('Centre on Town Center', () => {
       const tc = ownedBy(world, PLAYER, 'building', 'towncenter')[0];
       if (tc) { centerOnGrid(tc.x, tc.y); setSelection(world, [tc]); }
@@ -1873,6 +2161,80 @@ export function createHud(scene, world, audio = null) {
     });
     add('Clear selection', () => clearSelection(world));
     renderSoundControls();
+    renderResign();
+  }
+
+  /**
+   * Resign, last in the sheet and armed before it fires.
+   *
+   * The same arm-then-confirm Demolish uses, for the same reason and with the
+   * same wording, because this is the most destructive button in the game: it
+   * ends the match. It is last rather than first so that a thumb reaching for
+   * "Clear selection" cannot land on it, and it does not close the sheet on the
+   * first tap — the confirm has to be somewhere the player is already looking.
+   */
+  function renderResign() {
+    menuSheet.appendChild(el('div', 'menu-head', 'Match'));
+    const b = el('button', 'menu-resign');
+    const paint = () => {
+      const armed = state.resignArm && performance.now() - state.resignArm < DEMOLISH_ARM_MS;
+      b.textContent = armed ? 'Confirm — resign the match' : 'Resign';
+      b.classList.toggle('armed', !!armed);
+      b.setAttribute('aria-label', armed
+        ? 'Confirm resignation. The match ends now and counts as a defeat.'
+        : 'Resign the match. Asks to confirm.');
+    };
+    paint();
+    b.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      click();
+      if (!(state.resignArm && performance.now() - state.resignArm < DEMOLISH_ARM_MS)) {
+        state.resignArm = performance.now();
+        paint();
+        toast('Resign the match? Tap again', 'warn');
+        return;
+      }
+      state.resignArm = 0;
+      toggleMenu(false);
+      if (scene && typeof scene.resign === 'function') scene.resign();
+    });
+    menuSheet.appendChild(b);
+  }
+
+  /**
+   * The rules, in a sheet, cloned from the boot card's list.
+   *
+   * Cloned rather than restated: index.html owns the words, this owns where
+   * they appear, and the day somebody adds a line about walls there is exactly
+   * one place to add it. The boot card is hidden but still in the document
+   * during a match, so the source list is always there to copy.
+   */
+  function openHelp() {
+    helpSheet.textContent = '';
+    const head = el('div', 'menu-head', 'How to play');
+    helpSheet.appendChild(head);
+    const src = doc.getElementById('help-list');
+    if (src) {
+      helpSheet.appendChild(src.cloneNode(true)).removeAttribute('id');
+    } else {
+      helpSheet.appendChild(el('div', 'cmd-note', 'The rules are on the start screen.'));
+    }
+    const close = el('button', 'primary', 'Got it');
+    close.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      click();
+      closeHelp();
+    });
+    helpSheet.appendChild(close);
+    helpSheet.hidden = false;
+    state.helpOpen = true;
+    markCut(helpSheet);
+  }
+
+  function closeHelp() {
+    helpSheet.hidden = true;
+    helpSheet.textContent = '';
+    state.helpOpen = false;
   }
 
   // --- Sound ------------------------------------------------------------------
@@ -1960,7 +2322,13 @@ export function createHud(scene, world, audio = null) {
       toggleAlloc(false);
       toggleBuildMenu(false);
       toggleMarket(false);
+      closeHelp();
+      // A resignation armed in a previous visit to this sheet must not still be
+      // armed when it is opened again — the arm is a promise about the *next*
+      // tap, and reopening the menu is not that tap.
+      state.resignArm = 0;
       renderMenuSheet();
+      markCut(menuSheet);
     }
   }
 
@@ -2120,6 +2488,7 @@ export function createHud(scene, world, audio = null) {
       toggleMenu(false);
       toggleBuildMenu(false);
       toggleMarket(false);
+      closeHelp();
       renderAllocSheet();
     }
   }
@@ -2264,6 +2633,7 @@ export function createHud(scene, world, audio = null) {
       toggleAlloc(false);
       toggleMenu(false);
       toggleBuildMenu(false);
+      closeHelp();
       renderMarketSheet();
     } else {
       state.liveMarket = null;
@@ -2341,6 +2711,7 @@ export function createHud(scene, world, audio = null) {
     state.resSig = '';
     if (state.buildMenuOpen) renderBuildMenu();
     flashAge();
+    ageCard(p && p.age !== undefined ? p.age : tech.currentAge(world, PLAYER));
   }));
   off.push(world.events.on(EV.RESEARCH_DONE, (p) => {
     if (p && p.player !== undefined && p.player !== PLAYER) return;
@@ -2424,12 +2795,14 @@ export function createHud(scene, world, audio = null) {
   // Tapping the map (never the HUD) closes any transient sheet.
   const gameRoot = doc.getElementById('game-root');
   const onDocDown = (ev) => {
-    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden && marketSheet.hidden) return;
+    if (menuSheet.hidden && buildMenu.hidden && allocSheet.hidden && marketSheet.hidden
+      && helpSheet.hidden) return;
     if (!gameRoot || !gameRoot.contains(ev.target)) return;
     toggleMenu(false);
     toggleBuildMenu(false);
     toggleAlloc(false);
     toggleMarket(false);
+    closeHelp();
   };
   document.addEventListener('pointerdown', onDocDown, true);
 
@@ -2443,6 +2816,7 @@ export function createHud(scene, world, audio = null) {
     updateResources();
     updateIdle();
     tickToasts(now);
+    tickCoach();
 
     // A demolish arm that was never confirmed lapses back to safe on its own.
     if (state.demolishArm && now - state.demolishArm.at > DEMOLISH_ARM_MS) {
@@ -2465,6 +2839,9 @@ export function createHud(scene, world, audio = null) {
       state.cmdSig = csig;
       renderCommands();
       if (state.buildMenuOpen) renderBuildMenu();
+      // The panels just changed shape, which is the only moment their "there is
+      // more below" state can change without somebody scrolling.
+      markAllCut();
     } else {
       refreshQueue();
       refreshResearchQueue();
@@ -2485,6 +2862,45 @@ export function createHud(scene, world, audio = null) {
       perfEnd('hud.minimap', _t);
     }
   }
+
+  // --- Scroll fades -----------------------------------------------------------
+  //
+  // Three panels in this HUD scroll — the command panel, the build menu and the
+  // menu sheet — and none of them said so. Measured on a Barracks with the
+  // blacksmith line available, the command panel held 479px of buttons in
+  // 336px of box: the bottom row was cut off mid-button with no scrollbar (iOS
+  // does not paint one until you touch it), no fade and no gradient, so it read
+  // as a panel that had been clipped rather than one that had more in it. A
+  // player who never scrolls never finds Fletching.
+  //
+  // The fade is a sticky pseudo-element (see .is-cut in hud.css) and it is
+  // toggled rather than always on, because a permanent gradient over the last
+  // row would dim the bottom button of a panel that is *already* fully shown —
+  // which is most panels, most of the time. The measurement it needs
+  // (scrollHeight against clientHeight) forces layout, so it is taken when the
+  // panel is rebuilt and when it is scrolled, never per frame.
+  const SCROLLERS = [];
+
+  function watchScroller(node) {
+    if (!node) return;
+    SCROLLERS.push(node);
+    node.addEventListener('scroll', () => markCut(node), { passive: true });
+  }
+
+  function markCut(node) {
+    if (!node) return;
+    const cut = node.scrollHeight - node.scrollTop - node.clientHeight > 4;
+    node.classList.toggle('is-cut', cut);
+  }
+
+  function markAllCut() {
+    for (const n of SCROLLERS) markCut(n);
+  }
+
+  watchScroller(dom.cmdPanel);
+  watchScroller(buildMenu);
+  watchScroller(menuSheet);
+  watchScroller(helpSheet);
 
   function commandSignature() {
     const sel = selectedEntities(world);
@@ -2529,6 +2945,10 @@ export function createHud(scene, world, audio = null) {
     if (topObserver) topObserver.disconnect();
     root.style.removeProperty('--hud-h');
     root.style.removeProperty('--topbar-h');
+    root.style.removeProperty('--placebar-h');
+    root.classList.remove('placing');
+    if (dom.toasts) dom.toasts.classList.remove('wide');
+    doc.documentElement.style.removeProperty('--topbar-h');
     for (const fn of off) { try { fn(); } catch (_) { /* already gone */ } }
     if (dom.idleBtn) dom.idleBtn.removeEventListener('click', onIdle);
     if (dom.menuBtn) dom.menuBtn.removeEventListener('click', onMenu);
@@ -2543,7 +2963,8 @@ export function createHud(scene, world, audio = null) {
     document.removeEventListener('pointerdown', onDocDown, true);
     if (dom.minimapWrap) dom.minimapWrap.classList.remove('alarm');
     for (const n of [modeChip, idleBtn, jobsBtn, menuBtn,
-      buildMenu, allocSheet, marketSheet, placeBar, attackBar, menuSheet]) n.remove();
+      buildMenu, allocSheet, marketSheet, placeBar, attackBar, menuSheet,
+      helpSheet]) n.remove();
     if (dom.selPanel) dom.selPanel.textContent = '';
     if (dom.cmdPanel) dom.cmdPanel.textContent = '';
     if (dom.jobNote) { dom.jobNote.textContent = ''; dom.jobNote.hidden = true; }
@@ -2573,6 +2994,9 @@ export function createHud(scene, world, audio = null) {
     cycleIdle,
     flashRes,
     underAttackAlert,
+    // The age-up card, for tests/touchui.browser.mjs's layout sweep: it is the
+    // only full-width thing the toast stack ever holds and it must be measured.
+    _ageCard: ageCard,
     alertCount: () => state.alerts,
     attachInput(input) { state.input = input; modeChip.dataset.sig = ''; },
     _dom: dom,
@@ -2586,6 +3010,7 @@ export function createHud(scene, world, audio = null) {
   renderCommands();
   refreshBuildQueue();
   renderModeChip();
+  markAllCut();
   if (minimap) minimap.draw(camera());
 
   return api;

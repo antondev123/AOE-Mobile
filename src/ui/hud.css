@@ -433,6 +433,52 @@ body {
   animation: alertin 170ms ease-out, alertpulse 900ms ease-in-out 170ms infinite;
   cursor: pointer;
 }
+/* The age-up card. The alert's shape — full width, a heading and a sub-line,
+   loud enough to interrupt — in gold instead of red, because it is the best
+   news a player gets in a match and it used to arrive as a plain grey toast
+   identical to "Sound on". It is not tappable: there is nowhere to go, only
+   something to know. */
+.toast.agecard {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  width: 100%;
+  min-height: var(--tap);
+  padding: 6px 9px;
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.2px;
+  color: #fff6e0;
+  background: linear-gradient(180deg, rgba(163, 118, 32, 0.97), rgba(83, 57, 12, 0.97));
+  border: 1px solid #f0cd7d;
+  border-left: 4px solid var(--gold);
+  border-radius: 7px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(217, 171, 79, 0.42);
+  animation: alertin 170ms ease-out, agepulse 1100ms ease-in-out 170ms 3;
+}
+.toast.agecard .crest { margin-right: 5px; color: #ffe6a8; }
+.toast.agecard .sub {
+  display: block;
+  margin-top: 2px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: #f6e3bb;
+  letter-spacing: 0.2px;
+}
+/* Three pulses and then still. An alert pulses until it is dealt with because
+   it is a summons; this is an announcement, and something that never stops
+   glowing stops meaning anything. */
+@keyframes agepulse {
+  0%, 100% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(217, 171, 79, 0.35); }
+  50%      { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 22px rgba(240, 205, 125, 0.95); }
+}
+/* The stack is a narrow corner box by default (see .hud-toasts); a card that is
+   the width of a phone needs the width of the phone. The class is set by the
+   HUD rather than matched with :has(), so this does not quietly stop working on
+   a browser that has not shipped it. */
+.hud-toasts.wide { width: calc(100vw - 16px - var(--safe-l) - var(--safe-r)); }
+
 .toast.alert .siren { margin-right: 5px; }
 .toast.alert .sub {
   display: block;
@@ -539,6 +585,43 @@ body {
    button, so it can never be mistaken for something to tap. */
 .research-more { flex: 1 1 100%; font-size: 10px; opacity: 0.8; }
 
+/* --- "there is more below" -----------------------------------------------------
+   A sticky gradient at the foot of any panel that is scrolled part-way. A
+   Barracks command panel measured 479px of buttons inside 336px of box with no
+   scrollbar, no fade and nothing else to say so — it simply looked cut off, and
+   a player who does not scroll never sees the blacksmith upgrades.
+
+   Toggled by the HUD (see watchScroller in ui/hud.js) rather than left on: a
+   permanent fade would dim the last row of every panel that fits, which is most
+   of them. The pseudo-element is a full-width flex item pulled back over the
+   row above it, so it costs no layout of its own. */
+.cmd-panel.is-cut::after,
+.build-menu.is-cut::after,
+.menu-sheet.is-cut::after {
+  content: "";
+  position: sticky;
+  bottom: -1px;
+  height: 26px;
+  margin-top: -26px;
+  pointer-events: none;
+  /* A chevron sitting in the fade, because a gradient on its own reads as a
+     shadow and a shadow is not an instruction — it says "this panel is dark at
+     the bottom", not "keep going". An inline SVG so it needs no asset and no
+     glyph from a font that may not have one. */
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='9' viewBox='0 0 16 9'%3E%3Cpath d='M1 1l7 6 7-6' fill='none' stroke='%23d9ab4f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/%3E%3C/svg%3E"),
+    linear-gradient(180deg, rgba(29, 21, 14, 0) 0%, rgba(29, 21, 14, 0.94) 80%);
+  background-repeat: no-repeat, no-repeat;
+  background-position: center calc(100% - 4px), center;
+}
+/* The two flow directions need different flex settings, and getting this wrong
+   is invisible rather than broken: `flex: 1 1 100%` means "take a whole row" in
+   the wrapping row panels and "be as tall as the whole scroller" in the column
+   sheet, where it silently swallowed the fade. */
+.cmd-panel.is-cut::after,
+.build-menu.is-cut::after { flex: 1 1 100%; }
+.menu-sheet.is-cut::after { flex: 0 0 26px; align-self: stretch; }
+
 .sel-empty {
   color: var(--parch-dim);
   font-size: 12px;
@@ -634,6 +717,38 @@ body {
 .chip.neutral .badge { background: #9c8a63; }
 .chip .n { font-size: 11px; }
 
+/* --- Portraits ----------------------------------------------------------------
+   The actual sprite, cut out of the atlas the map is drawn from (see
+   ui/portraits.js). It replaces the three-letter code in the selection chips,
+   the training queue and the build queue.
+
+   The tinted plate behind it is doing real work and is not decoration: the
+   sprite already carries the player's colours, but at 24px on a wooden panel a
+   militia and an enemy militia are two brown smudges. A flat team-coloured
+   backing behind the picture is what keeps "mine" and "theirs" readable at chip
+   size, and it is the same blue and red the ground ellipses under the units
+   use. */
+.portrait {
+  display: block;
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  background-repeat: no-repeat;
+  background-position: center bottom;
+  background-size: contain;
+  background-color: rgba(61, 139, 253, 0.30);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+.chip.foe .portrait { background-color: rgba(224, 49, 49, 0.32); }
+.chip.neutral .portrait { background-color: rgba(156, 138, 99, 0.28); }
+/* The queues only ever show your own things, and the strip is busy enough
+   without a row of blue plates in it. */
+.qslot .portrait, .bq-chip .portrait {
+  width: 24px;
+  height: 24px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
 .hpbar {
   margin-top: 5px;
   height: 6px;
@@ -686,6 +801,17 @@ body {
 .cbtn.primary { border-color: var(--gold); }
 .cbtn.danger  { border-color: #7d2b1e; }
 .cbtn .short { display: none; }
+/* A button that is the only verb its selection has takes the whole row rather
+   than shrinking to its label. Laid out as a row, not a stack, so the width
+   goes into the target and not into the height. */
+.cbtn.wide {
+  flex: 1 1 100%;
+  flex-direction: row;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
 
 .cmd-note { font-size: 11px; color: var(--parch-dim); padding: 4px 2px; }
 
@@ -1006,6 +1132,18 @@ body {
   color: var(--parch-dim);
 }
 .build-menu .cbtn { flex: 1 1 0; min-width: 62px; }
+/* Close is the first row in the document and the menu opens scrolled to the
+   bottom (see renderBuildMenu: the shelves run bottom-up so the Dark Age lands
+   under the thumb), so without this it would be scrolled off the top of a long
+   tech tree. Sticky keeps it on screen at no layout cost, and opaque so the
+   shelves pass under it rather than through it. */
+.build-menu .cbtn.danger {
+  flex: 1 1 100%;
+  position: sticky;
+  top: -6px;
+  z-index: 1;
+  background: linear-gradient(180deg, #4a2a1f 0%, #2f1a14 100%);
+}
 .build-menu .cbtn .label { white-space: normal; line-height: 1.1; text-align: center; }
 
 /* The menu is capped and scrolls rather than growing: it now lists the whole
@@ -1052,6 +1190,26 @@ body {
   pointer-events: auto;
   animation: sheetin 140ms ease-out;
 }
+/* Pinned under the resource bar while placement is armed. See the note beside
+   placeBar in ui/hud.js: this bar used to sit in the bottom stack, dead centre
+   of the band the placement ghost lives in. It is text and a Cancel button, so
+   it does not need the thumb zone — and the middle of the screen, which is
+   where a player is aiming, is now clear. */
+.place-bar.place-top {
+  position: absolute;
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
+  left: calc(var(--safe-l) + 6px);
+  right: calc(var(--safe-r) + 6px);
+  z-index: 12;
+}
+/* The toast stack normally starts right under the resource bar. While the
+   placement bar is up it starts under that instead, so a "Cannot build there"
+   warning — which is exactly the toast a placing player needs — is not drawn
+   underneath the bar explaining what they are placing. */
+.hud.placing .hud-toasts {
+  top: calc(var(--safe-t) + var(--topbar-h, 48px) + var(--placebar-h, 64px));
+}
+
 .place-bar .txt { flex: 1 1 auto; font-size: 11.5px; font-weight: 700; line-height: 1.2; }
 .place-bar .txt small { display: block; font-weight: 600; color: var(--parch-dim); font-size: 10.5px; }
 .place-bar button { min-height: var(--tap); min-width: var(--tap); padding: 0 10px; font-weight: 800; font-size: 12px; }
@@ -1094,6 +1252,51 @@ body {
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
+/* The rules sheet. Same shell as the menu, but it is prose rather than a column
+   of buttons, so the list gets its own type and the sheet gets more of the
+   screen — 52vh of eleven bullet points is two bullet points and a scrollbar. */
+/* Taller than the other sheets, because eleven bullet points inside 52vh is two
+   bullet points and a scrollbar — but capped in absolute pixels as well as in
+   vh. The sheet stack is anchored to the *bottom* of the screen and grows
+   upwards, so a percentage of the viewport is only half the constraint: with a
+   Market selected the bottom bar is at its tallest and 62vh put the top of this
+   sheet 76px above the top of the phone. The layout sweep in
+   tests/touchui.browser.mjs is what caught it. */
+.help-sheet {
+  max-height: min(52vh, 400px);
+  font-size: 12.5px;
+  color: var(--parch-dim);
+}
+.help-sheet ul { margin: 0; padding: 0 0 4px 18px; }
+.help-sheet li { margin: 6px 0; line-height: 1.45; }
+.help-sheet b { color: var(--parch); }
+/* Sticky, so the way out is always under the thumb however far down the list
+   the player has read — and opaque, because a translucent button with eleven
+   bullet points sliding under it is unreadable in both directions. */
+.help-sheet button.primary {
+  position: sticky;
+  bottom: -6px;
+  /* Above the scroll fade, which is also pinned to the bottom of this scroller
+     and would otherwise wash over the one button in the sheet. */
+  z-index: 2;
+  margin-top: 2px;
+  background: linear-gradient(180deg, #4a351f 0%, #2f2114 100%);
+  box-shadow: 0 -10px 14px -6px rgba(20, 15, 10, 0.95), var(--shadow);
+}
+
+/* Resign. Red like Demolish, and it turns fully red once armed, because the two
+   are the same gesture and must not need learning twice. */
+.menu-sheet .menu-resign {
+  border-color: var(--danger);
+  color: #ffc9bf;
+}
+.menu-sheet .menu-resign.armed {
+  color: #fff;
+  background: linear-gradient(180deg, #b93020, #7a1d12);
+  border-color: #ff7a5e;
+  font-weight: 800;
+}
+
 .menu-head {
   margin-top: 4px;
   font-size: 10.5px;
@@ -1703,6 +1906,64 @@ body {
 
 .boot-build { margin: 14px 0 0; font-size: 10px; color: #6d6047; }
 .endcard-inner p { color: var(--parch-dim); font-size: 13.5px; margin: 6px 0 16px; }
+
+/* --- End card figures ---------------------------------------------------------
+   Three rows of label-and-number. A definition list rather than a table because
+   that is what it is, and because a table would need a width to stop the
+   numbers drifting into the middle of a 390px card. */
+.end-stats {
+  margin: 0 0 16px;
+  padding: 10px 12px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px 10px;
+  text-align: left;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--edge-soft);
+  border-radius: 10px;
+  font-size: 13px;
+}
+.end-stats dt { color: var(--parch-dim); }
+.end-stats dd {
+  margin: 0;
+  text-align: right;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  color: var(--parch);
+}
+
+/* Looking at the finished map. The card gets out of the way completely —
+   background, blocker and all — leaving one pill to bring the figures back.
+
+   It sits top-right, which is the one place in this HUD that is deliberately
+   out of thumb reach (see the note in index.html) and is exactly right here:
+   the match is over, the player has asked to look at the battlefield, and every
+   comfortable part of the screen belongs to that. Bottom-centre put it across
+   the selection panel, and the two places a thumb likes on this layout — the
+   dock and the minimap — are both still live. Top-left is the toast stack. */
+.endcard.peek { background: none; pointer-events: none; }
+.endcard.peek .endcard-inner { display: none; }
+.end-peek {
+  position: absolute;
+  right: calc(var(--safe-r) + 8px);
+  top: calc(var(--safe-t) + var(--topbar-h, 48px));
+  min-height: var(--tap);
+  min-width: 110px;
+  padding: 0 20px;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.4px;
+  color: #1d1409;
+  background: linear-gradient(180deg, #f0cd7d, #c08f2c);
+  border: 1px solid #7a5a1c;
+  border-radius: 11px;
+  box-shadow: 0 3px 0 #5d4315, var(--shadow);
+  pointer-events: auto;
+  cursor: pointer;
+  touch-action: manipulation;
+}
+.end-peek:active { transform: translateY(2px); box-shadow: 0 1px 0 #5d4315; }
 
 @media (prefers-reduced-motion: reduce) {
   .hud *, .boot *, .endcard * { animation: none !important; transition: none !important; }

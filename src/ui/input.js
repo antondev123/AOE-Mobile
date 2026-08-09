@@ -52,7 +52,7 @@
 import {
   TAP_SLOP, TAP_TIME_MS, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS,
   ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
-  BUILDING_STATS, isWallType, MILITARY_TYPES,
+  BUILDING_STATS, isWallType, isGateType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 // The local player's seat, as a live binding — see src/core/viewpoint.js for
@@ -836,9 +836,24 @@ export function createInput(scene, world, renderer, hud) {
   // run, which places exactly one segment — so tapping still works and the two
   // behaviours are the same code path rather than two rules that have to agree.
 
-  /** The type currently armed, if it is a wall. */
+  /**
+   * The type currently armed, if it is a wall you draw a run of.
+   *
+   * A GATE IS NOT ONE. Gates carry `wall: true` because they join up with a
+   * wall's sprite mask and sit in the same block grid, and that made them fall
+   * into the drag-draw path with everything else — so pulling a Palisade Gate
+   * across twelve tiles bought twelve palisade gates for 240 wood, which is not
+   * a thing any player has ever wanted. A gate is a *door*: there is exactly one
+   * of it in a stretch of wall, and AoE2 places them one at a time.
+   *
+   * Refusing them here is the whole fix, because a type that is not a wall for
+   * this purpose falls through to ordinary tap placement — which is already
+   * single-tile, already stays armed for the next one, and already runs
+   * refreshWallsAround so the gate joins the wall either side of it.
+   */
   function wallType() {
-    return st.placeType && isWallType(st.placeType) ? st.placeType : null;
+    if (!st.placeType || !isWallType(st.placeType)) return null;
+    return isGateType(st.placeType) ? null : st.placeType;
   }
 
   /** Tile under the touch, lifted clear of the finger the way the ghost is. */
@@ -1014,10 +1029,12 @@ export function createInput(scene, world, renderer, hud) {
     if (want === st.placeType) return;
     st.placeType = want || null;
     cancelWallRun();
-    if (st.placeType && isWallType(st.placeType)) {
+    if (wallType()) {
       // Said once, when the mode opens: the placement bar has room for the
       // building's name and nothing else, and "drag" is not a thing a player
-      // guesses about a build button.
+      // guesses about a build button. Not for a gate — a gate is placed one at
+      // a time (see wallType) and telling the player to drag one would be an
+      // instruction to do something the game now refuses.
       hud.toast('Drag to draw a wall — two fingers to cancel', 'info');
     }
     if (!st.placeType) {

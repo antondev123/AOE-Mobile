@@ -305,7 +305,14 @@ function boot() {
     fail('Phaser failed to load');
     return;
   }
-  bootStatus.textContent = `Phaser ${Phaser.VERSION} ready`;
+  // The first line a player ever reads in this game used to be "Phaser 3.90.0
+  // ready", which is a diagnostic for the person who wrote it and noise for
+  // everybody else — a card that opens with the name of a middleware version is
+  // a card that has not decided it is a game yet. The engine version is still
+  // one line down, in the build footer, where a bug report can find it.
+  bootStatus.textContent = 'Two settlements, one valley.';
+  const engine = document.getElementById('engine');
+  if (engine) engine.textContent = `Phaser ${Phaser.VERSION}`;
   startBtn.hidden = false;
   wireResume();
 
