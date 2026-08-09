@@ -231,6 +231,18 @@ async function allocationRun() {
     await page.locator('#btn-jobs').click();               // reopen (a step closed nothing, but be explicit)
     await page.evaluate(() => { document.getElementById('alloc-sheet').hidden = false; });
     await paint(page);
+    // Hold the simulation still across the toggle. The claim is that *the
+    // switch* moves nobody, not that the world stops — and a real Playwright
+    // click takes 50-100ms of wall clock, which is one or two live sim steps
+    // in which a villager can perfectly legitimately finish a bush and pick
+    // the next one on its own. That race made this check fail about one run in
+    // eight, always on a change that had nothing to do with it.
+    const resume = await page.evaluate(() => {
+      const s = window.__game.scene;
+      s._realStep = s.simStep;
+      s.simStep = () => {};
+      return true;
+    });
     const before = await page.evaluate(() => window.__game.world.units
       .filter((u) => u.player === 0 && u.type === 'villager')
       .map((u) => `${u.id}:${u.task && u.task.node ? u.task.node.id : '-'}`).join(','));
@@ -244,6 +256,12 @@ async function allocationRun() {
       return { same: now === was, now };
     }, before);
     check('and nobody is moved by the switch itself', after.same, after.now);
+    if (resume) {
+      await page.evaluate(() => {
+        const s = window.__game.scene;
+        s.simStep = s._realStep;
+      });
+    }
 
     check('no console errors (allocation run)', errors.length === 0, errors.slice(0, 3).join(' | '));
   } finally {
@@ -617,9 +635,11 @@ const AUDIT = `(() => {
   // The boot card is in the sweep too. It is the first screen a player ever
   // touches and, since the save landed, it can carry two full-width buttons
   // instead of one — which is exactly the kind of change that pushes something
-  // off a 390px screen without anyone noticing.
+  // off a 390px screen without anyone noticing. So is the end card, which has
+  // grown a second button and a Results pill pinned to a corner of the map.
   for (const n of document.querySelectorAll(
-    '#hud button, #hud input, #hud .tappable, #boot button, #boot summary')) {
+    '#hud button, #hud input, #hud .tappable, #boot button, #boot summary, ' +
+    '#endcard button')) {
     if (n.hidden || n.disabled) continue;
     const st = getComputedStyle(n);
     if (st.display === 'none' || st.visibility === 'hidden') continue;
@@ -744,6 +764,11 @@ async function layoutRun() {
           window.__game.hud.update(0.016);
         });
         await page.locator('#cmd-panel .cbtn', { hasText: 'Build' }).first().click();
+        // Past the 140ms sheetin. The menu's Close row is sticky now — it is
+        // the first row in the document since the shelves were reversed to put
+        // the Dark Age under the thumb — and a rect read while the sheet is
+        // still sliding in measures the slide, not the layout.
+        await page.waitForTimeout(200);
       }],
       ['the allocation sheet open', async () => {
         await page.evaluate(() => window.__game.hud.toggleAlloc(true));
@@ -795,7 +820,31 @@ async function layoutRun() {
         await paint(page);
         await page.locator('#cmd-panel .cbtn', { hasText: 'Trade' }).first().click();
       }],
+      // Added by the review pass. Four states the sweep had never seen, three
+      // of which contain controls that did not exist before it: the rules
+      // sheet cloned out of the boot card, the armed Resign row at the foot of
+      // the menu, and the end card's two buttons plus the Results pill that
+      // brings it back after "Look at the map".
+      ['the how-to-play sheet open', async () => {
+        await page.evaluate(() => { window.__game.hud.toggleMenu(true); });
+        await paint(page);
+        await page.locator('#menu-sheet .menu-help').click();
+        await paint(page);
+      }],
+      ['Resign armed in the menu sheet', async () => {
+        await page.evaluate(() => {
+          const h2 = window.__game.hud;
+          h2.toggleMenu(false);
+          h2.toggleMenu(true);
+        });
+        await paint(page);
+        const row = page.locator('#menu-sheet .menu-resign');
+        await row.scrollIntoViewIfNeeded();
+        await row.click();
+        await paint(page);
+      }],
       ['an under-attack alert up', async () => {
+        await page.evaluate(() => window.__game.hud.toggleMenu(false));
         await page.evaluate(() => {
           const g = window.__game;
           const tc = g.world.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
@@ -805,6 +854,26 @@ async function layoutRun() {
         // rect read mid-animation is a measurement of the animation, not of the
         // layout. 250ms is comfortably past the 170ms entrance.
         await page.waitForTimeout(250);
+      }],
+      // The age-up card. It is the widest thing the toast stack ever holds —
+      // the stack is a 182px corner box for everything else — so it is exactly
+      // the shape that overflows a 390px screen without anyone noticing.
+      ['the age-up card up', async () => {
+        await page.evaluate(async () => {
+          const { AGE } = await import('/src/systems/tech.js');
+          window.__game.hud._ageCard(AGE.FEUDAL);
+        });
+        await page.waitForTimeout(250);
+      }],
+      ['the end card', async () => {
+        await page.evaluate(() => {
+          window.__game.scene.onGameOver(0);
+        });
+        await paint(page);
+      }],
+      ['the end card folded away to look at the map', async () => {
+        await page.locator('#btn-look').click();
+        await paint(page);
       }],
     ];
 
@@ -879,16 +948,45 @@ async function soundRun() {
     check('and the cues the wiring needs are in it', wired.hasAge && wired.hasHammer);
 
     // Run a minute of simulation. Hundreds of events go through the adapter —
-    // gather ticks, deposits, hammer blows, training — and not one of them may
-    // start a voice, because nothing has gestured.
-    await step(page, 1200);
-    const silent = await page.evaluate(() => {
-      const s = window.__game.audio.stats();
-      return { played: s.played, voices: s.voices };
+    // gather ticks, deposits, hammer blows, training — and what happens to them
+    // depends on one thing outside this repository: whether the browser's
+    // autoplay policy left the AudioContext suspended.
+    //
+    // This check used to assert flatly that nothing played, and it was passing
+    // for the wrong reason. Headless Chromium here starts its context in
+    // `running`, so the premise was never true; what actually kept the counter
+    // at zero was that the player's three villagers stood idle for the whole
+    // minute and every cue the enemy raised was out of earshot. The moment the
+    // starting villagers were put to work (core/mapgen.js) the same silent run
+    // played thirteen cues and the check failed — on a change that fixed a bug.
+    //
+    // So the premise is measured rather than assumed, and the claim is the one
+    // that is actually worth defending in each case: a suspended context must
+    // schedule nothing at all (queued voices would fire in a heap on unlock),
+    // and a running one must carry the game's own events through to the mixer
+    // without raising a single console error.
+    const policy = await page.evaluate(() => {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return 'none';
+      const probe = new C();
+      const state = probe.state;
+      probe.close();
+      return state;
     });
-    check('a minute of play with no gesture plays nothing at all',
-      silent.played === 0 && silent.voices === 0,
-      `${silent.played} played, ${silent.voices} voices`);
+    await step(page, 1200);
+    const heard = await page.evaluate(() => {
+      const s = window.__game.audio.stats();
+      return { played: s.played, voices: s.voices, coalesced: s.coalesced };
+    });
+    if (policy === 'suspended' || policy === 'none') {
+      check('with the context still locked, a minute of play schedules nothing',
+        heard.played === 0 && heard.voices === 0,
+        `${heard.played} played, ${heard.voices} voices (context ${policy})`);
+    } else {
+      check('a minute of play reaches the mixer through the adapter',
+        heard.played > 0,
+        `${heard.played} played, ${heard.coalesced} coalesced (context ${policy})`);
+    }
 
     // Now gesture, the way a player does, and prove the wiring is real: a
     // selection is the cheapest cue to raise from outside the audio module.

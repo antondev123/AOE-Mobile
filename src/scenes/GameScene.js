@@ -12,7 +12,9 @@
 
 import { createWorld, ownedBy, recomputePop } from '../core/world.js';
 import { generateMap } from '../core/mapgen.js';
-import { SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY } from '../core/constants.js';
+import {
+  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY, BUILDING_STATS, MILITARY_TYPES,
+} from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
 
@@ -45,6 +47,11 @@ import { perf, perfBegin, perfEnd, perfFrame, perfCount } from '../core/perf.js'
 // taken on `visibilitychange`, which is the last moment a page reliably gets
 // before a phone browser is suspended or destroyed.
 const AUTOSAVE_SECONDS = 30;
+
+// Derived, not written out, for the same reason the HUD derives its own copy:
+// a unit added to the roster counts toward the peak-army figure the day it
+// declares itself a soldier.
+const MILITARY = new Set(MILITARY_TYPES);
 
 export class GameScene extends Phaser.Scene {
   constructor() {
@@ -128,6 +135,10 @@ export class GameScene extends Phaser.Scene {
       // The CPU profiler. Off unless something turns it on; see core/perf.js
       // for why the numbers it collects are the ones worth quoting.
       perf,
+      // Giving up, for the console and for tests. The HUD calls scene.resign()
+      // directly; this is the same door with a handle on the outside.
+      resign: () => this.resign(),
+      tally: () => ({ ...this.tally }),
       // Saving, for the console and for tests/save.browser.mjs.
       save: () => this.saveNow('manual'),
       serialize: () => this.snapshotSave(),
@@ -136,6 +147,22 @@ export class GameScene extends Phaser.Scene {
     this.accumulator = 0;
     this.alpha = 0;
     this.autosaveAcc = 0;
+
+    // What the end card reports besides the clock.
+    //
+    // Kills are counted here rather than derived at the end because there is
+    // nothing left to derive them from — a dead unit is gone from the world,
+    // and the alternative is a graveyard nobody else needs. Peak army is
+    // sampled once a simulated second: the number a player remembers is the
+    // biggest force they ever had on the field, not the one that happened to
+    // survive, and sampling per step would be twenty times the work for a
+    // figure that cannot move that fast.
+    this.tally = { kills: 0, losses: 0, peakArmy: 0 };
+    world.events.on(EV.DEATH, ({ entity, killer }) => {
+      if (!entity || entity.kind !== 'unit') return;
+      if (entity.player === PLAYER) this.tally.losses++;
+      else if (killer && killer.player === PLAYER) this.tally.kills++;
+    });
 
     world.events.on(EV.GAME_OVER, ({ winner }) => this.onGameOver(winner));
 
@@ -253,6 +280,7 @@ export class GameScene extends Phaser.Scene {
     world.time += dt;
     world.tick++;
 
+    if (world.tick % 20 === 0) this.sampleArmy();
     this.checkVictory();
     perfEnd('sim', _t);
   }
@@ -309,12 +337,27 @@ export class GameScene extends Phaser.Scene {
   }
 
   /**
-   * You lose when you have no buildings and no villagers left to rebuild.
+   * You lose when you can no longer produce anything.
    *
-   * Written as a scan rather than as three list comprehensions, because it runs
-   * every sim step for every player: the readable version allocated four arrays
-   * of up to two hundred entities twenty times a second, all of it to answer two
-   * yes/no questions that stop the moment they find their first hit.
+   * The old rule was "no buildings and no villagers", which is the last
+   * possible moment rather than the decisive one, and it made winning worse
+   * than losing: a player who had razed the enemy's Town Center, Barracks and
+   * Castle still had to hunt the last enemy villager across a map that is 93%
+   * fog, and there is no tool in this game for finding one villager on 9216
+   * tiles. Meanwhile the loser sat in a game that was decided ten minutes ago
+   * with no resign button and nothing to do but close the tab.
+   *
+   * A player who owns nothing that trains a unit cannot replace a villager,
+   * cannot replace a soldier and cannot rebuild — a lone villager can lay a
+   * Town Center foundation, so a foundation counts, which is why this asks
+   * "does anything you own train units" rather than "is anything finished".
+   * That is the point at which the match is over, and it is the point the
+   * match now ends at.
+   *
+   * Written as a scan rather than as list comprehensions, because it runs every
+   * sim step for every player: the readable version allocated four arrays of up
+   * to two hundred entities twenty times a second, all of it to answer a yes/no
+   * question that stops the moment it finds its first hit.
    */
   checkVictory() {
     const world = this.world;
@@ -324,11 +367,9 @@ export class GameScene extends Phaser.Scene {
       let canRecover = false;
       for (const id of p.owned) {
         const e = world.entities.get(id);
-        if (!e || e.dead) continue;
-        if (e.kind === 'building' || (e.kind === 'unit' && e.type === 'villager')) {
-          canRecover = true;
-          break;
-        }
+        if (!e || e.dead || e.kind !== 'building') continue;
+        const s = BUILDING_STATS[e.type];
+        if (s && s.trains && s.trains.length) { canRecover = true; break; }
       }
       if (!canRecover && world.time > 3) p.defeated = true;
     }
@@ -344,6 +385,33 @@ export class GameScene extends Phaser.Scene {
       world.winner = alive.id;
       world.events.emit(EV.GAME_OVER, { winner: alive.id });
     }
+  }
+
+  /** Biggest army the player ever fielded. Called once a simulated second. */
+  sampleArmy() {
+    let n = 0;
+    for (const u of this.world.units) {
+      if (!u.dead && u.player === PLAYER && MILITARY.has(u.type)) n++;
+    }
+    if (n > this.tally.peakArmy) this.tally.peakArmy = n;
+  }
+
+  /**
+   * Give up.
+   *
+   * Deliberately routed through the same defeat flag the simulation sets rather
+   * than jumping straight to the end card: a resignation is a loss, and it
+   * should produce exactly the state, the save handling and the card that
+   * losing produces. The HUD confirms before calling this — see the Resign row
+   * in ui/hud.js — so by the time we are here the player has said it twice.
+   */
+  resign() {
+    const world = this.world;
+    if (!world || world.over) return false;
+    world.players[PLAYER].defeated = true;
+    this.resigned = true;
+    this.checkVictory();
+    return true;
   }
 
   onGameOver(winner) {
@@ -362,9 +430,49 @@ export class GameScene extends Phaser.Scene {
     title.className = won ? 'win' : 'lose';
     const mins = Math.floor(this.world.time / 60);
     const secs = Math.floor(this.world.time % 60);
-    sub.textContent = won
-      ? `You razed the enemy in ${mins}m ${secs}s.`
-      : `Your settlement fell after ${mins}m ${secs}s.`;
+    sub.textContent = this.resigned
+      ? `You resigned after ${mins}m ${secs}s.`
+      : won
+        ? `The enemy can train nothing more. ${mins}m ${secs}s.`
+        : `You can train nothing more. ${mins}m ${secs}s.`;
+
+    const stats = document.getElementById('end-stats');
+    if (stats) {
+      stats.textContent = '';
+      const row = (label, value) => {
+        const dt = document.createElement('dt');
+        dt.textContent = label;
+        const dd = document.createElement('dd');
+        dd.textContent = String(value);
+        stats.appendChild(dt);
+        stats.appendChild(dd);
+      };
+      row('Time', `${mins}m ${secs}s`);
+      row('Units killed', this.tally.kills);
+      row('Units lost', this.tally.losses);
+      row('Peak army', this.tally.peakArmy);
+    }
+
+    // "Look at the map" folds the card away without ending anything, and the
+    // Results pill brings it back. The simulation has already stopped, so what
+    // is underneath is the final position, frozen — which is the thing a player
+    // wants to scroll around after a twenty minute match and the thing a modal
+    // over the whole screen has always denied them.
+    const look = document.getElementById('btn-look');
+    const back = document.getElementById('btn-results');
+    if (look && back && !this.peekWired) {
+      this.peekWired = true;
+      look.addEventListener('click', () => {
+        card.classList.add('peek');
+        back.hidden = false;
+      });
+      back.addEventListener('click', () => {
+        card.classList.remove('peek');
+        back.hidden = true;
+      });
+    }
+    card.classList.remove('peek');
+    if (back) back.hidden = true;
     card.hidden = false;
   }
 

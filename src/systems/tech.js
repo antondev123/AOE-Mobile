@@ -807,9 +807,12 @@ export function completeResearch(world, playerId, techId, building = null) {
     // hitpoints at the instant the age lands.
     applyAgeHpToAll(world, playerId);
     world.events.emit(EV.AGE_ADVANCE, { player: playerId, playerId, age: pt.age });
-    if (playerId === PLAYER) {
-      world.events.emit(EV.TOAST, { text: `You have advanced to the ${ageName(pt.age)}!`, tone: 'info' });
-    }
+    // No toast. This used to go out as `tone: 'info'` — the plainest of the
+    // three tones, identical in weight to "Halted" and "Sound on" — for the
+    // most important thing that happens in a match. The HUD now answers
+    // EV.AGE_ADVANCE with a card of its own (see ageCard in ui/hud.js), which
+    // is also the only layer that can say what the age unlocked; this file
+    // knows the tech table but not the build menu's shelves.
   } else if (playerId === PLAYER) {
     world.events.emit(EV.TOAST, { text: `${t.name} researched`, tone: 'info' });
   }
