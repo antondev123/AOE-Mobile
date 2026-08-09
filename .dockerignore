@@ -1,0 +1,15 @@
+# The image is index.html, src/ and vendor/. Everything else in this repository
+# is for people working on the game, not for people playing it — and the two
+# biggest directories here (screenshots/ and node_modules/) are together far
+# larger than the thing being served.
+.git
+.github
+node_modules
+screenshots
+tests
+tools
+*.md
+package.json
+package-lock.json
+fly.toml
+.dockerignore
