@@ -25,7 +25,7 @@
 // worked, emptied and retasked away from identically; the only difference is
 // that a farm is a building, so distances to it use edgeDist().
 
-import { dirIndex } from '../core/iso.js';
+import { dirIndex, hyp, dirForId } from '../core/iso.js';
 import {
   UNIT_STATS, ARMOR_CLASS, STANCE, FORMATION, DEFAULT_FORMATION,
   FORMATION_SPACING, SPREAD_SPACING,
@@ -684,7 +684,7 @@ function approachPoint(world, u, target) {
   const reach = attackReach(u, target);
   const dx = u.x - target.x;
   const dy = u.y - target.y;
-  const d = Math.hypot(dx, dy);
+  const d = hyp(dx, dy);
   if (reach > 1.2 && d > reach) {
     const want = reach * 0.8;
     const px = target.x + (dx / d) * want;
@@ -854,7 +854,7 @@ function assignSlots(world, list, gx, gy, formation) {
   cy /= n;
   let fx = gx - cx;
   let fy = gy - cy;
-  const fl = Math.hypot(fx, fy);
+  const fl = hyp(fx, fy);
   if (fl < 1e-3) { fx = 0; fy = 1; } else { fx /= fl; fy /= fl; }
   const rx = -fy;
   const ry = fx;
@@ -1029,7 +1029,7 @@ function tickEvict(world, u, dt) {
   }
   const dx = spot.x - u.x;
   const dy = spot.y - u.y;
-  const d = Math.hypot(dx, dy);
+  const d = hyp(dx, dy);
   // The route it was walking started from ground it no longer stands on; the
   // task re-plans from wherever it lands.
   u.path = null;
@@ -1133,7 +1133,7 @@ function tickMove(world, u, dt, ctx) {
       // as an ordered attack does.
       const moved = t.lastX === undefined
         ? Infinity
-        : Math.hypot(target.x - t.lastX, target.y - t.lastY);
+        : hyp(target.x - t.lastX, target.y - t.lastY);
       if (!t.engaging || !u.dest || (moved > 1.2 && u.repathTimer <= 0)) {
         t.engaging = true;
         t.lastX = target.x;
@@ -1161,7 +1161,7 @@ function tickMove(world, u, dt, ctx) {
 
   if (!u.dest) {
     // Arrived (or the path ran out). Close enough counts.
-    const d = Math.hypot(u.x - t.gx, u.y - t.gy);
+    const d = hyp(u.x - t.gx, u.y - t.gy);
     if (d <= 1.0 || u.aiFails >= MAX_PATH_FAILS) {
       u.task = null;
       u.state = 'idle';
@@ -1516,7 +1516,7 @@ function tickAttack(world, u, dt, ctx) {
   // Repath only when the quarry has actually moved, or when the path ran out.
   const moved = t.lastX === undefined
     ? Infinity
-    : Math.hypot(target.x - t.lastX, target.y - t.lastY);
+    : hyp(target.x - t.lastX, target.y - t.lastY);
   if (!u.dest || (moved > 1.2 && u.repathTimer <= 0)) {
     t.lastX = target.x;
     t.lastY = target.y;
@@ -1873,7 +1873,7 @@ function advance(world, u, dt) {
     }
   }
 
-  const len = Math.hypot(dirX, dirY);
+  const len = hyp(dirX, dirY);
   if (u.aiMoved > 1e-6 && len > 1e-9) {
     const speed = u.aiMoved / dt;
     u.vx = (dirX / len) * speed;
@@ -1913,7 +1913,7 @@ function checkStuck(world, u, dt, ctx) {
     u.aiAnchorX = u.x;
     u.aiAnchorY = u.y;
     u.aiAnchorT = world.time;
-  } else if (Math.hypot(u.x - u.aiAnchorX, u.y - u.aiAnchorY) >= HEADWAY_DIST) {
+  } else if (hyp(u.x - u.aiAnchorX, u.y - u.aiAnchorY) >= HEADWAY_DIST) {
     u.aiAnchorX = u.x;
     u.aiAnchorY = u.y;
     u.aiAnchorT = world.time;
@@ -1928,7 +1928,7 @@ function checkStuck(world, u, dt, ctx) {
   // goal: while rounding an obstacle a unit legitimately moves *away* from its
   // destination, and that must not read as being stuck.
   const wp = currentWaypoint(u) || u.dest;
-  const d = Math.hypot(wp.x - u.x, wp.y - u.y);
+  const d = hyp(wp.x - u.x, wp.y - u.y);
   const prev = u.aiLastDist;
   u.aiLastDist = d;
   // The first sample after a re-plan has nothing to compare against; judging it
@@ -1960,7 +1960,7 @@ function checkStuck(world, u, dt, ctx) {
   // goal itself and gated on plain sight of it, so a unit wedged at a corner
   // halfway there — a real problem — is never excused, while the nine of
   // twenty-four that used to orbit a shared destination forever now settle.
-  const gd = Math.hypot(goal.x - u.x, goal.y - u.y);
+  const gd = hyp(goal.x - u.x, goal.y - u.y);
   if (walking && gd <= CROWD_ARRIVE && hasLineOfSight(world, u.x, u.y, goal.x, goal.y)) {
     u.path = null;
     u.pathIndex = 0;
@@ -2069,9 +2069,16 @@ function separate(world, u, dt) {
           // id so the result is deterministic and the pair never chases itself.
           // Uses the id rather than world.rng, which belongs to the seeded
           // simulation.
-          const a = u.id * 2.3999632;
-          dx = Math.cos(a);
-          dy = Math.sin(a);
+          // A per-id direction from a literal table, not from trigonometry.
+          // The old form was `Math.cos(u.id * 2.3999632)`, whose comment
+          // rightly said it avoids world.rng — but it swapped one source of
+          // non-determinism for another, because sin and cos are not pinned
+          // across JavaScript engines while Math.imul (which dirForId uses) is.
+          // This is reachable in ordinary play: two units trained from the same
+          // building spawn at the same tile centre, to the bit.
+          const dir = dirForId(u.id);
+          dx = dir[0];
+          dy = dir[1];
           d = 1;
         }
         const weight = e.dest ? 1 : STATIONARY_WEIGHT;
@@ -2084,7 +2091,7 @@ function separate(world, u, dt) {
   }
 
   if (n === 0) return;
-  const mag = Math.hypot(px, py);
+  const mag = hyp(px, py);
   if (mag < SEP_DEADBAND) return;
 
   const step = u.speed * dt;
@@ -2101,7 +2108,7 @@ function separate(world, u, dt) {
     // --- Under orders: steer, do not stop. ---
     let hx = wp.x - u.x;
     let hy = wp.y - u.y;
-    const hl = Math.hypot(hx, hy);
+    const hl = hyp(hx, hy);
     if (hl < 1e-6) return;
     hx /= hl;
     hy /= hl;
@@ -2109,7 +2116,7 @@ function separate(world, u, dt) {
     const along = px * hx + py * hy;      // -1 head-on, +1 from behind
     let cx = px - along * hx;             // the part that is pure sideways
     let cy = py - along * hy;
-    let cl = Math.hypot(cx, cy);
+    let cl = hyp(cx, cy);
 
     if (cl < SIDESTEP_MIN && along < HEAD_ON_DOT) {
       // Dead ahead: no sideways component exists to grow, so pick a side.

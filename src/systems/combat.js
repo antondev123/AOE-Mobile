@@ -58,7 +58,7 @@ import {
   edgeDist, edgeDist2, forEachNear, isHostile, removeEntity, findNearestGlobal,
   inBounds, isBlocked, snapshotUnits,
 } from '../core/world.js';
-import { dist, dirIndex } from '../core/iso.js';
+import { dist, dirIndex, hyp } from '../core/iso.js';
 import { attackBonus, armorBonus } from './tech.js';
 
 // --- Tuning (feel) ----------------------------------------------------------
@@ -486,7 +486,7 @@ function startFleeing(world, v, threat) {
   // No home to run to: just run directly away from the threat.
   let dx = v.x - threat.x;
   let dy = v.y - threat.y;
-  const d = Math.hypot(dx, dy) || 1;
+  const d = hyp(dx, dy) || 1;
   dx /= d; dy /= d;
   v.fleeTo = {
     x: clamp(v.x + dx * FLEE_DISTANCE, 0, world.width - 1),
@@ -677,7 +677,7 @@ function updateProjectiles(world, dt) {
     p.elapsed += dt;
     const dx = p.tx - p.x;
     const dy = p.ty - p.y;
-    const d = Math.hypot(dx, dy);
+    const d = hyp(dx, dy);
     const step = p.speed * dt;
 
     if (d <= step || p.elapsed > p.duration + PROJECTILE_MAX_OVERTIME) {

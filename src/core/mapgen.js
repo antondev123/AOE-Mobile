@@ -6,6 +6,7 @@
 // the minutes after that are about deciding when to leave the base.
 
 import { MAP_W, MAP_H, TERRAIN, PLAYER, ENEMY } from './constants.js';
+import { dirVec, DIR_COUNT } from './iso.js';
 import { spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop } from './world.js';
 import { commandUnits } from '../systems/unitAI.js';
 
@@ -178,9 +179,16 @@ function scatterForests(world, bases) {
   // ...plus a guaranteed woodline for each player, close enough to be the
   // obvious first wood assignment.
   for (const b of bases) {
-    const ang = b.player === PLAYER ? 0.9 : 0.9 + Math.PI;
-    const cx = Math.round(b.x + Math.cos(ang) * 7);
-    const cy = Math.round(b.y + Math.sin(ang) * 7);
+    // A fixed heading per base, taken from the literal direction table. Index 9
+    // of 64 is ~0.88 radians, which is where the old `0.9` put it; the opposite
+    // base gets the antipode. Trigonometry is not used here because sin and cos
+    // differ in the last bit between JavaScript engines, and a single flipped
+    // Math.round relocates a whole woodline — which changes blocked[], which
+    // changes every path near it, on one machine and not the other.
+    const ang = b.player === PLAYER ? 9 : 9 + DIR_COUNT / 2;
+    const d = dirVec(ang);
+    const cx = Math.round(b.x + d[0] * 7);
+    const cy = Math.round(b.y + d[1] * 7);
     growForest(world, cx, cy, 30, bases, 4.5);
   }
 }
@@ -193,9 +201,9 @@ function growForest(world, cx, cy, count, bases, minBaseDist) {
     attempts++;
     // Random walk outward from the seed so clumps look organic.
     const r = rng.range(0, Math.sqrt(count) * 0.9);
-    const a = rng.range(0, Math.PI * 2);
-    const x = Math.round(cx + Math.cos(a) * r);
-    const y = Math.round(cy + Math.sin(a) * r);
+    const d = dirVec(rng.int(0, DIR_COUNT - 1));
+    const x = Math.round(cx + d[0] * r);
+    const y = Math.round(cy + d[1] * r);
     if (!freeSpot(world, x, y, bases, minBaseDist)) continue;
     spawnResource(world, 'tree', x, y);
     placed++;
@@ -318,9 +326,16 @@ function buildBase(world, base) {
   // Three starting villagers, fanned out in front of the Town Center.
   const spawned = [];
   for (let i = 0; i < 3; i++) {
-    const a = (Math.PI * 2 * i) / 3 + (player === PLAYER ? 0.6 : 3.7);
-    const ux = x + Math.cos(a) * 2.6;
-    const uy = y + Math.sin(a) * 2.6;
+    // These coordinates are NOT rounded to tiles — they are the villagers'
+    // exact starting positions, handed straight to spawnUnit. Computed through
+    // Math.cos they would differ in the last bit between engines, which means
+    // two peers in a lockstep match would start the game with their villagers
+    // at measurably different places, before a single order is given. A literal
+    // table removes the whole class of problem: index 6 of 64 is ~0.59 rad
+    // (the old 0.6) and the enemy's 3.7 rad is 21 sixty-fourths further round.
+    const d = dirVec((player === PLAYER ? 6 : 38) + Math.round((DIR_COUNT * i) / 3));
+    const ux = x + d[0] * 2.6;
+    const uy = y + d[1] * 2.6;
     spawned.push(spawnUnit(world, 'villager', player, ux, uy));
   }
 

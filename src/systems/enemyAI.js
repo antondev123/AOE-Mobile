@@ -50,6 +50,7 @@ import {
   AGE, TECHS, currentAge, hasTech, techsAt, queueResearch, researchRefusal,
   nextAgeTech,
 } from './tech.js';
+import { hyp, dirVec, DIR_COUNT } from '../core/iso.js';
 
 // --- Tuning -----------------------------------------------------------------
 
@@ -585,9 +586,11 @@ class EnemyAI {
     }
     // A short hop at a seeded random angle, onto ground we know is open.
     for (let i = 0; i < 6; i++) {
-      const a = w.rng.range(0, Math.PI * 2);
-      const gx = Math.round(u.x + Math.cos(a) * 2.5);
-      const gy = Math.round(u.y + Math.sin(a) * 2.5);
+      // A seeded direction from the literal table rather than a seeded angle
+      // through cos/sin, which are not identical across engines.
+      const d = dirVec(w.rng.int(0, DIR_COUNT - 1));
+      const gx = Math.round(u.x + d[0] * 2.5);
+      const gy = Math.round(u.y + d[1] * 2.5);
       if (gx < 1 || gy < 1 || gx >= w.width - 1 || gy >= w.height - 1) continue;
       if (!canPlace(w, gx + 0.5, gy + 0.5, 1, 1)) continue;
       this.command([u], { type: 'stop' });
@@ -662,7 +665,7 @@ class EnemyAI {
     const foe = this.foeBase();
     let vx = foe.x - home.x;
     let vy = foe.y - home.y;
-    const len = Math.hypot(vx, vy) || 1;
+    const len = hyp(vx, vy) || 1;
     vx /= len;
     vy /= len;
     // Walk outward from the TC and take the last open tile we find.
