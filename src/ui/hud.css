@@ -1798,6 +1798,85 @@ body {
   opacity: 0.75;
 }
 
+/* The invite card. It replaces the buttons rather than sitting under them:
+   once a match exists there is exactly one thing to do with this screen, which
+   is get the link to the other person. The URL is a real anchor so a long-press
+   offers "Share" on a phone, where the clipboard API is the least reliable
+   thing on the platform. */
+.invite {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #574a2c;
+  border-radius: 10px;
+  background: rgba(20, 16, 10, 0.6);
+  text-align: left;
+}
+.invite-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.invite-url {
+  display: block;
+  /* A match URL has no spaces to break at, so it has to be told it may break
+     anywhere — otherwise it runs off the side of a 390px phone. */
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--gold, #d8b45a);
+  text-decoration: none;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+}
+.invite-copy {
+  margin-top: 8px;
+  width: 100%;
+  min-height: 44px;
+  border-radius: 8px;
+  border: 1px solid #574a2c;
+  background: linear-gradient(180deg, #37301f, #241e13);
+  color: var(--parch, #e8dcc0);
+  font: inherit;
+  font-weight: 700;
+}
+.invite-state {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  opacity: 0.8;
+}
+.invite-state.error { color: #e08a6a; opacity: 1; }
+.invite.ready { border-color: #7fa05a; }
+
+/* Who is in the room. Two rows, and the only thing that changes is the word on
+   the right — which is what a player is actually watching for. */
+.lobby-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.lobby-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  background: rgba(0, 0, 0, 0.25);
+}
+.lobby-row + .lobby-row { margin-top: 5px; }
+.lobby-status { opacity: 0.65; }
+.lobby-row.is-ready { background: rgba(80, 110, 55, 0.35); }
+.lobby-row.is-ready .lobby-status { color: #a8cc7a; opacity: 1; font-weight: 700; }
+.ready-btn.is-on {
+  background: linear-gradient(180deg, #4a6b2c, #33501d);
+  border-color: #7fa05a;
+}
+
 .boot-help {
   margin-top: 14px;
   text-align: left;

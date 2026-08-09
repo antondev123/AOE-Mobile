@@ -19,6 +19,10 @@ import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
 
 import { createRenderer } from '../gfx/render.js';
+import { createLocalBus, createNetBus } from '../net/bus.js';
+import { setViewpoint } from '../core/viewpoint.js';
+import { applyCommand } from '../core/command.js';
+import { checksum } from '../core/checksum.js';
 import { updateEconomy } from '../systems/economy.js';
 import { updateAllocation } from '../systems/allocation.js';
 import { updateUnits, commandUnits } from '../systems/unitAI.js';
@@ -63,6 +67,18 @@ export class GameScene extends Phaser.Scene {
     // A payload from src/core/save.js, already version-checked by whoever read
     // it out of storage. Null for a fresh skirmish.
     this.resumeFrom = (data && data.resume) || null;
+    // A live net client (src/net/client.js) when this is a networked match, and
+    // null for a skirmish. Everything downstream branches on this one field.
+    this.net = (data && data.net) || null;
+    // Which seat we are. Always PLAYER in a skirmish; whatever the server gave
+    // us in a match.
+    this.seat = this.net && this.net.playerId != null ? this.net.playerId : PLAYER;
+    // Point the client's whole view — HUD, fog, selection, minimap — at that
+    // seat. This must happen in init() and not in create(): the renderer and
+    // the HUD read the binding as they are constructed, so a player two who
+    // learned their seat any later would spend the match looking at player
+    // one's resources and unable to select a single one of their own units.
+    setViewpoint(this.seat);
   }
 
   create() {
@@ -99,6 +115,12 @@ export class GameScene extends Phaser.Scene {
     // rebuilt from where the units are standing.
     world.vision.update();
 
+    // The bus has to exist before the HUD and the input do — both read it off
+    // the scene at construction time.
+    this.bus = this.net
+      ? createNetBus(this.net, this.seat)
+      : createLocalBus(world, this.seat);
+
     this.renderer = createRenderer(this, world);
     // Audio before the HUD, because the HUD plays the button clicks.
     //
@@ -108,7 +130,7 @@ export class GameScene extends Phaser.Scene {
     // them fires — which is why the browser harness, which boots with
     // ?autostart and never gestures, hears nothing and logs nothing.
     this.audio = createAudio({ seed: this.seed });
-    this.audioAdapter = createAudioAdapter(world, this.audio, { playerId: PLAYER });
+    this.audioAdapter = createAudioAdapter(world, this.audio, { playerId: this.seat });
     this.hud = createHud(this, world, this.audio);
     this.input2 = createInput(this, world, this.renderer, this.hud);
     this.enemyAI = createEnemyAI(world, ENEMY);
@@ -126,8 +148,18 @@ export class GameScene extends Phaser.Scene {
       step: (n = 1) => {
         for (let i = 0; i < n; i++) this.simStep();
       },
-      // Issue orders from the console or from the test harness.
-      command: (units, order) => commandUnits(world, units, order),
+      // Issue orders from the console or from the test harness. Goes through
+      // the bus, so a harness driving a networked match exercises the same path
+      // a tap does rather than mutating under the server's feet.
+      command: (units, order) => this.bus.dispatch({
+        t: 'order',
+        units: units.map((u) => (typeof u === 'number' ? u : u.id)),
+        order,
+      }),
+      bus: this.bus,
+      net: this.net,
+      seat: this.seat,
+      checksum: () => checksum(world),
       // Fog of war, for the console: masks, remembered objects and the timing
       // counters (see visionStats in systems/vision.js).
       vision: world.vision,
@@ -172,7 +204,7 @@ export class GameScene extends Phaser.Scene {
       this.renderer.centerOn(view.x, view.y);
       if (view.zoom && this.renderer.camera) this.renderer.camera.setZoom(view.zoom);
     } else {
-      const tc = ownedBy(world, PLAYER, 'building', 'towncenter')[0];
+      const tc = ownedBy(world, this.seat, 'building', 'towncenter')[0];
       if (tc && this.renderer.centerOn) this.renderer.centerOn(tc.x, tc.y);
     }
 
@@ -214,6 +246,11 @@ export class GameScene extends Phaser.Scene {
    */
   saveNow(reason = 'auto') {
     if (!this.world || this.world.over || this.saved === 'gone') return null;
+    // A networked match is not ours to save. The stored payload has no seat, no
+    // match id and no socket, so "Resume match" would drop the player into half
+    // a 1v1 with an empty chair — and worse, the boot card would offer it in
+    // preference to the game they were actually invited to.
+    if (this.net) return null;
     try {
       const res = writeSave(this.snapshotSave());
       this.lastSave = { at: Date.now(), reason, ...res };
@@ -236,6 +273,16 @@ export class GameScene extends Phaser.Scene {
     const world = this.world;
     if (world.over) return;
     const dt = SIM_DT;
+
+    // Networked: everything scheduled for this tick fires before it, in the
+    // order the server put it in. This is the single line that makes two
+    // machines play the same game — the commands are applied *between* steps,
+    // never during one, so an order either landed before this tick or lands
+    // before the next, and both ends agree which. (server/match.js does the
+    // same thing at the same point in its own step.)
+    if (this.net) {
+      for (const cmd of this.net.drain(world.tick)) applyCommand(world, cmd);
+    }
     const _t = perfBegin('sim');
     // How many fixed steps landed in this frame. On a device holding 60fps that
     // is 0 or 1; on a machine drawing at 20fps it is three, and without this
@@ -267,8 +314,11 @@ export class GameScene extends Phaser.Scene {
     const _tEcon = perfBegin('sim.economy');
     updateEconomy(world, dt);
     perfEnd('sim.economy', _tEcon);
+    // No AI in a networked match. The server does not run one either (see the
+    // seat note in server/server.js), and an AI whose memory is absent from the
+    // snapshot a client rebuilds from would diverge within seconds of joining.
     const _tAI = perfBegin('sim.enemyAI');
-    this.enemyAI.update(dt);
+    if (!this.net) this.enemyAI.update(dt);
     perfEnd('sim.enemyAI', _tAI);
     // Vision last, after everything has finished moving, dying and being built,
     // so the masks the renderer reads this frame describe the world the player
@@ -282,6 +332,14 @@ export class GameScene extends Phaser.Scene {
 
     if (world.tick % 20 === 0) this.sampleArmy();
     this.checkVictory();
+
+    // Did we still agree with the server at the tick just completed? verify()
+    // answers null for the nineteen ticks in twenty it has no digest for.
+    if (this.net) {
+      const agreed = this.net.verify(world.tick, checksum(world));
+      if (agreed === false) this.net.resync('checksum');
+    }
+
     perfEnd('sim', _t);
   }
 
@@ -289,18 +347,43 @@ export class GameScene extends Phaser.Scene {
     perfFrame();
     const _tFrame = perfBegin('scene.update');
     const dtSec = Math.min(delta, 250) / 1000;
-    this.accumulator += dtSec;
 
-    let steps = 0;
-    while (this.accumulator >= SIM_DT && steps < MAX_STEPS_PER_FRAME) {
-      this.simStep();
-      this.accumulator -= SIM_DT;
-      steps++;
+    if (this.net) {
+      // The server owns the clock. We simulate up to the tick it says we may
+      // reach — a little behind it, so commands stamped for a future tick have
+      // time to arrive before we get there — and no further. A frame that runs
+      // long simply catches up over the next few; a machine that has fallen so
+      // far behind that stepping cannot fix it asks to be rebuilt instead.
+      // Kept as a fraction, then stepped to the tick above it, so the renderer
+      // is interpolating *between* the last two simulated ticks rather than
+      // extrapolating past the newest one. Same relationship the skirmish's
+      // accumulator has to its own steps, just driven by a different clock.
+      const tf = this.net.targetTickFloat();
+      const target = Math.ceil(tf);
+      if (this.net.hopelesslyBehind(this.world.tick)) {
+        this.net.resync('too far behind');
+      } else {
+        let steps = 0;
+        while (this.world.tick < target && steps < MAX_STEPS_PER_FRAME) {
+          this.simStep();
+          steps++;
+        }
+      }
+      this.alpha = Math.max(0, Math.min(1, tf - (this.world.tick - 1)));
+    } else {
+      this.accumulator += dtSec;
+
+      let steps = 0;
+      while (this.accumulator >= SIM_DT && steps < MAX_STEPS_PER_FRAME) {
+        this.simStep();
+        this.accumulator -= SIM_DT;
+        steps++;
+      }
+      // If we blew the step budget, drop the backlog rather than spiralling.
+      if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0;
+
+      this.alpha = this.accumulator / SIM_DT;
     }
-    // If we blew the step budget, drop the backlog rather than spiralling.
-    if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0;
-
-    this.alpha = this.accumulator / SIM_DT;
     const _tInput = perfBegin('input');
     this.input2.update(dtSec);
     perfEnd('input', _tInput);
@@ -425,7 +508,7 @@ export class GameScene extends Phaser.Scene {
     const title = document.getElementById('end-title');
     const sub = document.getElementById('end-sub');
     if (!card) return;
-    const won = winner === PLAYER;
+    const won = winner === this.seat;
     title.textContent = won ? 'Victory' : 'Defeat';
     title.className = won ? 'win' : 'lose';
     const mins = Math.floor(this.world.time / 60);
