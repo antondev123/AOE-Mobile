@@ -52,9 +52,12 @@
 import {
   TAP_SLOP, TAP_TIME_MS, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS,
   ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
-  PLAYER, BUILDING_STATS, isWallType, MILITARY_TYPES,
+  BUILDING_STATS, isWallType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { screenDist, worldToGrid } from '../core/iso.js';
 import { canPlace, wallMaskAt } from '../core/world.js';
 
@@ -63,6 +66,7 @@ import * as economy from '../systems/economy.js';
 
 import { setSelection, clearSelection, selectedEntities } from './selection.js';
 import { rallyText } from './hud.js';
+import { createLocalBus } from '../net/bus.js';
 
 // --- Tuning that is local to gesture handling (the shared feel numbers live
 // in core/constants.js and must not be duplicated there). --------------------
@@ -100,6 +104,11 @@ export function createInput(scene, world, renderer, hud) {
   const game = scene.game;
   const canvas = game.canvas;
   const camera = (renderer && renderer.camera) || scene.cameras.main;
+
+  // Every action this file takes goes through the bus rather than into the
+  // world. The scene owns it; the fallback keeps a hand-built input (a test, the
+  // console) working exactly as it did before there was a bus at all.
+  const bus = scene.bus || createLocalBus(world, PLAYER);
 
   // World-pixel bounds of the playable diamond (see core/iso.js).
   const BOUNDS = {
@@ -310,9 +319,21 @@ export function createInput(scene, world, renderer, hud) {
 
   // ---------------------------------------------------------------- commands
 
+  // Orders name their units and their targets by id, because the object on this
+  // phone is not the object on the server. resolveOrderTargets() in command.js
+  // turns them back into references at the far end.
   function command(units, order) {
     if (!units.length) return;
-    if (typeof unitAI.commandUnits === 'function') unitAI.commandUnits(world, units, order);
+    bus.dispatch({ t: 'order', units: units.map((u) => u.id), order: idifyOrder(order) });
+  }
+
+  /** An order with its entity references flattened to ids, ready to be sent. */
+  function idifyOrder(order) {
+    const o = { ...order };
+    if (o.target && typeof o.target === 'object') o.target = o.target.id;
+    if (o.node && typeof o.node === 'object') o.node = o.node.id;
+    if (o.building && typeof o.building === 'object') o.building = o.building.id;
+    return o;
   }
 
   function fx(gx, gy, kind) {
@@ -729,13 +750,12 @@ export function createInput(scene, world, renderer, hud) {
       hud.toast(gh.reason || 'Cannot build there', 'warn');
       return; // stay in placement mode — the player just needs to move a bit
     }
-    if (typeof economy.placeFoundation !== 'function') return;
-    const f = economy.placeFoundation(world, PLAYER, gh.type, gh.gx, gh.gy);
-    if (!f) return; // economy already explained why
-
-    if (typeof economy.enqueueFoundation === 'function') economy.enqueueFoundation(world, f);
-    fx(f.x, f.y, 'build');
-
+    // Which villagers should start on this is a *local* decision — it reads the
+    // selection, which lives on this device and nowhere else — but it has to
+    // take effect on the authoritative path along with the placement itself.
+    // So the crew rides along in the command and command.js dispatches it the
+    // moment the foundation exists. One command, one tick, both machines.
+    //
     // Only send builders when nobody is already building. A batch is placed
     // faster than it is built, and re-ordering the same crew onto every new
     // site as it lands would walk them off the half-finished house to the one
@@ -743,21 +763,42 @@ export function createInput(scene, world, renderer, hud) {
     // foundations standing and one villager sprinting. They work the queue
     // through instead (onJobFinished in unitAI.js), and the only thing this has
     // to guarantee is that *somebody* starts.
+    let builders = [];
     if (!anyBuilding()) {
-      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
       if (!builders.length) {
         // Nothing selected? Send the nearest villager rather than doing nothing.
+        // Measured to the tile that was tapped, since the foundation does not
+        // exist yet — its centre is within half a tile of it either way.
         let best = null;
         let bd = Infinity;
         for (const u of world.units) {
           if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
-          const d = (u.x - f.x) ** 2 + (u.y - f.y) ** 2;
+          const d = (u.x - gh.gx) ** 2 + (u.y - gh.gy) ** 2;
           if (d < bd) { bd = d; best = u; }
         }
         if (best) builders = [best];
       }
-      command(builders, { type: 'build', gx: f.x, gy: f.y, target: f });
     }
+
+    const res = bus.dispatch({
+      t: 'place',
+      buildingType: gh.type,
+      gx: gh.gx,
+      gy: gh.gy,
+      builders: builders.map((u) => u.id),
+    });
+    if (!res.ok) return; // economy already explained why
+
+    // The tap gets its acknowledgement now either way. Locally the foundation
+    // already exists, so the flash lands on its centre exactly as it always
+    // has; over a network it is a few ticks out, and a flash that waited for it
+    // would read as the tap having been dropped — so it goes on the tapped
+    // tile, which for a 1x1 is the same place and for a Town Center is a tile
+    // off in a puff of dust nobody will measure.
+    const built = res.detail && world.entities.get(res.detail.id);
+    if (built) fx(built.x, built.y, 'build');
+    else fx(gh.gx, gh.gy, 'build');
 
     // Placement stays armed: the next tap places the next one. `Done` on the
     // placement bar (or Escape, or the build menu) is what ends the batch.
@@ -915,44 +956,50 @@ export function createInput(scene, world, renderer, hud) {
     }
 
     const tiles = economy.wallLineTiles(w.tx0, w.ty0, w.tx1, w.ty1);
-    const res = economy.placeWallLine(world, PLAYER, type, tiles);
-    const n = res.placed.length;
-    if (!n) {
-      hud.toast(res.reason || 'Cannot build there', 'warn');
-      return;
-    }
-
-    const s = BUILDING_STATS[type];
-    const label = `${n} ${s ? s.name : 'wall'}${n === 1 ? '' : 's'}`;
-    if (res.refused) hud.toast(`${label} — ${res.refused} could not be placed`, 'warn');
-    else hud.toast(`${label} — villagers on the way`, 'info');
-
-    // The foundations are ordinary construction sites, so ordinary builders
-    // finish them — and they are now queued, in the order the run was drawn, so
-    // a villager that finishes one segment walks to the next along the line
-    // instead of going back to a tree. That is what HANDOFF-walls.md left open:
-    // the wall is still built from one end inwards, which is what makes it
-    // useful while it is going up, but the crew no longer has to be re-ordered
-    // segment by segment.
-    const first = res.placed[0];
-    if (typeof economy.enqueueFoundation === 'function') {
-      for (const b of res.placed) economy.enqueueFoundation(world, b);
-    }
+    // As with a single foundation, the crew is chosen here (it reads the local
+    // selection) and dispatched there (it has to happen on the same tick as the
+    // placement, on both machines). See the 'place' case in core/command.js.
+    let wallCrew = [];
     if (!anyBuilding()) {
-      let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
-      if (!builders.length) {
+      wallCrew = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+      if (!wallCrew.length) {
         let best = null;
         let bd = Infinity;
         for (const u of world.units) {
           if (u.dead || u.player !== PLAYER || u.type !== 'villager') continue;
-          const d = (u.x - first.x) ** 2 + (u.y - first.y) ** 2;
+          const d = (u.x - w.tx0) ** 2 + (u.y - w.ty0) ** 2;
           if (d < bd) { bd = d; best = u; }
         }
-        if (best) builders = [best];
+        if (best) wallCrew = [best];
       }
-      command(builders, { type: 'build', gx: first.x, gy: first.y, target: first });
     }
-    fx(first.x, first.y, 'build');
+    const res = bus.dispatch({
+      t: 'placeWallLine',
+      buildingType: type,
+      tiles,
+      builders: wallCrew.map((u) => u.id),
+    });
+    if (!res.ok) {
+      hud.toast(res.reason || 'Cannot build there', 'warn');
+      return;
+    }
+
+    // Locally we know exactly how many segments went down. Over a network we do
+    // not yet, so the plan's own count — the same number the preview has been
+    // showing under the player's finger — stands in for it.
+    const n = res.detail ? res.detail.placed : plan.count;
+    const refused = res.detail ? res.detail.refused : 0;
+    const s = BUILDING_STATS[type];
+    const label = `${n} ${s ? s.name : 'wall'}${n === 1 ? '' : 's'}`;
+    if (refused) hud.toast(`${label} — ${refused} could not be placed`, 'warn');
+    else hud.toast(`${label} — villagers on the way`, 'info');
+
+    // The queueing and the crew both happened inside the command — the wall is
+    // still built from one end inwards, which is what makes it useful while it
+    // is going up. All that is left here is the dust.
+    const first = res.detail && world.entities.get(res.detail.firstId);
+    if (first) fx(first.x, first.y, 'build');
+    else fx(w.tx0, w.ty0, 'build');
 
     // Stays armed, exactly as tapped placement now does: the next drag draws the
     // next run. Two fingers still abandons a run mid-draw, and Done on the

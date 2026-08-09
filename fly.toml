@@ -5,8 +5,14 @@
 # matches wearing the same id. Hence one machine, and auto_stop_machines off
 # while a match could still be in progress.
 
-app = "age-of-skirmish"
-primary_region = "iad"
+# The app this actually deploys to. It was "age-of-skirmish", which no app of
+# that name ever backed: the credential this project deploys with is a
+# *deploy token* scoped to one app, so it cannot create a second one — pointing
+# elsewhere failed with a bare "unauthorized" rather than anything that named
+# the real problem. The region follows the machines that already exist, so a
+# deploy updates them instead of adding a third somewhere else.
+app = "aoe-mobile"
+primary_region = "jnb"
 
 [build]
   dockerfile = "Dockerfile"

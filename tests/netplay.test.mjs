@@ -1,9 +1,10 @@
 // Two real clients, one real server, over an actual socket.
 //
 // tests/multiplayer.test.mjs proves the simulation agrees with itself. This
-// proves the wire does not undo that: seats get assigned, commands travel,
-// nobody can command a seat they were not given, and a disconnect hands the
-// seat to the AI instead of stalling the other player.
+// proves the wire does not undo that: seats get assigned, commands travel
+// *stamped with the tick they will fire on*, nobody can command a seat they
+// were not given, and a disconnect frees the seat rather than stalling the
+// other player.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -70,15 +71,17 @@ test('two clients join one match, get different seats, and exchange commands', a
   const room = rooms.get(id);
   assert.deepEqual(room.match.roster.map((s) => s.kind), ['human', 'human']);
 
-  // A command from A must reach B, stamped with A's seat.
+  // A command from A must reach B, stamped with A's seat and with a tick that
+  // is still in B's future — announcing it as it executed would leave B no time
+  // to run it on the same tick, which is the entire purpose of the delay.
   const world = room.match.world;
   const mine = world.units.filter((u) => u.player === 0 && u.type === 'villager').map((u) => u.id);
+  const sentAt = room.match.tick;
   a.send({ type: 'cmd', cmd: { t: 'order', units: mine.slice(0, 2), order: { type: 'move', gx: 44, gy: 44 } } });
 
-  const tickMsg = await b.await((m) => m.type === 'tick' && m.cmds.some((c) => c.t === 'order'));
-  const cmd = tickMsg.cmds.find((c) => c.t === 'order');
-  assert.equal(cmd.p, 0, 'the command did not carry the sender seat');
-  assert.ok(tickMsg.tick > 0);
+  const sched = await b.await((m) => m.type === 'sched' && m.cmd.t === 'order');
+  assert.equal(sched.cmd.p, 0, 'the command did not carry the sender seat');
+  assert.ok(sched.at > sentAt, 'the command was scheduled for a tick already gone');
 });
 
 test('the server assigns the seat, so a forged one is ignored', async (t) => {
@@ -93,9 +96,8 @@ test('the server assigns the seat, so a forged one is ignored', async (t) => {
   // B (seat 1) claims to be seat 0.
   b.send({ type: 'cmd', cmd: { t: 'allocationOn', p: 0, on: true } });
 
-  const tickMsg = await b.await((m) => m.type === 'tick' && m.cmds.some((c) => c.t === 'allocationOn'));
-  const cmd = tickMsg.cmds.find((c) => c.t === 'allocationOn');
-  assert.equal(cmd.p, 1, 'a client forged another players seat');
+  const sched = await b.await((m) => m.type === 'sched' && m.cmd.t === 'allocationOn');
+  assert.equal(sched.cmd.p, 1, 'a client forged another players seat');
 });
 
 test('a third client may watch but never gets a seat', async (t) => {
@@ -113,7 +115,13 @@ test('a third client may watch but never gets a seat', async (t) => {
   assert.ok(c.hello.snapshot, 'a spectator got no world to watch');
 });
 
-test('a disconnect hands the seat to the AI, and rejoining takes it back', async (t) => {
+// The seat used to go to an AI here, which read better and was wrong: a client
+// rebuilds from match.snapshot(), and that snapshot carries the world but not
+// the AI's memory. The moment such an AI acted, the two machines would be
+// playing different games — with no symptom beyond a checksum mismatch and a
+// resync every second. An empty seat now stands still, and standing still is
+// something both ends can agree on.
+test('a disconnect frees the seat without letting an AI desync it, and rejoining takes it back', async (t) => {
   const { server, port, rooms } = await startServer(0);
   t.after(() => server.close());
 
@@ -126,8 +134,8 @@ test('a disconnect hands the seat to the AI, and rejoining takes it back', async
   assert.deepEqual(room.match.roster.map((s) => s.kind), ['human', 'human']);
 
   await b.close();
-  await a.await((m) => m.type === 'seats' && m.seats[1] === 'ai');
-  assert.equal(room.match.roster[1].kind, 'ai', 'the empty seat was not handed to the AI');
+  await a.await((m) => m.type === 'seats' && m.seats[1] === 'open');
+  assert.equal(room.match.roster[1].kind, 'open', 'the empty seat was not freed');
 
   const b2 = await connect(port, id);
   t.after(async () => { await b2.close(); });
@@ -144,12 +152,32 @@ test('joining a match that does not exist is refused, not crashed', async (t) =>
   assert.equal(c.hello.reason, 'no-such-match');
 });
 
-test('the match clock actually advances in real time', async (t) => {
+// The clock is deliberately held until the lobby releases it — a match that
+// began when its link was created would be minutes old by the time the second
+// player opened that link. So this fills both seats and readies up first, and
+// in doing so covers the gate as well as the rate.
+test('the match clock is held in the lobby and advances once both players are ready', async (t) => {
   const { server, port, rooms } = await startServer(0);
   t.after(() => server.close());
 
   const { id } = await newMatch(port);
   const room = rooms.get(id);
+
+  const a = await connect(port, id);
+  const b = await connect(port, id);
+  t.after(async () => { await a.close(); await b.close(); });
+
+  assert.equal(a.hello.started, false, 'the match started before anybody was ready');
+  await new Promise((r) => setTimeout(r, 400));
+  assert.equal(room.match.tick, 0, 'the clock ran while the room was still in its lobby');
+
+  a.send({ type: 'ready', ready: true });
+  await new Promise((r) => setTimeout(r, 150));
+  assert.equal(room.started, false, 'one player readying up started the match');
+
+  b.send({ type: 'ready', ready: true });
+  await b.await((m) => m.type === 'start');
+
   const t0 = room.match.tick;
   await new Promise((r) => setTimeout(r, 1000));
   const advanced = room.match.tick - t0;

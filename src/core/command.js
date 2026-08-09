@@ -31,7 +31,7 @@ import { removeEntity, setGateOpen } from './world.js';
 import { commandUnits } from '../systems/unitAI.js';
 import {
   placeFoundation, placeWallLine, cancelFoundation, queueTrain, cancelTrain,
-  buildQueue, cancelQueued, clearBuildQueue,
+  enqueueFoundation, cancelQueued, clearBuildQueue,
 } from '../systems/economy.js';
 import { queueResearch, cancelResearch } from '../systems/tech.js';
 import { setAllocationOn, setSplit, resetSplit } from '../systems/allocation.js';
@@ -109,20 +109,52 @@ export function applyCommand(world, cmd) {
       const b = placeFoundation(world, p, cmd.buildingType, cmd.gx, cmd.gy);
       if (!b) return no('refused');
       // Placing normally also enqueues the site for whoever is free to build it.
-      if (cmd.enqueue !== false) buildQueue(world, p);
+      // This must be enqueueFoundation() and not buildQueue(): the latter only
+      // *reads* the queue (and prunes it), so routing the UI through a command
+      // that called it would place foundations nobody was ever dispatched to.
+      if (cmd.enqueue !== false) enqueueFoundation(world, b);
+      // Placing may also dispatch a crew, because the UI's "somebody start on
+      // this" rule picks its builders from the local selection — knowledge the
+      // server does not have. Carrying the ids in the command keeps that choice
+      // client-side while keeping the *effect* on the authoritative path, which
+      // is the only way both machines end up ordering the same villagers.
+      if (Array.isArray(cmd.builders) && cmd.builders.length) {
+        const crew = ownedUnits(world, p, cmd.builders);
+        if (crew.length) {
+          commandUnits(world, crew, { type: 'build', gx: b.x, gy: b.y, target: b });
+        }
+      }
       return ok({ id: b.id });
     }
 
     case 'placeWallLine': {
+      // placeWallLine returns { placed: [...], refused: n, reason }, not an array.
       const res = placeWallLine(world, p, cmd.buildingType, cmd.tiles);
-      if (!res || (Array.isArray(res) && res.length === 0)) return no('refused');
-      return ok({ placed: Array.isArray(res) ? res.length : res });
+      const placed = res && Array.isArray(res.placed) ? res.placed : [];
+      if (!placed.length) return no(res?.reason || 'refused');
+      // Queued in the order the run was drawn, so a villager finishing one
+      // segment walks to the next along the line rather than back to a tree.
+      if (cmd.enqueue !== false) for (const b of placed) enqueueFoundation(world, b);
+      const first = placed[0];
+      if (Array.isArray(cmd.builders) && cmd.builders.length) {
+        const crew = ownedUnits(world, p, cmd.builders);
+        if (crew.length) {
+          commandUnits(world, crew, { type: 'build', gx: first.x, gy: first.y, target: first });
+        }
+      }
+      return {
+        ok: true,
+        detail: { placed: placed.length, refused: res.refused || 0, firstId: first.id },
+      };
     }
 
     case 'cancelFoundation': {
       const b = owned(world, p, cmd.id, 'building');
       if (!b) return no('not-yours');
-      cancelFoundation(world, b);
+      // The underlying call can still refuse — a site that has already been
+      // finished or destroyed this tick. The HUD's confirmation reads off this,
+      // so a refusal has to come back as one rather than as a silent ok().
+      if (!cancelFoundation(world, b)) return no('refused');
       return ok();
     }
 
@@ -144,7 +176,7 @@ export function applyCommand(world, cmd) {
     case 'cancelTrain': {
       const b = owned(world, p, cmd.id, 'building');
       if (!b) return no('not-yours');
-      cancelTrain(world, b, cmd.index | 0);
+      if (!cancelTrain(world, b, cmd.index | 0)) return no('refused');
       return ok();
     }
 
@@ -158,18 +190,20 @@ export function applyCommand(world, cmd) {
     case 'cancelResearch': {
       const b = owned(world, p, cmd.id, 'building');
       if (!b) return no('not-yours');
-      cancelResearch(world, b, cmd.index | 0);
+      if (!cancelResearch(world, b, cmd.index | 0)) return no('refused');
       return ok();
     }
 
     // ---- build queue -------------------------------------------------------
     case 'cancelQueued':
-      cancelQueued(world, p, cmd.index | 0);
+      if (!cancelQueued(world, p, cmd.index | 0)) return no('refused');
       return ok();
 
-    case 'clearBuildQueue':
-      clearBuildQueue(world, p);
-      return ok();
+    case 'clearBuildQueue': {
+      // Answers with how many sites it dropped, because the HUD says so out loud.
+      const n = clearBuildQueue(world, p);
+      return ok({ cleared: n });
+    }
 
     // ---- gates -------------------------------------------------------------
     case 'gate': {
@@ -181,8 +215,8 @@ export function applyCommand(world, cmd) {
 
     // ---- villager allocation ----------------------------------------------
     case 'allocationOn':
-      setAllocationOn(world, p, !!cmd.on);
-      return ok();
+      // Returns the state it settled on, which is what the toggle relabels from.
+      return ok({ on: setAllocationOn(world, p, !!cmd.on) });
 
     case 'allocationSplit':
       setSplit(world, p, cmd.resource, cmd.pct | 0);

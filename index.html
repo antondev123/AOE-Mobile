@@ -83,6 +83,18 @@
            one irreversible thing this card can do. -->
       <button id="btn-resume" class="start-btn" hidden>Resume match</button>
       <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
+      <!-- The invite link is the lobby. There is no room list and no account:
+           you get a URL, you send it to one person, they open it and they are
+           sitting opposite you. -->
+      <button id="btn-friend" class="start-btn secondary" hidden>Play a friend<span class="sub">creates a link to send</span></button>
+      <div id="invite" class="invite" hidden>
+        <p class="invite-label">Send this link to your friend</p>
+        <a id="invite-url" class="invite-url" href="#"></a>
+        <button id="invite-copy" class="invite-copy">Copy link</button>
+        <ul id="lobby-list" class="lobby-list"></ul>
+        <button id="btn-ready" class="invite-copy ready-btn" hidden>I'm ready</button>
+        <p id="invite-state" class="invite-state"></p>
+      </div>
       <details class="boot-help">
         <summary>How to play</summary>
         <ul>

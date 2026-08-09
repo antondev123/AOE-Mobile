@@ -46,6 +46,7 @@ import { updateEconomy } from '../src/systems/economy.js';
 import { createEnemyAI } from '../src/systems/enemyAI.js';
 import { serializeGame } from '../src/core/save.js';
 import { applyCommand } from '../src/core/command.js';
+import { checksum } from '../src/core/checksum.js';
 import { EV } from '../src/core/events.js';
 
 /** Ticks between a command arriving and taking effect. 4 ticks = 200ms at 20Hz. */
@@ -54,38 +55,10 @@ export const COMMAND_DELAY = 4;
 /** How often the authoritative world is hashed for desync detection. */
 export const CHECKSUM_EVERY = 20; // once a second
 
-/**
- * A cheap order-sensitive digest of everything the simulation owns.
- *
- * Positions are quantised to 1/1024 of a tile rather than hashed as raw floats.
- * A last-bit disagreement between two JS engines is not yet a divergence — it
- * either washes out or it grows, and only the growing kind matters. Quantising
- * ignores the noise and still catches drift long before a player could see it.
- */
-export function checksum(world) {
-  let h = 0x811c9dc5; // FNV-1a offset basis
-  const mix = (n) => {
-    h ^= n | 0;
-    h = Math.imul(h, 0x01000193) >>> 0;
-  };
-  const q = (f) => Math.round(f * 1024);
-
-  mix(world.tick);
-  mix(world.rng.getState());
-  mix(world.nextId);
-  for (const p of world.players) {
-    mix(p.id);
-    mix(p.defeated ? 1 : 0);
-    for (const k of ['food', 'wood', 'gold', 'stone']) mix(q(p.resources?.[k] ?? 0));
-  }
-  for (const u of world.units) {
-    mix(u.id); mix(q(u.x)); mix(q(u.y)); mix(q(u.hp)); mix(u.player);
-  }
-  for (const b of world.buildings) {
-    mix(b.id); mix(q(b.hp)); mix(b.player); mix(b.complete ? 1 : 0);
-  }
-  return h >>> 0;
-}
+// The digest moved to src/core/checksum.js when the client started needing it:
+// two implementations of "the same" hash is precisely the bug it exists to
+// catch. Re-exported here because this is where callers already look for it.
+export { checksum };
 
 /**
  * @param {object} opts
@@ -107,6 +80,12 @@ export function createMatch({ seed = 1, seats = null } = {}) {
     throw new Error(`need ${world.players.length} seats, got ${roster.length}`);
   }
 
+  // Listeners for the schedule, so a transport can tell clients about a command
+  // *when it is stamped* rather than when it fires. That lead time is the only
+  // reason the delay exists: a client told at the moment of execution has
+  // already run the tick it was supposed to execute on.
+  const scheduleListeners = new Set();
+
   // An AI is built for every seat, but only stepped for seats no human holds.
   // Keeping the object around for human seats is what lets a player drop out
   // and have their economy carry on rather than freeze — see takeOver().
@@ -126,7 +105,14 @@ export function createMatch({ seed = 1, seats = null } = {}) {
     if (!scheduled.has(at)) scheduled.set(at, []);
     scheduled.get(at).push(cmd);
     history.push({ at, cmd });
+    for (const fn of scheduleListeners) fn({ at, cmd });
     return at;
+  }
+
+  /** Be told the moment a command is stamped, and for which tick. */
+  function onSchedule(fn) {
+    scheduleListeners.add(fn);
+    return () => scheduleListeners.delete(fn);
   }
 
   /** Hand a seat to its AI (disconnect) or back to a human (reconnect). */
@@ -147,6 +133,10 @@ export function createMatch({ seed = 1, seats = null } = {}) {
   function step() {
     if (world.over) return null;
 
+    // The tick these commands run *on*, which is not the tick step() reports
+    // when it returns — that one has already been incremented. Clients schedule
+    // against this number, so it is the one worth naming.
+    const at = world.tick;
     const due = scheduled.get(world.tick);
     const applied = [];
     if (due) {
@@ -162,6 +152,12 @@ export function createMatch({ seed = 1, seats = null } = {}) {
     updateUnits(world, SIM_DT);
     updateCombat(world, SIM_DT);
     updateEconomy(world, SIM_DT);
+    // Only seats explicitly marked 'ai' are stepped. A networked room uses
+    // 'human' and 'open' and so runs no AI at all, deliberately: an AI's memory
+    // is not in snapshot() (serializeGame takes one `ai` blob, and the match has
+    // one per seat), so a client rebuilding from a snapshot would inherit the
+    // world but not the AI that is about to act on it, and drift within
+    // seconds. An unclaimed seat therefore stands still rather than desyncing.
     for (let i = 0; i < roster.length; i++) {
       if (roster[i].kind === 'ai') ais[i].update(SIM_DT);
     }
@@ -172,7 +168,7 @@ export function createMatch({ seed = 1, seats = null } = {}) {
 
     checkVictory();
 
-    return { tick: world.tick, applied };
+    return { tick: world.tick, at, applied };
   }
 
   // Ported from GameScene.checkVictory() so a headless match ends the same way
@@ -212,6 +208,7 @@ export function createMatch({ seed = 1, seats = null } = {}) {
     get tick() { return world.tick; },
     get over() { return over; },
     submit,
+    onSchedule,
     step,
     takeOver,
     checksum: () => checksum(world),
