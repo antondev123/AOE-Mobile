@@ -1,0 +1,39 @@
+# Fly.io deployment for the match server.
+#
+# Rooms live in memory, so this app must not be load balanced across machines:
+# two players who landed on different instances would be in two different
+# matches wearing the same id. Hence one machine, and auto_stop_machines off
+# while a match could still be in progress.
+
+app = "age-of-skirmish"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A stopped machine drops every room it was holding. Matches are short, but
+  # not short enough to risk it mid-game, so the machine stays up.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+  # See the note above: one machine, or invite links become a lottery.
+  max_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 200
+    hard_limit = 400
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/healthz"
+  timeout = "5s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
