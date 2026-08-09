@@ -164,6 +164,25 @@ const DETAIL_FOR_TERRAIN = [
 const FOG_R = 0x14;
 const FOG_G = 0x0e;
 const FOG_B = 0x08;
+// Ground nobody has ever walked on.
+//
+// It used to be painted with the veil above at full opacity, which is
+// (0x14,0x0e,0x08) — luma 15, and a luminance sweep of the map window found
+// 46% of it below luma 28 at t=0 and still 46% at 210s. That is not fog, that
+// is an unrendered screen, and on a first boot it is most of what the player is
+// looking at. Unexplored ground is not *nothing*: it is land, it is out there,
+// and the map is a thing the player is meant to want to go and open.
+//
+// So it is now a very dark wash of the terrain average — the map is mostly
+// grass with dirt and sand patches through it, which averages to a dun brown —
+// at luma 38. Dark enough that the lit map is unmistakably the bright part of
+// the screen and an edge between seen and unseen still reads as an edge; light
+// enough that it says "land you have not been to" rather than "the renderer
+// stopped here". The explored veil is untouched at FOG_* above: those are two
+// different statements and they should not look the same.
+const UNSEEN_R = 0x2e;
+const UNSEEN_G = 0x25;
+const UNSEEN_B = 0x19;
 // Alpha over explored-but-not-visible ground. 0.52 is where the terrain type is
 // still legible — you can tell your woodline from the open field you have to
 // cross to reach it — while nothing on it competes for attention with the
@@ -309,6 +328,77 @@ export function createRenderer(scene, world) {
 
   const screenG = scene.add.graphics();
   screenG.setDepth(950000);
+
+  // --- canopy fade ----------------------------------------------------------
+  //
+  // Trees and cliffs sort correctly and draw at full opacity, which is right up
+  // until a fight happens inside a forest. With forty units engaged at the
+  // default zoom, half the combatants were behind canopies and a Market built
+  // among the trees was invisible even with its selection diamond drawn over
+  // it — the player was being asked to fight a battle they could not see, on a
+  // map whose interior is mostly forest.
+  //
+  // So anything a unit or a building is standing behind goes translucent for
+  // that frame. This is not a fog or a stencil: it is a per-sprite alpha, set
+  // during the frame it is needed and reset by setFrame on the next one, so it
+  // costs nothing when nothing is hidden.
+  //
+  // The test is a screen-space box overlap plus a depth compare — a canopy only
+  // fades for something it is actually in front of. Both lists are gathered by
+  // the passes that were already walking those entities, so the extra work is
+  // the rectangle test itself: at most (canopies in view) x (bodies in view),
+  // which the view cull keeps to a few dozen each even in the worst melee, and
+  // it breaks out of the inner loop on the first body it finds.
+  const CANOPY_ALPHA = 0.45;
+  // Screen boxes, flat and reused: { s, x0, y0, x1, y1, depth } for canopies,
+  // { x0, y0, x1, y1, depth } for the things that may be behind them.
+  const canopies = [];
+  const bodies = [];
+  let canopyN = 0;
+  let bodyN = 0;
+
+  function noteCanopy(s, o, depth, scale) {
+    let rec = canopies[canopyN];
+    if (!rec) canopies[canopyN] = rec = { s: null, x0: 0, y0: 0, x1: 0, y1: 0, depth: 0 };
+    canopyN++;
+    const w = o.w * scale;
+    const h = o.h * scale;
+    rec.s = s;
+    rec.x0 = s.x - w * o.ox;
+    rec.y0 = s.y - h * o.oy;
+    rec.x1 = rec.x0 + w;
+    rec.y1 = rec.y0 + h;
+    rec.depth = depth;
+  }
+
+  function noteBody(wx, wy, o, depth) {
+    let rec = bodies[bodyN];
+    if (!rec) bodies[bodyN] = rec = { x0: 0, y0: 0, x1: 0, y1: 0, depth: 0 };
+    bodyN++;
+    rec.x0 = wx - o.w * o.ox;
+    rec.y0 = wy - o.h * o.oy;
+    rec.x1 = rec.x0 + o.w;
+    rec.y1 = rec.y0 + o.h;
+    rec.depth = depth;
+    return rec;
+  }
+
+  function fadeCanopies() {
+    if (!bodyN || !canopyN) return;
+    for (let i = 0; i < canopyN; i++) {
+      const c = canopies[i];
+      for (let j = 0; j < bodyN; j++) {
+        const b = bodies[j];
+        // Only what is drawn *behind* the canopy is hidden by it. A tree the
+        // unit walks in front of needs no help.
+        if (b.depth >= c.depth) continue;
+        if (b.x1 <= c.x0 || b.x0 >= c.x1 || b.y1 <= c.y0 || b.y0 >= c.y1) continue;
+        c.s.setAlpha(CANOPY_ALPHA);
+        break;
+      }
+      c.s = null; // never hold a pooled sprite across frames
+    }
+  }
 
   // --- state ---------------------------------------------------------------
   let ghost = null;      // { type, gx, gy, valid }
@@ -608,6 +698,9 @@ export function createRenderer(scene, world) {
     // them unreadable. sqrt splits the difference.
     const invZ = 1 / Math.sqrt(camera.zoom);
 
+    canopyN = 0;
+    bodyN = 0;
+
     const _tCliffs = perfBegin('render.cliffs');
     drawCliffs();
     perfEnd('render.cliffs', _tCliffs);
@@ -623,6 +716,11 @@ export function createRenderer(scene, world) {
     const _tMem = perfBegin('render.memory');
     drawMemory();
     perfEnd('render.memory', _tMem);
+    // After every body and every canopy is placed, and before the pools are
+    // trimmed: this only ever changes an alpha on a sprite already positioned.
+    const _tFade = perfBegin('render.canopy');
+    fadeCanopies();
+    perfEnd('render.canopy', _tFade);
     drawGhost();
     drawWallRun();
 
@@ -711,6 +809,8 @@ export function createRenderer(scene, world) {
       setFrame(s, c.frame, origins);
       s.setPosition(c.wx, c.wy);
       s.setDepth(c.depth);
+      const o = origins.get(c.frame);
+      if (o) noteCanopy(s, o, c.depth, 1);
     }
   }
 
@@ -726,11 +826,21 @@ export function createRenderer(scene, world) {
     const s = resPool.get();
     setFrame(s, frame, origins);
     s.setPosition(wx, wy);
-    s.setDepth(depthFor(e.x, e.y, 2));
+    const depth = depthFor(e.x, e.y, 2);
+    s.setDepth(depth);
     // A node visibly shrinks as it is worked out, so players can see which
     // trees are nearly gone without selecting them.
     const left = e.maxAmount ? e.amount / e.maxAmount : 1;
-    s.setScale(0.82 + 0.18 * Math.max(0, Math.min(1, left)));
+    const scale = 0.82 + 0.18 * Math.max(0, Math.min(1, left));
+    s.setScale(scale);
+    // Only trees join the fade list. A berry bush, a gold vein and a stone mine
+    // are all ground-level: nothing ever stands behind one, and putting them in
+    // the list would be three quarters of the rectangle tests for none of the
+    // benefit.
+    if (e.type === 'tree') {
+      const o = origins.get(frame);
+      if (o) noteCanopy(s, o, depth, scale);
+    }
     if (world.selection.has(e.id)) {
       overlayNodeRing(e);
     }
@@ -791,6 +901,10 @@ export function createRenderer(scene, world) {
       } else {
         constructionStage(b, s, o, wx, wy, depth, progress);
       }
+      // A building is exactly the case that made this necessary: a Market
+      // dropped inside a forest disappeared behind the canopies in front of it
+      // and stayed invisible even when it was selected.
+      if (o) noteBody(wx, wy, o, depth + 0.4);
 
       const selected = world.selection.has(b.id);
       if (selected) footprintOutline(b, b.player === PLAYER ? SEL_OWN : SEL_ENEMY);
@@ -1039,6 +1153,7 @@ export function createRenderer(scene, world) {
       if (flip) s.setFlipX(true);
       s.setDepth(depth + 0.2);
       const uo = rec.o;
+      noteBody(wx, wy, uo, depth + 0.2);
 
       // The poses carry the limb motion; this is only the whole-body travel
       // that a drawn frame cannot express — the rise and fall of a stride, and
@@ -1069,8 +1184,25 @@ export function createRenderer(scene, world) {
       const hurt = u.hp < u.maxHp;
       if (hurt || selected || (barsWanted && u.player === PLAYER)) {
         barCount++;
+        // The stem. A bar floating above a head in this projection is also
+        // floating over the *chest* of whatever stands two tiles behind, and at
+        // 32 world pixels of vertical spacing against 53 pixels of sprite there
+        // is no height at which it is over nothing. So instead of moving it,
+        // the bar is tied to the unit it belongs to with a two-pixel post down
+        // to the top of its own head — the same trick a map label uses, and the
+        // only thing that makes ownership unambiguous rather than merely
+        // probable.
+        //
+        // (The right answer is to draw bars in the sprite pass so the unit in
+        // front occludes the bar behind, the way the sprites already occlude
+        // each other. That is two more quads per bar, and with 216 units in
+        // view it puts 400 objects on top of a frame budget of 900 — see
+        // OBJECTS in tests/perf.browser.mjs. Not worth the frame.)
+        const barY = top - 8 * invZ;
+        overlay.fillStyle(0x0b0906, 0.85);
+        overlay.fillRect(wx - 1 * invZ, barY + 4 * invZ, 2 * invZ, 5 * invZ);
         healthBar(
-          overlay, wx, top - 6 * invZ, u.hp / u.maxHp,
+          overlay, wx, barY, u.hp / u.maxHp,
           u.player === PLAYER ? 0x4ade80 : 0xf05252, invZ, plainBars,
         );
       }
@@ -1717,16 +1849,18 @@ function makeFog(scene, world, rect) {
   if (!tex) return null;
   const ctx = tex.getContext();
   // Everything starts unexplored, including the permanently unexplorable sea in
-  // the padding, which is never written again.
-  ctx.fillStyle = `rgb(${FOG_R},${FOG_G},${FOG_B})`;
+  // the padding, which is never written again. The padding takes the same
+  // unseen colour as the map so there is no seam along the coast where one
+  // shade of dark meets another.
+  ctx.fillStyle = `rgb(${UNSEEN_R},${UNSEEN_G},${UNSEEN_B})`;
   ctx.fillRect(0, 0, TW, TH);
   tex.refresh();
   if (Phaser.Textures && Phaser.Textures.FilterMode) {
     tex.setFilter(Phaser.Textures.FilterMode.LINEAR);
   }
 
-  // One scratch ImageData for the playable area. The colour bytes are written
-  // once here; a repaint only touches alpha.
+  // One scratch ImageData for the playable area. writeFogAlpha owns the alpha
+  // byte; the three colour bytes are derived from it here (see paintUnseen).
   const img = ctx.createImageData(MAP_W, MAP_H);
   const bytes = img.data;
   for (let p = 0; p < bytes.length; p += 4) {
@@ -1735,6 +1869,35 @@ function makeFog(scene, world, rect) {
     bytes[p + 2] = FOG_B;
   }
   const EXPLORED_BYTE = Math.round(FOG_EXPLORED_ALPHA * 255);
+  const UNSEEN_SPAN = Math.max(1, 255 - EXPLORED_BYTE);
+
+  /**
+   * Colour the veil by how opaque it is.
+   *
+   * There are two statements to make and one texture to make them with. Below
+   * the explored alpha the veil is the warm black that dims ground you have
+   * seen; at full opacity it is the dun brown that means ground you have not.
+   * Ramping between the two off the alpha byte — which vision.js has already
+   * blurred — means the colour change follows exactly the same soft edge the
+   * opacity does, rather than cutting a hard line across it.
+   *
+   * 9216 texels of arithmetic at 12Hz. It does not appear in the profile.
+   */
+  function paintUnseen() {
+    for (let i = 0, p = 0; i < MAP_W * MAP_H; i++, p += 4) {
+      const a = bytes[p + 3];
+      if (a <= EXPLORED_BYTE) {
+        bytes[p] = FOG_R;
+        bytes[p + 1] = FOG_G;
+        bytes[p + 2] = FOG_B;
+        continue;
+      }
+      const k = (a - EXPLORED_BYTE) / UNSEEN_SPAN;
+      bytes[p] = FOG_R + (UNSEEN_R - FOG_R) * k;
+      bytes[p + 1] = FOG_G + (UNSEEN_G - FOG_G) * k;
+      bytes[p + 2] = FOG_B + (UNSEEN_B - FOG_B) * k;
+    }
+  }
 
   const root = scene.add.container(0, -2 * PAD * HALF_H);
   root.setScale(HALF_W * Math.SQRT2, HALF_H * Math.SQRT2);
@@ -1750,6 +1913,7 @@ function makeFog(scene, world, rect) {
 
   function repaint() {
     vision.writeFogAlpha(PLAYER, bytes, EXPLORED_BYTE);
+    paintUnseen();
     ctx.putImageData(img, PAD, PAD);
     tex.refresh();
     paintedRevision = st.revision;

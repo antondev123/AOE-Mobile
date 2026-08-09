@@ -123,20 +123,71 @@ function radiusOf(e) {
 // --- Disc tables ------------------------------------------------------------
 //
 // One entry per radius, shared by every world and every player: a flat
-// Int32Array of (dy, halfWidth) pairs. Walking rows and clamping the run against
-// the map beats a nested dx/dy loop with a bounds test and a sqrt per tile,
-// which is what this replaced — the inner loop below has no branches in it at
-// all beyond the count compare.
+// Int32Array of (dy, dx0, dx1) triples. Walking rows and clamping the run
+// against the map beats a nested dx/dy loop with a bounds test and a sqrt per
+// tile, which is what this replaced — the inner loop below has no branches in
+// it at all beyond the count compare.
+//
+// WHY THE DISC IS NOT A DISC
+// --------------------------
+// A circle in grid space is not a circle on screen. The projection is
+// wx = (gx - gy) * 32, wy = (gx + gy) * 16, so a viewer with r tiles of sight
+// lights an *ellipse* 90r pixels wide and 45r tall — exactly twice as wide as
+// it is tall. On a portrait phone that is the wrong way round: the viewport is
+// 390 wide and 844 tall, so the shape vision paints is squashed along the axis
+// the player has the most screen on. A base sitting in the middle of the view
+// can never light the top or the bottom of it, and a luminance measurement of
+// the map window found 46% of it black at t=0 and *still* 46% black at 210s
+// with the economy running normally — the fog was not hiding the map, the
+// projection was.
+//
+// The fix is to stretch the mask along the grid diagonal gx+gy, which is the
+// axis that maps to screen vertical. DILATE tiles are added to that semi-axis
+// and nothing is taken off the other, so this only ever reveals more: no
+// position that could see a tile before can fail to see it now, which keeps
+// every existing expectation about sight range true.
+//
+// It is deliberately a partial correction. Making the lit region a true screen
+// circle needs a = 2r, which doubles the area a viewer reveals — that is a
+// different game, with fog that barely functions. A single tile of dilation
+// takes the on-screen aspect from 2.0 down to about 1.6 at a villager's sight.
+//
+// Cost, measured with the 150-viewer stress in tests/vision.test.mjs: 68431
+// tile writes over 41 updates before, 83725 after, and the steady state moved
+// from 0.120ms/step to 0.121ms. The extra tiles are written inside a loop that
+// was already running with the same bounds check and the same array, so they
+// are close to free; what would not be free is a second pass, and there is not
+// one — the shape is baked into the cached row table at the radius it is first
+// asked for.
+const DILATE = 1;
 
 const DISC_CACHE = new Map();
 
 function discRows(r) {
   let rows = DISC_CACHE.get(r);
   if (rows) return rows;
+  // Semi-axes of the ellipse, in tiles: `a` along (gx+gy), `b` along (gx-gy).
+  const a = r + DILATE;
+  const b = r;
+  const A = 1 / (a * a);
+  const B = 1 / (b * b);
+  // With u = (dx+dy)/sqrt2 and v = (dx-dy)/sqrt2, the ellipse u^2/a^2 +
+  // v^2/b^2 <= 1 expands to a plain quadratic in dx for each row:
+  //     P*dx^2 + Q*dx + R <= 0
+  const P = (A + B) / 2;
   const out = [];
-  const r2 = r * r;
-  for (let dy = -r; dy <= r; dy++) {
-    out.push(dy, Math.floor(Math.sqrt(r2 - dy * dy)));
+  // The tallest the rotated ellipse ever gets is sqrt((a^2+b^2)/2).
+  const maxDy = Math.ceil(Math.sqrt((a * a + b * b) / 2));
+  for (let dy = -maxDy; dy <= maxDy; dy++) {
+    const Q = (A - B) * dy;
+    const R = P * dy * dy - 1;
+    const disc = Q * Q - 4 * P * R;
+    if (disc < 0) continue;
+    const root = Math.sqrt(disc);
+    const x0 = Math.ceil((-Q - root) / (2 * P));
+    const x1 = Math.floor((-Q + root) / (2 * P));
+    if (x1 < x0) continue;
+    out.push(dy, x0, x1);
   }
   rows = Int32Array.from(out);
   DISC_CACHE.set(r, rows);
@@ -198,12 +249,13 @@ export function createVision(world) {
     const { count, visible, explored } = st;
     let changed = 0;
     let writes = 0;
-    for (let k = 0; k < rows.length; k += 2) {
+    for (let k = 0; k < rows.length; k += 3) {
       const y = ty + rows[k];
       if (y < 0 || y >= H) continue;
-      const half = rows[k + 1];
-      let x0 = tx - half;
-      let x1 = tx + half;
+      // The rows are no longer symmetric about the viewer: the ellipse is
+      // rotated 45 degrees, so each row carries its own left and right offset.
+      let x0 = tx + rows[k + 1];
+      let x1 = tx + rows[k + 2];
       if (x0 < 0) x0 = 0;
       if (x1 >= W) x1 = W - 1;
       const base = y * W;
@@ -227,12 +279,11 @@ export function createVision(world) {
     const { count, visible } = st;
     let changed = 0;
     let writes = 0;
-    for (let k = 0; k < rows.length; k += 2) {
+    for (let k = 0; k < rows.length; k += 3) {
       const y = ty + rows[k];
       if (y < 0 || y >= H) continue;
-      const half = rows[k + 1];
-      let x0 = tx - half;
-      let x1 = tx + half;
+      let x0 = tx + rows[k + 1];
+      let x1 = tx + rows[k + 2];
       if (x0 < 0) x0 = 0;
       if (x1 >= W) x1 = W - 1;
       const base = y * W;
@@ -544,12 +595,11 @@ export function createVision(world) {
     const visible = new Uint8Array(N);
     const add = (tx, ty, r) => {
       const rows = discRows(r);
-      for (let k = 0; k < rows.length; k += 2) {
+      for (let k = 0; k < rows.length; k += 3) {
         const y = ty + rows[k];
         if (y < 0 || y >= H) continue;
-        const half = rows[k + 1];
-        const x0 = Math.max(0, tx - half);
-        const x1 = Math.min(W - 1, tx + half);
+        const x0 = Math.max(0, tx + rows[k + 1]);
+        const x1 = Math.min(W - 1, tx + rows[k + 2]);
         for (let x = x0; x <= x1; x++) {
           const i = y * W + x;
           count[i]++;

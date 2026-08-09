@@ -428,6 +428,13 @@ export function createFx(scene, world, opts) {
   // information about *this* hit and become a texture. Rate-limited, they read
   // as punctuation on the fight.
   const DAMAGE_TEXT_GAP = 0.32;
+  // The three damage colours. Green and red are the same pair the health bars
+  // use for own and enemy, so the whole combat display speaks one language;
+  // they are lifted a couple of steps in brightness because a five-pixel glyph
+  // needs more contrast against grass than a bar with a black surround does.
+  const DAMAGE_DEALT = 0x8df09a;
+  const DAMAGE_TAKEN = 0xff8272;
+  const DAMAGE_OTHER = 0xffe9c9;
   const lastNumberAt = new Map();
   let numberClock = 0;
 
@@ -449,12 +456,27 @@ export function createFx(scene, world, opts) {
     if (prev !== undefined && numberClock - prev < DAMAGE_TEXT_GAP) return;
     lastNumberAt.set(t.id, numberClock);
     if (texts.length >= MAX_TEXTS - 6) return;
-    // Red for something of yours being hurt, warm white for damage you are
-    // dealing: in a mixed melee that is the difference between "I am winning"
-    // and "I am losing" at a glance, without reading a single digit.
-    const mine = t.player === PLAYER;
+    // Coloured by WHO SWUNG, not by who was hit.
+    //
+    // These used to be red over your own casualties and a warm white over
+    // everything else, which is nearly the right idea and reads as one colour
+    // at speed: a warm white number is what every floating number in every game
+    // looks like, so a melee produced a cloud of pale digits and the only way
+    // to tell whether you were winning it was to read them. Green for a blow
+    // you landed and red for one you took is a distinction the eye makes
+    // without stopping — the balance of colour over a fight *is* the score, and
+    // a player can read it while doing something else.
+    //
+    // Off the dealer rather than the target because those two questions come
+    // apart: an enemy ram hitting a neutral tree, or two AI players fighting
+    // each other in view, are neither your win nor your loss and get the old
+    // neutral wash.
+    const src = p.entity;
+    const dealt = src && src.player === PLAYER;
+    const taken = t.player === PLAYER;
+    const tint = dealt ? DAMAGE_DEALT : taken ? DAMAGE_TAKEN : DAMAGE_OTHER;
     floatText(`-${Math.round(p.amount)}`, wx(t.x, t.y), wy(t.x, t.y) + entityAnchorY(t),
-      mine ? 0xff8f8f : 0xffe9c9, false, true);
+      tint, false, true);
   });
 
   on(EV.GATHER_TICK, (p) => {

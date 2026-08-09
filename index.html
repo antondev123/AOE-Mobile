@@ -83,9 +83,16 @@
            one irreversible thing this card can do. -->
       <button id="btn-resume" class="start-btn" hidden>Resume match</button>
       <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
+      <!-- The one copy of the rules in the whole game. It was written for this
+           card and then became unreachable the moment the match started, which
+           made it a tutorial nobody could consult and — collapsed by default —
+           one almost nobody opened. The menu sheet's "How to play" row now
+           clones this list rather than restating it (see openHelp in
+           ui/hud.js), so there is still exactly one place to edit it and no way
+           for the two copies to drift apart. -->
       <details class="boot-help">
         <summary>How to play</summary>
-        <ul>
+        <ul id="help-list">
           <li><b>Tap</b> a unit to select it. <b>Double-tap</b> selects every unit of that type on screen.</li>
           <li><b>Drag</b> to look around. With units selected, drag to box-select &mdash; or hold, then drag, any time.</li>
           <li><b>Tap</b> the ground to move, a resource to gather, an enemy to attack.</li>
@@ -100,16 +107,25 @@
           <li>Put a building somewhere you regret? Select it and tap <b>Demolish</b> twice.</li>
         </ul>
       </details>
-      <p class="boot-build">build <span id="commit">__COMMIT_SHA__</span> &middot; <span id="built">__BUILD_TIME__</span></p>
+      <p class="boot-build">build <span id="commit">__COMMIT_SHA__</span> &middot; <span id="built">__BUILD_TIME__</span> &middot; <span id="engine">engine</span></p>
     </div>
   </div>
 
+  <!-- The end card. It used to report a clock and nothing else, which is a
+       strange thing to tell somebody at the end of a war. The three figures
+       under the headline are the ones a player actually wants to argue about
+       afterwards — how long, how many did I kill, how big did my army get —
+       and "Look at the map" exists because the last thing anyone wants at the
+       end of a match is a modal over the battlefield they just won. -->
   <div id="endcard" class="endcard" hidden>
     <div class="endcard-inner">
       <h2 id="end-title">Victory</h2>
       <p id="end-sub"></p>
+      <dl class="end-stats" id="end-stats"></dl>
       <button id="btn-again" class="start-btn">Play again</button>
+      <button id="btn-look" class="start-btn secondary">Look at the map</button>
     </div>
+    <button id="btn-results" class="end-peek" hidden>Results</button>
   </div>
 
   <script src="vendor/phaser.min.js"></script>
