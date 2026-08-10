@@ -112,10 +112,18 @@ function poseOf(u, t, phase) {
   if (state === 'attack') {
     const seq = set.attack || set.idle;
     if (seq.length < 2) return seq[0];
-    // High attackAnim = the blow just landed, so show the follow-through;
-    // spent = back on guard for the rest of the cooldown.
+    // High attackAnim = the blow just landed, so the sequence plays *backwards*
+    // through the swing: the last frame is the follow-through and the first is
+    // back on guard for the rest of the cooldown.
+    //
+    // This used to be a single threshold — `f > 0.45 ? seq[1] : seq[0]` — which
+    // was correct for the two poses that existed and silently capped the
+    // animation at two forever: a third pose could never be selected, so baking
+    // one would have spent atlas space on a frame nothing could ask for.
+    // Indexing across the whole sequence means the swing is as smooth as the
+    // art is long, and a two-pose entry behaves as it always did.
     const f = Math.min(1, (u.attackAnim || 0) / SWING_TIME);
-    return f > 0.45 ? seq[1] : seq[0];
+    return seq[Math.min(seq.length - 1, (f * seq.length) | 0)];
   }
   const seq = set[state] || set.idle;
   if (seq.length < 2) return seq[0];
