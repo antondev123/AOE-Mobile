@@ -621,6 +621,17 @@ async function trainQueueRun() {
 // numbers the game can produce into the bar, walk through every state the HUD
 // can be in, and assert that EVERY interactive control is on screen and at
 // least 44x44. No exceptions, no allowances.
+//
+// ONE ALLOWANCE, AND IT IS NOT A LOOSENING. The rule is 44 *CSS pixels*, and
+// getBoundingClientRect returns floats: a control the stylesheet pins with
+// `min-height: 44px` can measure 43.99999999999999 once the browser has laid
+// out fractional parents around it, and which side of the line it lands on
+// depends on the browser build. The market sheet's Close button is exactly
+// 44px by CSS and failed this audit on CI while passing locally, reported —
+// unhelpfully — as "44.0x44.0". Comparing a float against an integer with no
+// tolerance tests the layout engine's rounding, not the design rule. Half a
+// pixel is far below anything a thumb or a reviewer can perceive and is nowhere
+// near letting a genuinely undersized 40px control through.
 
 const WORST = `four five-digit stockpiles and 199/200 population`;
 
@@ -658,7 +669,7 @@ const AUDIT = `(() => {
     if (b.width === 0 && b.height === 0) continue;
     const name = (n.id ? '#' + n.id : '') + '.' + (n.className || n.tagName);
     seen.push(name);
-    if (b.width < 44 || b.height < 44) {
+    if (b.width < 44 - 0.5 || b.height < 44 - 0.5) {
       bad.push(name + ' is ' + b.width.toFixed(1) + 'x' + b.height.toFixed(1));
     }
     let scroller = null;

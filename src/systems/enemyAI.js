@@ -32,9 +32,10 @@
 // and a wiped-out wave puts it back into an economy-rebuilding posture.
 
 import {
-  UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES, PLAYER,
+  UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES,
   MILITARY_TYPES as ROSTER, BONUS_DAMAGE,
 } from '../core/constants.js';
+import { foesOf, isHostile } from '../core/teams.js';
 import { EV } from '../core/events.js';
 import {
   ownedBy, findNearestGlobal, forEachNear, canPlace,
@@ -206,6 +207,18 @@ const WAVE_BREATHER = 15;      // minimum regroup before the next launch
 
 const STAGING_DIST = 5.5;      // rally point, tiles from the TC toward the foe
 const DEFEND_RADIUS = 13;      // hostiles this close to home trigger defence
+
+// --- Choosing which enemy to fight (see pickFoe) -----------------------------
+//
+// Only meaningful past two players, and both numbers exist to stop the same
+// failure: an army that walks back and forth across the middle of the map
+// because two enemies are at nearly equal range and the nearer one keeps
+// changing. The margin means a rival has to be four tiles closer to steal the
+// target, and the memory means whoever is actually hitting us wins outright for
+// twenty seconds regardless of geometry — being raided is a fact about who to
+// fight that distance cannot express.
+const FOE_SWITCH_MARGIN = 4;
+const AGGRESSOR_MEMORY = 20;
 const DEFEND_CLEAR_TIME = 12;  // all-clear delay before resuming offence
 const STUCK_WINDOW = 1.5;      // seconds between motion samples
 const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
@@ -391,7 +404,12 @@ class EnemyAI {
   constructor(world, playerId) {
     this.world = world;
     this.id = playerId;
-    this.foeId = playerId === PLAYER ? 1 : PLAYER;
+    // Who this AI is currently marching at. It was `playerId === PLAYER ? 1 : 0`
+    // — "the other one", which is the only enemy a 1v1 has and is wrong the
+    // moment there are three seats: seven AIs would all pick player 0 or 1 and
+    // ignore each other. pickFoe() chooses now, on the ordinary think cadence.
+    // Everything downstream still reads this one field.
+    this.foeId = null;
 
     this.acc = 0;
     this.rebalanceAcc = 0;
@@ -431,6 +449,7 @@ class EnemyAI {
     this.motion = new Map();
 
     this.lastDamageTime = -999;
+    this.lastAggressor = null;
     this.lastDamageAt = null;
     this.defendingUntil = -999;
 
@@ -469,6 +488,12 @@ class EnemyAI {
         if (!victim || victim.player !== this.id) return;
         this.lastDamageTime = world.time;
         this.lastDamageAt = { x: victim.x, y: victim.y };
+        // Remember WHO, not just when. With more than one enemy, "something is
+        // hitting me" is not enough to decide who to hit back.
+        const by = p.attacker || p.source;
+        if (by && by.player !== null && by.player !== undefined && by.player !== this.id) {
+          this.lastAggressor = by.player;
+        }
       });
     }
   }
@@ -510,6 +535,9 @@ class EnemyAI {
 
   tick(step) {
     this.refreshHome();
+    // Before anything reads foeId — the roster changes as players are knocked
+    // out, and a dead enemy is not a place to send an army.
+    this.pickFoe();
     this.refreshAvailability();
     this.trackWaveProgress();
     this.assessThreat();
@@ -640,15 +668,75 @@ class EnemyAI {
     if (!this.staging || !this.stagingStillGood()) this.staging = this.computeStaging();
   }
 
+  /** Every seat still in the match that is not on our side. */
+  hostiles() {
+    return foesOf(this.world, this.id);
+  }
+
+  /**
+   * Choose an enemy to point the army at.
+   *
+   * Nearest live base, with two forms of hysteresis, because an AI that
+   * re-targets on distance alone walks its army back and forth across the middle
+   * of the map forever: whoever hurt us most recently wins outright, and
+   * otherwise the current foe is kept unless someone else is meaningfully
+   * closer. A wave already in flight is not re-aimed — see trackWaveProgress.
+   */
+  pickFoe() {
+    const w = this.world;
+    const live = this.hostiles();
+    if (!live.length) { this.foeId = null; return; }
+
+    // Somebody attacking our town is the answer to this question regardless of
+    // what the geometry says.
+    if (this.lastAggressor !== null && this.lastAggressor !== undefined
+        && live.includes(this.lastAggressor)
+        && w.time - this.lastDamageTime < AGGRESSOR_MEMORY) {
+      this.foeId = this.lastAggressor;
+      return;
+    }
+
+    let best = null;
+    let bestD = Infinity;
+    for (const id of live) {
+      const p = this.baseOf(id);
+      if (!p) continue;
+      const d = dist(p.x, p.y, this.home.x, this.home.y);
+      if (d < bestD) { bestD = d; best = id; }
+    }
+    if (best === null) { this.foeId = live[0]; return; }
+
+    // Stick unless the newcomer is a real improvement. Without the margin, two
+    // enemies at nearly equal range make the target flip every half second.
+    if (this.foeId !== null && live.includes(this.foeId)) {
+      const cur = this.baseOf(this.foeId);
+      if (cur && dist(cur.x, cur.y, this.home.x, this.home.y) <= bestD + FOE_SWITCH_MARGIN) return;
+    }
+    this.foeId = best;
+  }
+
+  /** Where a given player's town is, or null if they have nothing left. */
+  baseOf(playerId) {
+    const w = this.world;
+    const tc = ownedBy(w, playerId, 'building', 'towncenter')[0];
+    if (tc) return { x: tc.x, y: tc.y };
+    const bs = ownedBy(w, playerId, 'building');
+    if (bs.length) return { x: bs[0].x, y: bs[0].y };
+    const us = ownedBy(w, playerId, 'unit');
+    if (us.length) return { x: us[0].x, y: us[0].y };
+    return null;
+  }
+
   foeBase() {
     const w = this.world;
-    const tc = ownedBy(w, this.foeId, 'building', 'towncenter')[0];
-    if (tc) return { x: tc.x, y: tc.y };
-    const bs = ownedBy(w, this.foeId, 'building');
-    if (bs.length) return { x: bs[0].x, y: bs[0].y };
-    const us = ownedBy(w, this.foeId, 'unit');
-    if (us.length) return { x: us[0].x, y: us[0].y };
-    // Mirror of our own corner, as a last resort.
+    if (this.foeId === null) this.pickFoe();
+    const at = this.foeId === null ? null : this.baseOf(this.foeId);
+    if (at) return at;
+    // Any hostile at all, then the mirror of our own corner as a last resort.
+    for (const id of this.hostiles()) {
+      const p = this.baseOf(id);
+      if (p) return p;
+    }
     return { x: w.width - this.home.x, y: w.height - this.home.y };
   }
 
@@ -1771,7 +1859,11 @@ class EnemyAI {
   foeArmorMix() {
     const mix = {};
     let total = 0;
-    for (const u of ownedBy(this.world, this.foeId, 'unit')) {
+    // Every hostile's army, because what we have to counter is what can arrive,
+    // and on an eight-player map that is not one roster.
+    const pool = [];
+    for (const id of this.hostiles()) pool.push(...ownedBy(this.world, id, 'unit'));
+    for (const u of pool) {
       if (!isMilitary(u) || isGarrisoned(u)) continue;
       const cls = armorClassOf(u);
       mix[cls] = (mix[cls] || 0) + 1;
@@ -2029,7 +2121,11 @@ class EnemyAI {
     let sx = 0;
     let sy = 0;
     forEachNear(w, this.home.x, this.home.y, DEFEND_RADIUS, (e) => {
-      if (e.kind !== 'unit' || e.player !== this.foeId) return;
+      // ANY hostile, not just the one we are marching at. A raid from the
+      // third player is exactly as much of an emergency as one from the second,
+      // and reading only `foeId` here meant an AI could be dismantled by
+      // somebody it had not happened to pick.
+      if (e.kind !== 'unit' || !isHostile(w, { player: this.id }, e)) return;
       count++;
       sx += e.x;
       sy += e.y;
@@ -2104,11 +2200,10 @@ class EnemyAI {
   }
 
   nearestFoeNear(point) {
-    return findNearestGlobal(
-      this.world, point.x, point.y,
-      ownedBy(this.world, this.foeId, 'unit'),
-      () => true,
-    );
+    const w = this.world;
+    let pool = [];
+    for (const id of this.hostiles()) pool = pool.concat(ownedBy(w, id, 'unit'));
+    return findNearestGlobal(w, point.x, point.y, pool, () => true);
   }
 
   /**
@@ -2118,6 +2213,11 @@ class EnemyAI {
    */
   chooseWaveTarget(from) {
     const w = this.world;
+    // Deliberately the chosen foe alone, unlike threat assessment: a wave has
+    // to arrive somewhere, and one aimed at the average of every enemy on an
+    // eight-player map marches into the middle and dies to whoever is there.
+    if (this.foeId === null) this.pickFoe();
+    if (this.foeId === null) return null;
     const foeUnits = ownedBy(w, this.foeId, 'unit');
     const foeBuildings = ownedBy(w, this.foeId, 'building');
 
@@ -2331,6 +2431,8 @@ class EnemyAI {
       lostLastWave: this.lostLastWave,
       motion: Array.from(this.motion.entries()).map(([id, r]) => [id, { ...r }]),
       lastDamageTime: this.lastDamageTime,
+      lastAggressor: this.lastAggressor,
+      foeId: this.foeId,
       lastDamageAt: this.lastDamageAt ? { ...this.lastDamageAt } : null,
       defendingUntil: this.defendingUntil,
       garrisonUntil: this.garrisonUntil || 0,
@@ -2398,6 +2500,8 @@ class EnemyAI {
       (data.motion || []).filter(([id]) => live_(id)).map(([id, r]) => [id, { ...r }]),
     );
     this.lastDamageTime = Number.isFinite(data.lastDamageTime) ? data.lastDamageTime : -999;
+    this.lastAggressor = Number.isInteger(data.lastAggressor) ? data.lastAggressor : null;
+    this.foeId = Number.isInteger(data.foeId) ? data.foeId : null;
     this.lastDamageAt = data.lastDamageAt ? { ...data.lastDamageAt } : null;
     this.defendingUntil = Number.isFinite(data.defendingUntil) ? data.defendingUntil : -999;
     this.garrisonUntil = data.garrisonUntil || 0;
