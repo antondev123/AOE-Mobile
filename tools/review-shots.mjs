@@ -66,6 +66,55 @@ async function look(page, gx, gy, zoom) {
 }
 
 /**
+ * Play the player's side, badly but continuously.
+ *
+ * Every shot after the opening used to be taken on a match where one side did
+ * nothing at all, and since the enemy AI learned to reach the Castle Age that
+ * is a match the player loses at 8m30s — so "battle" photographed the defeat
+ * card and "midgame" photographed a base with three villagers in it. Neither
+ * is a picture of this game.
+ *
+ * This is not an AI and is not trying to be. It keeps a Town Center training
+ * villagers, puts up the buildings an opening needs, and keeps the military
+ * buildings' queues full, which is enough to produce the thing the shots are
+ * for: two armies on the same piece of ground. The stockpile is topped up
+ * rather than earned, deliberately — a review harness that has to play well
+ * enough to afford an army is a review harness nobody can rely on.
+ */
+async function propUp(page) {
+  await page.evaluate(() => {
+    const g = window.__game;
+    const w = g.world;
+    if (w.__propped) return;
+    w.__propped = true;
+    const eco = g.economy || null;
+    // Re-driven from the scene's own step, so it keeps up however fast the
+    // harness advances the simulation.
+    const inner = g.step;
+    let acc = 0;
+    g.step = (n = 1) => {
+      for (let i = 0; i < n; i++) {
+        inner(1);
+        if (++acc % 40) continue;               // twice a simulated second
+        const p = w.players[0];
+        for (const k of ['food', 'wood', 'gold', 'stone']) {
+          if (p.resources[k] < 400) p.resources[k] = 400;
+        }
+        for (const b of w.buildings) {
+          if (b.dead || b.player !== 0 || !b.complete) continue;
+          if (!b.trains || !b.trains.length) continue;
+          if (b.queue && b.queue.length >= 2) continue;
+          // Everything it can make, round-robin off the tick counter, so the
+          // army that appears is mixed rather than forty militia.
+          const t = b.trains[(acc / 40 | 0) % b.trains.length];
+          if (g.queueTrain) g.queueTrain(b, t);
+        }
+      }
+    };
+  });
+}
+
+/**
  * Lift the fog for the player, for one screenshot.
  *
  * An artifice, and worth being clear about: this is not what a player sees. It
@@ -105,6 +154,9 @@ try {
     await play(page, 2);
     await shot(page, 'opening', 'the first frame of a new match');
   }
+
+  // Everything past the opening wants a match with two sides in it.
+  await propUp(page);
 
   // --- A working economy, at both readable zooms ----------------------------
   if (want('economy')) {

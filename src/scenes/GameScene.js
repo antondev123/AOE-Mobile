@@ -19,7 +19,7 @@ import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
 
 import { createRenderer } from '../gfx/render.js';
-import { updateEconomy } from '../systems/economy.js';
+import { updateEconomy, queueTrain } from '../systems/economy.js';
 import { updateAllocation } from '../systems/allocation.js';
 import { updateUnits, commandUnits } from '../systems/unitAI.js';
 import { updateCombat } from '../systems/combat.js';
@@ -128,6 +128,11 @@ export class GameScene extends Phaser.Scene {
       },
       // Issue orders from the console or from the test harness.
       command: (units, order) => commandUnits(world, units, order),
+      // Queue a unit, the same door the HUD's train button goes through. Here
+      // for the console and for tools/review-shots.mjs, which has to keep a
+      // player's production running to photograph a match with two sides in
+      // it — the enemy AI now beats a player who does nothing at 8m30s.
+      queueTrain: (building, type) => queueTrain(world, building, type),
       // Fog of war, for the console: masks, remembered objects and the timing
       // counters (see visionStats in systems/vision.js).
       vision: world.vision,

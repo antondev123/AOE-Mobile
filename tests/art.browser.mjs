@@ -369,18 +369,24 @@ const run = async () => {
           .find((e) => e && e.type === 'towncenter');
         const gx = Math.round(tc.x) + 12;
         const gy = Math.round(tc.y) + 12;
+        // The Town Center survives, and it has to: every section after this one
+        // re-finds it to place its own subject, and clearing it here took the
+        // whole rest of the run down with a null dereference three sections
+        // later. Anything that removes entities in this file has to say so.
         for (const e of [...w.resources, ...w.buildings, ...w.units]) {
-          if (Math.abs(e.x - gx) < 22 && Math.abs(e.y - gy) < 22) W.removeEntity(w, e);
+          if (e.type === 'towncenter') continue;
+          if (Math.abs(e.x - gx) < 20 && Math.abs(e.y - gy) < 20) W.removeEntity(w, e);
         }
         // Flat, unblocked ground: this is a silhouette comparison and a pond or
-        // a cliff behind one of the six is a distraction, not a control.
-        for (let ty = gy - 16; ty <= gy + 16; ty++) {
-          for (let tx = gx - 16; tx <= gx + 16; tx++) {
+        // a cliff behind one of the six is a distraction, not a control. Only
+        // terrain blocks are lifted — clearing `blocked` wholesale would also
+        // unblock whatever buildings are still standing.
+        for (let ty = gy - 14; ty <= gy + 14; ty++) {
+          for (let tx = gx - 14; tx <= gx + 14; tx++) {
             if (tx < 0 || ty < 0 || tx >= w.width || ty >= w.height) continue;
             const i = ty * w.width + tx;
-            w.terrain[i] = 0;
-            w.blocked[i] = 0;
-            if (w.cliff) w.cliff[i] = 0;
+            if (w.cliff && w.cliff[i]) { w.cliff[i] = 0; w.blocked[i] = 0; }
+            if (w.terrain[i] === 2) { w.terrain[i] = 0; w.blocked[i] = 0; }
           }
         }
         // Two rows of three along the screen-horizontal (equal gx+gy), so no
