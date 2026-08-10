@@ -22,16 +22,21 @@
 //         on continuously, because a farm is spent as fast as it is worked
 //   ~2:00 militia + spearmen train continuously (the Barracks trains nothing
 //         else now), aiming at whatever the counter table says
-//   ~2:55 first wave: 5 units, sent as one group at a soft edge of your base
-//         (it lands on your town around 3:45)
-//   then  a wave every 90-125 s, +2 units each wave, capped at 16
+//   ~2:55 first wave: 5 units, sent as one group at the softest thing it can
+//         actually break — a lumber camp, a mill, a field (it lands around 3:45)
+//   then  a dispatch every 75-105 s. The trigger size escalates by 2 a wave up
+//         to 16, but what *goes* is everything at the staging point above the
+//         home guard, so a thirty-strong army attacks with twenty-four of it.
 //   ~7:00 Feudal Age (6:20-9:20 across seeds), and immediately the building that
 //         turns it into units: an Archery Range or a Stable, whichever answers
 //         what the player has been seen fielding. Then the Blacksmith, then the
 //         second of the two arms.
 //   ~9:00 Castle Age (8:10-11:10, on five seeds out of six): Knights out of the
-//         Stable, and a Siege Workshop for the scorpions and rams that finish a
-//         town the waves keep bouncing off.
+//         Stable, and a Siege Workshop for the scorpions, rams and mangonels
+//         that finish a town the waves keep bouncing off. Which of those it
+//         actually builds is decided by militaryTrainers()'s ordering and by
+//         ROSTER_TARGET; before those existed the answer was "none of them,
+//         ever", because the Barracks emptied the purse on militia first.
 //
 // Both ages are *saved up for* rather than waited for — see the age-up push
 // under AGE_PUSH_VILLAGERS. Before it existed the Feudal Age landed at 8:40 and
@@ -47,13 +52,41 @@
 // becomes solvable. An AI that never built the second building would field
 // militia and spearmen for ten minutes; see buildingWishlist.
 //
-// Measured over eight seeds: 4-5 waves in ten minutes, gaps 95-120 s, every
-// wave reaching the player's town. A wave that gets wiped costs it ~135 s of
-// rebuilding before the next one, which is the intended punishment for the
-// player fighting back.
+// --- What a wave is, and why it is not a round trip any more -----------------
+//
+// A "wave" used to be a squad that walked over, hit something, and walked back
+// on a clock. Measured with two of these AIs facing each other for thirty
+// minutes on the review's own seeds, that produced: ten waves each, no winner,
+// and — the number that matters — *one destroyed building between the two of
+// them*, 550 and 322 points of damage against a Town Center's 900 hitpoints.
+// Three things caused it and all three are gone:
+//
+//   * every wave was sent after a villager (chooseWaveTarget scored one at 1.5
+//     against a Town Center's 0.5). A villager runs away and is replaced in
+//     sixteen seconds. See the TARGET_* table;
+//   * a wave was capped at sixteen while the army stood at forty-one. See
+//     MAX_WAVE_SIZE and homeGuard();
+//   * the recall clock was the march plus half again, and the march is 77-85 s
+//     of an 85-tile map, so a squad arrived with thirty seconds of fighting in
+//     hand and was called home standing in the enemy's town at full strength.
+//     See WAVE_FIGHT_TIME.
+//
+// What a push does now: it commits everything above the home guard, walks in
+// attack-moving so it fights what it meets, chops the objective once the ground
+// around it is clear, is *reinforced where it stands* when the next beat comes
+// round, and stays as long as it keeps destroying things. Sixty seconds without
+// a kill, or bleeding below a third of its peak strength, and it comes home.
+//
+// Measured over six seeds of two shipped AIs, thirty minutes each: a winner
+// every time, at 18.3, 18.6, 20.7, 21.9, 22.6 and 29.0 minutes, with the loser
+// ground down first — economy raided from the sixth minute, Town Center down
+// around the twentieth — rather than deleted.
 //
 // It never busy-waits: every "I want X" has a cooldown and a bounded search,
-// and a wiped-out wave puts it back into an economy-rebuilding posture.
+// and a wiped-out wave puts it back into an economy-rebuilding posture. And it
+// always attacks eventually: PUSH_PATIENCE lowers the launch bar the further
+// behind its own schedule it falls, because a gate the AI can never satisfy is
+// worse than no gate at all.
 
 import {
   UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES, PLAYER,
@@ -72,7 +105,7 @@ import { commandUnits, isIdle } from './unitAI.js';
 import { armorClassOf, isGarrisoned, garrisonCapacity, garrisonCount, ungarrisonAll } from './combat.js';
 import {
   AGE, TECHS, currentAge, hasTech, techsAt, queueResearch, researchRefusal,
-  nextAgeTech, unitUnlocked,
+  nextAgeTech, unitUnlocked, ageForUnit,
 } from './tech.js';
 import { hyp, dirVec, DIR_COUNT } from '../core/iso.js';
 
@@ -359,45 +392,198 @@ const MAX_MINING_CAMPS = 2;
 const FIRST_WAVE_TIME = 170;   // earliest first attack
 const FIRST_WAVE_SIZE = 5;
 const WAVE_SIZE_STEP = 2;
+// The size at which a wave stops *escalating*. It is a trigger, not a cap: see
+// launchWave and homeGuard — everything at the staging point above the home
+// guard goes, so a thirty-strong army attacks with twenty-four of it.
+//
+// It used to be a cap, and that was one of the three reasons two of these AIs
+// could not finish a match in thirty minutes. Measured, seed 4242, minute 25:
+// both sides stood on forty-one soldiers at the population ceiling and sent
+// sixteen. A third of an army walking into a whole one loses, comes home, and
+// is replaced by production — which is a stalemate machine, not an attack.
 const MAX_WAVE_SIZE = 16;
 // Waves are scheduled from the moment one *launches*, not from when it dies,
 // so pressure arrives on a predictable ~90-125 s beat whatever happens out
-// there. A wave that has been grinding for 80 s without finishing the job
-// comes home rather than feeding itself in one unit at a time.
-const WAVE_INTERVAL_MIN = 90;
-const WAVE_INTERVAL_MAX = 125;
+// there. When the beat comes round and a push is still fighting, the fresh
+// soldiers reinforce it instead of waiting for it to come home (see
+// reinforceWave), so this is the cadence of *dispatches*, not of round trips.
+const WAVE_INTERVAL_MIN = 75;
+const WAVE_INTERVAL_MAX = 105;
 const WAVE_REGROUP_AFTER_LOSS = 135; // longer pause after a wave is wiped
-// How long a wave may be out before it is called home as a failure.
+// The march budget floor. Eighty seconds was measured against a militia (1.1
+// tiles/second) crossing the ~85 tiles between the two bases, which is 77
+// seconds of walking; anything slower than a militia did not arrive at all,
+// which is why marchBudget() computes the walk per wave rather than holding one
+// number. This is only the floor for a raid on something close by.
+const WAVE_MARCH_MIN = 80;
+// --- How long a push presses ------------------------------------------------
 //
-// THIS IS A FLOOR, NOT THE ANSWER — see waveTimeout(). Eighty seconds was
-// measured against a militia (1.1 tiles/second) crossing the ~85 tiles between
-// the two bases, which is 77 seconds of walking: the wave arrived with three
-// seconds to spare and anything slower than a militia did not arrive at all.
-// The roster is nine units wide now and the Barracks trains the *spearman*,
-// which walks at 1.0 — 85 seconds, five seconds past the recall. Measured on
-// seed 12345 with this as a flat number: three waves launched, three waves
-// turned around 12.7 tiles short of the player's Town Center, and the AI's
-// closest approach in ten minutes was a wave that was still walking when it was
-// told to come home. A ram (0.65) would never have arrived at all.
-const WAVE_TIMEOUT = 80;
-// ...so the real timeout is the march the squad actually has to make, at the
-// pace of its slowest member, plus half again for the fighting, the pathing
-// around a base and the stragglers. 1.5 is deliberately generous: the cost of
-// being too patient is a wave that stands in the enemy's town for another
-// thirty seconds, and the cost of being too impatient is the whole attack.
-const WAVE_MARCH_SLACK = 1.5;
-// ...and a ceiling on the result, because the wave clock and the wave *schedule*
-// share one squad: manageArmy will not launch the next wave while this one is
-// out, so a budget of 212 seconds (which is what 85 tiles at a mangonel's 0.6
-// works out to) would quietly turn a 90-125 s cadence into a three-minute one.
-// A siege unit that is still walking at 150 seconds is not going to change the
-// outcome of the attack it was sent on; the pressure arriving on schedule will.
-const WAVE_TIMEOUT_MAX = 150;
+// THE OLD RULE WAS A FLAT CLOCK FROM LAUNCH, AND IT IS WHY NOTHING WAS EVER
+// DESTROYED. The budget was march x 1.5, capped at 150 s, and the march alone is
+// 77-85 s — so a wave arrived with thirty seconds of fighting in hand and was
+// called home in the middle of the enemy's town. Traced on seed 4242, six waves:
+// three ended on the clock while standing 3-6 tiles from their objective with
+// 13-16 of their 16 men alive. Thirty minutes of that produced 550 points of
+// damage to buildings, one destroyed building between the two sides, and no
+// winner.
+//
+// So the budget is now the walk *plus* a fight, and the fight is measured from
+// the moment the push is committed rather than shared with the march:
+//   WAVE_FIGHT_TIME       seconds of fighting bought at launch. 75 s is about
+//                         four buildings' worth of chopping for a mid-sized
+//                         squad (a militia does 5.5 damage a second and a
+//                         Barracks has 700 hitpoints), or one real battle.
+//   WAVE_KILL_EXTENSION   every objective the push actually destroys buys it a
+//                         fresh window of this length. There is deliberately no
+//                         ceiling on top of that: a push that is taking a base
+//                         apart one building a minute should stay until the base
+//                         is gone, and the moment it stops making progress the
+//                         window runs out and it walks home. That is the whole
+//                         bound — sixty seconds without a kill — and it is a
+//                         better one than a clock, because it is measured in
+//                         results rather than in patience.
+const WAVE_FIGHT_TIME = 75;
+const WAVE_KILL_EXTENSION = 90;
+// Survivors below this share of the largest the push ever *simultaneously* was:
+// come home rather than feed the rest in.
+//
+// Against the total ever committed rather than the peak, a push that is fed
+// three men at a time for four minutes is judged against a number that never
+// existed, and a healthy fifteen-strong front reads as the wreckage of a
+// forty-man army and is called home mid-siege.
+const WAVE_BLED_SHARE = 0.3;
 const WAVE_BREATHER = 15;      // minimum regroup before the next launch
+
+// --- The home guard ---------------------------------------------------------
+//
+// Soldiers that stay behind when the rest commits. Without them "send everything
+// above the guard" means "send everything", and the first raid to arrive walks
+// into an empty base — which is a different way to lose a match, not a fix.
+//
+// It is a share rather than a number so that it never gets in the way of the
+// opening: below HOME_GUARD_FROM the AI keeps nobody back at all, because an
+// army of five that keeps two at home launches a wave of three, and the first
+// wave is the one thing about this AI's schedule that is already right.
+const HOME_GUARD_FROM = 8;
+const HOME_GUARD_SHARE = 0.25;
+const HOME_GUARD_MIN = 2;
+const HOME_GUARD_MAX = 6;
+// Fresh soldiers join a push that is already out, but never as a trickle: two
+// men walking eighty tiles into a fight arrive as two casualties. Below this
+// they wait at the staging point for the next dispatch.
+//
+// And never into a push that is going to be recalled before they get there —
+// see reinforceWave. A push only earns reinforcements by destroying something;
+// one that has been sitting outside a base achieving nothing is one the army
+// should be regrouping at home instead of feeding, four men at a time.
+const REINFORCE_MIN = 4;
+// However far off a full-sized wave is, the AI attacks anyway once it is this
+// far past its own schedule — first with a halved bar, then with whatever it
+// has.
+//
+// THIS IS THE MOST IMPORTANT SAFETY RULE IN THE FILE. Every gate above is a
+// reason not to attack yet, and a set of reasons not to attack yet is exactly
+// how an AI ends up holding its whole army at home for ten minutes. A gate the
+// AI can never satisfy is worse than no gate at all, so the schedule always
+// wins in the end.
+const PUSH_PATIENCE = 45;
+
+// --- Breaking things --------------------------------------------------------
+//
+// How close the push has to be to its objective before it stops walking and
+// starts chopping, and how clear of enemy soldiers the ground has to be first.
+//
+// The two orders are genuinely different and the difference is not cosmetic. An
+// ordered attack (unitAI's orderAttack) sets `target` directly, which is what
+// tells combat.js the order came from outside — and a unit under one neither
+// auto-acquires, nor answers callForHelp, nor retaliates (reactToDamage bails on
+// `target.task`). Twenty soldiers ordered onto a Town Center will chop it while
+// twenty defenders kill them one at a time without a single swing back. So the
+// push attack-*moves* while there is anything alive to fight, and only switches
+// to chopping the building once the ground around it is clear.
+const SIEGE_RANGE = 8;         // near enough the objective to start on it
+const SIEGE_ENGAGE = 14;       // ...and near enough to count as "arrived" at all
+const SIEGE_CLEAR_RADIUS = 10; // enemy soldiers inside this keep it fighting
+// ...unless the front outnumbers them by this much, in which case the handful
+// still standing is the escort's problem and the building comes down now. An
+// undefended base is the easy case; a base with two men left in it should not
+// be able to keep a twenty-strong push nibbling houses on auto-acquire for the
+// rest of its budget, which is what an absolute "no enemies at all" rule did.
+const SIEGE_OVERWHELM = 4;
+const SIEGE_MODE_HOLD = 5;     // seconds between posture changes (no flapping)
+// Where the push walks to. Straight at the objective's centre is a tile inside a
+// building footprint, which no unit can stand on; a couple of tiles back along
+// the line it approached from is ground it can.
+const SIEGE_STANDOFF = 2.5;
+// Units that go straight for the building whatever else is happening. See
+// orderPush: a ram in an attack-move is a ram in a duel it cannot win.
+const BREAKERS = ['ram'];
+
+// What the push goes for, best first. The scores are multiplied by
+// TARGET_WEIGHT below and then traded off against how exposed the thing is and
+// how far away it is, exactly as before.
+//
+// THE ORDER HERE IS THE MATCH'S WIN CONDITION, and it used to be upside down. A
+// player is defeated when they own no building that can train anything
+// (GameScene.checkVictory), and the old table scored a villager at 1.5 against a
+// Town Center's 0.5 — so on seed 4242 every one of the six traced waves was sent
+// after a villager. A villager runs away (combat.js startFleeing), is replaced
+// in sixteen seconds, and leads the squad on a tour of the map; a Barracks does
+// none of those things. Villagers are not neglected by this change, they are
+// killed on the way in: the push attack-moves, and combat.js's own auto-acquire
+// puts units ahead of masonry, so a squad standing in a working base kills the
+// workers first and starts on the walls afterwards.
+const TARGET_TOWNCENTER = 3.4; // trains villagers, and losing it is unrecoverable
+const TARGET_TRAINER = 3.0;    // a Barracks, Range, Stable or Siege Workshop
+const TARGET_ECONOMY = 1.4;    // a drop-off or a field: this is the raid
+const TARGET_OTHER = 0.7;      // houses and the rest
+const TARGET_VILLAGER = 1.2;   // only reachable once nothing of theirs stands
+const TARGET_WEIGHT = 6;
+// ...and the same table for a squad too small to break a base, which is every
+// squad before about the eighth minute.
+//
+// Sending five men at a Town Center guarded by five men is a donation. Sending
+// them at the lumber camp out at the second woodline is the oldest opening in
+// the genre: the camp is 380 hitpoints against the Town Center's 900, it is
+// usually outside the defender's standing army, and the workers around it are
+// killed on the way in by combat.js's own acquisition. Measured before this
+// existed, on the three review seeds: the first permanent damage either side
+// took landed at 14.6, 16.8 and 8.8 minutes, because every wave before then had
+// been thrown at the front door and bounced.
+const RAID_SQUAD = 8;
+// Trainers left standing at or below which every push stops raiding and goes
+// for the throat, whatever its size. A player is defeated when the last
+// building that can train something falls, so an opponent down to one or two of
+// them is one push from losing — and a push that spends that moment burning
+// their fifteenth farm is a push that gives them the time to rebuild. Measured
+// without this: on seed 99 the loser's first building fell at 10:30 and its Town
+// Center at 25:18, and almost all of the fifteen minutes in between went on
+// fields, houses and drop-offs.
+const FINISH_THEM_TRAINERS = 1;
+const FINISH_WEIGHT = 2;
+const RAID_TOWNCENTER = 1.0;
+const RAID_TRAINER = 1.2;
+const RAID_ECONOMY = 3.0;
+const RAID_OTHER = 0.9;
 
 const STAGING_DIST = 5.5;      // rally point, tiles from the TC toward the foe
 const DEFEND_RADIUS = 13;      // hostiles this close to home trigger defence
 const DEFEND_CLEAR_TIME = 12;  // all-clear delay before resuming offence
+// How badly the home guard has to be outnumbered before a push is abandoned to
+// come and help.
+//
+// It used to be that *any* trouble at home cancelled the attack outright — two
+// hostiles inside DEFEND_RADIUS dropped the wave, wherever it was, and added
+// forty-five seconds to the clock. With two of these AIs on a map that is a
+// mutual cancellation machine: traced on seed 4242, two of six pushes were
+// called off within 43 s of leaving, one of them after nine seconds, because a
+// scout was standing in the wood line. Both sides spend the match walking their
+// armies backwards and forwards and neither ever arrives.
+//
+// So the home guard answers the raid, and the push only turns round for a threat
+// the guard is actually losing to. The trade is deliberate: two AIs that both
+// keep pressing are a race, and a race has a winner.
+const RECALL_OUTNUMBERED = 1.25;
 const STUCK_WINDOW = 1.5;      // seconds between motion samples
 const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
 const BUILD_RETRY_DELAY = 6;   // no infinite placement retries
@@ -442,7 +628,26 @@ const MILITARY_TYPES = ROSTER.slice();
 //                    cavalry, and an AI that reasons only from counters walks
 //                    into that every time the player shows it two knights.
 const COUNTER_WEIGHT = 2.2;
-const MIX_CEILING = 0.55;
+const MIX_CEILING = 0.4;
+// ...and a ceiling on how much the counter maths may ever be worth, which is
+// the knob that was missing.
+//
+// counterScore is an average of the bonus damage table, so a player fielding a
+// third archers hands the skirmisher 1.3 points and COUNTER_WEIGHT turns that
+// into 2.9 — against a base preference gap of 0.23 between the archer and the
+// skirmisher. The counter did not tilt the decision, it *was* the decision, and
+// two of these AIs facing each other counter-spiral into the two worst units in
+// the game: measured on seed 1337, thirty minutes, both armies ended as
+// spearmen and skirmishers (4 and 3 attack), neither could kill the other and
+// neither could dent a building — 1146 and 1447 points of damage between them in
+// half an hour.
+//
+// Capped, the counter is worth about two ranks in the preference table: enough
+// that massing knights is answered with spearmen, not enough that it erases
+// everything else. The spread term in chooseUnit then does the rest — once a
+// type is past a third of the army it starts losing to its own alternatives —
+// so the army settles into a mix with a bias rather than a monoculture.
+const COUNTER_CAP = 0.6;
 // What the AI builds when it has seen nothing of the player at all — the fog
 // means that is the normal state early on. AoE2's own default opening mix:
 // mostly infantry, a third archers, a scout out front.
@@ -474,27 +679,44 @@ const MIX_CEILING = 0.55;
 // Stable standing should be spending its gold here. The age gate in chooseUnit
 // is what stops that weight putting knights on the map in the Feudal Age.
 //
-// Siege Workshop. All three sit below the line units, and that is the whole
-// point of the building rather than a reservation about it: they are slow
-// (0.6-0.7 tiles/second against a militia's 1.1), two of them cost 2 population
-// each, and a wave that is a third siege arrives a minute after the wave that
-// left with it. The ordering inside the group is scorpion first — cheapest,
-// fastest, and 8 damage with +4 against infantry is the one siege engine that
-// pays for itself against bodies — then the ram, whose +40 against masonry is
-// what actually finishes a Town Center the waves keep bouncing off, then the
-// mangonel last: its splash hurts OUR line too (see splashRadius in
-// constants.js), and this AI has no formation micro to keep it out of its own
-// army.
+// Siege Workshop. THE RAM IS FIRST NOW, and the reordering is the difference
+// between a match that ends and one that does not. A player is defeated when
+// they own no building that trains anything, and measured, three rams take a
+// Town Center in 26 seconds against three militia's 56 — the ram is not a
+// flavour unit in this game, it is the win condition with legs. The mangonel is
+// second and no longer near-zero: the judgement that its splash hurts our own
+// line more than it hurts theirs was made against a mangonel whose scan was
+// capped below its own reach, so it sat idle after killing whatever it was
+// pointed at. That is fixed (combat.js acquireRange), and the measurement on the
+// repaired unit is 8 clumped militia dead in 90 s where 7 of 8 used to survive.
+// The scorpion is last of the three: cheapest and best against bodies, which is
+// what the Barracks is already for.
+//
+// Where these three are held in check is ROSTER_TARGET, not here — a weight
+// alone would have the Siege Workshop building nothing but rams forever.
 const DEFAULT_MIX = {
   militia: 0.45,
   archer: 0.35,
   scout: 0.2,
   skirmisher: 0.12,
   knight: 0.4,
-  scorpion: 0.2,
-  ram: 0.16,
-  mangonel: 0.12,
+  ram: 0.5,
+  mangonel: 0.35,
+  scorpion: 0.25,
 };
+// How many of a type the army wants standing at once. Anything not named here
+// is unlimited and is governed by MIX_CEILING alone.
+//
+// This exists because the siege engines need a *standing order* rather than a
+// preference. The spread term in chooseUnit is divided by the size of the whole
+// army, so at thirty soldiers it is worth a thirtieth of a point and the
+// highest-weighted siege unit would win every single decision the Siege Workshop
+// ever made. Two rams and two mangonels is the escort a push wants; a third of
+// either is 2 more population and 160 more wood spent on something that walks at
+// half the army's pace. Because `have` counts live units and queued ones, this
+// is self-replacing: lose the rams on a push and the Workshop starts on the next
+// pair the same think.
+const ROSTER_TARGET = { ram: 2, mangonel: 2, scorpion: 3 };
 // Wood the army is never allowed to spend.
 //
 // Two of the five units cost wood, where the old two-unit roster had one, and
@@ -822,6 +1044,18 @@ class EnemyAI {
       lastWaveSize: 0,
       // One entry per launch: { t, size, militia, archers, afterLoss }
       waveLog: [],
+      // One entry per push that ended: { t, peak, kills, left }. A push is a
+      // launch plus every reinforcement that joined it, so this is the honest
+      // record of how much of the army was ever committed at once and what it
+      // achieved — which the per-dispatch waveLog above cannot show.
+      pushLog: [],
+      // The same two numbers for the push that is still out, which pushLog by
+      // definition cannot carry: the largest force ever committed at once, and
+      // the number of objectives destroyed. A push that is winning does not end
+      // — it is reinforced where it stands — so an AI that is doing the right
+      // thing can finish a match with an empty pushLog.
+      maxPushPeak: 0,
+      objectivesRazed: 0,
     };
 
     // Cheap "am I being attacked" signal. Combat emits DAMAGE synchronously.
@@ -1455,7 +1689,8 @@ class EnemyAI {
       for (const t of BUILDING_STATS[type].trains || []) {
         if (!MILITARY_TYPES.includes(t)) continue;
         if (!unitUnlocked(this.world, this.id, t)) continue;
-        const s = (DEFAULT_MIX[t] || 0.1) + COUNTER_WEIGHT * this.counterScore(t, foe);
+        const s = (DEFAULT_MIX[t] || 0.1) +
+          Math.min(COUNTER_CAP, COUNTER_WEIGHT * this.counterScore(t, foe));
         if (s > score) score = s;
       }
       if (score > bestScore) {
@@ -2397,10 +2632,41 @@ class EnemyAI {
   }
 
   /** Every completed building of ours that can put a soldier on the map. */
+  /**
+   * Every finished building of ours that trains a soldier, **most expensive
+   * roster first**.
+   *
+   * The order is the fix for "half the roster is never built", and the
+   * measurement is unambiguous. Instrumented over twenty-five minutes on seed
+   * 4242, the Siege Workshop's unit choice came back `null` on 418 of 421 passes
+   * and the Stable's on 925 of 932: `ram: cannot afford wood` 573 times,
+   * `knight: cannot afford food` 633 times, `mangonel: cannot afford wood+gold`
+   * 578 times. The AI was not declining to build them, it was permanently broke
+   * — because this list used to come back in *build order*, so the Barracks got
+   * first refusal on the purse every think, spent it on a 60-food militia, and
+   * the Castle Age buildings behind it saw an empty bank forever. Twenty-five
+   * minutes of that is 47 militia, 29 archers, one knight and no siege at all.
+   *
+   * Sorting by the age of the best unit a building trains puts the Siege
+   * Workshop and the Stable at the front of the queue, where a player would put
+   * them: buy the expensive thing first and spend what is left on bodies. Ties
+   * break on entity id so the order is total and stable — two Barracks must not
+   * swap places between two identical matches.
+   */
   militaryTrainers() {
-    return this.myBuildings().filter(
+    const list = this.myBuildings().filter(
       (b) => b.complete && !b.dead && (b.trains || []).some((t) => MILITARY_TYPES.includes(t)),
     );
+    const tier = (b) => {
+      let best = -1;
+      for (const t of b.trains || []) {
+        if (!MILITARY_TYPES.includes(t)) continue;
+        const a = ageForUnit(t);
+        if (a > best) best = a;
+      }
+      return best;
+    };
+    return list.sort((a, b) => tier(b) - tier(a) || a.id - b.id);
   }
 
   /** Soldiers the next wave wants, standing plus queued. */
@@ -2409,9 +2675,10 @@ class EnemyAI {
       MAX_WAVE_SIZE,
       FIRST_WAVE_SIZE + this.waveNumber * WAVE_SIZE_STEP,
     );
-    // Plus a couple, so the AI is still training while a wave is out rather than
-    // starting from nothing every time one leaves.
-    return needed + 2;
+    // Plus the home guard, which by definition does not go, plus a couple so the
+    // AI is still training while a push is out rather than starting from nothing
+    // every time one leaves.
+    return needed + this.homeGuard(this.armySize()) + 2;
   }
 
   /**
@@ -2602,9 +2869,22 @@ class EnemyAI {
       if ((cost.wood || 0) > 0 && r.wood < (cost.wood || 0) + this.woodReserve()) continue;
       // The ceiling. Only bites once there is an army to be lopsided about.
       if (total >= 4 && (have[type] || 0) / total >= MIX_CEILING) continue;
+      // ...and the standing target, for the handful of types that need one. See
+      // ROSTER_TARGET: MIX_CEILING is a share of the whole army, which a two-ram
+      // escort never comes close to, so without this the Siege Workshop would
+      // build rams and nothing else for the rest of the match.
+      if (ROSTER_TARGET[type] !== undefined && (have[type] || 0) >= ROSTER_TARGET[type]) continue;
 
-      const score = (DEFAULT_MIX[type] || 0.1)
-        + COUNTER_WEIGHT * this.counterScore(type, foe)
+      // A type with a standing target is worth less the closer it is to it,
+      // which is what interleaves the Siege Workshop's roster instead of having
+      // it build two rams and then two mangonels. Measured with a flat weight:
+      // the Workshop built rams until the pair was standing, and the day one
+      // died it built another — so the mangonel, which is the better of the two
+      // against an army, never appeared at all.
+      const room = ROSTER_TARGET[type] === undefined
+        ? 1 : 1 - (have[type] || 0) / ROSTER_TARGET[type];
+      const score = (DEFAULT_MIX[type] || 0.1) * room
+        + Math.min(COUNTER_CAP, COUNTER_WEIGHT * this.counterScore(type, foe))
         // Spread: a type we already have plenty of is worth a little less, which
         // is what keeps the mix a mix on a map where we have seen no enemy.
         - (total > 0 ? (have[type] || 0) / total : 0);
@@ -2624,6 +2904,7 @@ class EnemyAI {
         const cost = UNIT_STATS[type].cost;
         if ((foodTight || savingForAge) && (cost.food || 0) > 0) continue;
         if ((cost.wood || 0) > 0 && r.wood < (cost.wood || 0) + this.woodReserve()) continue;
+        if (ROSTER_TARGET[type] !== undefined && (have[type] || 0) >= ROSTER_TARGET[type]) continue;
         return type;
       }
     }
@@ -2849,30 +3130,34 @@ class EnemyAI {
     // population, but they are not on the field and cannot be waved anywhere.
     const army = this.myUnits().filter((u) => isMilitary(u) && !isGarrisoned(u));
 
+    const inWave = new Set(this.wave ? this.wave.ids : []);
+    const reserves = army.filter((u) => !inWave.has(u.id));
+    const s = this.staging || this.home;
+
     if (this.defending) {
-      // Everything comes home, including whatever is mid-attack.
+      // The home guard — everything not committed to the push — answers.
       const point = this.threat || this.home;
-      const rally = army.filter((u) => !this.awaitingOrder(u) &&
+      const rally = reserves.filter((u) => !this.awaitingOrder(u) &&
         (this.idle(u) || dist(u.x, u.y, point.x, point.y) > 16));
       if (rally.length) {
         this.command(rally, { type: 'attack', gx: point.x, gy: point.y, target: this.nearestFoeNear(point) });
       }
-      if (this.wave) {
-        this.wave = null;
-        this.nextWaveTime = Math.max(this.nextWaveTime, w.time + 45);
+      // The push turns round only for a raid the guard is losing to. See
+      // RECALL_OUTNUMBERED: cancelling an attack because something is standing
+      // in the wood line is how two of these AIs spend a match walking their
+      // armies past each other in opposite directions.
+      if (this.wave && this.overrunAtHome(reserves)) {
+        this.recallWave(w.time + WAVE_BREATHER);
+        return;
       }
-      return;
+      if (!this.wave) return;   // nothing out there to keep driving
+    } else {
+      // Fresh soldiers gather at the staging point instead of trickling out.
+      const strays = reserves.filter(
+        (u) => this.idle(u) && dist(u.x, u.y, s.x, s.y) > 3.0,
+      );
+      if (strays.length) this.command(strays, { type: 'move', gx: s.x, gy: s.y });
     }
-
-    const inWave = new Set(this.wave ? this.wave.ids : []);
-    const reserves = army.filter((u) => !inWave.has(u.id));
-
-    // Fresh soldiers gather at the staging point instead of trickling out.
-    const s = this.staging || this.home;
-    const strays = reserves.filter(
-      (u) => this.idle(u) && dist(u.x, u.y, s.x, s.y) > 3.0,
-    );
-    if (strays.length) this.command(strays, { type: 'move', gx: s.x, gy: s.y });
 
     // Keep every military building's rally on the staging point too, for
     // whatever honours it. Hardcoding 'barracks' here meant a Stable's cavalry
@@ -2886,18 +3171,77 @@ class EnemyAI {
 
     if (this.wave) {
       this.driveWave();
+      // A push that is still out when the next beat comes round is reinforced
+      // rather than left to finish alone — see reinforceWave.
+      if (this.wave && !this.defending) this.reinforceWave(reserves);
       return;
     }
+    if (this.defending) return;
 
     // Launch conditions: it is time, and we have a real squad — never dribs.
-    const needed = Math.min(
+    const readyAt = reserves.filter((u) => dist(u.x, u.y, s.x, s.y) <= 9);
+    const overdue = w.time - this.nextWaveTime;
+    if (overdue < 0) return;
+    const guard = overdue >= PUSH_PATIENCE * 2 ? 0 : this.homeGuard(army.length);
+    const commit = readyAt.length - guard;
+    if (commit >= this.waveBar(overdue)) this.launchWave(readyAt.slice(0, commit));
+  }
+
+  /**
+   * How many soldiers a launch needs at the staging point, over and above the
+   * home guard.
+   *
+   * The first term is the escalation the design promises — five, then seven,
+   * then nine, up to MAX_WAVE_SIZE. The rest is the release valve, and it is not
+   * optional: everything else in this file is a reason to wait, and an AI that
+   * can always find one holds its army at home for the whole match. Past
+   * PUSH_PATIENCE the bar halves; past twice it the AI attacks with whatever is
+   * standing there, guard and all. See PUSH_PATIENCE.
+   */
+  waveBar(overdue) {
+    const full = Math.min(
       MAX_WAVE_SIZE,
       FIRST_WAVE_SIZE + this.waveNumber * WAVE_SIZE_STEP,
     );
-    const readyAt = reserves.filter((u) => dist(u.x, u.y, s.x, s.y) <= 9);
-    if (w.time >= this.nextWaveTime && readyAt.length >= needed) {
-      this.launchWave(readyAt.slice(0, Math.max(needed, Math.min(readyAt.length, MAX_WAVE_SIZE))));
+    if (overdue < PUSH_PATIENCE) return full;
+    if (overdue < PUSH_PATIENCE * 2) return Math.max(FIRST_WAVE_SIZE, Math.ceil(full * 0.5));
+    return 3;
+  }
+
+  /** Soldiers kept back to answer a raid. See HOME_GUARD_SHARE. */
+  homeGuard(armySize) {
+    if (armySize < HOME_GUARD_FROM) return 0;
+    const want = Math.round(armySize * HOME_GUARD_SHARE);
+    return Math.min(HOME_GUARD_MAX, Math.max(HOME_GUARD_MIN, want));
+  }
+
+  /** Is the raid at home bigger than what is left to meet it? */
+  overrunAtHome(reserves) {
+    const t = this.threat;
+    if (!t) return false;
+    return t.count >= Math.max(2, reserves.length * RECALL_OUTNUMBERED);
+  }
+
+  /** Call the push home and put the next one on the clock. */
+  recallWave(nextAt, wiped = false) {
+    const w = this.world;
+    const wave = this.wave;
+    this.wave = null;
+    if (!wave) return;
+    if (wiped) {
+      this.stats.wavesWiped++;
+      this.lostLastWave = true;
     }
+    const alive = wave.ids.map((id) => w.entities.get(id)).filter((u) => isMilitary(u));
+    this.stats.pushLog.push({
+      t: Math.round(w.time), peak: wave.peak || wave.size,
+      kills: wave.kills || 0, left: alive.length,
+    });
+    if (alive.length) {
+      const s = this.staging || this.home;
+      this.command(alive, { type: 'move', gx: s.x, gy: s.y });
+    }
+    this.nextWaveTime = Math.max(this.nextWaveTime, nextAt);
   }
 
   nearestFoeNear(point) {
@@ -2913,7 +3257,7 @@ class EnemyAI {
    * furthest from the defender's standing army wins, so the group naturally
    * walks into the soft edge of the base rather than the front door.
    */
-  chooseWaveTarget(from) {
+  chooseWaveTarget(from, raiding = false) {
     const w = this.world;
     const foeUnits = ownedBy(w, this.foeId, 'unit');
     const foeBuildings = ownedBy(w, this.foeId, 'building');
@@ -2930,11 +3274,34 @@ class EnemyAI {
     }
     const guard = dn ? { x: dx / dn, y: dy / dn } : null;
 
-    const candidates = [];
-    for (const u of foeUnits) if (u.type === 'villager') candidates.push({ e: u, bonus: 1.5 });
+    // Buildings, weighted by what losing one actually costs them — see the
+    // TARGET_* table. Villagers are the fallback and nothing else: they are the
+    // one candidate that runs away, and a squad sent after one spends its whole
+    // budget walking. They still die in numbers, because the push attack-moves
+    // into the middle of the base and combat.js puts bodies ahead of masonry.
+    // How close they are to being out of the match. See FINISH_THEM_TRAINERS.
+    let trainers = 0;
     for (const b of foeBuildings) {
-      const bonus = b.type === 'towncenter' ? 0.5 : b.trains && b.trains.length ? 1.2 : 0.8;
+      const st = BUILDING_STATS[b.type];
+      if (!b.dead && st && (st.trains || []).length) trainers++;
+    }
+    const finishing = trainers > 0 && trainers <= FINISH_THEM_TRAINERS;
+    const candidates = [];
+    for (const b of foeBuildings) {
+      if (b.dead) continue;
+      let bonus = this.targetWeight(b, raiding && !finishing);
+      if (finishing) {
+        const st = BUILDING_STATS[b.type];
+        if (st && (st.trains || []).length) bonus *= FINISH_WEIGHT;
+      }
       candidates.push({ e: b, bonus });
+    }
+    if (!candidates.length) {
+      for (const u of foeUnits) {
+        if (u.type === 'villager' && !isGarrisoned(u)) {
+          candidates.push({ e: u, bonus: TARGET_VILLAGER });
+        }
+      }
     }
     if (!candidates.length) return null;
 
@@ -2943,14 +3310,34 @@ class EnemyAI {
     for (const c of candidates) {
       const approach = dist(from.x, from.y, c.e.x, c.e.y);
       const exposure = guard ? dist(c.e.x, c.e.y, guard.x, guard.y) : 10;
-      // Close to us, far from their army, and juicy.
-      const score = c.bonus * 6 + Math.min(exposure, 16) * 0.9 - approach * 0.35;
+      // Close to us, far from their army, and juicy — with "juicy" now able to
+      // outvote the other two rather than being drowned by them. At the old
+      // coefficients a farm on the far side of the base beat the Barracks in the
+      // middle of it by six points of exposure, which is how a push that razed
+      // nine houses and eight fields left the one building that was keeping its
+      // owner in the match standing.
+      const score = c.bonus * TARGET_WEIGHT + Math.min(exposure, 16) * 0.5 - approach * 0.25;
       if (score > bestScore) {
         bestScore = score;
         best = c.e;
       }
     }
     return best;
+  }
+
+  /** What breaking this building is worth to us. See the TARGET_* table. */
+  targetWeight(b, raiding = false) {
+    const s = BUILDING_STATS[b.type];
+    const eco = (b.dropoff && b.dropoff.length) || b.type === 'farm';
+    const trains = !!s && (s.trains || []).some((t) => MILITARY_TYPES.includes(t));
+    if (raiding) {
+      if (b.type === 'towncenter') return RAID_TOWNCENTER;
+      if (trains) return RAID_TRAINER;
+      return eco ? RAID_ECONOMY : RAID_OTHER;
+    }
+    if (b.type === 'towncenter') return TARGET_TOWNCENTER;
+    if (trains) return TARGET_TRAINER;
+    return eco ? TARGET_ECONOMY : TARGET_OTHER;
   }
 
   launchWave(units) {
@@ -2960,7 +3347,10 @@ class EnemyAI {
       (a, u) => ({ x: a.x + u.x / units.length, y: a.y + u.y / units.length }),
       { x: 0, y: 0 },
     );
-    const target = this.chooseWaveTarget(from);
+    // A squad this small cannot break a base and should not be thrown at one.
+    // See RAID_SQUAD.
+    const raiding = units.length < RAID_SQUAD;
+    const target = this.chooseWaveTarget(from, raiding);
     if (!target) {
       // Nothing left to hit; try again shortly.
       this.nextWaveTime = w.time + 20;
@@ -2970,13 +3360,21 @@ class EnemyAI {
     this.wave = {
       ids: units.map((u) => u.id),
       target,
+      raiding,
       launchedAt: w.time,
       lastOrder: w.time,
       size: units.length,
-      // Worked out once, at launch, from the squad that is actually going: a
-      // wave of knights is given less rope than a wave with a ram in it, and
-      // both are given enough to get there. See waveTimeout().
-      timeout: this.waveTimeout(units, from, target),
+      // The posture the push is in — 'advance' (attack-move, fight what you
+      // meet) or 'siege' (chop the objective). See driveWave.
+      mode: null,
+      modeSince: w.time,
+      peak: units.length,
+      // Objectives destroyed. The only thing that buys a push more time.
+      kills: 0,
+      // Absolute time this push is written off at: the walk the squad actually
+      // has to make, at the pace of its slowest member, plus a fight. Extended
+      // by every objective it destroys. See WAVE_FIGHT_TIME.
+      deadline: w.time + this.marchBudget(units, from, target) + WAVE_FIGHT_TIME,
     };
     this.waveNumber++;
     this.stats.wavesLaunched++;
@@ -2993,6 +3391,15 @@ class EnemyAI {
     // the roster's order in every log line — the wave log goes into the
     // determinism fingerprint, and key order is part of what JSON.stringify
     // compares. Types with nobody in them are left out so the line stays short.
+    this.logDispatch(units);
+    // Schedule the next beat from this launch, so the cadence is steady.
+    this.nextWaveTime = w.time + this.waveInterval();
+    this.wave.mode = 'advance';
+    this.orderPush(units, this.wave, 'advance');
+  }
+
+  /** One line in the wave log per dispatch — a launch or a reinforcement. */
+  logDispatch(units) {
     const mix = {};
     for (const t of MILITARY_TYPES) {
       let n = 0;
@@ -3000,18 +3407,152 @@ class EnemyAI {
       if (n) mix[t] = n;
     }
     this.stats.waveLog.push({
-      t: Math.round(w.time), size: units.length, mix,
+      t: Math.round(this.world.time), size: units.length, mix,
       // Kept beside the mix because the wave report has always printed them:
       // both are now honest counts of their own type rather than a split.
       militia: mix.militia || 0, archers: mix.archer || 0,
       // True when the previous wave died out there, so this one waited for a
       // full rebuild rather than keeping the normal beat.
       afterLoss: this.lostLastWave,
+      // True when these men joined a push that was already fighting.
+      reinforcement: !!this.wave && this.wave.launchedAt !== this.world.time,
     });
     this.lostLastWave = false;
-    // Schedule the next beat from this launch, so the cadence is steady.
+  }
+
+  /**
+   * Feed a push that is still fighting when the next beat comes round.
+   *
+   * The alternative — which is what this AI did — is that the whole producer
+   * output sits at the staging point until the squad already out there gives up
+   * and walks eighty tiles home. Measured on seed 4242 at minute 25: forty-one
+   * soldiers standing at home and sixteen in the field. Reinforcing keeps one
+   * front instead of two half-armies, and keeps the dispatch cadence honest:
+   * every entry in the wave log is still a group of soldiers leaving on
+   * schedule, it is simply joining a fight rather than starting one.
+   */
+  reinforceWave(reserves) {
+    const w = this.world;
+    const wave = this.wave;
+    if (w.time < this.nextWaveTime) return;
+    const s = this.staging || this.home;
+    const guard = this.homeGuard(this.armySize());
+    const readyAt = reserves.filter((u) => dist(u.x, u.y, s.x, s.y) <= 9);
+    const spare = readyAt.length - guard;
+    if (spare < REINFORCE_MIN) return;
+    const squad = readyAt.slice(0, spare);
+
+    const from = squad.reduce(
+      (a, u) => ({ x: a.x + u.x / squad.length, y: a.y + u.y / squad.length }),
+      { x: 0, y: 0 },
+    );
+    const march = this.marchBudget(squad, from, wave.target);
+    // A push that has destroyed nothing does not get fed. Its budget is about to
+    // run out, these men would arrive after it had walked home, and four at a
+    // time across eighty tiles is the "feeding them in one unit at a time"
+    // failure the wave system exists to avoid. They stay and the next launch
+    // goes out as one group.
+    if (!wave.kills && w.time + march > wave.deadline) return;
+
+    for (const u of squad) wave.ids.push(u.id);
+    wave.size += squad.length;
+    // Enough men have now gone that this is an assault, not a raid.
+    if (wave.ids.length >= RAID_SQUAD) wave.raiding = false;
+    // Fresh troops buy the push the time to arrive, and a fight when they do —
+    // but only a push that is winning gets the fight as well as the walk.
+    wave.deadline = Math.max(
+      wave.deadline, w.time + march + (wave.kills ? WAVE_FIGHT_TIME : 0),
+    );
+    this.stats.lastWaveSize = squad.length;
+    this.logDispatch(squad);
     this.nextWaveTime = w.time + this.waveInterval();
-    this.command(units, { type: 'attack', target, gx: target.x, gy: target.y });
+    this.command(squad, { type: 'attackMove', ...this.pushGoal(wave) });
+  }
+
+  /**
+   * Where a push walks to: a couple of tiles short of the objective, on our side
+   * of it. The objective's own centre tile is inside a building footprint and
+   * nothing can stand on it.
+   *
+   * Taken off our own base rather than off the squad's current position on
+   * purpose — the answer has to be the same every time it is asked, or every
+   * re-issue sends the squad to a slightly different tile and the whole group
+   * spends the fight re-pathing.
+   */
+  pushGoal(wave) {
+    const t = wave.target;
+    const home = this.staging || this.home;
+    let vx = home.x - t.x;
+    let vy = home.y - t.y;
+    const len = hyp(vx, vy);
+    if (!(len > 0.001)) return { gx: t.x, gy: t.y };
+    vx /= len;
+    vy /= len;
+    return { gx: t.x + vx * SIEGE_STANDOFF, gy: t.y + vy * SIEGE_STANDOFF };
+  }
+
+  /**
+   * Put a squad in one of the push's two postures.
+   *
+   *   advance  attack-move at the objective. Units stop for whatever they meet,
+   *            combat.js does the acquiring, and they carry on afterwards.
+   *   siege    an ordered attack on the objective itself, which is the only way
+   *            the AI gets to choose *what* falls — combat.js's own acquisition
+   *            deliberately puts buildings last, so a squad left to itself
+   *            chews on the nearest house rather than the Barracks that keeps
+   *            the enemy in the match.
+   *
+   * The posture is never held for less than SIEGE_MODE_HOLD, because switching
+   * costs every unit in the squad a re-order, and a defender walking in and out
+   * of SIEGE_CLEAR_RADIUS would otherwise flap the whole army twice a second.
+   */
+  orderPush(units, wave, mode) {
+    if (!units.length) return;
+    const t = wave.target;
+    const siege = { type: 'attack', target: t, gx: t.x, gy: t.y };
+    if (mode === 'siege') {
+      this.command(units, siege);
+      return;
+    }
+    // Advancing, but the wall-breakers that have arrived start on the wall.
+    //
+    // A ram is not a soldier — 3 attack, 3-second swing — and putting one in an
+    // attack-move means a 160-wood siege engine walking up to a militia to lose
+    // a duel it cannot win. Its +40 against masonry is the entire unit, and it
+    // is the one thing on the roster that finishes a Town Center in half a
+    // minute. So the moment it is in reach of the objective it hits the
+    // objective, whatever is going on around it; the escort is what the rest of
+    // the squad is for.
+    const breaking = [];
+    const marching = [];
+    for (const u of units) {
+      if (BREAKERS.includes(u.type) && dist(u.x, u.y, t.x, t.y) <= SIEGE_ENGAGE) breaking.push(u);
+      else marching.push(u);
+    }
+    if (breaking.length) this.command(breaking, siege);
+    if (marching.length) this.command(marching, { type: 'attackMove', ...this.pushGoal(wave) });
+  }
+
+  /** Buildings of theirs that can still train something. See checkVictory. */
+  foeTrainers() {
+    let n = 0;
+    for (const b of ownedBy(this.world, this.foeId, 'building')) {
+      if (b.dead) continue;
+      const s = BUILDING_STATS[b.type];
+      if (s && (s.trains || []).length) n++;
+    }
+    return n;
+  }
+
+  /** Enemy soldiers within `r` of a point — what keeps a push out of siege mode. */
+  foeSoldiersNear(point, r) {
+    let n = 0;
+    forEachNear(this.world, point.x, point.y, r, (e) => {
+      if (e.kind !== 'unit' || e.player !== this.foeId) return;
+      if (!MILITARY_TYPES.includes(e.type) || isGarrisoned(e)) return;
+      n++;
+    });
+    return n;
   }
 
   driveWave() {
@@ -3024,47 +3565,104 @@ class EnemyAI {
 
     if (!alive.length) {
       // Wiped. Back to building economy and army before trying again, harder.
-      this.wave = null;
-      this.stats.wavesWiped++;
+      this.recallWave(w.time + WAVE_REGROUP_AFTER_LOSS, true);
+      return;
+    }
+
+    wave.peak = Math.max(wave.peak || 0, alive.length);
+    if (wave.peak > this.stats.maxPushPeak) this.stats.maxPushPeak = wave.peak;
+
+    // "They are one building from losing the match, and this squad is the one
+    // taking it down."
+    //
+    // Both halves matter. A trainer count alone is not an endgame — for the
+    // first two minutes of every match the enemy owns a Town Center and nothing
+    // else — so the push also has to have destroyed something itself. Without
+    // that clause a squad parked outside an untouched base reads as a squad
+    // about to win, and never comes home at all: measured, that is exactly what
+    // it did, and the AI launched twice in ten minutes.
+    //
+    // What it buys is the two recalls below. Walking eighty tiles home from in
+    // front of the last Barracks hands its owner the ninety seconds they need to
+    // put up another one, and then the same squad has to walk back — which is
+    // how a side that had been winning since the eighth minute took until the
+    // twenty-sixth to finish. It stays bounded either way: the remnant takes the
+    // last trainer down, or it is wiped doing it.
+    const finishing = this.foeTrainers() <= FINISH_THEM_TRAINERS &&
+      wave.kills > 0 && alive.length >= 3;
+
+    // Bled out — pull the survivors home rather than feeding them in. The next
+    // dispatch stays on the beat set at launch: only a wave that died to the
+    // last man buys the defender a full rebuild cycle.
+    if (!finishing &&
+        alive.length <= Math.max(1, Math.floor(wave.peak * WAVE_BLED_SHARE)) && wave.peak >= 4) {
       this.lostLastWave = true;
-      this.nextWaveTime = w.time + WAVE_REGROUP_AFTER_LOSS;
+      this.recallWave(w.time + WAVE_BREATHER);
       return;
     }
 
-    // Bled out — pull the survivors home rather than feeding them in.
-    if (alive.length <= Math.max(1, Math.floor(wave.size * 0.3)) && wave.size >= 4) {
-      const s = this.staging || this.home;
-      this.command(alive, { type: 'move', gx: s.x, gy: s.y });
-      this.wave = null;
-      this.lostLastWave = true;
-      this.nextWaveTime = w.time + WAVE_REGROUP_AFTER_LOSS;
-      return;
+    if (w.time > wave.deadline) {
+      // Out of budget — come home. The next wave stays on the beat set at
+      // launch; only a wipe earns a longer pause. (Unless it is finishing them,
+      // as above.)
+      if (!finishing) {
+        this.recallWave(w.time + WAVE_BREATHER);
+        return;
+      }
+      wave.deadline = w.time + WAVE_FIGHT_TIME;
     }
 
-    if (w.time - wave.launchedAt > (wave.timeout || WAVE_TIMEOUT)) {
-      // Grinding without result — come home. The next wave stays on the beat
-      // set at launch; only a wipe earns a longer pause.
-      const s = this.staging || this.home;
-      this.command(alive, { type: 'move', gx: s.x, gy: s.y });
-      this.wave = null;
-      this.nextWaveTime = Math.max(this.nextWaveTime, w.time + WAVE_BREATHER);
-      return;
-    }
+    // The vanguard: whoever has actually arrived. Everything below is decided
+    // from them and not from the squad's average position, and that distinction
+    // is worth a paragraph because getting it wrong cost the AI every siege it
+    // ever started. A reinforcement dispatched on the beat is eighty tiles
+    // behind the front; average it in and the "are we there yet" test reads 51
+    // tiles when the men doing the fighting are standing on the Town Center.
+    // Traced on seed 1337, that is exactly what happened: the vanguard reached
+    // 13 tiles, the reinforcement left home, and the push spent the rest of its
+    // budget believing it was still on the road.
+    const target = wave.target;
+    const front = alive.filter((u) => dist(u.x, u.y, target.x, target.y) <= SIEGE_ENGAGE);
+    const rear = alive.filter((u) => dist(u.x, u.y, target.x, target.y) > SIEGE_ENGAGE);
+    const centre = (front.length ? front : alive).reduce(
+      (a, u, _i, arr) => ({ x: a.x + u.x / arr.length, y: a.y + u.y / arr.length }),
+      { x: 0, y: 0 },
+    );
 
-    // Retarget when the current objective dies.
-    if (!liveIn(w, wave.target)) {
-      const cx = alive.reduce((a, u) => a + u.x, 0) / alive.length;
-      const cy = alive.reduce((a, u) => a + u.y, 0) / alive.length;
-      const next = this.chooseWaveTarget({ x: cx, y: cy });
+    // The objective fell. That is the one thing that buys more time — a push
+    // that is taking a base apart is not on a clock, a push that is bouncing
+    // off it is.
+    if (!liveIn(w, target)) {
+      wave.kills++;
+      this.stats.objectivesRazed++;
+      wave.deadline = Math.max(wave.deadline, w.time + WAVE_KILL_EXTENSION);
+      const next = this.chooseWaveTarget(centre, wave.raiding);
       if (!next) {
         // Nothing of theirs left standing anywhere. Regroup and look again.
-        this.wave = null;
-        this.nextWaveTime = Math.max(this.nextWaveTime, w.time + WAVE_BREATHER);
+        this.recallWave(w.time + WAVE_BREATHER);
         return;
       }
       wave.target = next;
+      wave.mode = 'advance';
+      wave.modeSince = w.time;
       wave.lastOrder = w.time;
-      this.command(alive, { type: 'attack', target: next, gx: next.x, gy: next.y });
+      this.orderPush(alive, wave, 'advance');
+      return;
+    }
+
+    // Posture. The vanguard chops the objective once it is on top of it and
+    // nothing is left to shoot at it; everyone else is still marching, and a
+    // marching unit is always attack-moving so that it fights what it meets.
+    const defenders = this.foeSoldiersNear(target, SIEGE_CLEAR_RADIUS);
+    const want = (front.length >= 2 &&
+      dist(centre.x, centre.y, target.x, target.y) <= SIEGE_RANGE &&
+      defenders * SIEGE_OVERWHELM <= front.length) ? 'siege' : 'advance';
+    if (want !== wave.mode && w.time - wave.modeSince >= SIEGE_MODE_HOLD) {
+      wave.mode = want;
+      wave.modeSince = w.time;
+      wave.lastOrder = w.time;
+      this.orderPush(front, wave, want);
+      if (rear.length) this.orderPush(rear, wave, 'advance');
       return;
     }
 
@@ -3073,9 +3671,10 @@ class EnemyAI {
     if (w.time - wave.lastOrder > 2.5) {
       const slack = alive.filter((u) => this.idle(u));
       if (slack.length) {
-        this.command(slack, {
-          type: 'attack', target: wave.target, gx: wave.target.x, gy: wave.target.y,
-        });
+        const near = slack.filter((u) => dist(u.x, u.y, target.x, target.y) <= SIEGE_ENGAGE);
+        const far = slack.filter((u) => dist(u.x, u.y, target.x, target.y) > SIEGE_ENGAGE);
+        if (near.length) this.orderPush(near, wave, wave.mode === 'siege' ? 'siege' : 'advance');
+        if (far.length) this.orderPush(far, wave, 'advance');
       }
       wave.lastOrder = w.time;
     }
@@ -3086,19 +3685,18 @@ class EnemyAI {
   }
 
   /**
-   * How long this particular wave is allowed to be out before it is written off
-   * and called home.
+   * How long this particular squad needs just to *get there*, at the pace of its
+   * slowest member — the walk, before any of the fighting.
    *
-   * The march the squad has to make, at the pace of its slowest member, times
-   * WAVE_MARCH_SLACK — and never less than WAVE_TIMEOUT, so a raid on something
-   * ten tiles away still gets a sensible minimum. Measuring it per wave rather
-   * than holding one number is what stops the recall firing on units that are
-   * simply still walking: the roster now spans 1.7 tiles a second (a scout) down
-   * to 0.6 (a mangonel), so one flat figure cannot be right for two of them at
-   * once, and the figure that was right for a militia was five seconds short for
-   * the spearman the Barracks trains today.
+   * Measuring it per push rather than holding one number is what stops the recall
+   * firing on units that are simply still walking: the roster spans 1.7 tiles a
+   * second (a scout) down to 0.6 (a mangonel), so one flat figure cannot be right
+   * for two of them at once, and the figure that was right for a militia was five
+   * seconds short for the spearman the Barracks trains today. A quarter is added
+   * for the pathing around a base and the stragglers; the *fight* is a separate
+   * budget on top (WAVE_FIGHT_TIME), which is the whole point of the split.
    */
-  waveTimeout(units, from, target) {
+  marchBudget(units, from, target) {
     let slowest = Infinity;
     for (const u of units) {
       const s = UNIT_STATS[u.type];
@@ -3107,7 +3705,7 @@ class EnemyAI {
     }
     if (!Number.isFinite(slowest) || slowest <= 0) slowest = 1;
     const march = dist(from.x, from.y, target.x, target.y) / slowest;
-    return Math.min(WAVE_TIMEOUT_MAX, Math.max(WAVE_TIMEOUT, march * WAVE_MARCH_SLACK));
+    return Math.max(WAVE_MARCH_MIN, march * 1.25);
   }
 
   /** Record how close our soldiers actually get to the enemy base. */
@@ -3167,7 +3765,12 @@ class EnemyAI {
           launchedAt: this.wave.launchedAt,
           lastOrder: this.wave.lastOrder,
           size: this.wave.size,
-          timeout: this.wave.timeout,
+          peak: this.wave.peak,
+          kills: this.wave.kills || 0,
+          raiding: !!this.wave.raiding,
+          mode: this.wave.mode || null,
+          modeSince: this.wave.modeSince,
+          deadline: this.wave.deadline,
           arrived: !!this.wave.arrived,
         }
         : null,
@@ -3232,10 +3835,19 @@ class EnemyAI {
           launchedAt: data.wave.launchedAt,
           lastOrder: data.wave.lastOrder,
           size: data.wave.size,
-          // A save written before waves carried their own march budget comes
-          // back with the old flat figure, which is the behaviour it was saved
-          // under.
-          timeout: Number.isFinite(data.wave.timeout) ? data.wave.timeout : WAVE_TIMEOUT,
+          peak: data.wave.peak || data.wave.size,
+          kills: data.wave.kills || 0,
+          raiding: !!data.wave.raiding,
+          mode: data.wave.mode || null,
+          modeSince: Number.isFinite(data.wave.modeSince)
+            ? data.wave.modeSince : data.wave.launchedAt,
+          // A save written before a push carried an absolute deadline comes back
+          // with the old flat timeout measured from launch, which is the
+          // behaviour it was saved under.
+          deadline: Number.isFinite(data.wave.deadline)
+            ? data.wave.deadline
+            : data.wave.launchedAt +
+              (Number.isFinite(data.wave.timeout) ? data.wave.timeout : WAVE_MARCH_MIN),
           arrived: !!data.wave.arrived,
         };
       }
