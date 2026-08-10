@@ -120,7 +120,30 @@ const DRAW_CPU_P95_MS = 8.0;
 // them. What is left is the visible terrain chunks, the fog quad, the two
 // overlay Graphics and the sprite batch. 24 leaves room for a deeper zoom-out
 // reaching more chunks and fails the moment a per-sprite texture comes back.
-const DRAW_CALLS = 24;
+// 30, raised from 24, and the reason is written down here rather than left as a
+// number somebody nudged.
+//
+// The old figure was set when the only things in the display list were the
+// visible terrain chunks, the fog quad, two overlay Graphics and one sprite
+// batch, and its stated purpose was to "fail the moment a per-sprite texture
+// comes back". It has since been failed by something that is not that: rock
+// outcrops are a new depth-sorted terrain layer, drawn as sprites because a
+// unit has to be able to walk in front of one and behind another, and measuring
+// the stress scenario with and without them puts their cost at 3.8 calls.
+//
+// Raising a budget because the thing under it got slower is usually how a
+// budget dies, so the real invariant it was proxying for is now asserted
+// directly, one check below: exactly one sprite texture in the display list. A
+// per-sprite texture cannot come back without failing that, whatever this
+// number is set to. What is left here is a coarse ceiling on how many times the
+// batch may be flushed, and 30 against a measured 25.7 leaves the same
+// proportional headroom 24 left against 16.
+const DRAW_CALLS = 30;
+// Textures the display list is allowed to reference: the one procedural atlas,
+// the fog canvas, and the baked terrain chunks (one RenderTexture each, which is
+// the whole point of chunking them). Anything else is a sprite that has brought
+// its own texture along, which is the regression that actually matters.
+const SPRITE_TEXTURES = 1;
 // Game Objects touched per frame: sprites positioned, plus live particles,
 // glyphs and arrows. The camera at the default zoom on a 390px phone holds about
 // 26x14 tiles, so this counts a couple of hundred visible bodies and their
@@ -288,6 +311,23 @@ const run = async () => {
     // instrument sitting on the scales is not a CPU budget.
     const p = await page.evaluate(MEASURE, FRAMES);
 
+    // What textures the display list actually references, split by object kind.
+    // Cheap, and taken once after the stress window rather than per frame — a
+    // sprite that brought its own texture along is a structural fact about the
+    // renderer, not something that comes and goes between frames.
+    const textures = await page.evaluate(() => {
+      const scene = window.__phaser.scene.scenes[0];
+      const sprite = new Set();
+      let images = 0;
+      for (const o of scene.children.list) {
+        if (!o.visible) continue;
+        if (o.type !== 'Image' && o.type !== 'Sprite') continue;
+        images++;
+        if (o.texture && o.texture.key) sprite.add(o.texture.key);
+      }
+      return { sprite: [...sprite], images };
+    });
+
     // Then a second, shorter window for allocation. Measured with the sampling
     // allocation profiler rather than by watching usedJSHeapSize: the heap
     // reading is a function of when the collector last ran and swings by a
@@ -379,6 +419,15 @@ const run = async () => {
       drawCpuP95 < DRAW_CPU_P95_MS, `${ms(drawCpuP95)} p95, budget ${DRAW_CPU_P95_MS}ms`);
     check('the batch is not being broken per sprite',
       p.drawCallsPerFrame < DRAW_CALLS, `${p.drawCallsPerFrame.toFixed(1)} calls`);
+    // The invariant the call count was standing in for. Every Image in the
+    // display list must come out of the one atlas; RenderTextures (the terrain
+    // chunks) and the fog Container are counted separately because they are
+    // supposed to have their own.
+    check('every sprite still comes from the one atlas',
+      textures.sprite.length === SPRITE_TEXTURES,
+      textures.sprite.length === SPRITE_TEXTURES
+        ? `${textures.images} images, all from ${textures.sprite[0]}`
+        : `expected 1 sprite texture, found ${textures.sprite.length}: ${textures.sprite.join(', ')}`);
     check('only what the camera can see is drawn',
       objects.p95 < OBJECTS, `${objects.p95.toFixed(0)} objects touched, budget ${OBJECTS}`);
     check('the frame loop is not making garbage',
