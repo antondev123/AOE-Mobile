@@ -504,7 +504,11 @@ export function createVision(world) {
    * Recompute the visible masks. Cheap when nothing moved — call it every sim
    * step and stop thinking about it.
    */
+  // Has update() ever run? See entityVisible for what this is for.
+  let everUpdated = false;
+
   function update() {
+    everUpdated = true;
     const t0 = nowMs();
     gen++;
 
@@ -558,8 +562,27 @@ export function createVision(world) {
     return states[playerId].explored[ty * W + tx] === 1;
   }
 
-  /** True when any tile the entity stands on is visible to `playerId`. */
+  /**
+   * True when any tile the entity stands on is visible to `playerId`.
+   *
+   * SELF-HEALING ON THE FIRST QUERY, and it earns that. Before any update()
+   * every mask is zero, which does not mean "nothing is visible" — it means
+   * nobody has worked out what is visible yet. The two readings are
+   * indistinguishable to a caller and the difference is enormous: combat's
+   * auto-acquisition is gated on this, so a harness that builds a world, spawns
+   * two armies and steps the systems *without* calling update() gets a battle in
+   * which no unit ever acquires a target and nobody dies. That is not a
+   * hypothetical failure mode. It has now produced two separate false readings —
+   * a probe of mine, and a whole-game review that concluded on the strength of it
+   * that combat in this game does not resolve.
+   *
+   * The game itself never hits this (GameScene calls update() every step, and so
+   * does tests/simharness.mjs), so the cost is one branch on a path that is
+   * already doing array indexing, and the benefit is that "I forgot to drive the
+   * fog" stops looking exactly like "the combat system is broken".
+   */
   function entityVisible(playerId, e) {
+    if (!everUpdated) update();
     const st = states[playerId];
     if (!st) return true;
     if (e.kind === 'building' && e.tiles) {
