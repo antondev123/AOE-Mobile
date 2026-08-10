@@ -81,6 +81,119 @@ const WOOD_D = 0x6a4522;
 const PLASTER = 0xe6d8b8;
 const PLASTER_D = 0xbfae8b;
 
+// ---------------------------------------------------------------------------
+// THE COLOUR BUDGET
+// ---------------------------------------------------------------------------
+//
+// A whole-game review failed this art on one sentence: "team colour has eaten
+// the units". Six of the ten combat types were blue lumps at the zoom the game
+// is actually played at, and the proof was sitting in the same frame — the monk
+// was the only unit anybody could name at a glance, precisely because it is the
+// only one that was allowed to keep its own colour. The moment a unit is made
+// of something, it becomes readable.
+//
+// So there is a budget now, and it is enforced rather than intended:
+// tests/art.browser.mjs bakes each unit for both players, XORs the two frames,
+// and fails the run if the pixels that changed are more than a quarter of the
+// body. That measurement is exact — team colour is *by definition* the set of
+// pixels that move when the player changes — and it needs no threshold on
+// "blueness" to tune. The old roster measured 26-31% on four of the ten and 1-2%
+// on all three siege engines, which is both halves of the same mistake: the
+// infantry were painted, and you could not tell whose mangonel was about to hit
+// your Town Center.
+//
+// WHERE THE COLOUR IS ALLOWED TO GO. Four places, and no others:
+//
+//   PLUME / CREST   on the helmet. High, small, and above the press of bodies
+//                   in a melee, which is the one part of a soldier that is
+//                   never occluded by the soldier in front.
+//   SHIELD FACE     but only a division of it — a half, a chevron, a border.
+//                   A shield painted edge to edge in one flat colour is the
+//                   single largest saturated field a 40px figure can carry, and
+//                   it is what turned the skirmisher into "a blue circle".
+//   PENNON / BANNER on a shaft: the spearman's pennon under the head, the
+//                   engines' masthead flag, the knight's lance bands.
+//   A BAND          one strip of surcoat, one painted panel, one saddle cloth.
+//                   Strips read as livery. Fields read as paint.
+//
+// EVERYTHING ELSE IS A MATERIAL. These are the materials, and each one is
+// carrying an identity as well as a colour: the militia is the one in mail, the
+// spearman is the one in quilted linen, the skirmisher is the one in leather,
+// the archer is the one in forest cloth. Four bodies that used to be the same
+// rounded rectangle in the same blue are now four different substances, and
+// substance survives being shrunk far better than a decal does.
+const MAIL = 0x9aa1ac;      // riveted mail: cooler and flatter than plate
+const MAIL_D = 0x676e79;
+const GAMBESON = 0xcbb289;  // quilted linen, undyed — the spearman's armour
+const GAMBESON_D = 0x9a8259;
+const LEATHER = 0x8a6236;   // the skirmisher's jerkin and every strap in the game
+const LEATHER_D = 0x5d4123;
+const FOREST = 0x5f6b40;    // the archer's cloth: a colour that hides in a wood
+const FOREST_D = 0x414a2b;
+const HORSE_BAY = 0x7c5233; // the scout's pony
+const HORSE_BAY_D = 0x593a24;
+const HORSE_GREY = 0x8f8880; // the knight's destrier — a warm grey, not steel
+const HORSE_GREY_D = 0x635c54;
+
+/**
+ * A shield, divided per bend — the team colour on one diagonal half of the
+ * face, the shield's own material on the other.
+ *
+ * The shield is the one shape a foot soldier carries that is big enough to hold
+ * ownership across a battlefield, and therefore the one most likely to eat the
+ * unit: painted edge to edge it is the largest saturated field a 40-pixel figure
+ * can have, and that is exactly what turned the skirmisher into "a blue circle".
+ * Halving it keeps all of the loudness and costs half the paint.
+ *
+ * A DIAGONAL division rather than a vertical one, for two reasons. Vertically
+ * split, a round shield reads as a circle with a bite out of it and the eye
+ * reassembles it into "a blue disc" anyway; split corner to corner it reads as a
+ * *device*, which is what a shield actually carries. And the renderer mirrors
+ * these sprites for four of the eight facings, so a vertical split would flip
+ * sides half the time and look like two different shields — a diagonal one
+ * mirrors into the other diagonal, which reads as the same heraldry seen from
+ * the other side.
+ *
+ * `pts` is the outline of the face in drawing order. Everything here works off
+ * that polygon, so the same function serves the militia's round disc, the
+ * skirmisher's tall oval and the knight's heater.
+ */
+function shieldFace(g, pts, cx, cy, col, own) {
+  g.fillStyle(own, 1);
+  g.fillPoints(pts, true, true);
+  // The half above the corner-to-corner diagonal. Clipping is done by hand
+  // because Phaser's Graphics has no clip: each outline vertex is kept if it is
+  // on the team side of the line, and the two crossings are interpolated, which
+  // is a polygon-halving in eight lines and exact.
+  const side = (p) => (p.x - cx) * 0.55 + (p.y - cy) * 1;
+  const half = [];
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    const sa = side(a);
+    const sb = side(b);
+    if (sa <= 0) half.push(a);
+    if ((sa <= 0) !== (sb <= 0)) {
+      const t = sa / (sa - sb);
+      half.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    }
+  }
+  if (half.length > 2) {
+    g.fillStyle(col, 1);
+    g.fillPoints(half, true, true);
+  }
+}
+
+/** The outline of an ellipse, as the polygon shieldFace wants. */
+function ellipsePts(cx, cy, rx, ry, n = 20) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = (Math.PI * 2 * i) / n;
+    out.push({ x: cx + Math.cos(a) * rx, y: cy + Math.sin(a) * ry });
+  }
+  return out;
+}
+
 // --- small colour helpers ---------------------------------------------------
 
 export function shade(c, f) {
@@ -1384,7 +1497,7 @@ const UNIT_BOX = {
   // A machine, not a man: no head, no limbs, no tunic. A player has to know at a
   // glance that the thing crawling at their Town Center cannot be answered by
   // trading blows with it.
-  ram: { w: 68, h: 66, cx: 34, ft: 58 },
+  ram: { w: 68, h: 62, cx: 34, ft: 55 },
 
   // --- the new roster --------------------------------------------------------
   //
@@ -1407,8 +1520,26 @@ const UNIT_BOX = {
   // separates them from each other is the throwing gear on top: the mangonel's
   // arm rakes back over its own axle and its bucket is a bowl, the scorpion's
   // is a flat horizontal bow with a bolt already in the groove.
-  mangonel: { w: 70, h: 68, cx: 35, ft: 58 },
-  scorpion: { w: 64, h: 58, cx: 32, ft: 50 },
+  // THE THREE ENGINES ARE THREE MASSES, and that is the whole of what tells
+  // them apart at play zoom. The review that failed this art called them "three
+  // identical brown carts", and it was right — they were all the same low
+  // horizontal slab, and no amount of detail on top of a shared outline fixes
+  // that, because at 0.7 zoom on a phone there is no detail, only outline.
+  //
+  //   ram        LOW and BROAD. A shed with a log under it: one long horizontal
+  //              roof, nothing above it.
+  //   mangonel   TALL. The arm stands up at rest with a stone in the bowl, so
+  //              the silhouette is a steep diagonal with a ball on top — the
+  //              only shape like it in the game. It costs ten pixels of box
+  //              height per frame and it is the best ten pixels in this file.
+  //   scorpion   LOWEST and FLATTEST. A bolt trough on two small wheels, with
+  //              a painted mantlet at the crew end. It sits a third lower than
+  //              the ram and half the height of the mangonel.
+  //
+  // The three tops now sit at roughly 40, 52 and 66 pixels above the ground,
+  // which is a spread you can see in a thumbnail.
+  mangonel: { w: 70, h: 78, cx: 35, ft: 70 },
+  scorpion: { w: 64, h: 50, cx: 32, ft: 41 },
   // The narrowest body in the game, and deliberately the plainest: a robe to
   // the ground, a cowl, and both hands on a book. No weapon, no helmet, no
   // shield, nothing on the shoulders — a monk has to read as a non-combatant
@@ -1811,20 +1942,44 @@ function drawMilitia(g, col, dark, back, P) {
   const bx = cx + P.bx;
   const by = ft + P.by;
 
-  legPair(g, cx, ft, 0x6a6b74, P, 5.4, 13);
+  legPair(g, cx, ft, MAIL_D, P, 5.4, 13);
 
-  // torso — wide, team coloured
-  g.fillStyle(col, 1);
+  // Torso — a mail hauberk under a steel breastplate. It used to be a flat
+  // rectangle of team colour with a small steel plate on it, which is most of
+  // why the militia, the spearman and the archer were the same blue lump: a
+  // body is the biggest field on a figure and it must be made of something.
+  // Mail is drawn as three values plus a stipple of rings, because a single
+  // grey rounded rectangle is only a different flat colour, not a different
+  // material.
+  g.fillStyle(MAIL, 1);
   g.fillRoundedRect(bx - 12, by - 34, 24, 23, 5);
-  g.fillStyle(shade(col, 0.16), 1);
-  g.fillRoundedRect(bx - 12, by - 34, 24, 8, 5); // pauldron band
+  g.fillStyle(dim(MAIL), 1);
+  g.fillRoundedRect(bx - 12, by - 34, 9, 23, 5);
+  g.fillStyle(lit(MAIL), 1);
+  g.fillRoundedRect(bx + 6, by - 33, 6, 21, 4);
+  g.lineStyle(0.9, MAIL_D, 0.55);
+  for (let r = 0; r < 5; r++) {
+    g.beginPath();
+    g.moveTo(bx - 11, by - 31 + r * 4.2);
+    g.lineTo(bx + 11, by - 31 + r * 4.2);
+    g.strokePath();
+  }
   g.fillStyle(STEEL, 1);
-  g.fillRoundedRect(bx - 7, by - 26, 14, 11, 3); // breastplate
+  g.fillRoundedRect(bx - 7, by - 27, 14, 12, 3); // breastplate
+  g.fillStyle(lit(STEEL), 1);
+  g.fillRoundedRect(bx + 1, by - 26, 5, 10, 2);
   g.fillStyle(STEEL_D, 1);
   g.fillRect(bx - 7, by - 17, 14, 2.5);
+  // The livery band: one strip of surcoat across the chest, under the plate.
+  // A strip reads as a uniform; a field reads as paint.
+  g.fillStyle(col, 1);
+  g.fillRect(bx - 12, by - 33.5, 24, 5);
+  g.fillStyle(dark, 1);
+  g.fillRect(bx - 12, by - 29.5, 24, 1.6);
   g.lineStyle(2.2, OUT, 1);
   g.strokeRoundedRect(bx - 12, by - 34, 24, 23, 5);
-  g.strokeRoundedRect(bx - 7, by - 26, 14, 11, 3);
+  g.strokeRoundedRect(bx - 7, by - 27, 14, 12, 3);
+  rimLine(g, bx + 11, by - 31, bx + 11, by - 13, 1.5, 0.45);
 
   head(g, bx, by - 39, 5.5, back);
 
@@ -1845,20 +2000,31 @@ function drawMilitia(g, col, dark, back, P) {
   g.lineStyle(1.5, OUT, 1);
   g.strokeEllipse(bx, by - 47.5, 6, 9);
 
-  // shield (front pose: at the side; back pose: slung across the back). It
+  // Shield (front pose: at the side; back pose: slung across the back). It
   // pushes forward as the sword comes back, which is how a guard reads.
+  //
+  // A round steel-rimmed board, half team colour and half limewashed white,
+  // with a steel boss in the middle. Painted all over in the team's colour —
+  // which is what it used to be — this disc alone was a tenth of the whole
+  // figure, and it is the reason a militia and a skirmisher across a battle
+  // read as the same object: two blobs of the same blue at the same height.
   const sx = (back ? bx : bx - 13.5) - P.swing * 1.6;
   const sy = (back ? by - 25 : by - 24);
-  g.fillStyle(shade(col, -0.12), 1);
-  g.fillCircle(sx, sy, back ? 9.5 : 9);
+  const sr = back ? 9.5 : 9;
+  const board = ellipsePts(sx, sy, sr, sr);
+  g.fillStyle(OUT, 1);
+  g.fillCircle(sx, sy, sr + 1.4);
+  shieldFace(g, board, sx, sy, col, 0xe8e2d2);
   g.lineStyle(2.4, OUT, 1);
-  g.strokeCircle(sx, sy, back ? 9.5 : 9);
+  g.strokeCircle(sx, sy, sr);
+  g.fillStyle(STEEL_D, 1);
+  g.fillCircle(sx, sy, 3.4);
   g.fillStyle(STEEL, 1);
-  g.fillCircle(sx, sy, 3);
+  g.fillCircle(sx + 0.7, sy - 0.7, 2.2);
   g.lineStyle(1.4, OUT, 1);
-  g.strokeCircle(sx, sy, 3);
-  g.lineStyle(1.6, shade(col, 0.3), 0.9);
-  g.strokeCircle(sx, sy, 6.2);
+  g.strokeCircle(sx, sy, 3.4);
+  g.lineStyle(1.4, STEEL_D, 0.9);
+  g.strokeCircle(sx, sy, sr - 1.6);
 
   // sword, swung about the fist
   const hx = bx + 12;
@@ -1883,7 +2049,7 @@ function drawSpearman(g, col, dark, back, P) {
   const bx = cx + P.bx;
   const by = ft + P.by;
 
-  legPair(g, cx, ft, 0x6a6b74, P, 5, 13);
+  legPair(g, cx, ft, LEATHER_D, P, 5, 13);
 
   // Butt of the spear passes behind the body. The wind-up is a short draw and
   // the thrust is a long one, deliberately: pulling the shaft back far enough
@@ -1897,21 +2063,38 @@ function drawSpearman(g, col, dark, back, P) {
 
   stick(g, sx0, sy0, sx1, sy1, 2.8, WOOD);
 
-  // torso — quilted gambeson rather than the militia's plate, so the two are
-  // not the same body with a different stick.
-  g.fillStyle(col, 1);
+  // Torso — a quilted gambeson in undyed linen, which is what a cheap
+  // spearman actually wore and, much more to the point here, what makes him a
+  // DIFFERENT COLOUR from the militia beside him. He used to be the same
+  // rounded rectangle of team colour with horizontal lines ruled across it, and
+  // at play zoom the lines are invisible: two units, one blue lump each.
+  // The quilting is drawn as alternating raised and sunken bands rather than as
+  // ruled lines, so it survives being shrunk to a fifth of this size.
+  g.fillStyle(GAMBESON, 1);
   g.fillRoundedRect(bx - 10, by - 33, 20, 22, 5);
-  g.fillStyle(dark, 1);
-  g.fillRect(bx - 10, by - 17, 20, 3.2);
-  g.lineStyle(1.2, shade(col, -0.3), 0.75);
-  for (let i = 1; i <= 3; i++) {
-    g.beginPath();
-    g.moveTo(bx - 10, by - 33 + i * 5);
-    g.lineTo(bx + 10, by - 33 + i * 5);
-    g.strokePath();
+  g.fillStyle(dim(GAMBESON), 1);
+  g.fillRoundedRect(bx - 10, by - 33, 8, 22, 5);
+  for (let i = 0; i < 4; i++) {
+    g.fillStyle(shade(GAMBESON_D, 0.1), 0.75);
+    g.fillRect(bx - 10, by - 31 + i * 5.2, 20, 2.2);
   }
+  g.fillStyle(LEATHER_D, 1);
+  g.fillRect(bx - 10, by - 17, 20, 3.2);
   g.lineStyle(2.2, OUT, 1);
   g.strokeRoundedRect(bx - 10, by - 33, 20, 22, 5);
+  rimLine(g, bx + 9, by - 31, bx + 9, by - 13, 1.5, 0.45);
+  // The livery: a diagonal sash from the shoulder to the belt. One strip, on
+  // the sunward side, where the spear arm does not cross it.
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    { x: bx - 8, y: by - 33 }, { x: bx - 2.5, y: by - 33 },
+    { x: bx + 10, y: by - 18 }, { x: bx + 10, y: by - 23.5 },
+  ], true, true);
+  g.fillStyle(dark, 1);
+  g.fillPoints([
+    { x: bx - 5, y: by - 33 }, { x: bx - 2.5, y: by - 33 },
+    { x: bx + 10, y: by - 18 }, { x: bx + 10, y: by - 20.5 },
+  ], true, true);
 
   head(g, bx, by - 38, 5.4, back);
 
@@ -1919,6 +2102,8 @@ function drawSpearman(g, col, dark, back, P) {
   g.fillStyle(STEEL, 1);
   g.fillEllipse(bx, by - 41.5, 12, 10);
   g.fillEllipse(bx, by - 39, 20, 5.5);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillEllipse(bx + 3, by - 42.5, 5, 4);
   g.lineStyle(1.8, OUT, 1);
   g.strokeEllipse(bx, by - 41.5, 12, 10);
   g.strokeEllipse(bx, by - 39, 20, 5.5);
@@ -1949,10 +2134,45 @@ function drawSpearman(g, col, dark, back, P) {
   ];
   g.fillStyle(STEEL, 1);
   g.fillPoints(leaf, true, true);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillPoints([leaf[0], leaf[1], leaf[2]], true, true);
   g.lineStyle(1.7, OUT, 1);
   g.strokePoints(leaf, true, true);
+
+  // The pennon, knotted to the shaft just under the collar and streaming back.
+  //
+  // This is where the spearman's whole team colour lives now, and it is the
+  // best place on any foot soldier to put it: forty-eight pixels above the
+  // ground, clear of every body in the melee, on the one part of the sprite
+  // that is already the unit's identity. A blue tunic in a press of bodies is
+  // one more blue tunic; a blue flag on a stick above the press is visible from
+  // the other side of the screen, and it says "spear line" at the same time as
+  // it says "mine".
+  //
+  // WHERE IT IS TIED matters more than what it looks like. The first attempt
+  // knotted it seven pixels below the collar and let it hang nine pixels down
+  // the shaft, which put the whole flag on top of the kettle hat: at play size
+  // the spearman came out wearing a blue bonnet. It is tied four pixels below
+  // the collar now and streams UP the shaft, so every pixel of it sits above
+  // the crown of the helmet with clear sky behind it.
+  const cX = sx1 - nx * 4;
+  const cY = sy1 - ny * 4;
+  const flag = [
+    { x: cX, y: cY },
+    { x: cX - px * 12 + nx * 1, y: cY - py * 12 + ny * 1 },
+    { x: cX - px * 10 + nx * 4.5, y: cY - py * 10 + ny * 4.5 },
+    { x: cX + nx * 3.5, y: cY + ny * 3.5 },
+  ];
+  g.fillStyle(col, 1);
+  g.fillPoints(flag, true, true);
   g.fillStyle(dark, 1);
-  g.fillCircle(sx1 - nx * 5, sy1 - ny * 5, 2.2);
+  g.fillPoints([flag[1], flag[2], {
+    x: cX - px * 5 + nx * 2, y: cY - py * 5 + ny * 2,
+  }], true, true);
+  g.lineStyle(1.4, OUT, 1);
+  g.strokePoints(flag, true, true);
+  g.fillStyle(LEATHER_D, 1);
+  g.fillCircle(cX, cY, 1.8);
 }
 
 // Archer. The old one was a coloured body with a 1px bow line and vanished
@@ -1962,7 +2182,6 @@ function drawSpearman(g, col, dark, back, P) {
 // peak (against the militia's round helmet dome).
 function drawArcher(g, col, dark, back, P) {
   const { cx, ft } = UNIT_BOX.archer;
-  const LEATHER = 0x63482a;
   const bx = cx + P.bx;
   const by = ft + P.by;
   // How far the string is pulled. Only a wound-up pose draws it: an archer
@@ -1971,9 +2190,13 @@ function drawArcher(g, col, dark, back, P) {
   // visible from across the map.
   const drawn = Math.max(0, Math.min(1, -P.swing));
 
-  legPair(g, cx, ft, 0x5d4a35, P, 4.2, 12);
+  legPair(g, cx, ft, LEATHER_D, P, 4.2, 12);
 
   // --- quiver, behind the body ---------------------------------------------
+  // The fletchings are team coloured. Four little flecks is a tiny amount of
+  // paint and it lands in the one place the eye is already going — the fan of
+  // arrows is half the archer's silhouette — so it buys ownership at almost no
+  // cost to the budget.
   const qx = bx + 9;
   const qy = by - 32;
   for (let i = 0; i < 4; i++) {
@@ -1983,7 +2206,7 @@ function drawArcher(g, col, dark, back, P) {
     stick(g, qx, qy, tipX, tipY, 1.7, WOOD);
     g.fillStyle(OUT, 1);
     g.fillCircle(tipX, tipY, 2.8);
-    g.fillStyle(i % 2 ? 0xf2ecda : 0xe0574f, 1);
+    g.fillStyle(i % 2 ? col : 0xf2ecda, 1);
     g.fillCircle(tipX, tipY, 1.8);
   }
   g.fillStyle(LEATHER, 1);
@@ -1993,13 +2216,30 @@ function drawArcher(g, col, dark, back, P) {
   g.fillStyle(shade(LEATHER, 0.3), 1);
   g.fillRect(qx - 5, qy + 3, 10, 3);
 
-  // --- slim tunic -----------------------------------------------------------
-  g.fillStyle(col, 1);
+  // --- slim tunic, in forest cloth -----------------------------------------
+  // Not team colour. An archer painted in the team's colour from the knees to
+  // the crown of the hood is a coloured blob with a wire arc beside it, and the
+  // arc — which is the entire identity of the unit — is the first thing that
+  // gets lost against it. Dressed in a green that belongs to the woodline, the
+  // bow reads as a separate object and the archer reads as an archer.
+  g.fillStyle(FOREST, 1);
   g.fillRoundedRect(bx - 7.5, by - 31, 15, 20, 4);
-  g.fillStyle(dark, 1);
+  g.fillStyle(dim(FOREST), 1);
+  g.fillRoundedRect(bx - 7.5, by - 31, 6, 20, 3);
+  g.fillStyle(LEATHER_D, 1);
   g.fillRect(bx - 7.5, by - 16, 15, 3.2);
   g.lineStyle(2, OUT, 1);
   g.strokeRoundedRect(bx - 7.5, by - 31, 15, 20, 4);
+  rimLine(g, bx + 6.5, by - 29, bx + 6.5, by - 18, 1.4, 0.4);
+  // The livery: a chevron across the chest, pointing up. It sits above the
+  // belt and below the cape, which is the only band of tunic the baldric, the
+  // bow arm and the quiver all leave clear.
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    { x: bx - 7.5, y: by - 22 }, { x: bx, y: by - 27 },
+    { x: bx + 7.5, y: by - 22 }, { x: bx + 7.5, y: by - 18.5 },
+    { x: bx, y: by - 23.5 }, { x: bx - 7.5, y: by - 18.5 },
+  ], true, true);
   // quiver baldric, corner to corner across the chest
   g.lineStyle(3.4, LEATHER, 1);
   g.beginPath();
@@ -2023,8 +2263,10 @@ function drawArcher(g, col, dark, back, P) {
     { x: bx + 8.5, y: by - 36 },
     { x: bx + 7.5, y: by - 31 },
   ];
-  g.fillStyle(shade(col, back ? -0.02 : -0.22), 1);
+  g.fillStyle(back ? FOREST : FOREST_D, 1);
   g.fillPoints(hood, true, true);
+  g.fillStyle(lit(FOREST), 1);
+  g.fillPoints([hood[2], hood[3], hood[4], { x: bx + 1, y: by - 40 }], true, true);
   g.lineStyle(2, OUT, 1);
   g.strokePoints(hood, true, true);
   // shoulder cape, so the hood does not float
@@ -2034,8 +2276,15 @@ function drawArcher(g, col, dark, back, P) {
     { x: bx + 7.5, y: by - 34.5 },
     { x: bx + 10, y: by - 30 },
   ];
-  g.fillStyle(shade(col, back ? 0.02 : -0.3), 1);
+  g.fillStyle(back ? FOREST : FOREST_D, 1);
   g.fillPoints(cape, true, true);
+  // A band of team colour along the cape's lower edge. High on the body,
+  // horizontal, and never covered by the bow arm.
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    cape[0], cape[3], { x: cape[3].x - 0.8, y: cape[3].y - 2.6 },
+    { x: cape[0].x + 0.8, y: cape[0].y - 2.6 },
+  ], true, true);
   g.lineStyle(1.7, OUT, 1);
   g.strokePoints(cape, true, true);
   if (!back) {
@@ -2120,8 +2369,8 @@ function drawArcher(g, col, dark, back, P) {
  */
 function drawScout(g, col, dark, back, P) {
   const { cx, ft } = UNIT_BOX.scout;
-  const HIDE = 0x7c5233;
-  const HIDE_D = 0x593a24;
+  const HIDE = HORSE_BAY;
+  const HIDE_D = HORSE_BAY_D;
   const MANE = 0x35251a;
   const bx = cx + P.bx;
   const by = ft + P.by;
@@ -2203,13 +2452,24 @@ function drawScout(g, col, dark, back, P) {
 
   // Rider legs, one visible, gripping the barrel.
   stick(g, rx + 1, ry - 4, rx + 3, ry + 6, 3.6, 0x5a4a38);
-  // Rider torso in team colour.
-  g.fillStyle(col, 1);
+  // Rider torso: a leather riding coat, not a team-coloured jersey. The scout
+  // and the knight stand next to each other constantly and the pair have to
+  // separate at a glance — a man in soft leather on a bay pony against a man in
+  // plate on a grey destrier does that far harder than "the same rider, bigger".
+  g.fillStyle(LEATHER, 1);
   g.fillRoundedRect(rx - 6, ry - 19, 13, 16, 4);
-  g.fillStyle(shade(col, 0.16), 1);
-  g.fillRoundedRect(rx - 6, ry - 19, 13, 6, 3);
+  g.fillStyle(dim(LEATHER), 1);
+  g.fillRoundedRect(rx - 6, ry - 19, 5, 16, 3);
+  g.fillStyle(shade(LEATHER, 0.2), 1);
+  g.fillRoundedRect(rx - 6, ry - 19, 13, 4, 3);
+  // One band of livery across the chest, and a second on the shoulder.
+  g.fillStyle(col, 1);
+  g.fillRect(rx - 6, ry - 14, 13, 4.4);
+  g.fillStyle(dark, 1);
+  g.fillRect(rx - 6, ry - 10.4, 13, 1.4);
   g.lineStyle(2, OUT, 1);
   g.strokeRoundedRect(rx - 6, ry - 19, 13, 16, 4);
+  rimLine(g, rx + 6, ry - 17, rx + 6, ry - 5, 1.3, 0.4);
   head(g, rx, ry - 24, 4.6, back);
   // A skullcap rather than a full helm: at this size a helmet as big as the
   // head turns the rider into a featureless ball, and the rider's job is to be
@@ -2291,7 +2551,7 @@ function drawRam(g, col, dark, back, P) {
   g.lineStyle(1.8, OUT, 0.8);
   for (const rxp of [bx - 12, bx + 10]) {
     g.beginPath();
-    g.moveTo(rxp, by - 38);
+    g.moveTo(rxp, by - 36);
     g.lineTo(rxp + push * 0.5, logY - 3);
     g.strokePath();
   }
@@ -2301,16 +2561,36 @@ function drawRam(g, col, dark, back, P) {
   g.fillRoundedRect(lx0, logY - 6, lx1 - lx0, 12, 6);
   g.fillStyle(WOOD, 1);
   g.fillRoundedRect(lx0 + 2, logY - 5.5, lx1 - lx0 - 6, 5, 2.5);
-  // Iron head on the striking end.
-  g.fillStyle(STEEL_D, 1);
-  g.fillRoundedRect(lx1 - 9, logY - 6.5, 10, 13, 4);
-  g.lineStyle(1.6, OUT, 1);
-  g.strokeRoundedRect(lx1 - 9, logY - 6.5, 10, 13, 4);
-  g.fillStyle(STEEL, 1);
-  g.fillRect(lx1 - 7, logY - 4.5, 6, 3);
+  if (!back) {
+    // Iron head on the striking end. Only from the front: seen from behind the
+    // machine, the head is at the far end and what is nearest to the camera is
+    // the open tail the crew stands in — see below.
+    g.fillStyle(STEEL_D, 1);
+    g.fillRoundedRect(lx1 - 9, logY - 6.5, 10, 13, 4);
+    g.lineStyle(1.6, OUT, 1);
+    g.strokeRoundedRect(lx1 - 9, logY - 6.5, 10, 13, 4);
+    g.fillStyle(STEEL, 1);
+    g.fillRect(lx1 - 7, logY - 4.5, 6, 3);
+  } else {
+    // The sawn butt of the log, with the rope collar wound round it. Same
+    // object, the other end of it.
+    g.fillStyle(shade(WOOD_D, 0.16), 1);
+    g.fillEllipse(lx0 + 1, logY, 8, 12);
+    g.lineStyle(1.5, OUT, 1);
+    g.strokeEllipse(lx0 + 1, logY, 8, 12);
+    g.lineStyle(1.4, 0xbca87c, 0.9);
+    for (const dy of [-3.5, 0, 3.5]) {
+      g.beginPath();
+      g.moveTo(lx0 + 3, logY + dy);
+      g.lineTo(lx0 + 12, logY + dy);
+      g.strokePath();
+    }
+  }
 
-  // Roof: two rafters and a plank shed, high enough to hide a crew.
-  const ridgeY = by - 42;
+  // Roof: two rafters and a plank shed, low and broad — this is the whole of
+  // the ram's silhouette, and it is deliberately the flattest of the three
+  // engines. Nothing stands above the ridge except a short pennant staff.
+  const ridgeY = by - 40;
   g.fillStyle(PLANK, 1);
   g.fillPoints([
     { x: bx - 26, y: by - 26 }, { x: bx, y: ridgeY },
@@ -2331,6 +2611,25 @@ function drawRam(g, col, dark, back, P) {
     g.lineTo(bx - 26 + 26 * t, by - 22 - (by - 26 - ridgeY) * t);
     g.strokePath();
   }
+  // The painted eave board. A siege engine's share of the colour budget has to
+  // be proportionate to its size the same way an infantryman's is — a ram
+  // carrying nothing but a twelve-pixel flag is a ram whose owner is a guess,
+  // and in a mixed siege line "whose engine is that" is the single most
+  // expensive question a player can be unable to answer. A board along the
+  // whole eave is the largest flat run on the machine and reads at any zoom.
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    { x: bx - 20, y: by - 26 }, { x: bx + 20, y: by - 26 },
+    { x: bx + 20, y: by - 22 }, { x: bx - 20, y: by - 22 },
+  ], true, true);
+  g.fillStyle(dark, 1);
+  g.fillRect(bx - 20, by - 23.4, 40, 1.6);
+  g.lineStyle(1.6, OUT, 1);
+  g.beginPath();
+  g.moveTo(bx - 26, by - 26);
+  g.lineTo(bx + 26, by - 26);
+  g.strokePath();
+
   // Uprights, so the roof is carried rather than floating.
   for (const ux of [bx - 22, bx + 20]) {
     g.fillStyle(FRAME, 1);
@@ -2339,14 +2638,38 @@ function drawRam(g, col, dark, back, P) {
     g.strokeRect(ux - 2.5, by - 26, 5, 13);
   }
 
-  // Team pennant on the ridge — the only colour on the machine.
-  stick(g, bx, ridgeY, bx, ridgeY - 13, 1.8, 0x6a5334);
+  if (back) {
+    // Seen from behind: the open tail of the shed, with the crew's step under
+    // it and a painted tailboard across the top. This is what makes the back
+    // drawing a different picture rather than the same one twice — the three
+    // engines all used to bake identical front and back rows, which meant an
+    // army marching north had its catapults pointing south.
+    g.fillStyle(0x241b10, 1);
+    g.fillPoints([
+      { x: bx - 24, y: by - 24 }, { x: bx - 8, y: by - 24 },
+      { x: bx - 8, y: by - 12 }, { x: bx - 24, y: by - 12 },
+    ], true, true);
+    g.lineStyle(1.8, OUT, 1);
+    g.strokePoints([
+      { x: bx - 24, y: by - 24 }, { x: bx - 8, y: by - 24 },
+      { x: bx - 8, y: by - 12 }, { x: bx - 24, y: by - 12 },
+    ], true, true);
+    g.fillStyle(col, 1);
+    g.fillRect(bx - 24, by - 24, 16, 3.4);
+    g.fillStyle(FRAME, 1);
+    g.fillRect(bx - 26, by - 12, 20, 3.4);
+    g.lineStyle(1.4, OUT, 1);
+    g.strokeRect(bx - 26, by - 12, 20, 3.4);
+  }
+
+  // Team pennant on the ridge. Short — this engine's job is to be the low one.
+  stick(g, bx, ridgeY, bx, ridgeY - 11, 1.8, 0x6a5334);
   g.fillStyle(col, 1);
-  g.fillTriangle(bx, ridgeY - 13, bx + 12, ridgeY - 9.5, bx, ridgeY - 6);
+  g.fillTriangle(bx, ridgeY - 11, bx + 12, ridgeY - 8, bx, ridgeY - 5);
   g.lineStyle(1.4, OUT, 1);
-  g.strokeTriangle(bx, ridgeY - 13, bx + 12, ridgeY - 9.5, bx, ridgeY - 6);
+  g.strokeTriangle(bx, ridgeY - 11, bx + 12, ridgeY - 8, bx, ridgeY - 5);
   g.fillStyle(dark, 1);
-  g.fillTriangle(bx, ridgeY - 11, bx + 6, ridgeY - 9.4, bx, ridgeY - 8);
+  g.fillTriangle(bx, ridgeY - 9.4, bx + 6, ridgeY - 8, bx, ridgeY - 6.6);
 }
 
 /**
@@ -2364,7 +2687,12 @@ function drawRam(g, col, dark, back, P) {
 function drawSkirmisher(g, col, dark, back, P) {
   const { cx, ft } = UNIT_BOX.skirmisher;
   const WICKER = 0xbe9a5e;
-  const LEATHER = 0x77542f;
+  const JERKIN = 0x77542f;
+  // A russet homespun tunic under the jerkin. Not team colour, and not the
+  // spearman's oat linen or the archer's forest green either: the four foot
+  // soldiers are told apart by material before anything else, and four
+  // distinguishable cloths is the cheapest way to buy that.
+  const TUNIC = 0xa8724a;
   const bx = cx + P.bx;
   const by = ft + P.by;
   // How far back the throwing arm is cocked. Only a wound-up pose shows it;
@@ -2390,15 +2718,15 @@ function drawSkirmisher(g, col, dark, back, P) {
   }
 
   // --- short tunic over a leather jerkin ------------------------------------
-  g.fillStyle(col, 1);
+  g.fillStyle(TUNIC, 1);
   g.fillRoundedRect(bx - 8, by - 30, 16, 19, 4);
-  g.fillStyle(lit(col), 1);
-  g.fillRoundedRect(bx + 1, by - 29, 6, 17, 3);
-  g.fillStyle(LEATHER, 1);
+  g.fillStyle(dim(TUNIC), 1);
+  g.fillRoundedRect(bx - 8, by - 30, 7, 19, 3);
+  g.fillStyle(JERKIN, 1);
   g.fillRoundedRect(bx - 8, by - 26, 16, 8, 2.5);
-  g.fillStyle(shade(LEATHER, 0.22), 1);
+  g.fillStyle(shade(JERKIN, 0.22), 1);
   g.fillRect(bx - 8, by - 25, 16, 2);
-  g.fillStyle(dark, 1);
+  g.fillStyle(LEATHER_D, 1);
   g.fillRect(bx - 8, by - 16, 16, 3);
   g.lineStyle(2, OUT, 1);
   g.strokeRoundedRect(bx - 8, by - 30, 16, 19, 4);
@@ -2408,9 +2736,9 @@ function drawSkirmisher(g, col, dark, back, P) {
 
   // A soft cap with a feather rather than a helmet: cheap troops, and it keeps
   // the head small so the shield and the sheaf dominate.
-  g.fillStyle(LEATHER, 1);
+  g.fillStyle(JERKIN, 1);
   g.fillEllipse(bx, by - 37.4, 13, 8);
-  g.fillStyle(shade(LEATHER, 0.2), 1);
+  g.fillStyle(shade(JERKIN, 0.2), 1);
   g.fillEllipse(bx + 1.6, by - 38.6, 7, 4);
   g.lineStyle(1.6, OUT, 1);
   g.strokeEllipse(bx, by - 37.4, 13, 8);
@@ -2442,18 +2770,40 @@ function drawSkirmisher(g, col, dark, back, P) {
     g.lineTo(sx + 8, sy + k * 5);
     g.strokePath();
   }
-  // Team colour goes on the shield, not just on the tunic: the shield is two
-  // thirds of what the camera sees of this unit from the front, and a skirmisher
-  // whose only livery is a band of jerkin behind it is a skirmisher whose owner
-  // is a guess in a melee.
-  g.fillStyle(col, 1);
-  g.fillRect(sx - 2.6, sy - 11.5, 5.2, 23);
-  g.fillStyle(dark, 1);
-  g.fillEllipse(sx, sy, 6.5, 7.5);
-  g.fillStyle(col, 1);
-  g.fillEllipse(sx, sy, 4, 4.8);
-  g.lineStyle(1.6, dark, 0.9);
-  g.strokeEllipse(sx, sy, 15, 21.5);
+  // The device painted on the shield, and the whole argument of this pass in
+  // one object.
+  //
+  // The shield used to be a broad vertical bar of team colour with a team
+  // roundel on top of it, covering most of the face; the review's verdict was
+  // that the skirmisher "reads as a blue circle", and it was right — this
+  // shield is the largest single field on any foot soldier in the game, and
+  // filling it with the player's colour makes the player's colour the unit.
+  // What is painted on it now is a CHEVRON: two strokes of livery over bare
+  // wicker. It is about a fifth of the paint, it is still the loudest mark on
+  // the figure, and — because a chevron is a shape rather than a fill — it
+  // survives at play size as a mark on a shield instead of dissolving into one
+  // more coloured blob.
+  g.lineStyle(4.4, col, 1);
+  g.beginPath();
+  g.moveTo(sx - 9, sy - 1);
+  g.lineTo(sx, sy - 10);
+  g.lineTo(sx + 9, sy - 1);
+  g.strokePath();
+  g.lineStyle(1.3, dark, 0.8);
+  g.beginPath();
+  g.moveTo(sx - 9, sy + 1.2);
+  g.lineTo(sx, sy - 7.8);
+  g.lineTo(sx + 9, sy + 1.2);
+  g.strokePath();
+  // A hide-bound rim and an iron boss, so the shield is a made object.
+  g.fillStyle(OUT, 1);
+  g.fillEllipse(sx, sy + 7, 8.4, 8.4);
+  g.fillStyle(STEEL_D, 1);
+  g.fillEllipse(sx, sy + 7, 6.6, 6.6);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillEllipse(sx + 1.2, sy + 5.8, 2.8, 2.8);
+  g.lineStyle(2.2, JERKIN, 0.95);
+  g.strokeEllipse(sx, sy, 15.6, 22.4);
 
   // --- the javelin in hand, cocked and thrown --------------------------------
   const hx = bx + 8;
@@ -2501,8 +2851,8 @@ function drawKnight(g, col, dark, back, P) {
   // slab with legs — you could not see where the animal stopped and the man
   // began. Warming the hide by a few points of red separates them at a glance
   // and still reads as a grey destrier rather than a bay.
-  const HIDE = 0x7d7268;
-  const HIDE_D = 0x585048;
+  const HIDE = HORSE_GREY;
+  const HIDE_D = HORSE_GREY_D;
   const MANE = 0x2c2b31;
   const bx = cx + P.bx;
   const by = ft + P.by;
@@ -2545,41 +2895,61 @@ function drawKnight(g, col, dark, back, P) {
       bx - 23 - k * 1.4 + P.la * 2, by - 17 + (k - 1) * 2.2, 2.4 - k * 0.4, MANE);
   }
 
-  // The caparison. A SKIRT hanging off the barrel, not a blanket over it — the
-  // first attempt covered the whole animal and the knight came out as a blue
-  // slab on four boots, with no horse in it at all. Hung from the lower edge
-  // and scalloped at the hem, it does what a caparison actually does: adds mass
-  // low down, carries the team colour on the biggest cloth in the game, and
-  // leaves the horse's back and shoulder visible above it.
-  // The hem stops ABOVE the knee, and that is the whole tuning of this piece.
-  // Hung any lower it covers the tops of all four legs, and a galloping horse
-  // whose legs only show for seven pixels is a blue box that slides — the pose
-  // sheet made that obvious and nothing else would have.
+  // The caparison, and the single loudest thing this pass changed.
+  //
+  // It used to be a skirt of solid team colour hanging the full depth of the
+  // barrel, and the review's sentence about it is worth keeping verbatim: the
+  // knight was "a slightly larger blue lump because its entire horse is painted
+  // team colour". That was true, and it was the most expensive kind of true —
+  // the knight is the unit that ends games, the one a player most needs to spot
+  // coming, and it had no shape of its own left to spot.
+  //
+  // What hangs there now is a CLOTH, in the linen the rest of the army is made
+  // of, with the livery on its hem and its edge: a deep band along the
+  // scalloped bottom and a narrow one at the top, which is exactly how a real
+  // caparison is trimmed and about a fifth of the paint. The horse underneath
+  // shows through as a grey destrier, the barding on its shoulders reads as
+  // steel, and the outline of the animal — which is what says "cavalry" from
+  // across the map — is back.
+  //
+  // The hem stops ABOVE the knee, and that has not changed: hung any lower it
+  // covers the tops of all four legs, and a galloping horse whose legs only show
+  // for seven pixels is a box that slides. The pose sheet made that obvious and
+  // nothing else would have.
+  const CAPARISON = 0xd8cdb2;
   const capTop = by - 26;
   const hem = [];
   for (let k = 0; k <= 7; k++) {
     hem.push({ x: bx - 17 + k * 4.9, y: by - 14 + (k % 2 ? 2.2 : 0) });
   }
+  const capOutline = [
+    { x: bx - 17, y: capTop }, { x: bx + 17, y: capTop },
+    ...hem.slice().reverse(),
+  ];
+  g.fillStyle(CAPARISON, 1);
+  g.fillPoints(capOutline, true, true);
+  g.fillStyle(dim(CAPARISON), 1);
+  g.fillPoints([
+    { x: bx - 17, y: capTop }, { x: bx - 4, y: capTop },
+    ...hem.slice(0, 4).reverse(),
+  ], true, true);
+  // The trim: livery along the hem, where it is lowest on the sprite and least
+  // likely to be occluded by the rider, and a thin course at the top.
   g.fillStyle(col, 1);
   g.fillPoints([
-    { x: bx - 17, y: capTop }, { x: bx + 17, y: capTop },
+    { x: bx - 17, y: by - 20 }, { x: bx + 17, y: by - 20 },
     ...hem.slice().reverse(),
   ], true, true);
   g.fillStyle(dark, 1);
   g.fillPoints([
-    { x: bx - 17, y: by - 18 }, { x: bx + 17, y: by - 18 },
+    { x: bx - 17, y: by - 16.5 }, { x: bx + 17, y: by - 16.5 },
     ...hem.slice().reverse(),
   ], true, true);
-  g.lineStyle(1.3, shade(col, 0.32), 0.6);
-  g.beginPath();
-  g.moveTo(bx - 15, capTop + 4);
-  g.lineTo(bx + 15, capTop + 4);
-  g.strokePath();
+  g.fillStyle(col, 1);
+  g.fillRect(bx - 17, capTop, 34, 2.6);
   g.lineStyle(1.8, OUT, 1);
-  g.strokePoints([
-    { x: bx - 17, y: capTop }, { x: bx + 17, y: capTop },
-    ...hem.slice().reverse(),
-  ], true, true);
+  g.strokePoints(capOutline, true, true);
+  rimLine(g, bx + 16, capTop + 2, bx + 16, by - 15, 1.5, 0.4);
 
   // Neck and head under a steel chanfron.
   const neckX = bx + 14;
@@ -2615,10 +2985,28 @@ function drawKnight(g, col, dark, back, P) {
   stick(g, rx + 3, ry - 3, rx + 5, ry + 8, 4, STEEL_D);
   g.fillStyle(STEEL, 1);
   g.fillRoundedRect(rx - 8, ry - 19, 16, 17, 5);
+  g.fillStyle(dim(STEEL), 1);
+  g.fillRoundedRect(rx - 8, ry - 19, 6, 17, 4);
+  // Fluting on the breastplate: three shallow ridges, which is the difference
+  // between "a man in plate" and "a grey rectangle with pauldrons".
+  g.lineStyle(1, mix(STEEL_D, 0x3a4a66, 0.2), 0.7);
+  for (const t of [-3, 0.5, 4]) {
+    g.beginPath();
+    g.moveTo(rx + t, ry - 17);
+    g.lineTo(rx + t, ry - 3);
+    g.strokePath();
+  }
+  // The surcoat: one band across the chest rather than the top half of the
+  // man. The crest above it and the caparison below it are both livery too, and
+  // three small marks stacked up the sprite carry ownership further than one
+  // large one — they survive being half-occluded, which in a cavalry charge is
+  // the normal case.
   g.fillStyle(col, 1);
-  g.fillRoundedRect(rx - 8, ry - 19, 16, 10, 5);
+  g.fillRect(rx - 8, ry - 13.5, 16, 5);
+  g.fillStyle(dark, 1);
+  g.fillRect(rx - 8, ry - 9.5, 16, 1.6);
   g.fillStyle(lit(STEEL), 1);
-  g.fillRoundedRect(rx + 2.5, ry - 10, 4.5, 7, 2);
+  g.fillRoundedRect(rx + 3.5, ry - 7.5, 4, 5, 2);
   g.lineStyle(2.2, OUT, 1);
   g.strokeRoundedRect(rx - 8, ry - 19, 16, 17, 5);
   // Pauldrons.
@@ -2757,19 +3145,29 @@ function drawMangonel(g, col, dark, back, P) {
     }
   }
 
-  // Chassis: two rails and the cross members between them.
+  // Chassis: two rails and the cross members between them, with the machine's
+  // livery painted along the flank. That painted rail is the engine's share of
+  // the colour budget — fifty pixels of team colour on a fifty-pixel-long
+  // machine, against the twelve-pixel pennant it used to carry and nothing
+  // else. A player has to be able to answer "whose mangonel is that" from the
+  // far side of a siege line, and a flag on a mast is exactly the thing that
+  // disappears behind the building being knocked down.
   g.fillStyle(FRAME_D, 1);
   g.fillRect(bx - 26, by - 16, 52, 7);
   g.fillStyle(FRAME, 1);
   g.fillRect(bx - 26, by - 16, 52, 2.6);
   g.lineStyle(2.2, OUT, 1);
   g.strokeRect(bx - 26, by - 16, 52, 7);
+  g.fillStyle(col, 1);
+  g.fillRect(bx - 24, by - 14.6, 48, 4.4);
+  g.fillStyle(dark, 1);
+  g.fillRect(bx - 24, by - 11.4, 48, 1.4);
 
   // The A-frame uprights that carry the arm's axle, and the axle itself.
   const axX = bx + 2;
   // The axle sits LOW, and that is a measurement rather than a taste. The arm
   // rotates about it, so its height plus the arm's length plus the bowl on the
-  // end is exactly how far the sprite reaches, and the frame box has 58 pixels
+  // end is exactly how far the sprite reaches, and the frame box has 70 pixels
   // above the unit's feet. The first version put the axle at by-32 with a
   // 40-pixel arm and the whole throwing gear was sliced off by the top of the
   // box in every pose but the wound-up one — invisible in play, obvious the
@@ -2783,13 +3181,23 @@ function drawMangonel(g, col, dark, back, P) {
   g.fillStyle(STEEL_D, 1);
   g.fillCircle(axX, axY, 4.2);
 
-  // The padded crossbeam the arm slams into, up at the front.
-  g.fillStyle(OUT, 1);
-  g.fillRoundedRect(bx + 12, by - 36, 12, 22, 4);
-  g.fillStyle(FRAME, 1);
-  g.fillRoundedRect(bx + 13.5, by - 34.5, 9, 19, 3);
-  g.fillStyle(0x8a6a3c, 1);
-  g.fillRoundedRect(bx + 13, by - 37, 10, 6, 3);
+  // The padded crossbeam the arm slams into, up at the front. Seen from behind
+  // it is at the far end of the machine, so it is drawn narrower and a little
+  // higher — the cheapest honest way to say "further away" in a projection
+  // that has no perspective.
+  if (back) {
+    g.fillStyle(OUT, 1);
+    g.fillRoundedRect(bx + 14, by - 36, 9, 20, 3);
+    g.fillStyle(FRAME_D, 1);
+    g.fillRoundedRect(bx + 15.2, by - 34.8, 6.6, 17.6, 2.4);
+  } else {
+    g.fillStyle(OUT, 1);
+    g.fillRoundedRect(bx + 12, by - 36, 12, 22, 4);
+    g.fillStyle(FRAME, 1);
+    g.fillRoundedRect(bx + 13.5, by - 34.5, 9, 19, 3);
+    g.fillStyle(0x8a6a3c, 1);
+    g.fillRoundedRect(bx + 13, by - 37, 10, 6, 3);
+  }
 
   // The twisted skein of rope that powers it: two coils either side of the axle.
   for (const sgn of [-1, 1]) {
@@ -2806,19 +3214,23 @@ function drawMangonel(g, col, dark, back, P) {
     }
   }
 
-  // The arm. Loaded, it rakes back over the tail of the chassis; released, it
-  // stands up against the crossbeam. One rotation about the axle does both.
+  // --- the arm, and the whole identity of this unit -------------------------
+  //
+  // THE ARM STANDS UP AT REST. That one decision is what stops this machine
+  // from being the third of "three identical brown carts": at rest it used to
+  // rake back flat over its own tail, which put its entire mass inside the same
+  // low horizontal slab the ram and the scorpion occupy, and no amount of
+  // detail rescues three objects that share an outline. Standing, it makes a
+  // steep diagonal with a stone on the end of it — a shape nothing else in the
+  // game makes, and one that survives being twenty pixels tall.
+  //
+  // It is also what a loaded engine looks like between shots, which is the
+  // state it is in for almost all of its life. `swing` swings it about the
+  // axle from there: wound down and back over the tail to load, then snapped
+  // forward against the crossbeam as the stone leaves.
   const rel = (P.swing + 1) * 0.5; // 0 = fully wound, 1 = fully thrown
-  // Raked back over its own tail when loaded, standing against the crossbeam
-  // when thrown. The span is wide on purpose: an arm that barely moves is an
-  // arm nobody sees move, and this is the only moving part on the machine.
-  // Rest is RAKED BACK over the tail, not upright: an engine standing about or
-  // rolling forward carries its arm down, and the difference between that and
-  // the arm snapped up against the crossbeam is what makes a shot visible from
-  // across the map. Mapped off `swing` directly rather than off `rel`, because
-  // what matters is where zero sits.
-  const armA = -2.55 + P.swing * 0.75;
-  const armLen = 31;
+  const armA = -1.75 + P.swing * 0.9;
+  const armLen = 32;
   const tipX = axX + Math.cos(armA) * armLen;
   const tipY = axY + Math.sin(armA) * armLen;
   stick(g, axX, axY, tipX, tipY, 6, FRAME);
@@ -2848,24 +3260,53 @@ function drawMangonel(g, col, dark, back, P) {
     g.fillCircle(tipX + 1.6, tipY - 6, 3.4);
   }
 
-  // A rack of spare shot on the chassis, and the team pennant. Ownership goes
-  // on a pennant for the same reason it does on the ram: a team-coloured
-  // machine looks like a man in a uniform.
-  for (const [ox, oy] of [[-19, -19], [-12, -19], [-15.5, -25]]) {
+  if (back) {
+    // The tail of the machine, which is what is nearest the camera when the
+    // engine is pointing away: the windlass the crew hauls the arm down with,
+    // its rope running up to the arm, and the ratchet pawl on the drum.
+    const wx0 = bx - 20;
+    const wy0 = by - 21;
+    g.lineStyle(2.6, OUT, 0.75);
+    g.beginPath();
+    g.moveTo(wx0, wy0);
+    g.lineTo(axX + Math.cos(armA) * 14, axY + Math.sin(armA) * 14);
+    g.strokePath();
+    g.lineStyle(1.3, 0xdccfa8, 0.95);
+    g.beginPath();
+    g.moveTo(wx0, wy0);
+    g.lineTo(axX + Math.cos(armA) * 14, axY + Math.sin(armA) * 14);
+    g.strokePath();
     g.fillStyle(OUT, 1);
-    g.fillCircle(bx + ox, by + oy, 5);
-    g.fillStyle(0x6f7883, 1);
-    g.fillCircle(bx + ox, by + oy, 4);
-    g.fillStyle(0x99a3af, 1);
-    g.fillCircle(bx + ox + 1, by + oy - 1.2, 2);
+    g.fillCircle(wx0, wy0, 8.4);
+    g.fillStyle(WOOD_D, 1);
+    g.fillCircle(wx0, wy0, 6.8);
+    g.fillStyle(shade(WOOD, 0.1), 1);
+    g.fillCircle(wx0 + 1.4, wy0 - 1.6, 3);
+    g.lineStyle(2, STEEL_D, 1);
+    g.beginPath();
+    g.moveTo(wx0, wy0);
+    g.lineTo(wx0 - 8, wy0 - 7);
+    g.strokePath();
+  } else {
+    // A rack of spare shot on the chassis, on the near flank.
+    for (const [ox, oy] of [[-19, -19], [-12, -19], [-15.5, -25]]) {
+      g.fillStyle(OUT, 1);
+      g.fillCircle(bx + ox, by + oy, 5);
+      g.fillStyle(0x6f7883, 1);
+      g.fillCircle(bx + ox, by + oy, 4);
+      g.fillStyle(0x99a3af, 1);
+      g.fillCircle(bx + ox + 1, by + oy - 1.2, 2);
+    }
   }
-  stick(g, bx + 24, by - 16, bx + 24, by - 46, 1.8, 0x6a5334);
+
+  // The masthead pennant, on a staff at the front rail.
+  stick(g, bx + 24, by - 16, bx + 24, by - 44, 1.8, 0x6a5334);
   g.fillStyle(col, 1);
-  g.fillTriangle(bx + 24, by - 46, bx + 36, by - 42.5, bx + 24, by - 39);
+  g.fillTriangle(bx + 24, by - 44, bx + 35, by - 40.5, bx + 24, by - 37);
   g.lineStyle(1.4, OUT, 1);
-  g.strokeTriangle(bx + 24, by - 46, bx + 36, by - 42.5, bx + 24, by - 39);
+  g.strokeTriangle(bx + 24, by - 44, bx + 35, by - 40.5, bx + 24, by - 37);
   g.fillStyle(dark, 1);
-  g.fillTriangle(bx + 24, by - 44, bx + 30, by - 42.4, bx + 24, by - 41);
+  g.fillTriangle(bx + 24, by - 42, bx + 30, by - 40.4, bx + 24, by - 39);
 }
 
 /**
@@ -2887,10 +3328,15 @@ function drawScorpion(g, col, dark, back, P) {
   // How far the string is drawn. Wound up = loaded and ready; released = the
   // string has snapped forward and the bolt has gone.
   const drawn = Math.max(0, Math.min(1, -P.swing));
+  // Seen from behind, the bow is at the far end of the machine and the crew's
+  // mantlet is at the near one, so the bow is drawn foreshortened and the
+  // mantlet is drawn large. Nothing else about the engine changes — it is the
+  // same object from the other side, not a different one.
+  const far = back ? 0.72 : 1;
 
   // Two small wheels — a scorpion is a cart, not a siege tower.
   const spin = P.la * 1.8;
-  for (const [wx0, wy0, rr] of [[bx - 16, by - 6, 6.5], [bx + 15, by - 6, 7]]) {
+  for (const [wx0, wy0, rr] of [[bx - 16, by - 5.5, 6], [bx + 15, by - 5.5, 6.5]]) { // scorpion
     g.fillStyle(OUT, 1);
     g.fillCircle(wx0, wy0, rr + 1.6);
     g.fillStyle(FRAME_D, 1);
@@ -2905,17 +3351,20 @@ function drawScorpion(g, col, dark, back, P) {
     }
   }
 
-  // A splayed trestle carrying the stock.
+  // A splayed trestle carrying the stock. Short: this engine's whole job is to
+  // be the LOW one. Its top sits about forty pixels above the ground against
+  // the ram's fifty and the mangonel's sixty-five, and that spread is what
+  // stops the three of them reading as one cart drawn three times.
   for (const sgn of [-1, 1]) {
-    stick(g, bx + sgn * 13, by - 8, bx + sgn * 5, by - 24, 4, sgn > 0 ? FRAME : FRAME_D);
+    stick(g, bx + sgn * 13, by - 7, bx + sgn * 5, by - 16, 4, sgn > 0 ? FRAME : FRAME_D);
   }
   g.fillStyle(FRAME_D, 1);
-  g.fillRect(bx - 16, by - 14, 32, 5);
+  g.fillRect(bx - 16, by - 11, 32, 5);
   g.lineStyle(1.8, OUT, 1);
-  g.strokeRect(bx - 16, by - 14, 32, 5);
+  g.strokeRect(bx - 16, by - 11, 32, 5);
 
   // The stock: a squared beam running fore and aft, with the groove on top.
-  const stockY = by - 28;
+  const stockY = by - 20;
   g.fillStyle(OUT, 1);
   g.fillRoundedRect(bx - 21, stockY - 5, 46, 11, 3);
   g.fillStyle(FRAME, 1);
@@ -2924,11 +3373,12 @@ function drawScorpion(g, col, dark, back, P) {
   g.fillRect(bx - 18, stockY - 2.5, 40, 2.4);
   g.fillStyle(FRAME_D, 1);
   g.fillRect(bx - 18, stockY - 0.6, 40, 2.2);
-  // The windlass at the back, which is what a crew winds.
+  // The windlass at the back, which is what a crew winds. From behind it is
+  // the nearest thing on the machine, so it gets its crank and its rope.
   g.fillStyle(OUT, 1);
-  g.fillCircle(bx - 21, stockY, 6.4);
+  g.fillCircle(bx - 21, stockY, back ? 7.6 : 6.4);
   g.fillStyle(WOOD_D, 1);
-  g.fillCircle(bx - 21, stockY, 5);
+  g.fillCircle(bx - 21, stockY, back ? 6.2 : 5);
   g.lineStyle(1.8, STEEL_D, 1);
   g.beginPath();
   g.moveTo(bx - 21, stockY);
@@ -2946,25 +3396,29 @@ function drawScorpion(g, col, dark, back, P) {
   // on the chassis rescued it. A curve is the whole difference.
   const bowX = bx + 11;
   const bowY = stockY - 2;
-  const span = 24;
+  const span = 16 * far;
   for (const sgn of [-1, 1]) {
+    // A gentle sweep, not a curl. The bulge used to reach eight pixels forward
+    // over a sixteen-pixel limb, and with a six-pixel outline on it the two
+    // limbs met in the middle and the bow came out as a brown blob with a
+    // white V beside it. Half the bulge and a thinner line is a bow.
     const arcPts = [
-      { x: bowX + 1, y: bowY + sgn * 3 },
-      { x: bowX + 8, y: bowY + sgn * 11 },
-      { x: bowX + 9, y: bowY + sgn * 19 },
-      { x: bowX + 4, y: bowY + sgn * span },
+      { x: bowX + 1, y: bowY + sgn * 2 * far },
+      { x: bowX + 4.5, y: bowY + sgn * 7 * far },
+      { x: bowX + 5, y: bowY + sgn * 12 * far },
+      { x: bowX + 3, y: bowY + sgn * span },
     ];
-    g.lineStyle(6.2, OUT, 1);
+    g.lineStyle(5, OUT, 1);
     g.strokePoints(arcPts, false, false);
-    g.lineStyle(3.4, WOOD, 1);
+    g.lineStyle(2.6, WOOD, 1);
     g.strokePoints(arcPts, false, false);
-    g.lineStyle(1.2, shade(WOOD, 0.3), 0.75);
-    g.strokePoints(arcPts.map((p) => ({ x: p.x + 1.2, y: p.y })), false, false);
+    g.lineStyle(1, shade(WOOD, 0.3), 0.75);
+    g.strokePoints(arcPts.map((p) => ({ x: p.x + 1, y: p.y })), false, false);
     // Horn nock at the limb tip.
     g.fillStyle(OUT, 1);
-    g.fillCircle(bowX + 4, bowY + sgn * span, 2.9);
+    g.fillCircle(bowX + 3, bowY + sgn * span, 2.6);
     g.fillStyle(STEEL_D, 1);
-    g.fillCircle(bowX + 4, bowY + sgn * span, 1.8);
+    g.fillCircle(bowX + 3, bowY + sgn * span, 1.6);
   }
   // The case the limbs are socketed into. Small and wooden — a big steel block
   // here reads as a hammer head sitting on the machine.
@@ -2979,33 +3433,99 @@ function drawScorpion(g, col, dark, back, P) {
   // it is only ever standing about because it has nothing to shoot at yet — so
   // the bolt is drawn in every pose, and what `swing` moves is how far back the
   // string has hauled it.
-  const nockX = bowX - 2 - drawn * 18;
+  const nockX = bowX - 2 - drawn * 16;
   g.lineStyle(2.4, OUT, 0.55);
   g.beginPath();
-  g.moveTo(bowX + 4, bowY - span);
+  g.moveTo(bowX + 3, bowY - span);
   g.lineTo(nockX, bowY);
-  g.lineTo(bowX + 4, bowY + span);
+  g.lineTo(bowX + 3, bowY + span);
   g.strokePath();
   g.lineStyle(1.3, 0xf4eedd, 0.95);
   g.beginPath();
-  g.moveTo(bowX + 4, bowY - span);
+  g.moveTo(bowX + 3, bowY - span);
   g.lineTo(nockX, bowY);
-  g.lineTo(bowX + 4, bowY + span);
+  g.lineTo(bowX + 3, bowY + span);
   g.strokePath();
-  stick(g, nockX, bowY, bowX + 19, bowY, 2.2, 0xd8b070);
+  stick(g, nockX, bowY, bowX + 15 * far, bowY, 2.2, 0xd8b070);
   g.fillStyle(0xe6ebf0, 1);
-  g.fillTriangle(bowX + 17, bowY - 3.6, bowX + 27, bowY, bowX + 17, bowY + 3.6);
+  g.fillTriangle(bowX + 14 * far, bowY - 3.4, bowX + 23 * far, bowY, bowX + 14 * far, bowY + 3.4);
   g.lineStyle(1.3, OUT, 1);
-  g.strokeTriangle(bowX + 17, bowY - 3.6, bowX + 27, bowY, bowX + 17, bowY + 3.6);
+  g.strokeTriangle(bowX + 14 * far, bowY - 3.4, bowX + 23 * far, bowY,
+    bowX + 14 * far, bowY + 3.4);
   g.fillStyle(0xf2f2f2, 1);
   g.fillTriangle(nockX, bowY - 3.4, nockX + 6, bowY, nockX, bowY + 3.4);
 
-  // Team pennant on the stock's tail.
-  stick(g, bx - 24, stockY - 4, bx - 24, stockY - 24, 1.7, 0x6a5334);
+  // --- the mantlet: the crew's shield, and the engine's livery --------------
+  //
+  // A plank screen standing at the winding end, painted in the team's colour.
+  // It does three jobs at once, which is why it is here rather than another
+  // flag: it is a piece of real siege equipment, it puts mass at the low tail
+  // end so the machine reads as a wedge rather than a rectangle, and it is the
+  // engine's share of the colour budget — an object as big as a mangonel that
+  // carries twelve pixels of ownership is an object nobody can claim.
+  //
+  // Drawn LAST, because from behind it is the nearest thing on the machine and
+  // must overlap the stock; and drawn wider in the back pose for the same
+  // reason.
+  const mw = back ? 10.5 : 7;
+  const mx = bx - 22;
+  const mTop = stockY - 11;
+  const mH = 20;
+  // A pavise, not a placard: the top is arched, the bottom is a plain plank
+  // rail and there are two iron straps across the face. Those three marks are
+  // the difference between "a shield" and "a coloured rectangle", and a
+  // coloured rectangle is exactly the failure this whole pass is about.
+  const face = [
+    { x: mx - mw, y: mTop + 4 },
+    { x: mx - mw * 0.55, y: mTop },
+    { x: mx + mw * 0.55, y: mTop },
+    { x: mx + mw, y: mTop + 4 },
+    { x: mx + mw, y: mTop + mH },
+    { x: mx - mw, y: mTop + mH },
+  ];
+  g.fillStyle(OUT, 1);
+  g.fillPoints(face.map((q) => ({
+    x: mx + (q.x - mx) * 1.2, y: mTop + (q.y - mTop) * 1.06 - 1.2,
+  })), true, true);
   g.fillStyle(col, 1);
-  g.fillTriangle(bx - 24, stockY - 24, bx - 13, stockY - 21, bx - 24, stockY - 18);
+  g.fillPoints(face, true, true);
+  g.fillStyle(dark, 1);
+  g.fillPoints([
+    face[0], { x: mx - mw * 0.55, y: mTop },
+    { x: mx - mw * 0.55, y: mTop + mH }, face[5],
+  ], true, true);
+  // Plank joints, an iron strap top and bottom, and a bare timber sill.
+  g.lineStyle(1, shade(dark, -0.25), 0.75);
+  for (let k = 1; k < (back ? 4 : 3); k++) {
+    const px2 = mx - mw + (mw * 2 * k) / (back ? 4 : 3);
+    g.beginPath();
+    g.moveTo(px2, mTop + 2);
+    g.lineTo(px2, mTop + mH - 1);
+    g.strokePath();
+  }
+  g.fillStyle(STEEL_D, 1);
+  g.fillRect(mx - mw, mTop + 5.5, mw * 2, 2.2);
+  g.fillStyle(FRAME_D, 1);
+  g.fillRect(mx - mw, mTop + mH - 4, mw * 2, 4);
+  g.fillStyle(STEEL, 1);
+  g.fillCircle(mx + mw * 0.25, mTop + 13, 2.4);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints(face, true, true);
+  rimLine(g, mx + mw - 1, mTop + 5, mx + mw - 1, mTop + mH - 2, 1.4, 0.45);
+
+  // A short staff on the mantlet's top edge with the pennant on it, so the
+  // engine still reads as owned when the mantlet is behind a wall.
+  //
+  // SHORT is the operative word. The first version put a twelve-pixel staff on
+  // here and the flag became the tallest thing on the machine — which is
+  // exactly backwards, because "the low one" is this engine's entire job in the
+  // siege line, and it was also two pixels outside the top of its own frame
+  // box. It clears the bow limbs by a pixel and no more.
+  stick(g, mx, mTop, mx, mTop - 7, 1.7, 0x6a5334);
+  g.fillStyle(col, 1);
+  g.fillTriangle(mx, mTop - 7, mx + 9, mTop - 4.6, mx, mTop - 2.2);
   g.lineStyle(1.3, OUT, 1);
-  g.strokeTriangle(bx - 24, stockY - 24, bx - 13, stockY - 21, bx - 24, stockY - 18);
+  g.strokeTriangle(mx, mTop - 7, mx + 9, mTop - 4.6, mx, mTop - 2.2);
 }
 
 /**
@@ -6718,10 +7238,101 @@ function buildDetails(put, rng) {
  * in this projection uses: every wall, roof and fence line runs along a grid
  * axis and therefore at 26 degrees to the screen, and a band that runs flat
  * across is instantly a different *material* rather than another built thing.
+ *
+ * THE ROCK IS NOT GREY.
+ *
+ * That is the single biggest thing this pass changed, and it is worth writing
+ * down because it is invisible in code review and obvious in a screenshot. The
+ * old palette was a desaturated neutral — 0x8e8b80 over 0x6f6a5f over 0x5a564d
+ * — sitting on a map made entirely of warm greens and ochres, and no amount of
+ * texture drawn on top of a wrong hue will fix it: the outcrop read as poured
+ * concrete before the first stratum went down, because concrete is exactly what
+ * neutral grey next to warm green looks like. Real rock in a grassland is a warm
+ * buff, iron-stained, greyer than the sand tiles but pulled the same way off
+ * neutral. CLIFF_STONE is that, and every plane on a cliff is now derived from
+ * it through the light model rather than being three hand-picked greys.
+ *
+ * The three planes, and why they sit where they do:
+ *
+ *   TOP     a horizontal plane. At a sun 40 degrees up it is the best-lit
+ *           surface on the map, and it is also the only one taking the whole
+ *           dome of the sky, so it is lifted hard and warmed with a little RIM.
+ *   FACE_R  the sunward vertical (the +x face). lit(), taken off a base that is
+ *           already dropped, because a vertical surface at this sun angle
+ *           receives well under half what the plateau above it does. Lighting a
+ *           vertical face with the same lift as a horizontal one is how you get
+ *           a cliff that looks like a photograph of a cliff with the contrast
+ *           slider at zero.
+ *   FACE_L  the shaded vertical (the +y face). dim(), which cools as it darkens.
+ *
+ * The old three were at luma 140 / 107 / 87. The two *faces* were within twenty
+ * per cent of each other, which meant the corner where they meet — the one
+ * place in the whole drawing where a cliff can prove it is a solid and not a
+ * shape — had almost no value break across it. The new three are roughly
+ * 150 / 134 / 78, and the corner does the work now. Note which pair moved
+ * apart: the plateau and the sunward face are nearly the same value, and that
+ * is not a mistake. A vertical surface aimed at a sun 40 degrees up receives
+ * about as much beam as a horizontal one does; what separates them is the sky,
+ * and the sky is worth ten per cent, not fifty. The contrast that has to exist
+ * is between the two *faces*, and it does.
+ *
+ * The stone *mine* is still neutral grey (PAL_STONE, up in the resources), and
+ * that is also deliberate. Two different rocks on one map want to be told apart
+ * without a label: quarried blocks are cool and squared, natural outcrop is warm
+ * and broken. Making them the same colour would have been the tidier decision
+ * and the worse one.
  */
-const CLIFF_TOP = 0x8e8b80;
-const CLIFF_FACE_R = 0x6f6a5f;
-const CLIFF_FACE_L = 0x5a564d;
+// How warm is warm enough? The test that settled it: hold the stone next to
+// SAND[0] (0xd5bf82, red minus blue = 83) and GRASS[0] (0x537d38, r-b = 27).
+// The first attempt at this used r-b = 27 and still photographed as concrete,
+// because at the value a lit rock plane sits at, a hue that weak is washed out
+// by its own brightness. CLIFF_STONE is r-b = 60: clearly not sand, clearly not
+// neutral, and it survives being lifted to the plateau's value.
+const CLIFF_STONE = 0x9d8b64;
+const CLIFF_TOP = mix(CLIFF_STONE, RIM, 0.12);
+const CLIFF_FACE_BASE = shade(CLIFF_STONE, -0.3);
+const CLIFF_FACE_R = lit(CLIFF_FACE_BASE);
+const CLIFF_FACE_L = dim(CLIFF_FACE_BASE);
+// Lichen and soil. The greens are lifted off the GRASS ramp and the browns off
+// DIRT rather than being invented, so what grows on the rock and what stains it
+// are the same substances as the ground round its foot. This is the cheapest
+// single thing that makes an outcrop belong to a map instead of sitting on it,
+// and it is why the plateau — which for a big mass is nearly all of what the
+// player sees — is no longer one flat fill.
+const CLIFF_MOSS = [0x6a7a44, 0x5b7139, 0x74814a];
+const CLIFF_SOIL = [0x8a6a45, 0x7d5f3c];
+
+/**
+ * A drawn edge that is not a ruled line.
+ *
+ * Pinned at both endpoints — those are shared with the neighbouring tile and
+ * have to meet it exactly, or a run of cliffs grows a visible stitch at every
+ * boundary — and pushed a pixel or two off true in between.
+ *
+ * This turned out to be the cheapest large improvement in the whole cliff pass,
+ * and it is not about texture at all. With the palette fixed and the faces lit,
+ * a single tile still photographed as a cardboard carton, and the reason was
+ * the outline: four perfectly straight edges meeting at four sharp corners is
+ * the definition of a manufactured box, and no amount of stratum drawn inside
+ * one will argue with it. Two pixels of wobble on the same four edges and the
+ * thing is a rock.
+ */
+function roughLine(g, p, q, amp, rng, n = 4) {
+  const dx = q.x - p.x;
+  const dy = q.y - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len;
+  const ny = dx / len;
+  g.beginPath();
+  g.moveTo(p.x, p.y);
+  for (let k = 1; k < n; k++) {
+    const t = k / n;
+    const j = rng.range(-amp, amp);
+    g.lineTo(p.x + dx * t + nx * j, p.y + dy * t + ny * j);
+  }
+  g.lineTo(q.x, q.y);
+  g.strokePath();
+}
 
 function buildCliffs(put, rng) {
   // Half a pixel wider than a real tile in each direction, for the same reason
@@ -6757,94 +7368,246 @@ function drawCliff(g, cx, cy, hw, hh, mask, v, rng) {
   const up = (p) => ({ x: p.x, y: p.y - CLIFF_H });
   const openX = !(mask & 1);
   const openY = !(mask & 2);
+  const tx = cx - hw; // top-left of the tile's bounding box, for inDiamond()
+  const ty = cy - hh - CLIFF_H;
 
-  // Rubble at the foot of any face that is actually exposed. A cliff that meets
-  // the ground in a clean line reads as a wall; a cliff with its own debris at
-  // the bottom reads as rock that has been there a while.
-  if (openX || openY) {
-    g.fillStyle(0x000000, 0.16);
-    g.fillEllipse(cx, cy + hh * 0.4, hw * 1.85, hh * 1.5);
-  }
+  // The ground shadow the whole mass throws, offset away from the sun. This was
+  // one hard black ellipse, which under the biggest solid on the map is a second
+  // silhouette competing with the rock's own; contactShadow() stacks four and
+  // feathers, which is what the rest of the file does and what this always
+  // should have.
+  if (openX || openY) contactShadow(g, cx, cy + hh * 0.24, hw * 1.55, hh * 1.5, 0.95);
 
   // Each visible face has a vertical corner at either end, and those are the
   // last thing that can give the game away: draw them unconditionally and a run
   // of cliff tiles gets a seam at every tile boundary, which is a stack of
   // crates. A corner is only drawn where the neighbour *along that face* is
   // open ground, so a run has verticals at its two ends and nowhere else.
-  const wall = (a, b, lit, capA, capB) => {
-    const face = lit ? CLIFF_FACE_R : CLIFF_FACE_L;
-    const quad = [a, b, up(b), up(a)];
-    g.fillStyle(face, 1);
-    g.fillPoints(quad, true, true);
-    // The foot of a rock face is always in its own shadow.
-    g.fillStyle(shade(face, -0.3), 0.85);
-    g.fillPoints([
-      a, b, { x: b.x, y: b.y - CLIFF_H * 0.28 }, { x: a.x, y: a.y - CLIFF_H * 0.28 },
-    ], true, true);
-    // Strata: flat bands across the face. Horizontal is the one direction
-    // nothing built uses in this projection — every wall, roof and fence runs
-    // along a grid axis — so a flat band reads as a different material rather
-    // than as another piece of carpentry.
-    for (let k = 1; k <= 4; k++) {
-      const t = k / 5 + (v === 1 ? 0.05 : 0);
-      const y0 = a.y - CLIFF_H * t;
-      const y1 = b.y - CLIFF_H * t;
-      const cut = 0.1 + ((k * 7 + v * 3) % 4) * 0.06;
-      g.lineStyle(1.5, shade(face, -0.32), 0.8);
+  const wall = (a, b, sunward, capA, capB) => {
+    const face = sunward ? CLIFF_FACE_R : CLIFF_FACE_L;
+    // Everything on a face is placed in (u, t): `u` runs along the base from a
+    // to b, `t` runs up the face from the ground to the rim. Both are in tile
+    // units, so a mark at u = 0.5 sits mid-tile whichever of the two faces it
+    // is on and whichever way that face runs across the screen.
+    const at = (u, t) => ({
+      x: a.x + (b.x - a.x) * u,
+      y: a.y + (b.y - a.y) * u - CLIFF_H * t,
+    });
+    const band = (t0, t1, c, alpha = 1) => {
+      g.fillStyle(c, alpha);
+      g.fillPoints([at(0, t0), at(1, t0), at(1, t1), at(0, t1)], true, true);
+    };
+    /**
+     * The boundary of a bed: `t` at both ends, wobbling in between.
+     *
+     * Pinned at u = 0 and u = 1 so the bed carries across a tile join and meets
+     * its neighbour exactly — that continuity is the whole reason a run of
+     * tiles reads as one outcrop. Wobbled everywhere else because a bedding
+     * plane drawn as a ruled line, at this scale, is a plank; the amplitude is
+     * two and a half pixels, which is small enough to stay a rock edge and
+     * large enough to be visible at all, and the first attempt at this used
+     * under one pixel and might as well have been straight.
+     */
+    const seamPts = (t, amp) => {
+      const pts = [at(0, t)];
+      for (let k = 1; k < 5; k++) pts.push(at(k / 5, t + rng.range(-amp, amp)));
+      pts.push(at(1, t));
+      return pts;
+    };
+    const bed = (t0, t1, c, alpha, amp) => {
+      const lo = seamPts(t0, amp);
+      const hi = seamPts(t1, amp);
+      hi.reverse();
+      g.fillStyle(c, alpha);
+      g.fillPoints(lo.concat(hi), true, true);
+      return lo;
+    };
+
+    band(0, 1, face);
+    // HOW MUCH STRATA A THIRTY-PIXEL FACE WILL TAKE: not much.
+    //
+    // The version before this one drew five beds at up to +/- 0.17 value across
+    // the full width of the face, with hard straight boundaries. Photographed,
+    // that is not sedimentary rock, it is board-and-batten siding — five clean
+    // stripes of alternating tone is a *manufactured* surface, and swapping the
+    // old corrugation for it was trading one machined material for another. A
+    // face this size has room for two value shapes that are actually read, so
+    // there are two: one dark bed low down and one pale bed above the middle,
+    // both with broken edges and both at a third of the contrast. Everything
+    // else on the face is a mark rather than a tone.
+    bed(0.17, 0.33, shade(face, -0.09), 0.85, 0.05);
+    bed(0.52, 0.66, shade(face, 0.11), 0.8, 0.055);
+    // Ambient occlusion at the foot, as a four-step ramp rather than one dark
+    // band. The old face had a hard-edged shaded block across its bottom 28 per
+    // cent, and a hard edge at a constant height is read as a course of masonry
+    // — a plinth — which is the exact opposite of what it was for. The matching
+    // two steps at the top are the other half of the same argument: the rock
+    // nearest the rim sees the most sky.
+    for (let k = 0; k < 4; k++) band(-0.02, 0.05 + k * 0.07, shade(face, -0.52), 0.1);
+    for (let k = 0; k < 2; k++) band(0.98 - k * 0.13, 1.01, mix(face, RIM, 0.3), 0.1);
+
+    // A crack along the underside of each bed. Thin, low alpha, and drawn on the
+    // *bottom* edge only: mark both edges of a band and it becomes a moulding.
+    for (const t of [0.17, 0.52]) {
+      g.lineStyle(1.2, shade(face, -0.42), 0.5);
+      g.strokePoints(seamPts(t, 0.045), false, false);
+    }
+
+    // FACETS. A rock face is not a plane, it is several dozen small planes at
+    // slightly different angles, and that — not the strata — is what the eye
+    // actually uses to tell stone from stucco. Three quads of nudged value,
+    // shaped and placed from the bake rng so no two of the forty-eight frames
+    // carry the same ones. That last part matters more than the facets do: the
+    // old face was a pure function of `v`, so a nine-tile ridge was three
+    // drawings shown three times each, and the repeat was more visible than
+    // anything drawn inside it.
+    for (let k = 0; k < 3; k++) {
+      const u0 = rng.range(-0.05, 0.62);
+      const t0 = rng.range(0.08, 0.6);
+      const du = rng.range(0.26, 0.5);
+      const dt = rng.range(0.18, 0.36);
+      g.fillStyle(shade(face, rng.chance(0.5) ? 0.14 : -0.15), 0.5);
+      g.fillPoints([
+        at(u0, t0),
+        at(u0 + du, t0 + rng.range(-0.07, 0.07)),
+        at(u0 + du * rng.range(0.5, 1), t0 + dt),
+        at(u0 + rng.range(-0.06, 0.06), t0 + dt * rng.range(0.5, 1)),
+      ], true, true);
+    }
+
+    // Vertical jointing, kept away from u = 0 and u = 1. A joint that lands on
+    // a tile edge is a seam between two crates; a joint at u = 0.4 is rock. It
+    // leans slightly, because a plumb-vertical line in an isometric drawing is
+    // the one thing that never occurs naturally — and it is drawn as a *groove*,
+    // dark on one side and catching light on the other, because a single dark
+    // line is a scratch and two lines side by side are a channel cut into
+    // something with thickness.
+    for (let k = 0, n = rng.int(1, 2); k < n; k++) {
+      const u = rng.range(0.22, 0.74);
+      const t0 = rng.range(0, 0.22);
+      const t1 = t0 + rng.range(0.42, 0.74);
+      const skew = rng.range(-0.05, 0.05);
+      const path = (du) => [
+        at(u + du, t0), at(u + skew + du, (t0 + t1) / 2), at(u + skew * 0.4 + du, t1),
+      ];
+      g.lineStyle(1.5, mix(shade(face, -0.5), 0x2b2822, 0.45), 0.5);
+      g.strokePoints(path(0), false, false);
+      g.lineStyle(1, shade(face, 0.2), 0.35);
+      g.strokePoints(path(0.045), false, false);
+    }
+
+    // ONE RECESS. A face built only out of value *bands* has no events on it —
+    // it is a gradient with stripes, and the eye finds nothing to land on. A
+    // single dark wedge where the rock has broken back under an overhang does
+    // more than three more strata would, because it is the only place on the
+    // face where the surface is not the surface. The lit lip above it is half
+    // the effect: a hole with a bright edge over it reads as depth, a hole
+    // without one reads as a stain.
+    //
+    // It is a WEDGE, and the first attempt at it was a rectangle with a bright
+    // line over the top. That is a window. Four-sided, level, evenly lit and
+    // sitting a third of the way up a wall — the eye had no choice, and every
+    // cliff in the game grew a row of little doors. A hollow in rock tapers.
+    {
+      const u = rng.range(0.16, 0.6);
+      const t = rng.range(0.3, 0.62);
+      const w0 = rng.range(0.16, 0.3);
+      const h0 = rng.range(0.1, 0.18);
+      g.fillStyle(mix(shade(face, -0.5), OUT, 0.25), 0.5);
+      g.fillPoints([
+        at(u, t + h0), at(u + w0 * 0.55, t + h0 * 1.1), at(u + w0, t + h0 * 0.2),
+        at(u + w0 * 0.5, t - h0 * 0.25),
+      ], true, true);
+      g.lineStyle(1.2, mix(shade(face, 0.3), RIM, 0.25), 0.42);
       g.beginPath();
-      g.moveTo(a.x + (b.x - a.x) * cut, y0 + (y1 - y0) * cut);
-      g.lineTo(b.x, y1);
-      g.strokePath();
-      g.lineStyle(1, shade(face, 0.24), 0.6);
-      g.beginPath();
-      g.moveTo(a.x + (b.x - a.x) * cut, y0 - 1.7 + (y1 - y0) * cut);
-      g.lineTo(b.x, y1 - 1.7);
+      g.moveTo(at(u + w0 * 0.1, t + h0 * 1.05).x, at(u + w0 * 0.1, t + h0 * 1.05).y);
+      g.lineTo(at(u + w0 * 0.62, t + h0 * 1.2).x, at(u + w0 * 0.62, t + h0 * 1.2).y);
       g.strokePath();
     }
-    // A vertical fracture — but only on one variant in three. Give every tile
-    // one and the fractures line up into a seam at every tile boundary, which
-    // is the block-wall look this whole design is trying to avoid; give a third
-    // of them one and the same mark reads as weathering.
-    if (v === 2) {
-      const fx = a.x + (b.x - a.x) * 0.42;
-      const fy = a.y + (b.y - a.y) * 0.42;
-      g.lineStyle(1.5, 0x2b2822, 0.55);
+
+    // SCREE. The old version put one or two 13px boulders on the base line of
+    // every face, at positions fixed by `v`, and the result along a ridge was a
+    // row of identical dark bumps — a scalloped skirt, or the feet of a
+    // caterpillar track. What a cliff actually has at its foot is talus: rock
+    // that came off the face, piling *against* it, small and many and unequal.
+    // So the chips are drawn mostly above the base line rather than sitting on
+    // it, sized over a 3x range, and only two or three of them get big enough
+    // to carry a highlight.
+    //
+    // They also cluster. Talus does not distribute itself evenly along a cliff;
+    // it piles where the face has shed, so the chips are drawn around one or two
+    // seed points rather than at independent random positions. Evenly spread,
+    // even at random sizes, they come out as a row of bumps — a scalloped skirt
+    // — and that is what the previous version's fixed boulders looked like along
+    // a ridge.
+    for (let c = 0, heaps = rng.int(1, 2); c < heaps; c++) {
+      const u0 = rng.range(0.12, 0.88);
+      for (let k = 0, n = rng.int(3, 5); k < n; k++) {
+        const u = u0 + rng.range(-0.16, 0.16);
+        const t = rng.range(0.012, 0.12);
+        const r = rng.range(1.8, 5.2);
+        const p = at(u, t);
+        // A thinner ring of ink than a unit gets. Half a dozen chips each with
+        // a full-weight outline pile up into one black smear at the foot of the
+        // cliff, which reads as the rock standing in mud.
+        g.fillStyle(OUT, 0.55);
+        g.fillEllipse(p.x, p.y + 0.6, r * 2.2 + 1.4, r * 1.5 + 1.4);
+        g.fillStyle(shade(face, rng.range(-0.24, -0.02)), 1);
+        g.fillEllipse(p.x, p.y, r * 2.2, r * 1.5);
+        if (r > 3.6) {
+          // Catchlight up-and-right, like every other solid in this file.
+          g.fillStyle(shade(face, 0.16), 0.9);
+          g.fillEllipse(p.x + r * 0.4, p.y - r * 0.35, r * 1.1, r * 0.55);
+        }
+      }
+    }
+
+    // THE RIM.
+    //
+    // The top two or three pixels of a rock face are the whole reason a cliff
+    // reads as a solid rather than as a shape cut out of paper. That strip is
+    // the silhouette against the sky: it takes the sun almost edge-on, it takes
+    // the entire dome of skylight, and it is where the ground's own warm bounce
+    // arrives from below. Every other object in this file got one in the last
+    // pass and the cliffs — the biggest solids on the map — got nothing.
+    //
+    // It is drawn HERE, on the face, and not on the plateau edge, which is the
+    // mistake worth recording: the plateau polygon's boundary *is* the top of
+    // the face, so a highlight painted along it lands on the horizontal plane,
+    // where it reads as a bright hem on a tablecloth. Two pixels lower it lands
+    // on the vertical plane and reads as light catching an edge. Same line, two
+    // pixels apart, completely different picture. The sunward face gets the warm
+    // one at full strength; the shaded face still faces the sky even though it
+    // has turned away from the sun, so it gets a narrower, cooler version.
+    const r0 = at(0, 1);
+    const r1 = at(1, 1);
+    if (sunward) {
+      rimLine(g, r0.x, r0.y + 2.4, r1.x, r1.y + 2.4, 1.8, 0.55);
+    } else {
+      g.lineStyle(1.4, mix(RIM, SKY, 0.6), 0.32);
       g.beginPath();
-      g.moveTo(fx, fy);
-      g.lineTo(fx + 2.5, fy - CLIFF_H * 0.72);
+      g.moveTo(r0.x, r0.y + 2.2);
+      g.lineTo(r1.x, r1.y + 2.2);
       g.strokePath();
     }
-    // Loose boulders at the base, again not on every tile.
-    for (let k = 0; k < (v === 1 ? 2 : 1); k++) {
-      const t = 0.26 + k * 0.4 + v * 0.12;
-      const bx = a.x + (b.x - a.x) * t;
-      const by = a.y + (b.y - a.y) * t;
-      g.fillStyle(OUT, 0.9);
-      g.fillEllipse(bx, by + 1, 13, 7.5);
-      g.fillStyle(shade(face, -0.1), 1);
-      g.fillEllipse(bx, by, 11, 6);
-      g.fillStyle(shade(face, 0.2), 1);
-      g.fillEllipse(bx + 1.6, by - 1.4, 6, 3);
-    }
+
     // The exposed silhouette: the ground line always, the two vertical corners
     // only where this face actually ends. The top edge is left to the plateau,
     // which draws it once.
-    g.lineStyle(2.2, OUT, 1);
-    g.beginPath();
-    g.moveTo(a.x, a.y);
-    g.lineTo(b.x, b.y);
-    g.strokePath();
-    if (capA) {
-      g.beginPath();
-      g.moveTo(up(a).x, up(a).y);
-      g.lineTo(a.x, a.y);
-      g.strokePath();
+    outline(g, false, 2.2);
+    roughLine(g, a, b, 1.3, rng, 5);
+    for (const [c, on] of [[a, capA], [b, capB]]) {
+      if (!on) continue;
+      roughLine(g, up(c), c, 1.2, rng, 4);
     }
-    if (capB) {
-      g.beginPath();
-      g.moveTo(up(b).x, up(b).y);
-      g.lineTo(b.x, b.y);
-      g.strokePath();
+    // A corner that is a hard black line on both sides is a folded piece of
+    // card. The sunward face gets a warm bounce down its own vertical edges,
+    // just inside the ink, so the turn reads as a turn.
+    if (sunward) {
+      for (const [c, on] of [[a, capA], [b, capB]]) {
+        if (!on) continue;
+        rimLine(g, c.x - 1, c.y - 1.5, up(c).x - 1, up(c).y + 1, 1.4, 0.28);
+      }
     }
   };
 
@@ -6860,40 +7623,149 @@ function drawCliff(g, cx, cy, hw, hh, mask, v, rng) {
   // is lit evenly whatever angle the sun is at, and shading the northern half of
   // each tile — which is what this used to do — stamps a visible chevron into
   // every diamond and turns a plateau into a tiled floor.
+  //
+  // "Unshaded" is not the same as "unmarked", though, and that is where the old
+  // plateau went wrong: one flat fill with nine speckle ellipses on it is a
+  // sheet of grey card with dust on it. What goes on instead is the same three
+  // layers the ground tiles use — a slow swell far larger than the tile, then
+  // marks, then incident — none of which respects the diamond.
   g.fillStyle(CLIFF_TOP, 1);
   g.fillPoints(top, true, true);
-  for (let k = 0; k < 9; k++) {
-    const p = inDiamond(rng, TILE_W, TILE_H, 0.22);
-    const moss = rng.chance(0.45);
-    g.fillStyle(moss ? 0x6a7a44 : shade(CLIFF_TOP, rng.chance(0.5) ? -0.22 : 0.18), 0.55);
-    g.fillEllipse(cx - hw + p.x, cy - CLIFF_H - hh + p.y, rng.range(4, 11), rng.range(2, 5));
+  swell(g, TILE_W, TILE_H, CLIFF_TOP, v * 3 + (mask & 3), 0.06);
+
+  // CLINTS. Weathered bedrock breaks into big flat slabs with joints between
+  // them, and slabs are the largest shape available on a plane that is not
+  // allowed to be shaded. Two or three per tile, each a quadrilateral of nudged
+  // value with a dark joint down one side and a hairline catch on the other,
+  // drawn oversized and clipped by nothing — they run off the diamond, which is
+  // the point. A mark that stops inside the tile draws the tile.
+  for (let k = 0, n = rng.int(2, 3); k < n; k++) {
+    const p = inDiamond(rng, TILE_W, TILE_H, -0.15);
+    const w0 = rng.range(16, 30);
+    const h0 = rng.range(7, 14);
+    const sk = rng.range(-0.5, 0.5);
+    const q = [
+      { x: tx + p.x - w0 / 2, y: ty + p.y - h0 / 2 + sk * 3 },
+      { x: tx + p.x + w0 / 2, y: ty + p.y - h0 / 2 - sk * 3 },
+      { x: tx + p.x + w0 / 2 + sk * 4, y: ty + p.y + h0 / 2 },
+      { x: tx + p.x - w0 / 2 + sk * 2, y: ty + p.y + h0 / 2 + sk * 2 },
+    ];
+    g.fillStyle(shade(CLIFF_TOP, rng.chance(0.5) ? 0.09 : -0.1), 0.55);
+    g.fillPoints(q, true, true);
+    g.lineStyle(1.2, shade(CLIFF_TOP, -0.38), 0.5);
+    g.beginPath();
+    g.moveTo(q[3].x, q[3].y);
+    g.lineTo(q[2].x, q[2].y);
+    g.lineTo(q[1].x, q[1].y);
+    g.strokePath();
+    g.lineStyle(1, shade(CLIFF_TOP, 0.2), 0.4);
+    g.beginPath();
+    g.moveTo(q[0].x, q[0].y);
+    g.lineTo(q[1].x, q[1].y);
+    g.strokePath();
+  }
+
+  // SOIL AND LICHEN, and this is the part that does the most work of anything
+  // in the function.
+  //
+  // For a big outcrop nearly every tile the player sees is plateau — the faces
+  // are one tile deep round the edge and the top is all the rest — so whatever
+  // the top does is what a cliff looks like from across the map. One flat fill
+  // with nine speckles on it is a concrete slab however good the faces are, and
+  // that is what a third of the screen was. What breaks it is not more noise; it
+  // is the map's own colours arriving on the rock: turf caught in the hollows
+  // and iron-brown staining where water runs off. Coverage is deliberately high
+  // — call it a quarter of the tile — because at a quarter it reads as an
+  // outcrop weathering into a grassland, and at a tenth it reads as dirt on a
+  // clean surface.
+  for (let k = 0, n = rng.int(3, 5); k < n; k++) {
+    const p = inDiamond(rng, TILE_W, TILE_H, 0.02);
+    const soil = rng.chance(0.38);
+    const col = rng.pick(soil ? CLIFF_SOIL : CLIFF_MOSS);
+    const s = rng.range(0.7, 1.35);
+    for (let j = 0; j < 4; j++) {
+      g.fillStyle(col, rng.range(0.22, soil ? 0.34 : 0.52));
+      g.fillEllipse(tx + p.x + rng.range(-7, 7) * s, ty + p.y + rng.range(-3.5, 3.5) * s,
+        rng.range(9, 20) * s, rng.range(4, 9) * s);
+    }
+    // A few blades standing up out of the turf, drawn exactly the way the grass
+    // tiles draw theirs — dark stroke, paler stroke a hair to the right. Three
+    // of these on a patch of green is the difference between "lichen stain" and
+    // "something is growing here", and something growing on the rock is the last
+    // step of tying it to the map. Sparse on purpose: a plateau the player can
+    // mistake for walkable grass is a worse bug than a plateau that is dull.
+    if (soil) continue;
+    for (let j = 0, m = rng.int(2, 4); j < m; j++) {
+      const bx = tx + p.x + rng.range(-8, 8) * s;
+      const by = ty + p.y + rng.range(-3, 3) * s;
+      const lean = rng.range(-1.4, 1.4);
+      g.lineStyle(1, shade(col, -0.3), 0.6);
+      g.beginPath();
+      g.moveTo(bx, by + 1);
+      g.lineTo(bx + lean, by - 3.2);
+      g.strokePath();
+      g.lineStyle(1, shade(col, 0.3), 0.55);
+      g.beginPath();
+      g.moveTo(bx + 0.7, by + 0.6);
+      g.lineTo(bx + lean + 0.7, by - 2.7);
+      g.strokePath();
+    }
+  }
+  // Loose stones lying on the shelf, each with its own tiny sunward catchlight.
+  // Three pixels of highlight on a five-pixel pebble is what stops the top plane
+  // being a plane.
+  for (let k = 0, n = rng.int(2, 4); k < n; k++) {
+    const p = inDiamond(rng, TILE_W, TILE_H, 0.26);
+    const r = rng.range(1.8, 3.6);
+    g.fillStyle(shade(CLIFF_TOP, -0.34), 0.7);
+    g.fillEllipse(tx + p.x, ty + p.y + 0.7, r * 2.4, r * 1.5);
+    g.fillStyle(shade(CLIFF_TOP, -0.06), 1);
+    g.fillEllipse(tx + p.x, ty + p.y, r * 2.2, r * 1.3);
+    g.fillStyle(mix(shade(CLIFF_TOP, 0.2), RIM, 0.2), 1);
+    g.fillEllipse(tx + p.x + r * 0.4, ty + p.y - r * 0.35, r * 1, r * 0.55);
   }
 
   // Outline only the edges that face open air, and put a broken lip on them so
   // the rim is rock rather than a drawn line.
+  //
+  // `brink` marks the two edges that actually have a drop under them — the tops
+  // of the two drawn faces. Those get a narrow pale strip just inside the ink:
+  // rock at a break is freshly exposed and has not weathered down to the colour
+  // of the shelf behind it. The warm highlight that belongs to those edges is
+  // NOT here; it is two pixels lower, on the face, drawn by wall(). See the note
+  // there — it is the difference between light catching an edge and a bright hem
+  // sewn onto a tablecloth.
   const edges = [
-    [up(E), up(S), mask & 1],
-    [up(S), up(W), mask & 2],
-    [up(W), up(N), mask & 4],
-    [up(N), up(E), mask & 8],
+    [up(E), up(S), mask & 1, 1],
+    [up(S), up(W), mask & 2, 1],
+    [up(W), up(N), mask & 4, 0],
+    [up(N), up(E), mask & 8, 0],
   ];
-  for (const [a, b, joined] of edges) {
+  for (const [a, b, joined, brink] of edges) {
     if (joined) continue;
+    if (brink) {
+      const inx = (cx - (a.x + b.x) / 2) * 0.085;
+      const iny = (cy - CLIFF_H - (a.y + b.y) / 2) * 0.085;
+      g.fillStyle(shade(CLIFF_TOP, 0.12), 0.6);
+      g.fillPoints([a, b, { x: b.x + inx, y: b.y + iny }, { x: a.x + inx, y: a.y + iny }],
+        true, true);
+    }
     g.lineStyle(2.4, OUT, 1);
-    g.beginPath();
-    g.moveTo(a.x, a.y);
-    g.lineTo(b.x, b.y);
-    g.strokePath();
+    roughLine(g, a, b, 1.15, rng, 5);
     // Chips knocked out of the rim, drawn inward so neighbouring tiles still
-    // meet exactly at the shared corners.
-    for (let k = 0; k < 3; k++) {
-      const t = 0.18 + k * 0.3;
+    // meet exactly at the shared corners. Sizes and positions now come off the
+    // rng: three evenly spaced identical triangles per edge scalloped every
+    // plateau in the game into the same pinking-shear zigzag.
+    for (let k = 0, n = rng.int(2, 4); k < n; k++) {
+      const t = rng.range(0.1, 0.82);
+      const d = rng.range(0.1, 0.2);
       const px = a.x + (b.x - a.x) * t;
       const py = a.y + (b.y - a.y) * t;
-      const inx = (cx - px) * 0.12;
-      const iny = (cy - CLIFF_H - py) * 0.12;
-      g.fillStyle(shade(CLIFF_TOP, 0.2), 1);
-      g.fillTriangle(px, py, px + inx * 2, py + iny * 2, px + (b.x - a.x) * 0.16, py + (b.y - a.y) * 0.16);
+      const inx = (cx - px) * rng.range(0.07, 0.15);
+      const iny = (cy - CLIFF_H - py) * rng.range(0.07, 0.15);
+      g.fillStyle(shade(CLIFF_TOP, rng.range(0.1, 0.26)), 1);
+      g.fillTriangle(px, py, px + inx * 2, py + iny * 2,
+        px + (b.x - a.x) * d, py + (b.y - a.y) * d);
     }
   }
 }

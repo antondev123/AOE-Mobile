@@ -600,31 +600,33 @@ body {
   animation: toastin 160ms ease-out;
 }
 .toast.warn { border-left-color: var(--danger); color: #ffd9d1; }
-/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
-   The exit is a 260ms fade, and for those 260ms the box kept its full height in
-   the flex column — so a stack the HUD believes is two lines tall is briefly
-   four, and the stack sits over the top-left of the map, which is where the
-   player's own base usually is. Measured at 176px against a 96px contract.
-   Collapsing max-height alongside the fade keeps the animation and gives the
-   map back on the frame the toast is retired; the 120px start is simply larger
-   than any toast this stack holds (the alert, the tallest, is 54). */
-/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
-   The exit is a 260ms fade, and for those 260ms the box kept its full place in
-   the flex column — so a stack the HUD believes is two lines tall is really
-   three or four, over the top-left of the map, which is where the player's own
-   base usually is. Measured at 176px against the 96px this stack is allowed.
+/* A TOAST ON ITS WAY OUT MUST NEVER PAINT OVER THE ONE THAT REPLACED IT.
+   This rule used to read `position: absolute; left: 0; right: 0`, on the theory
+   that leaving the flow would let the survivors slide up at once while the
+   retired line faded "exactly where it was". It does not fade where it was. The
+   static position of an absolutely positioned child of a FLEX CONTAINER is the
+   container's own content-box corner — the flex algorithm never ran for it — so
+   every retiring toast jumped to the TOP of the stack and spent its whole exit
+   painted across whatever was now sitting there.
 
-   Taking it out of flow rather than collapsing its height is what keeps the
-   animation honest: an animated max-height gives the space back gradually,
-   which is no good to a test or to a player who is looking at the map *now*.
-   Out of flow, the survivors slide up immediately and the retired line fades
-   over them, which is what a crossfade looks like anyway. It keeps its static
-   position, so it fades exactly where it was. */
+   That is the defect a whole-game review put first: three coaching sentences in
+   700-weight parchment, all reporting y≈48 on a 390x844 phone, 41px of mutual
+   overlap, unreadable. It only shows up when the picture is taken during those
+   260ms, so it read as intermittent and got blamed on whatever changed last.
+
+   In flow, collapsing, is the version that cannot do that. Overlap is
+   impossible by construction: the box is still a flex item, so the ones under
+   it are laid out below it for as long as it exists, and it exists for 200ms
+   while its height runs to zero. The space does come back over 200ms rather
+   than on the frame — the honest cost of the fix, and the reason the exit is
+   200ms rather than 260 — but the alternative is not "the space back sooner",
+   it is "the space back sooner and three sentences in the same box".
+
+   --toast-h is measured and set by killToast, because max-height has no `auto`
+   to animate from and this stack holds boxes from one line to three. */
 .toast.out {
-  animation: toastout 260ms ease-in forwards;
-  position: absolute;
-  left: 0;
-  right: 0;
+  animation: toastout 200ms ease-in forwards;
+  overflow: hidden;
   pointer-events: none;
 }
 /* A TOAST MUST NOT ARRIVE FROM OFF THE SCREEN.
@@ -639,7 +641,32 @@ body {
    the stack hangs anyway and where the player is already looking after an
    action. Every pixel of the travel is inside the screen. */
 @keyframes toastin  { from { opacity: 0; transform: translateY(-6px) scale(0.97); } }
-@keyframes toastout { to   { opacity: 0; transform: translateY(-8px); } }
+/* Opacity goes first and height follows, so the line is unreadable well before
+   the box has finished shrinking — a half-height box with half a sentence in it
+   is the thing this whole section exists to avoid. Everything that contributes
+   height is animated, not just max-height: padding and border are 10px of the
+   41px a one-line toast occupies, and leaving them behind ends the run on a
+   visible 10px sliver. */
+@keyframes toastout {
+  from {
+    opacity: 1;
+    max-height: var(--toast-h, 120px);
+  }
+  60% {
+    opacity: 0;
+  }
+  to {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-width: 0;
+    border-bottom-width: 0;
+    /* Eats the column's 4px gap on the way out, so the survivors do not sit in
+       a hole for the length of the animation. */
+    margin-bottom: -4px;
+  }
+}
 
 /* The under-attack alert. Nothing about it reads like a routine toast: the
    others are parchment on dark wood and sit still, this one is red, bigger,
@@ -725,8 +752,10 @@ body {
   letter-spacing: 0.2px;
 }
 .toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
-/* The shared exit animation must still win when the toast is retired. */
-.toast.alert.out { animation: toastout 260ms ease-in forwards; }
+/* The shared exit animation must still win when the toast is retired — the
+   alert's own entrance and pulse would otherwise go on running under it. Same
+   200ms as everything else in the stack: see .toast.out. */
+.toast.alert.out { animation: toastout 200ms ease-in forwards; }
 /* Same rule as toastin above, and it matters more here: the alert is the one
    toast that goes full width, so a leftward entrance put a 344px box six
    pixels off the edge of a 360px phone. */
@@ -1663,10 +1692,26 @@ body {
 
 /* --- Build menu sheet -------------------------------------------------------- */
 
+/* A GRID, NOT A WRAP.
+   This was `display: flex; flex-wrap: wrap` with `flex: 1 1 0` on the buttons,
+   which is the layout you write when you want "as many per row as fit" and it
+   is not what a catalogue wants. Flex sizes each row on its own, so the row's
+   button count decided the button width: measured at 390x844 the five shelves
+   came out 4, 5, 2, 5 and 4 across, at 86, 68, 178, 68 and 86px. The Blacksmith
+   and the Market, alone on their row, were 178px wide — twice the width of the
+   House — which reads as emphasis nobody meant, and a review read the whole
+   sheet as "flex-wrap, not a designed grid" because that is exactly what it was.
+
+   Four fixed columns fixes it by construction: every cell in the sheet is the
+   same width whatever row it lands in, rows line up down the sheet, and a shelf
+   with seven buildings in it ends with a short row instead of stretching three
+   of them. Four rather than three or five because 4 x 85px on a 390px phone is
+   the widest cell that still fits "Lumber Camp" on two lines without either
+   shrinking the type or spilling the shelves down the screen. */
 .build-menu {
   padding: 7px;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   align-items: stretch;
   background: var(--panel);

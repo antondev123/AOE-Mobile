@@ -39,7 +39,7 @@ const shot = (page, name) => page.screenshot({ path: path.join(SHOT_DIR, `${name
  * caption under each. Returns the canvas size so the caller can screenshot the
  * element rather than the viewport.
  */
-const SHEET = ({ frames, cols, scale, bg, label }) => {
+const SHEET = ({ frames, cols, scale, bg, label, grass, smooth, captions = true }) => {
   const game = window.__phaser;
   const tex = game.textures.get('aoe-gfx');
   const src = tex.getSourceImage();
@@ -48,7 +48,7 @@ const SHEET = ({ frames, cols, scale, bg, label }) => {
     return fr ? { name: f, x: fr.cutX, y: fr.cutY, w: fr.width, h: fr.height } : null;
   });
   const cw = Math.max(...cells.map((c) => (c ? c.w : 10))) * scale + 12;
-  const ch = Math.max(...cells.map((c) => (c ? c.h : 10))) * scale + 26;
+  const ch = Math.max(...cells.map((c) => (c ? c.h : 10))) * scale + (captions ? 26 : 8);
   const rows = Math.ceil(cells.length / cols);
   let cv = document.getElementById('__sheet');
   if (cv) cv.remove();
@@ -59,9 +59,26 @@ const SHEET = ({ frames, cols, scale, bg, label }) => {
   cv.style.cssText = 'position:fixed;left:0;top:0;z-index:99999;background:' + bg;
   document.body.appendChild(cv);
   const c = cv.getContext('2d');
-  c.imageSmoothingEnabled = false;
+  // Nearest-neighbour is right for a pose sheet blown up to 2x — it shows the
+  // packed pixels. It is WRONG for a sheet drawn at play scale, which is a
+  // minification the GPU does with a linear filter; nearest there invents
+  // aliasing the player never sees and hides detail the player does.
+  c.imageSmoothingEnabled = !!smooth;
   c.fillStyle = bg;
   c.fillRect(0, 0, cv.width, cv.height);
+  if (grass) {
+    // The real ground, not a flat green. A unit's readability is a contrast
+    // question and the answer changes completely between "on a swatch" and "on
+    // eleven variants of mottled grass with the game's own light on them".
+    const gt = Object.keys(tex.frames).filter((n) => /^t0_\d+$/.test(n));
+    for (let y = 0, r = 0; y < cv.height; y += 17, r++) {
+      for (let x = 0, k = 0; x < cv.width + 66; x += 66, k++) {
+        const fr = tex.frames[gt[(r * 7 + k * 3) % gt.length]];
+        c.drawImage(src, fr.cutX, fr.cutY, fr.width, fr.height,
+          x - (r % 2 ? 33 : 0), y - 17, fr.width, fr.height);
+      }
+    }
+  }
   c.font = '12px system-ui, sans-serif';
   c.fillStyle = '#fff';
   c.fillText(label, 6, 15);
@@ -75,9 +92,10 @@ const SHEET = ({ frames, cols, scale, bg, label }) => {
     }
     c.drawImage(
       src, cell.x, cell.y, cell.w, cell.h,
-      gx + (cw - cell.w * scale) / 2, gy + (ch - 20 - cell.h * scale) / 2,
+      gx + (cw - cell.w * scale) / 2, gy + (ch - (captions ? 20 : 4) - cell.h * scale) / 2,
       cell.w * scale, cell.h * scale,
     );
+    if (!captions) return;
     c.fillStyle = '#cbb';
     c.fillText(cell.name.replace(/^u_/, '').replace(/_0_/, ' '), gx + 4, gy + ch - 6);
   });
@@ -181,6 +199,86 @@ const run = async () => {
       `${atlas.empty} blank: ${atlas.blank.join(', ')}`);
     check('the atlas is one texture', atlas.w === atlas.h && atlas.w <= 2048, `${atlas.w}px`);
 
+    // --- 1b. the team-colour budget ------------------------------------------
+    //
+    // A whole-game review failed this art on one sentence: "team colour has
+    // eaten the units". Six of the ten combat types were blue lumps, the tell
+    // being that the monk — the one unit not painted in team colour — was the
+    // only one anybody could name at play zoom. That is a *measurable* claim,
+    // and this is the measurement.
+    //
+    // HOW IT IS MEASURED. Team colour is exactly the set of pixels that change
+    // when the same drawing is baked for a different player, so the two frames
+    // are XORed: pixels that differ between player 0's and player 1's copy are
+    // team colour, and pixels that agree are the unit's own materials. No hue
+    // matching, no threshold on "blueness", nothing to tune — and it cannot be
+    // fooled by a unit whose livery happens to be near the grass colour.
+    //
+    // THE NUMBER. Team colour must be an accent — a plume, a shield face, a
+    // pennon, a painted panel — not a paint job. 25% is the ceiling rather than
+    // the target: the brief was "under ~20% of the sprite", and 25 leaves room
+    // for the shield-carriers, whose one legitimately large flat colour field
+    // is the thing that identifies them.
+    //
+    // THE FLOOR MATTERS TOO, and it is the half of this that the old art got
+    // wrong in the other direction: the siege engines carried a 12-pixel
+    // pennant and nothing else, so in a mixed siege line you could not tell
+    // whose mangonel was about to hit your Town Center. Anything that can be
+    // owned has to be identifiable as owned, so 3% is the floor.
+    const budgetOf = async (frames) => page.evaluate((names) => {
+      const tex = window.__phaser.textures.get('aoe-gfx');
+      const img = tex.getSourceImage();
+      const cv = document.createElement('canvas');
+      cv.width = img.width;
+      cv.height = img.height;
+      const c = cv.getContext('2d', { willReadFrequently: true });
+      c.drawImage(img, 0, 0);
+      const out = {};
+      for (const [key, a, b] of names) {
+        const fa = tex.frames[a];
+        const fb = tex.frames[b];
+        if (!fa || !fb) { out[key] = null; continue; }
+        const da = c.getImageData(fa.cutX, fa.cutY, fa.width, fa.height).data;
+        const db = c.getImageData(fb.cutX, fb.cutY, fb.width, fb.height).data;
+        let opaque = 0;
+        let team = 0;
+        for (let i = 0; i < da.length; i += 4) {
+          if (da[i + 3] < 24) continue;
+          opaque++;
+          // A generous tolerance: antialiased edges of a team-coloured shape
+          // differ by a point or two between the two bakes and are not the
+          // thing being counted.
+          if (Math.abs(da[i] - db[i]) + Math.abs(da[i + 1] - db[i + 1])
+            + Math.abs(da[i + 2] - db[i + 2]) > 24) team++;
+        }
+        out[key] = { opaque, team, frac: opaque ? team / opaque : 0 };
+      }
+      return out;
+    }, frames);
+
+    const COMBAT = ['militia', 'spearman', 'skirmisher', 'archer', 'monk',
+      'scout', 'knight', 'ram', 'mangonel', 'scorpion'];
+    const unitBudget = await budgetOf(
+      COMBAT.map((t) => [t, `u_${t}_0_f_i`, `u_${t}_1_f_i`]));
+    const over = [];
+    const under = [];
+    const line = [];
+    for (const t of COMBAT) {
+      const b = unitBudget[t];
+      if (!b) continue;
+      line.push(`${t} ${(b.frac * 100).toFixed(0)}%`);
+      // The monk is exempt at the bottom end and always was: a unit that has to
+      // read as a non-combatant from its outline alone cannot afford a plume,
+      // and its one stole is deliberately the smallest livery in the game.
+      if (b.frac > 0.25) over.push(`${t} ${(b.frac * 100).toFixed(0)}%`);
+      if (b.frac < 0.03 && t !== 'monk') under.push(`${t} ${(b.frac * 100).toFixed(0)}%`);
+    }
+    console.log(`\n  team colour per unit: ${line.join(', ')}`);
+    check('team colour is an accent on every unit, not a paint job',
+      over.length === 0, `over 25%: ${over.join(', ')}`);
+    check('every unit carries enough team colour to own it',
+      under.length === 0, `under 3%: ${under.join(', ')}`);
+
     // --- 2. unit pose sheets -------------------------------------------------
     if (want('poses')) {
       // Must track UNIT_POSES in textures.js. The walk is six drawings for
@@ -216,6 +314,105 @@ const run = async () => {
       }
       await page.evaluate(CLEAR_SHEET);
       console.log(`  wrote pose sheets for ${Object.keys(sets).length} unit types`);
+    }
+
+    // --- 2b. THE ROSTER SHEET ------------------------------------------------
+    //
+    // The single picture this whole art pass is judged against: one of each of
+    // the ten combat types, side by side, both drawn facings, on real grass, at
+    // the size a player actually sees them.
+    //
+    // WHAT "AT PLAY SIZE" MEANS HERE. The game is played on a 390x844 phone at
+    // camera zoom 0.7, and the screenshots come off a deviceScaleFactor-2
+    // display — so one texture pixel lands on 1.4 device pixels, and 1.4 is the
+    // scale this sheet blits at. It is minification-ish, so the canvas is left
+    // smoothing (the GPU filters too); a nearest-neighbour blow-up would be a
+    // picture of the atlas rather than a picture of the game.
+    //
+    // Three rows, and each one answers a different question. Row 1 is the front
+    // drawing for the blue player: can you name the unit? Row 2 is the back
+    // drawing: is it a different picture at all, or has somebody ignored the
+    // `back` flag? Row 3 is the same ten in the red player's colours: has team
+    // colour eaten the unit, so that all ten read as "a red thing"?
+    //
+    // The rule this sheet enforces is the one from the review that failed the
+    // game: if you cannot name every column without reading the caption, the
+    // art is not done. There is no assertion for that and there cannot be —
+    // this is a file you LOOK at.
+    if (want('roster')) {
+      const COMBAT = ['militia', 'spearman', 'skirmisher', 'archer', 'monk',
+        'scout', 'knight', 'ram', 'mangonel', 'scorpion'];
+      const frames = [];
+      for (const t of COMBAT) frames.push(`u_${t}_0_f_i`);
+      for (const t of COMBAT) frames.push(`u_${t}_0_b_i`);
+      for (const t of COMBAT) frames.push(`u_${t}_1_f_i`);
+      await page.evaluate(SHEET, {
+        frames, cols: COMBAT.length, scale: 1.4, bg: '#4a6b34', grass: true, smooth: true,
+        label: 'the ten combat types at play size (zoom 0.7 on a 2x phone) — '
+          + 'blue front, blue back, red front',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-roster-070.png'),
+      });
+      // The same ten at 3x with no filtering, for reading what a shape is
+      // actually made of once the 1.4x sheet has said it is unreadable.
+      await page.evaluate(SHEET, {
+        frames: frames.slice(0, COMBAT.length * 2), cols: COMBAT.length, scale: 3,
+        bg: '#3f5a2e', label: 'the ten combat types at 3x — front row, back row',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-roster-3x.png'),
+      });
+      // The attack pose as well: half of what identifies a unit is what it does
+      // with its weapon, and 'i' hides the mangonel's throw and the archer's
+      // draw entirely.
+      const swing = [];
+      for (const t of COMBAT) swing.push(`u_${t}_0_f_${t === 'monk' ? 'h1' : 'a1'}`);
+      for (const t of COMBAT) swing.push(`u_${t}_0_f_${t === 'monk' ? 'h0' : 'a0'}`);
+      await page.evaluate(SHEET, {
+        frames: swing, cols: COMBAT.length, scale: 1.4, bg: '#4a6b34', grass: true, smooth: true,
+        label: 'the ten combat types mid-action at play size — follow-through, wind-up',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-roster-action.png'),
+      });
+      await page.evaluate(CLEAR_SHEET);
+      console.log('  wrote the roster sheets (10 combat types)');
+    }
+
+    // --- 2c. the things there are many of ------------------------------------
+    //
+    // A base has eight houses in it and a map has two thousand trees, and both
+    // of those were one drawing repeated. Repetition at that count is not a
+    // detail problem, it is the texture of the whole screen — so the variants
+    // get their own sheet, laid out so that the failure mode (all n columns
+    // identical) is impossible to miss.
+    if (want('variants')) {
+      const houses = [];
+      for (let v = 0; v < 4; v++) houses.push(`b_house${v ? v : ''}_0`);
+      for (let v = 0; v < 4; v++) houses.push(`b_house${v ? v : ''}_1`);
+      await page.evaluate(SHEET, {
+        frames: houses, cols: 4, scale: 1.4, bg: '#4a6b34', grass: true, smooth: true,
+        label: 'house variants at play size — blue, then red',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-variants-house.png'),
+      });
+      // However many tree variants there are — asked of the atlas rather than
+      // written down here, so this sheet keeps working the next time somebody
+      // adds one.
+      const trees = await page.evaluate(() => Object.keys(
+        window.__phaser.textures.get('aoe-gfx').frames,
+      ).filter((n) => /^r_tree_\d+$/.test(n)).sort());
+      await page.evaluate(SHEET, {
+        frames: trees, cols: trees.length, scale: 1.4, bg: '#4a6b34', grass: true,
+        smooth: true, label: `${trees.length} tree silhouettes at play size`,
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-variants-tree.png'),
+      });
+      await page.evaluate(CLEAR_SHEET);
+      console.log('  wrote the variant sheets (houses, trees)');
     }
 
     // --- 3. every unit on the ground, at the zoom the game actually uses -----
@@ -527,6 +724,33 @@ const run = async () => {
       check('the route round the ridge is longer than the straight line',
         route.len > route.direct * 1.2, `${route.len.toFixed(1)} tiles vs 8 direct`);
       console.log(`  ${n.count} cliff tiles drawn`);
+
+      // The cliff sheet: one tile at a time, blown up, on real grass.
+      //
+      // The map shot above is the honest test of whether an outcrop reads, and
+      // it is useless for working out *why* it does not. A ridge on the map is
+      // eight overlapping sprites with a depth sort through them, so a value
+      // that looks wrong there could be the face, the bed, the rim, the chip
+      // lip or the neighbour drawn on top of it. Here each frame stands alone.
+      //
+      // The masks chosen are the ones that show something different: 0 is a
+      // lone stack with both faces and all four corners, 1 and 2 are the middle
+      // of a run in each of the two grid directions (one face each), 3 is an
+      // interior tile that is nothing but plateau, and 12 is the outside corner
+      // where both faces are drawn and both cap. Three variants of each, so the
+      // repeat across a run is visible as a repeat.
+      await page.evaluate(SHEET, {
+        frames: [0, 1, 2].flatMap((v) => [0, 1, 2, 3, 12].map((m) => `cf_${v}_${m}`)),
+        cols: 5,
+        scale: 3,
+        bg: '#3f5a2e',
+        grass: true,
+        label: 'cliffs — variant x mask (0 lone, 1/2 mid-run, 3 interior, 12 corner)',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-cliff-frames.png'),
+      });
+      await page.evaluate(CLEAR_SHEET);
     }
 
     // --- 7. selection, rally, bars, damage -----------------------------------
