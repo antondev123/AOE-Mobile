@@ -995,11 +995,30 @@ function acquireRange(u, stance) {
   if (stance === STANCE.NO_ATTACK) return 0;
   const reach = (u.range || 0) + (u.radius || 0);
   if (stance === STANCE.STAND_GROUND) return reach + 1.0;
-  if (isAttackMoving(u)) return ENGAGE_RANGE;
   if (stance === STANCE.DEFENSIVE) {
     return Math.max(reach + 1.0, STANCE_LEASH[STANCE.DEFENSIVE]);
   }
-  return u.task ? AGGRO_RANGE : ENGAGE_RANGE;
+  // NEVER SCAN LESS FAR THAN YOU CAN SHOOT.
+  //
+  // The two passive stances above have always taken `reach + 1.0` as a floor;
+  // the aggressive and attack-move cases returned a flat constant, which was
+  // right for every unit that existed when it was written — an archer reaches
+  // 4.5 + 0.32 and ENGAGE_RANGE is 7.5, so the constant was always the larger.
+  //
+  // Siege broke that. A mangonel reaches 7.0 + 0.46 + its target's radius, or
+  // 7.82 against a militia, which is *further than the scan*. That leaves a
+  // live band between 7.5 and 7.82 where the engine can hit something it will
+  // never look for, and it is not a theoretical band: measured, a mangonel that
+  // killed its ordered target went idle with seven more militia standing 7.52
+  // tiles away and never fired again for the rest of the match. Two hundred and
+  // ninety-five resources of siege engine, sat down 0.02 tiles outside its own
+  // attention span.
+  //
+  // A floor rather than a replacement, so nothing that used to scan 7.5 now
+  // scans less, and a unit parked mid-order still only spares AGGRO_RANGE for
+  // its surroundings unless its own weapon reaches further than that.
+  if (isAttackMoving(u)) return Math.max(reach + 1.0, ENGAGE_RANGE);
+  return Math.max(reach + 1.0, u.task ? AGGRO_RANGE : ENGAGE_RANGE);
 }
 
 function acquire(world, u, dt) {
