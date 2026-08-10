@@ -44,6 +44,13 @@ export function createWorld(seed = 12345) {
     terrain: new Uint8Array(MAP_W * MAP_H),
     // See BLOCK_* below: 0 walkable, 1 static object, 2 terrain, 3 closed gate.
     blocked: new Uint8Array(MAP_W * MAP_H),
+    // 1 where a rock outcrop stands. Written by mapgen's scatterCliffs, read by
+    // the renderer to pick the connected cliff sprite. It carries no
+    // passability of its own — the tiles are marked BLOCK_TERRAIN in `blocked`
+    // like water is, and every system that cares asks that grid. This one is
+    // purely "what does this tile look like", which is why the renderer can
+    // have it and the pathfinder never needs to know it exists.
+    cliff: new Uint8Array(MAP_W * MAP_H),
     // Entity id occupying each tile (0 = none). Lets units find what blocks them.
     occupant: new Int32Array(MAP_W * MAP_H),
     // Who owns the gate on each tile, as playerId + 1 (0 = no gate here). This

@@ -213,6 +213,12 @@ export function serializeGame(world, extra = {}) {
     width: world.width,
     height: world.height,
     terrain: bytesToB64(world.terrain),
+    // Rock outcrops. Stored rather than derived, and it is the one grid here
+    // that has to be: the terrain under a cliff is ordinary dirt, so there is
+    // nothing in `terrain` to reconstruct it from, and re-running mapgen to
+    // find out would regenerate the whole map. One byte per tile, the same
+    // 9216-byte cost the terrain already pays.
+    cliff: bytesToB64(world.cliff),
 
     players: world.players.map((p) => ({
       resources: { ...p.resources },
@@ -293,10 +299,22 @@ export function restoreGame(data) {
   if (terrain.length !== world.terrain.length) throw new Error('Save terrain is the wrong size');
   world.terrain.set(terrain);
 
-  // The block grid is derived, never stored: water from the terrain, everything
-  // else from the entities that are about to be put back on it.
+  // A save written before rock outcrops existed simply has no cliffs, which is
+  // a correct reading of it rather than a migration: that match was played on a
+  // map with none.
+  world.cliff.fill(0);
+  if (data.cliff) {
+    const cliff = b64ToBytes(data.cliff);
+    if (cliff.length !== world.cliff.length) throw new Error('Save cliff grid is the wrong size');
+    world.cliff.set(cliff);
+  }
+
+  // The block grid is derived, never stored: water from the terrain, the rock
+  // from the cliff grid, everything else from the entities that are about to be
+  // put back on it.
   for (let i = 0; i < world.terrain.length; i++) {
-    world.blocked[i] = world.terrain[i] === TERRAIN.WATER ? 2 : 0;
+    world.blocked[i] =
+      world.terrain[i] === TERRAIN.WATER || world.cliff[i] ? 2 : 0;
     world.occupant[i] = 0;
     world.gateOwner[i] = 0;
   }

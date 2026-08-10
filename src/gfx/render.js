@@ -73,6 +73,12 @@ const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa
 // player sees on the floor reads as a targeting error.
 const MARKER_SCALE = {
   militia: 1.12, spearman: 1.08, archer: 1.05, scout: 1.34, ram: 1.42,
+  // The new roster. A knight stands on more ground than a scout (it is a
+  // barded warhorse, not a pony), the two engines are wheeled and wide, and the
+  // skirmisher and the monk are ordinary men. A missing entry silently falls
+  // back to 1 — a villager-sized ring under a mangonel — which is why these are
+  // here rather than left to the default.
+  skirmisher: 1.05, knight: 1.44, mangonel: 1.5, scorpion: 1.38, monk: 1.02,
 };
 
 // Selection colours by relationship. Own units are the warm gold the HUD uses

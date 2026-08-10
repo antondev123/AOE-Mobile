@@ -7,7 +7,10 @@
 
 import { MAP_W, MAP_H, TERRAIN, PLAYER, ENEMY } from './constants.js';
 import { dirVec, DIR_COUNT } from './iso.js';
-import { spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop } from './world.js';
+import {
+  spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop,
+  setBlocked, BLOCK_TERRAIN,
+} from './world.js';
 import { commandUnits } from '../systems/unitAI.js';
 
 // Distance of each Town Center from its map corner.
@@ -32,6 +35,11 @@ export function generateMap(world) {
     { player: PLAYER, x: BASE_OFFSET, y: BASE_OFFSET },
     { player: ENEMY, x: MAP_W - BASE_OFFSET, y: MAP_H - BASE_OFFSET },
   ];
+
+  // Rock before anything that has to path around it: an outcrop that landed on
+  // top of a forest would have to evict trees, whereas trees placed afterwards
+  // simply do not choose a rock tile.
+  scatterCliffs(world, bases);
 
   // Scatter neutral forest across the middle before bases claim their ground,
   // then clear anything that would sit on top of a base.
@@ -285,6 +293,210 @@ function scatterBerries(world, bases) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
     placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, NEUTRAL_MIN_BASE_DIST);
+  }
+}
+
+// --- Rock outcrops ----------------------------------------------------------
+//
+// The map has been perfectly flat since it was written, and flatness is the
+// thing a screenshot of it shows first: a green sheet with objects standing on
+// it, no horizon, nothing to walk around. The art for the fix has been sitting
+// in the atlas the whole time — forty-eight cliff frames, sixteen neighbour
+// masks by three variants, baked at every boot — drawn by render.js's
+// drawCliffs() off `world.cliff`, a grid that nothing has ever written to. So
+// this is not new art and not a new renderer; it is the writer that was never
+// hooked up.
+//
+// WHAT A CLIFF IS, MECHANICALLY. Impassable terrain, exactly like water:
+// BLOCK_TERRAIN in the block grid, so A* routes around it, buildings refuse to
+// sit on it and walls cannot be drawn through it. There is no elevation model
+// and units do not climb — a cliff is a wall the map came with. That is the
+// whole feature, and it is deliberately the whole feature: real elevation would
+// mean height in the projection, ramps, and a pathfinder that knows about both.
+//
+// WHAT IT IS FOR. Ground you cannot walk over is what turns an open field into
+// a place with routes through it. A raid has to commit to one side of an
+// outcrop, an army can be met at the gap rather than in the open, and a wall
+// only has to cover the ground between two rocks instead of the whole frontage.
+//
+// COVERAGE. About 2.5% of the map, in a dozen-odd blobs. That number was picked
+// by looking at it: at 1% the rock reads as litter, and past 5% the map starts
+// feeling like a maze and the AI's approach paths get long enough to change the
+// pacing everything else is tuned around.
+const CLIFF_BLOBS = Math.max(6, Math.round(scaled(12)));
+// No rock within this many tiles of a Town Center. Fifteen clears the base, the
+// starting woodline and the near gold, so an outcrop can never be the reason an
+// opening does not work. The two bases are 85 tiles apart, so this costs the
+// middle of the map nothing.
+const CLIFF_MIN_BASE_DIST = 15;
+
+function scatterCliffs(world, bases) {
+  const { rng } = world;
+  const W = world.width;
+  const H = world.height;
+  // createWorld allocates it; a regenerated map must clear it rather than
+  // accumulate the last one's rock.
+  if (!world.cliff || world.cliff.length !== W * H) world.cliff = new Uint8Array(W * H);
+  else world.cliff.fill(0);
+
+  for (let i = 0; i < CLIFF_BLOBS; i++) {
+    // Four tiles in from the edge. A blob that touches the border would draw
+    // its faces against the out-of-bounds sea, which is not a picture the
+    // terrain bake is set up to make sense of.
+    const cx = rng.int(4, W - 5);
+    const cy = rng.int(4, H - 5);
+    growOutcrop(world, cx, cy, rng.int(5, 16), bases);
+  }
+
+  stampCliffTerrain(world);
+}
+
+/**
+ * Grow one outcrop from a seed tile by repeated random walk.
+ *
+ * A blob rather than a disc, and a walk rather than a radius, because a disc of
+ * rock in this projection is a diamond, and a map dotted with diamonds looks
+ * placed rather than eroded. Walking outward from a seed and claiming whatever
+ * it steps on gives the ragged, slightly linear shapes that read as a ridge.
+ *
+ * Every candidate tile is checked against the base exclusion, the map edge and
+ * the water, and then — the expensive one — against whether claiming it would
+ * cut the map in two. See cutsTheMap().
+ */
+function growOutcrop(world, cx, cy, size, bases) {
+  const { rng } = world;
+  let x = cx;
+  let y = cy;
+  for (let n = 0; n < size * 4 && n < 90; n++) {
+    if (claimable(world, x, y, bases) && !cutsTheMap(world, x, y, bases)) {
+      world.cliff[y * world.width + x] = 1;
+      setBlocked(world, x, y, BLOCK_TERRAIN);
+      size--;
+      if (size <= 0) return;
+    }
+    // A step of one tile on one axis. dirVec would give a smooth heading and
+    // this deliberately does not want one: four-way steps keep the blob on the
+    // grid the cliff mask is drawn from, so the faces meet cleanly.
+    const d = rng.int(0, 3);
+    x += d === 0 ? 1 : d === 1 ? -1 : 0;
+    y += d === 2 ? 1 : d === 3 ? -1 : 0;
+    if (x < 4 || y < 4 || x >= world.width - 4 || y >= world.height - 4) return;
+  }
+}
+
+/** May a cliff stand on this tile at all? Cheap tests only — see cutsTheMap. */
+function claimable(world, x, y, bases) {
+  if (!inBounds(world, x, y)) return false;
+  const i = y * world.width + x;
+  if (world.cliff[i]) return false;
+  // Water is already impassable and a cliff drawn into a lake would be a rock
+  // standing in the sea with no shoreline under it.
+  if (world.terrain[i] === TERRAIN.WATER) return false;
+  if (world.blocked[i] !== 0) return false;
+  for (const b of bases) {
+    const dx = x - b.x;
+    const dy = y - b.y;
+    if (dx * dx + dy * dy < CLIFF_MIN_BASE_DIST * CLIFF_MIN_BASE_DIST) return false;
+  }
+  return true;
+}
+
+/**
+ * Would blocking this tile disconnect the two bases?
+ *
+ * THIS CHECK IS NOT OPTIONAL AND IT IS WHY THIS FEATURE IS SAFE. A random walk
+ * that happens to close the last gap between two ridges produces a map where
+ * one player simply cannot reach the other: no raids, no waves, no victory
+ * condition reachable, and a ten-minute match that ends in a timeout with two
+ * untouched economies. It would happen rarely — which is worse than often,
+ * because it would happen to a player and not to us.
+ *
+ * So: claim the tile provisionally, flood fill from one Town Center, and put it
+ * back if the other one is no longer reachable. A flood over 9216 tiles is a
+ * few tens of microseconds and this runs at most a few hundred times during
+ * generation, once per match.
+ *
+ * The flood is a plain queue over the block grid — no diagonals, matching the
+ * pathfinder's own connectivity — and it deliberately does NOT use findPath:
+ * this asks whether ground is connected at all, which is a cheaper question
+ * than the route, and it must stay answerable before any unit exists.
+ */
+function cutsTheMap(world, x, y, bases) {
+  const W = world.width;
+  const H = world.height;
+  const i = y * W + x;
+  const was = world.blocked[i];
+  world.blocked[i] = BLOCK_TERRAIN;
+
+  const from = bases[0];
+  const to = bases[1];
+  const seen = new Uint8Array(W * H);
+  // Reused across the whole generation would be faster; allocated per call is
+  // 9KB of short-lived typed array a few hundred times, which is nothing beside
+  // the rest of map generation and keeps this function pure.
+  const queue = new Int32Array(W * H);
+  let head = 0;
+  let tail = 0;
+  const start = from.y * W + from.x;
+  queue[tail++] = start;
+  seen[start] = 1;
+  let reached = false;
+  while (head < tail) {
+    const cur = queue[head++];
+    const ux = cur % W;
+    const uy = (cur - ux) / W;
+    if (ux === to.x && uy === to.y) { reached = true; break; }
+    for (let k = 0; k < 4; k++) {
+      const nx = ux + (k === 0 ? 1 : k === 1 ? -1 : 0);
+      const ny = uy + (k === 2 ? 1 : k === 3 ? -1 : 0);
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (seen[ni]) continue;
+      // A closed gate is passable-in-principle ground for this question: gates
+      // do not exist during map generation, but reading the grid rather than
+      // testing for zero keeps this honest if that ever changes.
+      if (world.blocked[ni] !== 0) continue;
+      seen[ni] = 1;
+      queue[tail++] = ni;
+    }
+  }
+
+  world.blocked[i] = was;
+  return !reached;
+}
+
+/**
+ * Dry the ground out under and around the rock.
+ *
+ * Grass running right up to the foot of a cliff and stopping dead is the tell
+ * that the rock was pasted on afterwards — which it was. A tile of dirt under
+ * every cliff and a scatter of it on the tiles immediately around gives the
+ * outcrop a bit of scree to sit in, and the terrain bake's own transition
+ * washes then do the blending for free.
+ */
+function stampCliffTerrain(world) {
+  const { rng } = world;
+  const W = world.width;
+  const H = world.height;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (world.cliff[i]) {
+        world.terrain[i] = TERRAIN.DIRT;
+        continue;
+      }
+      if (world.terrain[i] === TERRAIN.WATER) continue;
+      // Adjacent to rock, two thirds of the time. Not always, or the scree is
+      // a neat one-tile border — which is the diamond outline again.
+      let near = false;
+      for (let k = 0; k < 4 && !near; k++) {
+        const nx = x + (k === 0 ? 1 : k === 1 ? -1 : 0);
+        const ny = y + (k === 2 ? 1 : k === 3 ? -1 : 0);
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+        if (world.cliff[ny * W + nx]) near = true;
+      }
+      if (near && rng.chance(0.66)) world.terrain[i] = TERRAIN.DIRT;
+    }
   }
 }
 

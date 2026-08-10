@@ -24,7 +24,7 @@ import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 // the pair is a deliberate (and shallow) import cycle — see the note at the top
 // of tech.js. Research is production, so it ticks on this module's beat.
 import {
-  updateResearch, gatherMultiplier, lockReason, applyAgeHp,
+  updateResearch, gatherMultiplier, lockReason, applyAgeHp, unitLockReason,
 } from './tech.js';
 
 // --- Tuning (local to this module; constants.js is read-only for me) --------
@@ -1004,6 +1004,16 @@ export function queueTrain(world, building, unitType) {
   const playerId = building.player;
   const p = playerOf(world, playerId);
   if (!p) return false;
+
+  // The age gate. A Feudal Stable can train a scout and cannot yet train a
+  // Knight — see AGE_UNITS in tech.js for why the building's own age is not a
+  // sufficient answer. Checked before the queue and the purse so the refusal a
+  // player gets is the real reason rather than "queue is full".
+  const locked = unitLockReason(world, playerId, unitType);
+  if (locked) {
+    world.events.emit(EV.TOAST, { text: locked, tone: 'warn' });
+    return false;
+  }
 
   if (building.queue.length >= MAX_QUEUE) {
     world.events.emit(EV.TOAST, { text: 'Queue is full', tone: 'warn' });

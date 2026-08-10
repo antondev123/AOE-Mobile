@@ -77,6 +77,11 @@ function techWorld({ rich = true } = {}) {
   const lumber = spawnBuilding(w, 'lumbercamp', PLAYER, 20, 10);
   const mining = spawnBuilding(w, 'miningcamp', PLAYER, 24, 10);
   const barracks = spawnBuilding(w, 'barracks', PLAYER, 28, 10);
+  // The Blacksmith is where the ten attack/armour techs actually live. They
+  // spent a long time falling back to the Barracks because no Blacksmith
+  // existed; now that one does, a test that wants "a building with plenty of
+  // research" has to ask for the right building.
+  const blacksmith = spawnBuilding(w, 'blacksmith', PLAYER, 32, 10);
   if (rich) {
     // Enough of everything that "can you afford it" is never the thing under
     // test unless a test says so.
@@ -84,7 +89,7 @@ function techWorld({ rich = true } = {}) {
   }
   recomputePop(w, PLAYER);
   reindex(w);
-  return { w, tc, mill, lumber, mining, barracks, p: w.players[PLAYER] };
+  return { w, tc, mill, lumber, mining, barracks, blacksmith, p: w.players[PLAYER] };
 }
 
 function record(world, type) {
@@ -620,18 +625,18 @@ test('a building researches one thing at a time but may queue more', () => {
 });
 
 test('the research queue is capped', () => {
-  const { w, barracks } = techWorld();
+  const { w, blacksmith } = techWorld();
   grant(w, PLAYER, 'feudal_age');
-  const feudalAtBarracks = techsAt('barracks')
-    .filter((id) => researchRefusal(w, PLAYER, id, barracks) === null);
-  assert.ok(feudalAtBarracks.length > MAX_RESEARCH_QUEUE,
+  const available = techsAt('blacksmith')
+    .filter((id) => researchRefusal(w, PLAYER, id, blacksmith) === null);
+  assert.ok(available.length > MAX_RESEARCH_QUEUE,
     'this test needs more available techs than the cap');
   let queued = 0;
-  for (const id of feudalAtBarracks) {
-    if (queueResearch(w, barracks, id)) queued++;
+  for (const id of available) {
+    if (queueResearch(w, blacksmith, id)) queued++;
   }
   assert.equal(queued, MAX_RESEARCH_QUEUE);
-  assert.equal(barracks.research.length, MAX_RESEARCH_QUEUE);
+  assert.equal(blacksmith.research.length, MAX_RESEARCH_QUEUE);
 });
 
 test('research does not reserve population the way training does', () => {

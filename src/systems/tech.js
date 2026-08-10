@@ -92,6 +92,60 @@ export const AGE_UNLOCKS = {
 };
 
 /**
+ * The age a UNIT type needs, over and above the building that trains it.
+ *
+ * Until this pass there was no such thing: a unit was gated purely by which
+ * building could train it, and that was enough while every building held one
+ * age's worth of roster. It stopped being enough the moment the Stable arrived.
+ * The Stable is a Feudal building — a scout is a Feudal unit and belongs there
+ * — but a Knight is Castle Age in every version of this game that has ever
+ * been played, and "the building is Feudal so everything in it is Feudal" would
+ * have put 100-hitpoint cavalry on the map four minutes early.
+ *
+ * The same applies to the Siege Workshop, which is Castle Age as a building and
+ * so needs nothing here; it is listed anyway, because a table that only
+ * mentions the awkward cases is a table nobody can read.
+ *
+ * Anything not named here is available as soon as its building is, which is the
+ * old behaviour and the right default: an unrecognised unit must never end up
+ * permanently untrainable.
+ */
+export const AGE_UNITS = {
+  [AGE.DARK]: ['villager', 'militia', 'spearman'],
+  [AGE.FEUDAL]: ['archer', 'skirmisher', 'scout'],
+  [AGE.CASTLE]: ['knight', 'ram', 'mangonel', 'scorpion', 'monk'],
+};
+
+let unitAgeCache = null;
+
+/** The age `type` becomes trainable in. Dark for anything unrecognised. */
+export function ageForUnit(type) {
+  if (!unitAgeCache) {
+    unitAgeCache = new Map();
+    for (const age of [AGE.DARK, AGE.FEUDAL, AGE.CASTLE]) {
+      for (const t of AGE_UNITS[age]) if (!unitAgeCache.has(t)) unitAgeCache.set(t, age);
+    }
+  }
+  const a = unitAgeCache.get(type);
+  return a === undefined ? AGE.DARK : a;
+}
+
+/** May `playerId` train `type` today? */
+export function unitUnlocked(world, playerId, type) {
+  return currentAge(world, playerId) >= ageForUnit(type);
+}
+
+/**
+ * Why this unit cannot be trained yet, or null if it can. Phrased for the HUD
+ * exactly as the building lock is: "Needs the Castle Age".
+ */
+export function unitLockReason(world, playerId, type) {
+  const need = ageForUnit(type);
+  if (currentAge(world, playerId) >= need) return null;
+  return `Needs the ${AGE_NAMES[need]}`;
+}
+
+/**
  * The age a building type needs, for a type nobody listed above.
  *
  * The failure mode matters more than the answer. A building whose key we did

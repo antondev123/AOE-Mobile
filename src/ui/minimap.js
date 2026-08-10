@@ -27,6 +27,10 @@ const TERRAIN_COLOR = {
   [TERRAIN.SAND]:  '#9c8a5b',
 };
 
+// Rock outcrops. Not a TERRAIN value — a cliff sits on ordinary dirt and lives
+// on its own grid (see world.cliff) — so it needs its own entry here.
+const CLIFF_COLOR = '#8e93a0';
+
 // Node colours. Stone is deliberately the palest, coolest pip on the map: at
 // two pixels it has to separate from gold's warm yellow *and* from the blue-grey
 // of water underneath it, and a light slate is the only value that does both.
@@ -488,6 +492,26 @@ function bake(g, world, size) {
       g.fillStyle = TERRAIN_COLOR[t] || '#444';
       tileDiamond(g, tx, ty, size);
       g.fill();
+    }
+  }
+
+  // Rock, painted last and over everything, because a cliff is the one thing on
+  // this map that decides where an army can walk. The terrain under it is
+  // ordinary dirt (mapgen dries the ground out around an outcrop), so the
+  // terrain pass above cannot draw it and it has to come off its own grid.
+  //
+  // A cool grey, deliberately lighter than any of the four terrains and the
+  // only cool colour on a warm map: the question this answers at a glance is
+  // "can I get there from here", and the answer has to survive being a
+  // two-pixel diamond under a fog wash.
+  if (world.cliff) {
+    g.fillStyle = CLIFF_COLOR;
+    for (let ty = 0; ty < MAP_H; ty++) {
+      for (let tx = 0; tx < MAP_W; tx++) {
+        if (!world.cliff[ty * MAP_W + tx]) continue;
+        tileDiamond(g, tx, ty, size);
+        g.fill();
+      }
     }
   }
 

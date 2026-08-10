@@ -442,8 +442,32 @@ test('tech, fog and the allocation manager come back exactly', () => {
   const beforeHp = tc.maxHp;
   const beforeAlloc = allocationState(world, PLAYER);
   const beforeExplored = Array.from(world.vision.state(PLAYER).explored);
+
+  // Make the memory rather than hope for it.
+  //
+  // This used to assert that 1400 steps of ordinary villager work had left
+  // something remembered, and on the seed it was written against it had. That
+  // is a coincidence, not a fixture: memory is written at the instant a tile
+  // stops being visible, so whether any exists depends entirely on whether some
+  // unit happened to walk away from something it had uncovered — and the day
+  // the map generator changed (rock outcrops moved every resource on this seed)
+  // this test failed for a reason that had nothing to do with saving or
+  // loading. A test whose subject is "does memory round-trip" must not be able
+  // to fail because of where the berries landed.
+  //
+  // So: walk a villager out to bare ground and back. Out uncovers tiles it has
+  // never seen; back conceals them again, which is exactly the moment vision.js
+  // writes a snapshot. Assert it worked before relying on it.
+  const walker = ownedBy(world, PLAYER, 'unit')[0];
+  const home = { x: walker.x, y: walker.y };
+  commandUnits(world, [walker], { type: 'move', gx: walker.x + 12, gy: walker.y + 12 });
+  run(world, ai, 400);
+  commandUnits(world, [walker], { type: 'move', gx: home.x, gy: home.y });
+  run(world, ai, 400);
+
   const beforeMemory = world.vision.state(PLAYER).memory.length;
-  assert.ok(beforeMemory > 0, 'the fixture remembers nothing');
+  assert.ok(beforeMemory > 0,
+    'the fixture was supposed to create memory by walking a unit out and back');
 
   const payload = JSON.parse(JSON.stringify(serializeGame(world, { ai: ai.serialize() })));
   const { world: loaded } = restoreGame(payload);
