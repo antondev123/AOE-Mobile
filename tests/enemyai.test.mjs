@@ -19,7 +19,7 @@ register('./enemyai.loader.mjs', import.meta.url);
 const SRC = new URL('../src/', import.meta.url);
 const realModule = (rel) => existsSync(fileURLToPath(new URL(rel, SRC)));
 
-const { createWorld, reindex, ownedBy, recomputePop, spawnUnit, removeEntity } =
+const { createWorld, reindex, ownedBy, recomputePop, spawnUnit, spawnBuilding, removeEntity } =
   await import('../src/core/world.js');
 const { generateMap } = await import('../src/core/mapgen.js');
 const { SIM_DT, PLAYER, ENEMY, MAX_POP_CAP } = await import('../src/core/constants.js');
@@ -39,6 +39,9 @@ const REAL = {
 };
 
 const STEPS = 12000; // 12000 * (1/20)s = 600s = 10 minutes of sim time
+// How close an enemy soldier has to be to the player's Town Center to count as
+// "there is a war on in my town". Twelve tiles is the width of a base.
+const PRESSURE_RADIUS = 12;
 
 /** A value that must be identical for two matches on the same seed. */
 function fingerprint(r) {
@@ -83,6 +86,17 @@ function dist(ax, ay, bx, by) {
  *   to exercise the AI's defensive recall.
  * @param {boolean} [opts.propUp] keep the player's town alive all match, so the
  *   full wave schedule can be observed instead of ending at the first kill.
+ *
+ *   IT REBUILDS THE TOWN CENTER RATHER THAN MAKING IT INVULNERABLE, and the
+ *   difference is not cosmetic. The AI's push now presses until it stops making
+ *   progress and comes home when it does (see WAVE_KILL_EXTENSION in
+ *   enemyAI.js), so a punchbag that cannot be destroyed is a punchbag that
+ *   teaches it nothing: measured against the old immortal Town Center, the AI
+ *   launched twice in ten minutes and stood outside a building it could not
+ *   dent for three of them. A town that falls and is put straight back up is the
+ *   thing the test was always trying to be — a player who keeps losing buildings
+ *   and keeps rebuilding — and it exercises the retarget, the kill extension and
+ *   the reinforcement flow that a real match runs on.
  * @param {number} [opts.razeAt] raze the enemy's Town Center and Barracks at
  *   this sim time, to check it rebuilds instead of softlocking.
  * @param {number} [opts.starveAt] strip every berry within STARVE_RADIUS of the
@@ -171,11 +185,24 @@ function runMatch({
         m.popViolations.push({ t: +world.time.toFixed(1), pop, cap: p.popCap });
       }
 
+      let near = false;
       for (const u of ownedBy(world, ENEMY, 'unit')) {
         if (u.type === 'villager') continue;
         const d = dist(u.x, u.y, playerBase.x, playerBase.y);
         if (d < m.minDistToPlayerBase) m.minDistToPlayerBase = d;
+        if (d <= PRESSURE_RADIUS) near = true;
         if (d <= 10 && m.firstContactTime === null) m.firstContactTime = world.time;
+      }
+      // Pressure, measured where the player actually feels it: how long the AI
+      // ever leaves their town alone once it has arrived there for the first
+      // time. This is what the wave-cadence check used to stand in for, and it
+      // stopped standing in for it when a push started staying to finish the
+      // job — see the check itself.
+      if (near) {
+        m.lastNear = world.time;
+      } else if (m.lastNear !== undefined) {
+        const quiet = world.time - m.lastNear;
+        if (quiet > (m.maxQuiet || 0)) m.maxQuiet = quiet;
       }
 
       if (ai._ai && ai._ai.defending) m.defendedTicks++;
@@ -213,13 +240,19 @@ function runMatch({
         m.razedAt = world.time;
       }
 
-      // Keep the punching bag standing so waves 2..n actually happen.
+      // Keep the punching bag standing so waves 2..n actually happen: let the
+      // town be destroyed, and put it straight back up. See the note on propUp.
       if (propUp) {
-        if (playerTC && !playerTC.dead) playerTC.hp = playerTC.maxHp;
+        const tc = ownedBy(world, PLAYER, 'building', 'towncenter')[0];
+        if (!tc) {
+          try {
+            spawnBuilding(world, 'towncenter', PLAYER, playerBase.x, playerBase.y);
+            m.propRebuilds = (m.propRebuilds || 0) + 1;
+          } catch { /* ground taken this step; try again on the next one */ }
+        }
         const pv = ownedBy(world, PLAYER, 'unit').filter((u) => u.type === 'villager');
-        for (const v of pv) v.hp = v.maxHp;
-        if (pv.length < 3 && playerTC && !playerTC.dead) {
-          spawnUnit(world, 'villager', PLAYER, playerTC.x + 2, playerTC.y + 2);
+        if (pv.length < 3) {
+          spawnUnit(world, 'villager', PLAYER, playerBase.x + 2, playerBase.y + 2);
         }
       }
 
@@ -258,6 +291,16 @@ function runMatch({
   m.endArmy = ownedBy(world, ENEMY, 'unit').filter((u) => u.type !== 'villager').length;
   m.militia = ownedBy(world, ENEMY, 'unit', 'militia').length;
   m.archers = ownedBy(world, ENEMY, 'unit', 'archer').length;
+  // The whole army by type. Two counters used to be enough because there were
+  // two units; the roster is nine wide now, and "militia and archers" is no
+  // longer a description of anything — a report that only names those two
+  // cannot show whether the AI ever built the Archery Range or the Stable the
+  // Barracks stopped standing in for.
+  m.armyMix = {};
+  for (const u of ownedBy(world, ENEMY, 'unit')) {
+    if (u.type === 'villager') continue;
+    m.armyMix[u.type] = (m.armyMix[u.type] || 0) + 1;
+  }
   m.buildings = ownedBy(world, ENEMY, 'building').map((b) => b.type);
   m.endFood = world.players[ENEMY].resources.food;
   m.endWood = world.players[ENEMY].resources.wood;
@@ -387,30 +430,101 @@ check('is deterministic for a given seed (fresh process each time)', () => {
 const pressure = runMatch({ seed: 12345, propUp: true });
 const waveLog = pressure.stats.waveLog;
 const gaps = waveLog.slice(1).map((wv, i) => wv.t - waveLog[i].t);
+const asMix = (mix) =>
+  Object.entries(mix || {}).map(([t, n]) => `${n} ${t}`).join(' + ') || 'nothing';
+const pushLog = pressure.stats.pushLog;
 console.log(
   `  wave schedule (player propped up): ` +
-  waveLog.map((wv) => `${wv.t}s x${wv.size} (${wv.militia}M/${wv.archers}A)`).join(', ') +
-  `\n  gaps between waves: ${gaps.join('s, ')}s` +
-  `\n  army mix at 10:00: ${pressure.militia} militia / ${pressure.archers} archers\n`,
+  waveLog.map((wv) => `${wv.t}s x${wv.size}${wv.reinforcement ? '+' : ''} (${asMix(wv.mix)})`).join(', ') +
+  `\n  gaps between dispatches: ${gaps.join('s, ')}s` +
+  `\n  pushes that ended: ` +
+  (pushLog.map((p) => `${p.t}s peak ${p.peak}, ${p.kills} razed, ${p.left} home`).join('; ') ||
+    'none — the first one never had to come home') +
+  `\n  biggest force committed at once: ${pressure.stats.maxPushPeak}` +
+  `, objectives razed: ${pressure.stats.objectivesRazed}` +
+  ` (the punchbag rebuilt its Town Center ${pressure.propRebuilds || 0} times)` +
+  `\n  longest quiet spell in the player's town after first contact: ` +
+  `${Math.round(pressure.maxQuiet || 0)}s` +
+  `\n  army at 10:00: ${asMix(pressure.armyMix)}` +
+  `\n  buildings started: ${JSON.stringify(pressure.stats.started)}` +
+  `\n  ages reached: ${JSON.stringify(pressure.stats.ageUps)}\n`,
 );
 
 check('keeps launching waves, not just the first', () => {
   assert.ok(waveLog.length >= 3, `only ${waveLog.length} waves in 10 minutes`);
 });
-check('waves land every 90-150s (longer only after losing one)', () => {
-  assert.ok(gaps.length > 0, 'no gaps to measure');
-  const bad = gaps.filter((g, i) => {
-    // A wave that got wiped buys the player a full rebuild cycle — that is the
-    // designed reward for fighting back, not a scheduling miss.
-    const ceiling = waveLog[i + 1].afterLoss ? 200 : 155;
-    return g < 80 || g > ceiling;
-  });
-  assert.equal(bad.length, 0, `out-of-band gaps: ${bad.join(',')}s of ${gaps.join(',')}`);
-});
-check('waves escalate in size', () => {
+// This used to be "waves land every 90-150s", measured off the dispatch log, and
+// that measurement stopped meaning what it was written to mean.
+//
+// It was a proxy for "the player is never left alone for long", and it was a
+// good proxy while every wave was a round trip: the squad walked over, was
+// beaten off or ran out of clock, walked home, and the next one left on the
+// beat. A push now *stays* while it is destroying things (WAVE_KILL_EXTENSION in
+// enemyAI.js) and is reinforced where it stands rather than being replaced from
+// home, so a gap between dispatches is no longer a gap in pressure — it is
+// usually the opposite, a squad that is still standing in the player's town and
+// did not need replacing.
+//
+// So the pressure is measured where the player feels it instead: how long the
+// enemy is ever absent from their town, once it has turned up there at all. Two
+// minutes is the bar, which is under the old 90-125 s cadence plus the walk, and
+// the dispatch gaps are still checked, at a ceiling loose enough to allow a push
+// that is winning and tight enough to catch one that has quietly stopped.
+check('never leaves the player alone for long once it has arrived', () => {
+  assert.ok(pressure.firstContactTime !== null, 'never reached the player at all');
   assert.ok(
-    waveLog[waveLog.length - 1].size > waveLog[0].size,
-    `first ${waveLog[0].size}, last ${waveLog[waveLog.length - 1].size}`,
+    (pressure.maxQuiet || 0) <= 120,
+    `left the player alone for ${Math.round(pressure.maxQuiet)}s`,
+  );
+  const bad = gaps.filter((g) => g > 240);
+  assert.equal(bad.length, 0, `dispatch gaps of ${bad.join(',')}s among ${gaps.join(',')}`);
+});
+// ...and this used to be "waves escalate in size", off the same log.
+//
+// Escalation is now a property of the *push* rather than of the dispatch: the
+// AI commits everything above its home guard and then feeds the fight, so a
+// twenty-strong assault shows up in the dispatch log as a nine and three fours.
+// stats.pushLog records what was actually standing in front of the player at
+// once, which is the number the original check was reaching for.
+check('commits more of its army as the match goes on', () => {
+  const first = waveLog[0].size;
+  assert.ok(
+    pressure.stats.maxPushPeak >= first * 2,
+    `first wave was ${first} and the biggest force it ever had in the field ` +
+    `at once was ${pressure.stats.maxPushPeak}`,
+  );
+});
+check('pushes destroy things rather than bouncing off', () => {
+  assert.ok(
+    pressure.stats.objectivesRazed >= 2,
+    `razed ${pressure.stats.objectivesRazed} of the objectives it was sent after`,
+  );
+});
+// The regression this whole pass exists to prevent. The Barracks trains militia
+// and spearmen and nothing else now: the archer moved to the Archery Range and
+// the scout to the Stable, and both of those units are Feudal Age besides. So an
+// AI that ages up and does not follow it with one of those two buildings fields
+// an infantry-only army for the entire match — no ranged unit, no cavalry, and
+// no answer to a player who masses either.
+//
+// A word on the margin, because this check is tighter than it looks. Seed 12345
+// is one of the slower food starts the AI has been measured on: it commits to
+// the Feudal Age at about 8:05, stands in it a minute later, and the Archery
+// Range follows within the minute after that — inside the last ninety seconds of
+// the match. That is close to the worst case; over six seeds of a twelve-minute
+// run the age lands at 6:20-9:20, the Range is always up, five seeds add a
+// Blacksmith and four add a Stable. If this check starts failing, look first at
+// what has delayed the age-up (see the age-up push in enemyAI.js) rather than at
+// the build order behind it.
+check('follows the Feudal Age with the arm the Barracks no longer trains', () => {
+  const feudal = s.ageUps.find((a) => a.age === 1);
+  assert.ok(feudal, `never reached the Feudal Age: ${JSON.stringify(s.ageUps)}`);
+  const started = s.started || {};
+  const arms = (started.archeryrange || 0) + (started.stable || 0);
+  assert.ok(
+    arms >= 1,
+    `Feudal Age at ${feudal.t}s but no Archery Range or Stable — started ` +
+    `${JSON.stringify(started)}`,
   );
 });
 check('first wave is beatable but real (4-8 units)', () => {

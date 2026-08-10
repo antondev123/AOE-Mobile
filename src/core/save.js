@@ -213,11 +213,21 @@ export function serializeGame(world, extra = {}) {
     width: world.width,
     height: world.height,
     terrain: bytesToB64(world.terrain),
+    // Rock outcrops. Stored rather than derived, and it is the one grid here
+    // that has to be: the terrain under a cliff is ordinary dirt, so there is
+    // nothing in `terrain` to reconstruct it from, and re-running mapgen to
+    // find out would regenerate the whole map. One byte per tile, the same
+    // 9216-byte cost the terrain already pays.
+    cliff: bytesToB64(world.cliff),
 
     players: world.players.map((p) => ({
       resources: { ...p.resources },
       popCap: p.popCap,
       defeated: !!p.defeated,
+      // Which side they play for. A save from before there were teams has none,
+      // and restoreGame falls back to the seat number — a free-for-all, which is
+      // exactly what a two-player save was.
+      team: p.team,
       // Insertion order matters: ownedBy() walks this set and several passes
       // stop at their first hit.
       owned: Array.from(p.owned),
@@ -251,8 +261,20 @@ export function serializeGame(world, extra = {}) {
       }))
       : null,
 
-    ai: extra.ai || null,
+    // One blob per seat, not one blob.
+    //
+    // This carried a single `ai` because a match had a single AI, which is what
+    // stopped server/match.js running AI seats in a networked room at all: a
+    // client rebuilding from a snapshot would inherit the world but not the
+    // brains about to act on it, and drift within seconds. `ai` is still
+    // accepted and still written, so a save from before this loads unchanged.
+    ais: extra.ais || (extra.ai ? [extra.ai] : null),
+    ai: extra.ai || (extra.ais && extra.ais[0]) || null,
     view: extra.view || null,
+    // Who was in which chair. A save without it is the classic skirmish and is
+    // reconstructed as one on load; carrying it is what lets an eight-player
+    // offline match come back with the same seats on the same sides.
+    roster: extra.roster || null,
   };
 }
 
@@ -275,10 +297,27 @@ export function restoreGame(data) {
   }
   if (!Array.isArray(data.entities)) throw new Error('Save has no entities');
 
-  const world = createWorld(data.seed);
+  // Built to the save's shape rather than checked against the build's.
+  //
+  // This used to be createWorld(seed) followed by "is this the size I always
+  // am", which was the only thing it could be when there was one possible map.
+  // The map is a lobby decision now, so the save carries its own dimensions and
+  // its own roster and the world is made to fit them.
+  const savedPlayers = Array.isArray(data.players) ? data.players : [];
+  const world = createWorld(data.seed, {
+    playerCount: savedPlayers.length || 2,
+    width: data.width,
+    height: data.height,
+    teams: savedPlayers.map((p, i) => (p && p.team !== undefined && p.team !== null ? p.team : i)),
+  });
   if (world.width !== data.width || world.height !== data.height) {
     throw new Error(
-      `Save is a ${data.width}x${data.height} map, this build plays ${world.width}x${world.height}`,
+      `Save is a ${data.width}x${data.height} map, which this build cannot build`,
+    );
+  }
+  if (world.players.length !== savedPlayers.length) {
+    throw new Error(
+      `Save has ${savedPlayers.length} players, which is outside what this build supports`,
     );
   }
 
@@ -293,10 +332,22 @@ export function restoreGame(data) {
   if (terrain.length !== world.terrain.length) throw new Error('Save terrain is the wrong size');
   world.terrain.set(terrain);
 
-  // The block grid is derived, never stored: water from the terrain, everything
-  // else from the entities that are about to be put back on it.
+  // A save written before rock outcrops existed simply has no cliffs, which is
+  // a correct reading of it rather than a migration: that match was played on a
+  // map with none.
+  world.cliff.fill(0);
+  if (data.cliff) {
+    const cliff = b64ToBytes(data.cliff);
+    if (cliff.length !== world.cliff.length) throw new Error('Save cliff grid is the wrong size');
+    world.cliff.set(cliff);
+  }
+
+  // The block grid is derived, never stored: water from the terrain, the rock
+  // from the cliff grid, everything else from the entities that are about to be
+  // put back on it.
   for (let i = 0; i < world.terrain.length; i++) {
-    world.blocked[i] = world.terrain[i] === TERRAIN.WATER ? 2 : 0;
+    world.blocked[i] =
+      world.terrain[i] === TERRAIN.WATER || world.cliff[i] ? 2 : 0;
     world.occupant[i] = 0;
     world.gateOwner[i] = 0;
   }
@@ -362,9 +413,18 @@ export function restoreGame(data) {
   world.projectiles.length = 0;
   for (const rec of data.projectiles || []) {
     const p = unpackValue(rec, byId);
+    if (!p) continue;
     // A projectile whose target died between the save and the load has nothing
     // to hit. combat.js copes, but there is no reason to restore one.
-    if (p && p.target) world.projectiles.push(p);
+    //
+    // A SPLASH SHOT IS THE EXCEPTION AND HAS TO BE. A mangonel's boulder
+    // deliberately carries no target at all — it is thrown at a *place*, which
+    // is what makes minimum range and the SPREAD formation mean anything (see
+    // launchProjectile in combat.js). Testing for a target alone therefore
+    // silently deleted every boulder in the air across a save, which is the
+    // sort of thing nobody notices until a player reloads mid-siege and their
+    // shot never lands.
+    if (p.target || p.splashRadius > 0) world.projectiles.push(p);
   }
 
   restoreTech(world, data.tech);
@@ -387,7 +447,12 @@ export function restoreGame(data) {
     recomputePop(world, i);
   }
 
-  return { world, ai: data.ai || null, view: data.view || null };
+  const ais = Array.isArray(data.ais) ? data.ais : (data.ai ? [data.ai] : []);
+  return {
+    world, ais, ai: ais[0] || data.ai || null,
+    view: data.view || null,
+    roster: Array.isArray(data.roster) ? data.roster : null,
+  };
 }
 
 // --- Storage -----------------------------------------------------------------

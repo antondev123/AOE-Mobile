@@ -17,20 +17,23 @@
 // quad — see makeFog — darkens the ground. Nothing per-tile happens per frame.
 
 import {
-  MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
-  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT, PLAYER,
-  BUILDING_STATS, isWallType, isGateType,
+  HALF_W, HALF_H, TILE_W, TILE_H,
+  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT,
+  BUILDING_STATS, isWallType, isGateType, TERRAIN,
 } from '../core/constants.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
 import {
   buildTextures, ATLAS, TILE_TEX_W, TILE_TEX_H, TILE_TEX_OFF_X, TILE_TEX_OFF_Y,
   terrainFrame, unitFrame, unitAnim, buildingFrame, foundationFrame, resourceFrame,
   markerFrame, farmFrame, farmFoundationFrame, wallFrame, gateFrame, scaffoldFrame,
-  oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME,
+  oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME, waterFrame,
   TERRAIN_VARIANTS, RESOURCE_VARIANTS, DETAIL_VARIANTS, DETAIL_BOX, detailFrame,
   TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
-  CLIFF_H, CLIFF_VARIANTS,
+  CLIFF_H, CLIFF_VARIANTS, BUILDING_VARIANTS, smokeFrame, SMOKE_FPS, CHIMNEY,
 } from './textures.js';
 import { createFx } from './fx.js';
 import { EV } from '../core/events.js';
@@ -73,6 +76,12 @@ const RES_COLOR = { food: 0xe8524a, wood: 0xc98a45, gold: 0xf5c333, stone: 0x9aa
 // player sees on the floor reads as a targeting error.
 const MARKER_SCALE = {
   militia: 1.12, spearman: 1.08, archer: 1.05, scout: 1.34, ram: 1.42,
+  // The new roster. A knight stands on more ground than a scout (it is a
+  // barded warhorse, not a pony), the two engines are wheeled and wide, and the
+  // skirmisher and the monk are ordinary men. A missing entry silently falls
+  // back to 1 — a villager-sized ring under a mangonel — which is why these are
+  // here rather than left to the default.
+  skirmisher: 1.05, knight: 1.44, mangonel: 1.5, scorpion: 1.38, monk: 1.02,
 };
 
 // Selection colours by relationship. Own units are the warm gold the HUD uses
@@ -106,10 +115,18 @@ function poseOf(u, t, phase) {
   if (state === 'attack') {
     const seq = set.attack || set.idle;
     if (seq.length < 2) return seq[0];
-    // High attackAnim = the blow just landed, so show the follow-through;
-    // spent = back on guard for the rest of the cooldown.
+    // High attackAnim = the blow just landed, so the sequence plays *backwards*
+    // through the swing: the last frame is the follow-through and the first is
+    // back on guard for the rest of the cooldown.
+    //
+    // This used to be a single threshold — `f > 0.45 ? seq[1] : seq[0]` — which
+    // was correct for the two poses that existed and silently capped the
+    // animation at two forever: a third pose could never be selected, so baking
+    // one would have spent atlas space on a frame nothing could ask for.
+    // Indexing across the whole sequence means the swing is as smooth as the
+    // art is long, and a two-pose entry behaves as it always did.
     const f = Math.min(1, (u.attackAnim || 0) / SWING_TIME);
-    return f > 0.45 ? seq[1] : seq[0];
+    return seq[Math.min(seq.length - 1, (f * seq.length) | 0)];
   }
   const seq = set[state] || set.idle;
   if (seq.length < 2) return seq[0];
@@ -142,6 +159,22 @@ const CULL_PAD = 140;
 // oscillate within a frame. Forty-eight is a fight of about two dozen a side,
 // which is where the bars stop being individually readable anyway.
 const BAR_PLAIN_ABOVE = 48;
+// Above this many bars in a frame, a full-health bar stops being drawn at all
+// and only the wounded and the selected keep theirs.
+//
+// The reason is a photograph. A whole-game review caught a 45-unit army in a
+// fight and reported that it was "literally a mosaic of ~45 overlapping green
+// rectangles; you cannot see a single soldier under them" — which was correct,
+// and is the honest failure mode of the rule below it (bars come up across the
+// army whenever combat is happening, because during a battle "who is about to
+// die" is the only question). That rule is right at ten units and self-defeating
+// at forty-five: forty-five full bars are forty-five identical shapes that
+// answer the question for nobody, drawn over the only thing that could.
+//
+// 26 is roughly where the bars of a clumped group start to touch at the default
+// zoom. Below it you get the whole picture; above it you get exactly the units
+// the picture was for, which is the ones losing.
+const BAR_CROWD_ABOVE = 26;
 
 const TERRAIN_CHUNK = 512;
 
@@ -202,6 +235,14 @@ const FOG_MEMORY_ALPHA = 0.85;
 // a 45x22 pixel blob on screen. At 12Hz the edge still slides smoothly under a
 // walking unit and the upload cost drops by half.
 const FOG_REFRESH_INTERVAL = 1 / 12;
+// Frames per second for the water caustics. Slow on purpose: four frames at 6fps
+// is a two-thirds-of-a-second cycle, which reads as a slow swell. Faster and it
+// is a boiling pot; slower and the eye catches each frame as a separate picture.
+const WATER_FPS = 6;
+// The overlay is a highlight, not the water. At 0.34 it lifts the surface and
+// leaves the baked depth banding underneath doing the work of saying how deep it
+// is; at 1.0 it replaces the pond with a light show.
+const WATER_ALPHA = 0.34;
 // Above every entity, every effect and the terrain; below the overlay Graphics
 // (800000), which draws selection rings and bars for things you can see.
 const FOG_DEPTH = 700000;
@@ -209,12 +250,19 @@ const FOG_DEPTH = 700000;
 let fogTextureSerial = 0;
 
 export function createRenderer(scene, world) {
-  const tex = buildTextures(scene);
+  // Only this match's seats get a colour variant baked. See buildTextures.
+  const tex = buildTextures(scene, { seats: world.players.length });
   const origins = tex.origins;
 
   const camera = scene.cameras.main;
 
   // --- camera --------------------------------------------------------------
+  // Read off the world, not off a constant: the map is as big as the roster
+  // needs it to be. Everything below that indexes, culls or bakes by tile has to
+  // agree with core/world.js's arrays or it silently addresses the wrong ones.
+  const MAP_W = world.width;
+  const MAP_H = world.height;
+
   // The playable diamond spans x in [-MAP_H*HALF_W, MAP_W*HALF_W] and
   // y in [0, (MAP_W+MAP_H)*HALF_H] (see the header of iso.js). Its bounding
   // box therefore has four empty corners, which used to show as raw canvas
@@ -311,11 +359,37 @@ export function createRenderer(scene, world) {
   // and does nothing at all when there isn't one.
   let cliffs = buildCliffList(world);
 
+  // --- moving water ---------------------------------------------------------
+  //
+  // THE MAP HAS NEVER MOVED. Terrain is baked once into chunk RenderTextures
+  // and never touched again, which is the whole reason it is cheap — and it is
+  // also the loudest remaining "this is a mock-up" signal in a screenshot, well
+  // above any individual sprite. A still frame of a game and a still frame of a
+  // diorama are the same picture; the difference only exists in motion, and
+  // nothing here supplied any.
+  //
+  // Water is the cheapest place to buy it. textures.js bakes four caustic
+  // frames on transparency (waterFrame 0..3), each a quarter-cycle later with
+  // the threads drifting, so cycling them travels rather than flickers. They
+  // are laid over the baked water at low alpha as ordinary sprites, which is
+  // the only way to animate something the bake has already flattened.
+  //
+  // ONLY INTERIOR WATER. The out-of-bounds ocean shelf is eight rings of tiles
+  // around the whole map and would be hundreds of quads for scenery nobody
+  // looks at; the ponds are two per map and are the water a player actually
+  // stands beside. Bounded by construction rather than by a cap, which is the
+  // difference between a budget and a hope.
+  const waterTiles = buildWaterList(world);
+  let waterPhase = 0;
+  let smokePhase = 0;
+
   // --- pools ---------------------------------------------------------------
+  const waterPool = makePool(() => mkImage(scene, waterFrame(0), -999000));
   const cliffPool = makePool(() => mkImage(scene, cliffFrame(0, 0), -1));
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
   const unitPool = makePool(() => mkImage(scene, unitFrame('villager', 0, false), -1));
   const bldPool = makePool(() => mkImage(scene, buildingFrame('house', 0), -1));
+  const smokePool = makePool(() => mkImage(scene, smokeFrame(0), -1));
   const resPool = makePool(() => mkImage(scene, resourceFrame('tree', 0), -1));
   const selPool = makePool(() => mkImage(scene, 'mk_sel', -1));
   const ghostPool = makePool(() => mkImage(scene, 'tile_hi', -1));
@@ -409,6 +483,7 @@ export function createRenderer(scene, world) {
   // switch to the plain form. See BAR_PLAIN_ABOVE.
   let barCount = 0;
   let plainBars = false;
+  let barsCrowded = false;
 
   // --- combat feedback ------------------------------------------------------
   // Two facts, both read straight off the damage event: which units were hit
@@ -456,8 +531,19 @@ export function createRenderer(scene, world) {
   // Other systems own the entity types; if one ever grows a type we have no
   // art for, fall back rather than spraying missing-frame warnings.
   const has = (frame) => origins.has(frame);
-  /** Clamp an owner id into the range we generated colours for. */
-  const pi = (player) => (player === 1 ? 1 : 0);
+  /**
+   * Clamp an owner id into the range we generated colours for.
+   *
+   * It used to be `player === 1 ? 1 : 0`, which is a clamp to {0,1} and was
+   * exactly right while the atlas held two colours: anything else drew as player
+   * 0, silently, so a third player's army would have been indistinguishable from
+   * your own. The atlas now bakes one variant per seat in the match (see
+   * buildTextures), so the clamp is against that count. Neutral things — a tree,
+   * a bush — arrive here as null and take seat 0's frame, which is what they
+   * always did and never shows, because nothing player-coloured is drawn for them.
+   */
+  const seatCount = world.players.length;
+  const pi = (player) => (player >= 0 && player < seatCount ? player : 0);
 
   /**
    * Which frame a unit shows, memoised on (type, player, back, pose).
@@ -500,11 +586,43 @@ export function createRenderer(scene, world) {
   }
   const unitFrameFor = (type, player, back, pose = 'i') =>
     unitPoseFor(type, player, back, pose).f;
+  /**
+   * Which drawing of a building to use, when the atlas holds more than one.
+   *
+   * The variant is the entity id and nothing cleverer. It is stable for the
+   * life of the building, it survives a save, and two houses raised next to
+   * each other get different numbers because they were raised at different
+   * times — which is exactly the case this exists for. Deriving it from
+   * position instead would make the two bases mirror each other, and deriving
+   * it from a render-side counter would reshuffle every roof on the map the
+   * moment one house burned down.
+   *
+   * The fallback is two-stage on purpose. A type the atlas has never heard of
+   * has to become *something*, and a house is the least alarming something. But
+   * a type that exists and merely lacks the variant asked for must fall back to
+   * its own variant 0, or a Barracks with an unlucky id silently turns into a
+   * cottage — a failure that looks like a gameplay bug rather than a missing
+   * frame, which is the worst way for a renderer to break.
+   */
   function buildingFrameFor(type, player, b) {
     if (type === 'farm') return farmFrame(player, farmStage(b));
     if (isWallType(type)) return wallPieceFrame(type, player, b);
-    const f = buildingFrame(type, player);
-    return has(f) ? f : buildingFrame('house', player);
+    const f = buildingFrame(type, player, (b && b.id) | 0);
+    if (has(f)) return f;
+    const base = buildingFrame(type, player, 0);
+    return has(base) ? base : buildingFrame('house', player);
+  }
+
+  /**
+   * The variant index buildingFrameFor landed on — same arithmetic, no string.
+   * Only the smoke needs this, because where a chimney is depends on which
+   * house got drawn.
+   */
+  function buildingVariant(type, b) {
+    const n = BUILDING_VARIANTS[type] || 1;
+    if (n <= 1) return 0;
+    const v = ((b && b.id) | 0) % n;
+    return (v + n) % n;
   }
 
   /**
@@ -527,10 +645,42 @@ export function createRenderer(scene, world) {
     const f = wallFrame(type, player, mask);
     return has(f) ? f : wallFrame('palisade', player, mask);
   }
-  function resourceFrameFor(type, variant) {
+  /**
+   * Which drawing of a resource node to use.
+   *
+   * The simulation rolls a three-way flavour for every node it spawns
+   * (core/world.js), and that number is three because it always has been, not
+   * because the art has three of anything: there are six trees, three golds,
+   * three stones and two berry bushes. Taking `variant % n` straight — which is
+   * what this used to do — leaves trees 3, 4 and 5 baked into the atlas and
+   * unreachable, and hands berry bush 1 twice the ground of bush 0.
+   *
+   * So the renderer re-rolls, mixing the node's id into the sim's flavour. This
+   * is the right side of the wall for it: how many drawings exist is an atlas
+   * fact, and core/ has to run headless under node with no Phaser in the room,
+   * so it cannot import the table that knows. Widening the constant in world.js
+   * instead would put an art number inside the simulation, where the next art
+   * change silently desyncs it — and would change the world hash for a decision
+   * no peer needs to agree about.
+   *
+   * The mix is a hash rather than `id % n` because nodes are spawned in
+   * spatial runs — a forest is a blob laid down in one pass — and consecutive
+   * ids down a row of trees would march 0,1,2,3,4,5,0,1,2 in a line you can see
+   * from the minimap.
+   */
+  function resourceFrameFor(type, variant, id) {
     const n = RESOURCE_VARIANTS[type];
-    const f = resourceFrame(type, n ? variant % n : 0);
+    const f = resourceFrame(type, n ? mixVariant(variant, id, n) : 0);
     return has(f) ? f : resourceFrame('tree', 0);
+  }
+
+  /** Stable, well-spread pick in [0, n) from two integers. */
+  function mixVariant(variant, id, n) {
+    let h = Math.imul(((variant | 0) + 1), 0x27d4eb2d) ^ Math.imul(id | 0, 0x165667b1);
+    h ^= h >>> 15;
+    h = Math.imul(h, 0x2545f491);
+    h ^= h >>> 13;
+    return (h >>> 0) % n;
   }
 
   // Cached screen<->world affine terms, refreshed whenever the camera moves.
@@ -682,16 +832,22 @@ export function createRenderer(scene, world) {
     terrain.ensure(viewRect);
     perfEnd('render.terrain', _tTerrain);
 
+    waterPool.reset();
     cliffPool.reset();
     markerPool.reset();
     unitPool.reset();
     bldPool.reset();
+    smokePool.reset();
     resPool.reset();
     selPool.reset();
     ghostPool.reset();
 
     overlay.clear();
     plainBars = barCount > BAR_PLAIN_ABOVE;
+    // Both of these read *last* frame's count, for the same reason: the count
+    // is not known until the frame has been drawn, and a bar that appears and
+    // disappears on alternate frames is worse than either choice.
+    barsCrowded = barCount > BAR_CROWD_ABOVE;
     barCount = 0;
     // Bars and dots are only *partially* zoom-compensated: fully compensating
     // makes them swamp the units when zoomed out, not compensating at all makes
@@ -702,6 +858,7 @@ export function createRenderer(scene, world) {
     bodyN = 0;
 
     const _tCliffs = perfBegin('render.cliffs');
+    drawWater(dt);
     drawCliffs();
     perfEnd('render.cliffs', _tCliffs);
     const _tRes = perfBegin('render.resources');
@@ -709,6 +866,10 @@ export function createRenderer(scene, world) {
     perfEnd('render.resources', _tRes);
     const _tBld = perfBegin('render.buildings');
     drawBuildings(invZ);
+    // Inside the buildings span rather than beside it: the smoke is one sprite
+    // per smoking building and it is spent on making buildings look alive, so
+    // it belongs against the buildings budget where it will be noticed.
+    drawSmoke(dt);
     perfEnd('render.buildings', _tBld);
     const _tUnits = perfBegin('render.units');
     drawUnits(alpha, invZ);
@@ -724,10 +885,12 @@ export function createRenderer(scene, world) {
     drawGhost();
     drawWallRun();
 
+    waterPool.trim();
     cliffPool.trim();
     markerPool.trim();
     unitPool.trim();
     bldPool.trim();
+    smokePool.trim();
     resPool.trim();
     selPool.trim();
     ghostPool.trim();
@@ -801,6 +964,32 @@ export function createRenderer(scene, world) {
    * stays on your map — the fog overlay darkens it along with everything else,
    * which is exactly the treatment the ground under it gets.
    */
+  /**
+   * The caustic overlay on interior water.
+   *
+   * Driven by the render clock rather than by world.time, so the water keeps
+   * moving while the simulation is paused — a frozen pond in a paused game
+   * reads as a bug, and this layer is decoration that no peer has to agree
+   * about.
+   *
+   * Not fog-gated: water is terrain, and terrain you have seen once stays on
+   * your map. The fog quad above darkens it along with the ground it sits on,
+   * which is exactly the treatment the baked water underneath gets.
+   */
+  function drawWater(dt) {
+    if (!waterTiles.length) return;
+    waterPhase += dt * WATER_FPS;
+    const frame = waterFrame(waterPhase | 0);
+    for (let i = 0; i < waterTiles.length; i++) {
+      const t = waterTiles[i];
+      if (!visible(t.wx, t.wy)) continue;
+      const s = waterPool.get();
+      setFrame(s, frame, origins);
+      s.setPosition(t.wx, t.wy);
+      s.setAlpha(WATER_ALPHA);
+    }
+  }
+
   function drawCliffs() {
     for (let i = 0; i < cliffs.length; i++) {
       const c = cliffs[i];
@@ -822,7 +1011,7 @@ export function createRenderer(scene, world) {
     const wx = (e.x - e.y) * HALF_W;
     const wy = (e.x + e.y) * HALF_H;
     if (!visible(wx, wy)) return;
-    const frame = resourceFrameFor(e.type, e.variant || 0);
+    const frame = resourceFrameFor(e.type, e.variant || 0, e.id);
     const s = resPool.get();
     setFrame(s, frame, origins);
     s.setPosition(wx, wy);
@@ -929,6 +1118,53 @@ export function createRenderer(scene, world) {
       if (selected && b.rally && typeof b.rally.x === 'number') {
         rallyLine(b, wx, wy, invZ);
       }
+    }
+  }
+
+  /**
+   * Chimney plumes — the one thing on the map that moves without being told to.
+   *
+   * A second walk of the building list rather than four lines inside
+   * drawBuildings. The list is a few dozen entries against the hundreds of
+   * sprites that pass drives, so the walk is free, and keeping it separate
+   * means the smoke can be moved, muted or depth-ruled differently without
+   * touching the pass that has to get buildings right.
+   *
+   * The plume is an overlay on an unchanged building frame, which is why it is
+   * affordable: the Blacksmith's own drawing keeps the first two puffs at the
+   * flue and this continues upward from where they stop, so the building is
+   * correct with the overlay on and correct with it off. Only two of the four
+   * house drawings have a chimney in CHIMNEY, which is not an oversight — a
+   * street where every roof smokes in step is worse than one where two do.
+   *
+   * Driven by the render clock like the water, and for the same reason: a
+   * paused game with frozen smoke reads as a crash, and no peer has ever had
+   * to agree about a puff of smoke.
+   */
+  function drawSmoke(dt) {
+    smokePhase += dt * SMOKE_FPS;
+    const frame = smokeFrame(smokePhase | 0);
+    const list = world.buildings;
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      // A half-built forge has no fire in it, and a remembered one is a
+      // snapshot — drawMemory paints the past, and the past holds still.
+      if (b.dead || !b.complete) continue;
+      const v = buildingVariant(b.type, b);
+      const c = CHIMNEY[v ? `${b.type}_v${v}` : b.type];
+      if (!c) continue;
+      if (!litBuilding(b)) continue;
+      const wx = (b.x - b.y) * HALF_W;
+      const wy = (b.x + b.y) * HALF_H;
+      if (!visible(wx, wy)) continue;
+      const s = smokePool.get();
+      setFrame(s, frame, origins);
+      s.setPosition(wx + c.dx, wy + c.dy);
+      // Above its own building and below anything standing a tile in front:
+      // depthFor gives whole tiles sixteen units apart, so a fractional bias
+      // orders the pair without reaching the neighbour.
+      s.setDepth(depthFor(b.x, b.y, 1) + 0.5);
+      s.setScale(c.scale);
     }
   }
 
@@ -1182,7 +1418,7 @@ export function createRenderer(scene, world) {
       //    question "who is about to die" is the only question, and answering
       //    it only for units that have already been hit answers it too late.
       const hurt = u.hp < u.maxHp;
-      if (hurt || selected || (barsWanted && u.player === PLAYER)) {
+      if (hurt || selected || (barsWanted && u.player === PLAYER && !barsCrowded)) {
         barCount++;
         // The stem. A bar floating above a head in this projection is also
         // floating over the *chest* of whatever stands two tiles behind, and at
@@ -1251,7 +1487,7 @@ export function createRenderer(scene, world) {
 
       if (m.kind === 'resource') {
         const s = resPool.get();
-        setFrame(s, resourceFrameFor(m.type, m.variant || 0), origins);
+        setFrame(s, resourceFrameFor(m.type, m.variant || 0, m.id), origins);
         s.setPosition(wx, wy);
         s.setDepth(depthFor(m.x, m.y, 2));
         const left = m.maxAmount ? m.amount / m.maxAmount : 1;
@@ -1592,6 +1828,8 @@ function setFrame(s, frame, origins) {
 const INDEX_CELL = 8;
 
 function makeStaticIndex(world) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const cols = Math.ceil(MAP_W / INDEX_CELL);
   const rows = Math.ceil(MAP_H / INDEX_CELL);
   const cells = new Array(cols * rows);
@@ -1821,6 +2059,8 @@ function strokeDiamond(g, cx, cy, hw, hh) {
  * the world.
  */
 function makeFog(scene, world, rect) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const vision = world.vision;
   if (!vision) return null;
 
@@ -1907,7 +2147,7 @@ function makeFog(scene, world, rect) {
   quad.setRotation(Math.PI / 4);
   root.add(quad);
 
-  const st = vision.state(PLAYER);
+  const st = vision.viewState(PLAYER);
   let paintedRevision = -1;
   let since = FOG_REFRESH_INTERVAL;
 
@@ -1981,6 +2221,8 @@ function bakeTerrain(scene, world, rect) {
         ox: minX + cx * TERRAIN_CHUNK - CHUNK_PAD,
         oy: minY + cy * TERRAIN_CHUNK - CHUNK_PAD,
         rt: null,
+        // When this chunk was last within reach of the camera. Drives eviction.
+        used: 0,
       });
     }
   }
@@ -2024,21 +2266,63 @@ function bakeTerrain(scene, world, rect) {
    * stress scenario with twenty chunks resident, hiding the off-screen ones took
    * the frame from 27 draw calls to 13.
    */
+  /**
+   * How many baked chunks may exist at once.
+   *
+   * Lazy baking bounds what is resident only if something also lets go. Nothing
+   * did: a chunk painted on the way past was kept for the life of the scene, so
+   * a match that visited most of the map ended up holding most of the map. On
+   * the two-player 96x96 that is 91 chunks and about 100MB, which the comment
+   * above has always said and which a phone survives. On the eight-player
+   * 192x192 it is ~325 chunks and something like 350MB of GPU texture, which it
+   * does not — the context is lost, and a lost context is a black screen rather
+   * than a slow one.
+   *
+   * 64 is comfortably more than the viewport plus its prebake margin can want at
+   * the widest zoom, so in ordinary play nothing is ever evicted and this costs
+   * nothing. It only bites when the camera has been somewhere else entirely, and
+   * what it costs then is one re-bake of a chunk that is off screen anyway.
+   */
+  const MAX_RESIDENT = 64;
+  let paintClock = 0;
+
+  /** Throw away the chunks touched longest ago, keeping the budget. */
+  function evict(keepFrom) {
+    const live = [];
+    for (let i = 0; i < planned.length; i++) if (planned[i].rt) live.push(planned[i]);
+    if (live.length <= MAX_RESIDENT) return;
+    live.sort((a, b) => a.used - b.used);
+    for (let i = 0; i < live.length - MAX_RESIDENT; i++) {
+      const c = live[i];
+      // Never evict something the camera is looking at right now: re-baking it
+      // in the same frame would be a stutter for no memory saved.
+      if (c.used >= keepFrom) continue;
+      c.rt.destroy();
+      c.rt = null;
+    }
+  }
+
   function ensure(view) {
     const bx0 = view.x - PREBAKE_PAD;
     const by0 = view.y - PREBAKE_PAD;
     const bx1 = view.r + PREBAKE_PAD;
     const by1 = view.b + PREBAKE_PAD;
+    const now = ++paintClock;
+    let baked = 0;
     for (let i = 0; i < planned.length; i++) {
       const c = planned[i];
+      const near = !(c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0);
       if (!c.rt) {
-        if (c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0) continue;
+        if (!near) continue;
         paint(c);
+        baked++;
       }
+      if (near) c.used = now;
       const on = !(c.ox > view.r || c.ox + size < view.x
         || c.oy > view.b || c.oy + size < view.y);
       if (c.rt.visible !== on) c.rt.setVisible(on);
     }
+    if (baked) evict(now);
   }
 
   function destroy() {
@@ -2111,12 +2395,36 @@ function buildTerrainOps(world) {
   }
 
   // --- 3. transition washes -------------------------------------------------
+  //
   // Edge index order matches textures.js: 0 = -y, 1 = +x, 2 = +y, 3 = -x.
+  //
+  // WHY THIS IS NOT JUST ONE WASH PER EDGE ANY MORE. It was, at a flat alpha of
+  // 0.85, and the result is the single loudest thing wrong with a screenshot of
+  // this map: a tile either received the neighbour's colour or it did not, so
+  // every grass/dirt boundary was a clean one-tile-wide staircase of 45-degree
+  // diamonds. The wash softened the *colour* across that boundary and did
+  // nothing at all about its *shape*, and shape is what the eye reads first.
+  // Ground in the world does not change over exactly one tile and it does not
+  // change by the same amount all along a border.
+  //
+  // So the boundary now varies in two ways, both driven by the tile hash, so
+  // both are stable across re-bakes and identical on every machine:
+  //
+  //   * strength varies per tile, 0.5 to 1.0, so the edge fades in and out
+  //     along its length instead of reading as one drawn line;
+  //   * on about a third of tiles the neighbouring terrain bleeds a SECOND tile
+  //     inland, faintly. That is the part that actually kills the staircase —
+  //     it makes the boundary two tiles wide in patches and one tile wide in
+  //     others, which is a ragged edge rather than a stepped one.
+  //
+  // Both are free: they change the alpha and the count of quads already being
+  // pushed into a batched bake that happens once per chunk.
   const NEIGH = [[0, -1], [1, 0], [0, 1], [-1, 0]];
   for (let ty = 0; ty < H; ty++) {
     for (let tx = 0; tx < W; tx++) {
       const id = world.terrain[ty * W + tx];
       const mine = TERRAIN_PRIORITY[id];
+      const h = tileHash(tx, ty);
       let placed = false;
       for (let e = 0; e < 4; e++) {
         const nId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
@@ -2126,20 +2434,60 @@ function buildTerrainOps(world) {
           tilePos(tx, ty, p);
           placed = true;
         }
-        push(edgeBlendFrame(e), 0.85, TERRAIN_BASE[nId]);
+        // (h >>> shift) & 7 gives each edge its own three bits, so the four
+        // edges of one tile do not all get the same strength.
+        const bits = (h >>> (e * 3)) & 7;
+        // The variant is what stops a fifty-tile boundary rhyming. Four shapes
+        // per edge, chosen by the same hash that sets the strength but a
+        // different slice of it, so shape and strength do not correlate into a
+        // visible pattern of their own.
+        push(edgeBlendFrame(e, (h >>> (18 + e * 2)) & 3),
+          0.5 + bits * (0.5 / 7), TERRAIN_BASE[nId]);
+      }
+
+      // The second rank: this tile is not adjacent to the other terrain, but
+      // the tile beyond its neighbour is. A faint wash here on a hashed
+      // minority of tiles is what makes the border wander.
+      if (!placed) {
+        for (let e = 0; e < 4; e++) {
+          const midId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
+          if (midId !== id) continue;              // only bleed through our own kind
+          const farId = terrainAt(tx + NEIGH[e][0] * 2, ty + NEIGH[e][1] * 2);
+          if (farId < 0 || farId === id) continue;
+          if (TERRAIN_PRIORITY[farId] <= mine) continue;
+          if (((h >>> (12 + e * 2)) & 3) !== 0) continue;   // one tile in four
+          tilePos(tx, ty, p);
+          push(edgeBlendFrame(e, (h >>> 26) & 3), 0.3, TERRAIN_BASE[farId]);
+          break;
+        }
       }
     }
   }
 
-  // --- 4. surf along the coast ---------------------------------------------
+  // --- 4. surf along every coast, not just the map's own --------------------
+  //
+  // This used to run only on the four border rows (`tx !== 0 && ty !== 0 &&
+  // ...`), which meant the out-of-bounds ocean got a surf line and every pond
+  // on the map got none: a lake was a flat blue diamond butted straight against
+  // sand with a hard edge, which is exactly the frame that gives a tilemap
+  // away. Every land tile that touches water now gets the line on the side that
+  // faces it, and the map edge is the same rule with "off the map" counting as
+  // water — which is what it is.
   for (let ty = 0; ty < H; ty++) {
     for (let tx = 0; tx < W; tx++) {
-      if (tx !== 0 && ty !== 0 && tx !== W - 1 && ty !== H - 1) continue;
-      tilePos(tx, ty, p);
-      if (ty === 0) push(shoreFrame(0), 0.75, 0xdff1ff);
-      if (tx === W - 1) push(shoreFrame(1), 0.75, 0xdff1ff);
-      if (ty === H - 1) push(shoreFrame(2), 0.75, 0xdff1ff);
-      if (tx === 0) push(shoreFrame(3), 0.75, 0xdff1ff);
+      if (world.terrain[ty * W + tx] === TERRAIN.WATER) continue;
+      let placed = false;
+      for (let e = 0; e < 4; e++) {
+        const nId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
+        // Out of bounds (-1) is the sea the map sits in.
+        if (nId >= 0 && nId !== TERRAIN.WATER) continue;
+        if (!placed) {
+          tilePos(tx, ty, p);
+          placed = true;
+        }
+        push(shoreFrame(e, (tileHash(tx * 5 + 3, ty * 7 + 1) >>> (e * 2)) & 3),
+          0.75, 0xdff1ff);
+      }
     }
   }
 
@@ -2189,6 +2537,40 @@ function buildTerrainOps(world) {
     }
   }
 
+  // --- 6. the ground shadow the rock casts ----------------------------------
+  //
+  // Cliffs are drawn as sprites so they can depth-sort against units (see
+  // drawCliffs), which means they sit *on* the terrain with nothing underneath
+  // them: a thirty-pixel-tall block of stone that casts no shadow at all, and
+  // the eye reads it as a sticker rather than as a thing standing on ground.
+  // One dark wash on the tiles the rock would shade fixes it, and it belongs in
+  // the bake rather than in the sprite pass because it is a property of the
+  // ground, not of the cliff — it must be under the units that walk across it.
+  //
+  // The light in this game comes from the upper left, stated everywhere in
+  // textures.js and honoured in every hand-shaded face. Upper left in this
+  // projection means the shadow falls toward +x and +y, so those are the two
+  // neighbours that darken, and the tile diagonally beyond both — the corner
+  // the two shadows overlap in — darkens most.
+  if (world.cliff) {
+    const cliffAt = (tx, ty) =>
+      (tx < 0 || ty < 0 || tx >= W || ty >= H ? 0 : world.cliff[ty * W + tx]);
+    for (let ty = 0; ty < H; ty++) {
+      for (let tx = 0; tx < W; tx++) {
+        if (cliffAt(tx, ty)) continue;          // the rock shades itself
+        const ex = cliffAt(tx - 1, ty) ? 1 : 0; // rock uphill on the -x side
+        const ey = cliffAt(tx, ty - 1) ? 1 : 0;
+        const diag = cliffAt(tx - 1, ty - 1) ? 1 : 0;
+        if (!ex && !ey && !diag) continue;
+        // Two faces of shade is darker than one; the diagonal alone is the
+        // faint corner where a real shadow would only just reach.
+        const a = ex && ey ? 0.34 : (ex || ey) ? 0.24 : 0.11;
+        tilePos(tx, ty, p);
+        push(terrainFrame(TERRAIN.GRASS, 0), a, 0x1a1710);
+      }
+    }
+  }
+
   return ops;
 }
 
@@ -2207,6 +2589,32 @@ function buildTerrainOps(world) {
  * draws the tile grid across the rock in black — the exact failure this frame
  * set exists to avoid.
  */
+/**
+ * Every interior water tile, flattened once into screen positions.
+ *
+ * "Interior" means inside the playable grid — the out-of-bounds ocean shelf is
+ * drawn by the terrain bake and is deliberately left still. See the note at the
+ * water pool for why.
+ */
+function buildWaterList(world) {
+  const out = [];
+  const W = world.width;
+  const H = world.height;
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      if (world.terrain[ty * W + tx] !== TERRAIN.WATER) continue;
+      // Exactly tilePos(): the overlay has to land on the same pixels the
+      // baked water underneath it occupies, and these frames share the
+      // terrain frames' top-left anchor.
+      out.push({
+        wx: (tx - ty) * HALF_W - TILE_TEX_W / 2 + TILE_TEX_OFF_X,
+        wy: (tx + ty + 1) * HALF_H - TILE_TEX_H / 2 + TILE_TEX_OFF_Y,
+      });
+    }
+  }
+  return out;
+}
+
 function buildCliffList(world) {
   const grid = world.cliff;
   const out = [];

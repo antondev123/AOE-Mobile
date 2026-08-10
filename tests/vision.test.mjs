@@ -10,7 +10,7 @@
 // times over.
 
 import { createWorld, spawnUnit, spawnBuilding, spawnResource, removeEntity } from '../src/core/world.js';
-import { MAP_W, MAP_H, PLAYER, ENEMY } from '../src/core/constants.js';
+import { DEFAULT_MAP_W as MAP_W, DEFAULT_MAP_H as MAP_H, PLAYER, ENEMY } from '../src/core/constants.js';
 import {
   unitLineOfSight, buildingLineOfSight, visionStats, resetVisionStats,
 } from '../src/systems/vision.js';

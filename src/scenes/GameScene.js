@@ -13,12 +13,18 @@
 import { createWorld, ownedBy, recomputePop } from '../core/world.js';
 import { generateMap } from '../core/mapgen.js';
 import {
-  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY, BUILDING_STATS, MILITARY_TYPES,
+  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
+import { checkVictory } from '../core/victory.js';
+import { sameTeam } from '../core/teams.js';
 
 import { createRenderer } from '../gfx/render.js';
+import { createLocalBus, createNetBus } from '../net/bus.js';
+import { setViewpoint } from '../core/viewpoint.js';
+import { applyCommand } from '../core/command.js';
+import { checksum } from '../core/checksum.js';
 import { updateEconomy } from '../systems/economy.js';
 import { updateAllocation } from '../systems/allocation.js';
 import { updateUnits, commandUnits } from '../systems/unitAI.js';
@@ -63,6 +69,24 @@ export class GameScene extends Phaser.Scene {
     // A payload from src/core/save.js, already version-checked by whoever read
     // it out of storage. Null for a fresh skirmish.
     this.resumeFrom = (data && data.resume) || null;
+    // A live net client (src/net/client.js) when this is a networked match, and
+    // null for a skirmish. Everything downstream branches on this one field.
+    this.net = (data && data.net) || null;
+    // Which seat we are. Always PLAYER in a skirmish; whatever the server gave
+    // us in a match.
+    this.seat = this.net && this.net.playerId != null ? this.net.playerId : PLAYER;
+    // Who is in every chair: [{ kind, team }], seat-indexed. The server sends it
+    // with the start signal; a skirmish makes the classic one up.
+    this.roster = (data && data.roster) || null;
+    // Map dimensions, when the lobby chose them. Absent for a resumed save (the
+    // save carries its own) and for a networked match (the snapshot does).
+    this.worldOpts = (data && data.world) || null;
+    // Point the client's whole view — HUD, fog, selection, minimap — at that
+    // seat. This must happen in init() and not in create(): the renderer and
+    // the HUD read the binding as they are constructed, so a player two who
+    // learned their seat any later would spend the match looking at player
+    // one's resources and unable to select a single one of their own units.
+    setViewpoint(this.seat);
   }
 
   create() {
@@ -84,10 +108,24 @@ export class GameScene extends Phaser.Scene {
       }
     }
     if (!world) {
-      world = createWorld(this.seed);
+      // Built to the lobby's roster. A plain skirmish passes none of this and
+      // gets the two-player 96x96 default, which is the game as it shipped.
+      const roster = this.roster;
+      world = createWorld(this.seed, {
+        playerCount: roster ? roster.length : undefined,
+        width: this.worldOpts ? this.worldOpts.width : undefined,
+        height: this.worldOpts ? this.worldOpts.height : undefined,
+        teams: roster ? roster.map((r, i) => (r && r.team !== undefined ? r.team : i)) : undefined,
+      });
       generateMap(world);
-      recomputePop(world, PLAYER);
-      recomputePop(world, ENEMY);
+      // A closed chair is out from tick zero and owns nothing — see the note on
+      // compaction in server/room.js.
+      if (roster) {
+        for (let i = 0; i < roster.length; i++) {
+          if (roster[i] && roster[i].kind === 'closed') world.players[i].defeated = true;
+        }
+      }
+      for (const p of world.players) recomputePop(world, p.id);
     }
     this.world = world;
     this.resumeFrom = null;
@@ -99,6 +137,12 @@ export class GameScene extends Phaser.Scene {
     // rebuilt from where the units are standing.
     world.vision.update();
 
+    // The bus has to exist before the HUD and the input do — both read it off
+    // the scene at construction time.
+    this.bus = this.net
+      ? createNetBus(this.net, this.seat)
+      : createLocalBus(world, this.seat);
+
     this.renderer = createRenderer(this, world);
     // Audio before the HUD, because the HUD plays the button clicks.
     //
@@ -108,11 +152,39 @@ export class GameScene extends Phaser.Scene {
     // them fires — which is why the browser harness, which boots with
     // ?autostart and never gestures, hears nothing and logs nothing.
     this.audio = createAudio({ seed: this.seed });
-    this.audioAdapter = createAudioAdapter(world, this.audio, { playerId: PLAYER });
+    this.audioAdapter = createAudioAdapter(world, this.audio, { playerId: this.seat });
     this.hud = createHud(this, world, this.audio);
     this.input2 = createInput(this, world, this.renderer, this.hud);
-    this.enemyAI = createEnemyAI(world, ENEMY);
-    if (restored && restored.ai) this.enemyAI.restore(restored.ai);
+    // ONE AI PER 'ai' SEAT, stepped in seat order — and now in a networked match
+    // too, which used to be refused because a snapshot carried a single AI blob.
+    // Both ends build the same list from the same roster and step it at the same
+    // point in the step; that is the whole of the agreement.
+    // NEVER GUESS THIS OVER A NETWORK. The fallback below — "everybody who is
+    // not me is an AI" — is right for an offline skirmish and catastrophic in a
+    // match: two clients would each build a different set of brains, neither
+    // matching the server's, and every think would be a fresh divergence. It
+    // cost 109 desyncs in a two-browser 1v1 the first time it shipped. A
+    // networked match with no roster runs no AI at all, which is what an
+    // unclaimed seat has always done.
+    const roster = this.roster
+      || (restored && restored.roster)
+      || (this.net
+        ? world.players.map(() => ({ kind: 'human' }))
+        : world.players.map((p) => ({ kind: p.id === this.seat ? 'human' : 'ai' })));
+    this.roster = roster;
+    this.ais = [];
+    for (let i = 0; i < world.players.length; i++) {
+      if (roster[i] && roster[i].kind === 'ai') this.ais[i] = createEnemyAI(world, i);
+    }
+    // Restore their memory if we were rebuilt from a save or a resync. Without
+    // this an AI wakes up with the world it is in and no recollection of what it
+    // was doing — which on one machine only is a desync.
+    const blobs = restored && (restored.ais || (restored.ai ? [null, restored.ai] : null));
+    if (Array.isArray(blobs)) {
+      for (let i = 0; i < this.ais.length; i++) {
+        if (this.ais[i] && blobs[i]) this.ais[i].restore(blobs[i]);
+      }
+    }
 
     // Expose for the headless test harness and for debugging in the console.
     window.__game = {
@@ -126,8 +198,33 @@ export class GameScene extends Phaser.Scene {
       step: (n = 1) => {
         for (let i = 0; i < n; i++) this.simStep();
       },
-      // Issue orders from the console or from the test harness.
-      command: (units, order) => commandUnits(world, units, order),
+      // Issue orders from the console or from the test harness. Goes through
+      // the bus, so a harness driving a networked match exercises the same path
+      // a tap does rather than mutating under the server's feet.
+      command: (units, order) => this.bus.dispatch({
+        t: 'order',
+        units: units.map((u) => (typeof u === 'number' ? u : u.id)),
+        order,
+      }),
+      // Queue a unit, the same door the HUD's train button goes through. Here
+      // for the console and for tools/review-shots.mjs, which has to keep a
+      // player's production running to photograph a match with two sides in
+      // it — the enemy AI now beats a player who does nothing at 8m30s. Through
+      // the bus for the same reason `command` is: a harness that mutates the
+      // world directly is not exercising the path a tap takes.
+      queueTrain: (building, type) => this.bus.dispatch({
+        t: 'train',
+        id: typeof building === 'number' ? building : building.id,
+        unitType: type,
+      }),
+      bus: this.bus,
+      net: this.net,
+      seat: this.seat,
+      // One per 'ai' seat, seat-indexed and sparse. Was `enemyAI`, singular,
+      // when a match could only have one.
+      ais: this.ais,
+      roster: this.roster,
+      checksum: () => checksum(world),
       // Fog of war, for the console: masks, remembered objects and the timing
       // counters (see visionStats in systems/vision.js).
       vision: world.vision,
@@ -172,7 +269,7 @@ export class GameScene extends Phaser.Scene {
       this.renderer.centerOn(view.x, view.y);
       if (view.zoom && this.renderer.camera) this.renderer.camera.setZoom(view.zoom);
     } else {
-      const tc = ownedBy(world, PLAYER, 'building', 'towncenter')[0];
+      const tc = ownedBy(world, this.seat, 'building', 'towncenter')[0];
       if (tc && this.renderer.centerOn) this.renderer.centerOn(tc.x, tc.y);
     }
 
@@ -202,7 +299,8 @@ export class GameScene extends Phaser.Scene {
       if (c) view = { x: c.x, y: c.y, zoom: cam.zoom };
     }
     return serializeGame(this.world, {
-      ai: this.enemyAI && this.enemyAI.serialize ? this.enemyAI.serialize() : null,
+      ais: this.ais.map((a) => (a && a.serialize ? a.serialize() : null)),
+      roster: this.roster,
       view,
     });
   }
@@ -214,6 +312,11 @@ export class GameScene extends Phaser.Scene {
    */
   saveNow(reason = 'auto') {
     if (!this.world || this.world.over || this.saved === 'gone') return null;
+    // A networked match is not ours to save. The stored payload has no seat, no
+    // match id and no socket, so "Resume match" would drop the player into half
+    // a 1v1 with an empty chair — and worse, the boot card would offer it in
+    // preference to the game they were actually invited to.
+    if (this.net) return null;
     try {
       const res = writeSave(this.snapshotSave());
       this.lastSave = { at: Date.now(), reason, ...res };
@@ -236,6 +339,16 @@ export class GameScene extends Phaser.Scene {
     const world = this.world;
     if (world.over) return;
     const dt = SIM_DT;
+
+    // Networked: everything scheduled for this tick fires before it, in the
+    // order the server put it in. This is the single line that makes two
+    // machines play the same game — the commands are applied *between* steps,
+    // never during one, so an order either landed before this tick or lands
+    // before the next, and both ends agree which. (server/match.js does the
+    // same thing at the same point in its own step.)
+    if (this.net) {
+      for (const cmd of this.net.drain(world.tick)) applyCommand(world, cmd);
+    }
     const _t = perfBegin('sim');
     // How many fixed steps landed in this frame. On a device holding 60fps that
     // is 0 or 1; on a machine drawing at 20fps it is three, and without this
@@ -267,8 +380,13 @@ export class GameScene extends Phaser.Scene {
     const _tEcon = perfBegin('sim.economy');
     updateEconomy(world, dt);
     perfEnd('sim.economy', _tEcon);
+    // No AI in a networked match. The server does not run one either (see the
+    // seat note in server/server.js), and an AI whose memory is absent from the
+    // snapshot a client rebuilds from would diverge within seconds of joining.
     const _tAI = perfBegin('sim.enemyAI');
-    this.enemyAI.update(dt);
+    for (let i = 0; i < this.ais.length; i++) {
+      if (this.ais[i]) this.ais[i].update(dt);
+    }
     perfEnd('sim.enemyAI', _tAI);
     // Vision last, after everything has finished moving, dying and being built,
     // so the masks the renderer reads this frame describe the world the player
@@ -282,6 +400,14 @@ export class GameScene extends Phaser.Scene {
 
     if (world.tick % 20 === 0) this.sampleArmy();
     this.checkVictory();
+
+    // Did we still agree with the server at the tick just completed? verify()
+    // answers null for the nineteen ticks in twenty it has no digest for.
+    if (this.net) {
+      const agreed = this.net.verify(world.tick, checksum(world));
+      if (agreed === false) this.net.resync('checksum');
+    }
+
     perfEnd('sim', _t);
   }
 
@@ -289,18 +415,43 @@ export class GameScene extends Phaser.Scene {
     perfFrame();
     const _tFrame = perfBegin('scene.update');
     const dtSec = Math.min(delta, 250) / 1000;
-    this.accumulator += dtSec;
 
-    let steps = 0;
-    while (this.accumulator >= SIM_DT && steps < MAX_STEPS_PER_FRAME) {
-      this.simStep();
-      this.accumulator -= SIM_DT;
-      steps++;
+    if (this.net) {
+      // The server owns the clock. We simulate up to the tick it says we may
+      // reach — a little behind it, so commands stamped for a future tick have
+      // time to arrive before we get there — and no further. A frame that runs
+      // long simply catches up over the next few; a machine that has fallen so
+      // far behind that stepping cannot fix it asks to be rebuilt instead.
+      // Kept as a fraction, then stepped to the tick above it, so the renderer
+      // is interpolating *between* the last two simulated ticks rather than
+      // extrapolating past the newest one. Same relationship the skirmish's
+      // accumulator has to its own steps, just driven by a different clock.
+      const tf = this.net.targetTickFloat();
+      const target = Math.ceil(tf);
+      if (this.net.hopelesslyBehind(this.world.tick)) {
+        this.net.resync('too far behind');
+      } else {
+        let steps = 0;
+        while (this.world.tick < target && steps < MAX_STEPS_PER_FRAME) {
+          this.simStep();
+          steps++;
+        }
+      }
+      this.alpha = Math.max(0, Math.min(1, tf - (this.world.tick - 1)));
+    } else {
+      this.accumulator += dtSec;
+
+      let steps = 0;
+      while (this.accumulator >= SIM_DT && steps < MAX_STEPS_PER_FRAME) {
+        this.simStep();
+        this.accumulator -= SIM_DT;
+        steps++;
+      }
+      // If we blew the step budget, drop the backlog rather than spiralling.
+      if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0;
+
+      this.alpha = this.accumulator / SIM_DT;
     }
-    // If we blew the step budget, drop the backlog rather than spiralling.
-    if (steps === MAX_STEPS_PER_FRAME) this.accumulator = 0;
-
-    this.alpha = this.accumulator / SIM_DT;
     const _tInput = perfBegin('input');
     this.input2.update(dtSec);
     perfEnd('input', _tInput);
@@ -337,54 +488,16 @@ export class GameScene extends Phaser.Scene {
   }
 
   /**
-   * You lose when you can no longer produce anything.
+   * End the match when one side is left standing.
    *
-   * The old rule was "no buildings and no villagers", which is the last
-   * possible moment rather than the decisive one, and it made winning worse
-   * than losing: a player who had razed the enemy's Town Center, Barracks and
-   * Castle still had to hunt the last enemy villager across a map that is 93%
-   * fog, and there is no tool in this game for finding one villager on 9216
-   * tiles. Meanwhile the loser sat in a game that was decided ten minutes ago
-   * with no resign button and nothing to do but close the tab.
-   *
-   * A player who owns nothing that trains a unit cannot replace a villager,
-   * cannot replace a soldier and cannot rebuild — a lone villager can lay a
-   * Town Center foundation, so a foundation counts, which is why this asks
-   * "does anything you own train units" rather than "is anything finished".
-   * That is the point at which the match is over, and it is the point the
-   * match now ends at.
-   *
-   * Written as a scan rather than as list comprehensions, because it runs every
-   * sim step for every player: the readable version allocated four arrays of up
-   * to two hundred entities twenty times a second, all of it to answer a yes/no
-   * question that stops the moment it finds its first hit.
+   * The rule itself lives in core/victory.js, called by both this scene and
+   * server/match.js. It used to be written out in both places with two
+   * *different* elimination conditions, which is invisible in a skirmish and
+   * means the server ends a game the clients are still playing in a networked
+   * one.
    */
   checkVictory() {
-    const world = this.world;
-    if (world.over) return;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      let canRecover = false;
-      for (const id of p.owned) {
-        const e = world.entities.get(id);
-        if (!e || e.dead || e.kind !== 'building') continue;
-        const s = BUILDING_STATS[e.type];
-        if (s && s.trains && s.trains.length) { canRecover = true; break; }
-      }
-      if (!canRecover && world.time > 3) p.defeated = true;
-    }
-    let alive = null;
-    let aliveCount = 0;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      aliveCount++;
-      alive = p;
-    }
-    if (aliveCount === 1) {
-      world.over = true;
-      world.winner = alive.id;
-      world.events.emit(EV.GAME_OVER, { winner: alive.id });
-    }
+    checkVictory(this.world);
   }
 
   /** Biggest army the player ever fielded. Called once a simulated second. */
@@ -408,7 +521,9 @@ export class GameScene extends Phaser.Scene {
   resign() {
     const world = this.world;
     if (!world || world.over) return false;
-    world.players[PLAYER].defeated = true;
+    // This seat, not seat zero. In a networked match the local player is
+    // whichever chair the server gave them, and resigning must give up that one.
+    world.players[this.seat].defeated = true;
     this.resigned = true;
     this.checkVictory();
     return true;
@@ -425,16 +540,30 @@ export class GameScene extends Phaser.Scene {
     const title = document.getElementById('end-title');
     const sub = document.getElementById('end-sub');
     if (!card) return;
-    const won = winner === PLAYER;
-    title.textContent = won ? 'Victory' : 'Defeat';
-    title.className = won ? 'win' : 'lose';
+    // Won as a *side*, not as a seat. A team-mate still standing when your own
+    // town has fallen has won the match, and so have you. A draw — every
+    // remaining side eliminated on one step — is neither.
+    const draw = winner === null || winner === undefined;
+    const won = !draw && sameTeam(this.world, winner, this.seat);
+    title.textContent = draw ? 'Draw' : won ? 'Victory' : 'Defeat';
+    title.className = draw ? '' : won ? 'win' : 'lose';
     const mins = Math.floor(this.world.time / 60);
     const secs = Math.floor(this.world.time % 60);
+    // "The enemy" was a fair thing to call the other player when there was
+    // exactly one of them. With a roster it is a side, and the sentence has to
+    // survive both a 1v1 and a four-way free-for-all.
+    const mine = this.world.players[this.seat];
+    const wonAlone = won && mine && !mine.defeated
+      && this.world.players.every((p) => p.defeated || p.id === this.seat);
     sub.textContent = this.resigned
       ? `You resigned after ${mins}m ${secs}s.`
-      : won
-        ? `The enemy can train nothing more. ${mins}m ${secs}s.`
-        : `You can train nothing more. ${mins}m ${secs}s.`;
+      : draw
+        ? `Nobody was left standing. ${mins}m ${secs}s.`
+        : wonAlone
+          ? `Nobody else can train anything more. ${mins}m ${secs}s.`
+          : won
+            ? `Your side is the last one standing. ${mins}m ${secs}s.`
+            : `You can train nothing more. ${mins}m ${secs}s.`;
 
     const stats = document.getElementById('end-stats');
     if (stats) {

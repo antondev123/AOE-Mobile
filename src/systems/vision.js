@@ -49,7 +49,7 @@
 // visionStats for the measured numbers.
 
 import {
-  MAP_W, MAP_H, UNIT_STATS, BUILDING_STATS,
+  UNIT_STATS, BUILDING_STATS,
   DEFAULT_UNIT_LOS, DEFAULT_BUILDING_LOS,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
@@ -227,8 +227,8 @@ function makeState(n) {
  * or enforces who is allowed to know what; it only answers the question.
  */
 export function createVision(world) {
-  const W = world.width || MAP_W;
-  const H = world.height || MAP_H;
+  const W = world.width;
+  const H = world.height;
   const N = W * H;
 
   const states = world.players.map(() => makeState(N));
@@ -504,7 +504,11 @@ export function createVision(world) {
    * Recompute the visible masks. Cheap when nothing moved — call it every sim
    * step and stop thinking about it.
    */
+  // Has update() ever run? See entityVisible for what this is for.
+  let everUpdated = false;
+
   function update() {
+    everUpdated = true;
     const t0 = nowMs();
     gen++;
 
@@ -537,6 +541,23 @@ export function createVision(world) {
       }
     }
 
+    // Refresh any team composite that has already been built.
+    //
+    // This has to happen here rather than purely on read, because the renderer,
+    // the minimap and the effects layer each capture their mask ONCE and hold
+    // the reference for the life of the scene — which is correct and cheap for a
+    // seat's own state, since that object is mutated in place. A composite is
+    // mutated in place too, but only by the function that builds it, so without
+    // this a shared-vision mask would be assembled on the first frame and then
+    // never move again: allies' fog frozen at whatever they could see when the
+    // match started.
+    //
+    // Only teams that someone has actually asked for exist here, so a
+    // free-for-all and a 1v1 iterate an empty Map.
+    if (teamStates.size) {
+      for (const teamId of teamStates.keys()) teamState(teamId);
+    }
+
     const ms = nowMs() - t0;
     visionStats.updates++;
     visionStats.lastMs = ms;
@@ -548,6 +569,76 @@ export function createVision(world) {
 
   const state = (playerId) => states[playerId];
 
+  // --- Shared vision -------------------------------------------------------
+  //
+  // A composite of a team's masks, built on read and only when one of its
+  // members has changed. Deliberately NOT another set of stamped masks: the
+  // per-viewer stamping is what makes this system cheap (a viewer that has not
+  // changed tile costs one Map lookup and three compares), and doubling it so
+  // that every disc lands in a team grid as well as a player grid would double
+  // the hot loop for a mask only the local player's renderer ever reads.
+  //
+  // `explored` is a union that never shrinks, which is right — ground your ally
+  // walked past is ground you have seen. `visible` is a union of what is lit
+  // right now, so it falls dark again when they leave.
+  //
+  // What is NOT shared is `memory`: the remembered buildings behind the fog stay
+  // per-player. AoE2 does not merge them either, and doing so would mean
+  // reconciling two players' snapshots of the same tile taken at different times
+  // — a much larger change than a bitwise or.
+  const teamStates = new Map();
+
+  function teamState(teamId) {
+    const members = [];
+    for (const p of world.players) {
+      const t = p.team === undefined || p.team === null ? p.id : p.team;
+      if (t === teamId) members.push(states[p.id]);
+    }
+    // A team of one is its own member's state, with no copying at all. That is
+    // the free-for-all case and the 1v1 case, which is to say almost always.
+    if (members.length === 1) return members[0];
+    if (!members.length) return null;
+
+    let cached = teamStates.get(teamId);
+    if (!cached) {
+      cached = { visible: new Uint8Array(N), explored: new Uint8Array(N), revision: 0, seen: [] };
+      teamStates.set(teamId, cached);
+    }
+    // Rebuild only when a member has moved on since the last composite.
+    let stamp = 0;
+    for (const m of members) stamp += m.revision;
+    if (cached.stamp === stamp) return cached;
+    cached.stamp = stamp;
+    cached.revision++;
+
+    const vis = cached.visible;
+    const exp = cached.explored;
+    vis.fill(0);
+    for (const m of members) {
+      const mv = m.visible;
+      const me = m.explored;
+      for (let i = 0; i < N; i++) {
+        if (mv[i]) vis[i] = 1;
+        if (me[i]) exp[i] = 1;
+      }
+    }
+    // The renderer wants somewhere to read remembered objects from, and a
+    // composite has none of its own; the viewer's own memory is the honest
+    // answer, since it is the only one they actually looked at.
+    cached.memory = members[0].memory;
+    cached.memoryTile = members[0].memoryTile;
+    cached.count = members[0].count;
+    return cached;
+  }
+
+  /** The mask a given seat should be *shown*: their team's, not just their own. */
+  const viewState = (playerId) => {
+    const p = world.players[playerId];
+    if (!p) return states[playerId];
+    const t = p.team === undefined || p.team === null ? p.id : p.team;
+    return teamState(t) || states[playerId];
+  };
+
   function isVisible(playerId, tx, ty) {
     if (tx < 0 || ty < 0 || tx >= W || ty >= H) return false;
     return states[playerId].visible[ty * W + tx] === 1;
@@ -558,8 +649,27 @@ export function createVision(world) {
     return states[playerId].explored[ty * W + tx] === 1;
   }
 
-  /** True when any tile the entity stands on is visible to `playerId`. */
+  /**
+   * True when any tile the entity stands on is visible to `playerId`.
+   *
+   * SELF-HEALING ON THE FIRST QUERY, and it earns that. Before any update()
+   * every mask is zero, which does not mean "nothing is visible" — it means
+   * nobody has worked out what is visible yet. The two readings are
+   * indistinguishable to a caller and the difference is enormous: combat's
+   * auto-acquisition is gated on this, so a harness that builds a world, spawns
+   * two armies and steps the systems *without* calling update() gets a battle in
+   * which no unit ever acquires a target and nobody dies. That is not a
+   * hypothetical failure mode. It has now produced two separate false readings —
+   * a probe of mine, and a whole-game review that concluded on the strength of it
+   * that combat in this game does not resolve.
+   *
+   * The game itself never hits this (GameScene calls update() every step, and so
+   * does tests/simharness.mjs), so the cost is one branch on a path that is
+   * already doing array indexing, and the benefit is that "I forgot to drive the
+   * fog" stops looking exactly like "the combat system is broken".
+   */
   function entityVisible(playerId, e) {
+    if (!everUpdated) update();
     const st = states[playerId];
     if (!st) return true;
     if (e.kind === 'building' && e.tiles) {
@@ -682,7 +792,7 @@ export function createVision(world) {
 
   /**
    * Write the fog alpha field for a player into the alpha bytes of an RGBA
-   * buffer sized MAP_W x MAP_H — one texel per tile, ready to be uploaded and
+   * buffer sized W x H — one texel per tile, ready to be uploaded and
    * stretched over the map.
    *
    * This lives here, in the sim file, rather than in the renderer for one
@@ -700,7 +810,10 @@ export function createVision(world) {
    * instead of ending on a hard line at the map edge.
    */
   function writeFogAlpha(playerId, rgba, exploredByte, blur = true) {
-    const st = states[playerId];
+    // The veil a player is shown covers what their SIDE can see. viewState is
+    // the seat's own mask whenever they have no allies, which is every
+    // free-for-all and every 1v1.
+    const st = viewState(playerId);
     const { visible, explored } = st;
     if (!fogRaw) {
       fogRaw = new Uint8Array(N);
@@ -743,6 +856,8 @@ export function createVision(world) {
     height: H,
     states,
     state,
+    teamState,
+    viewState,
     update,
     isVisible,
     isExplored,

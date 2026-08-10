@@ -14,6 +14,7 @@ import {
   isWallType, isGateType, wallFamily,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
+import { sameTeam } from '../core/teams.js';
 import {
   spawnUnit, spawnBuilding, removeEntity, canPlace, placeBlockedBy, isBlocked, inBounds,
   applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy, forEachNear,
@@ -24,7 +25,7 @@ import { pointsSealedBy, hasOpenPerimeter } from './pathfinding.js';
 // the pair is a deliberate (and shallow) import cycle — see the note at the top
 // of tech.js. Research is production, so it ticks on this module's beat.
 import {
-  updateResearch, gatherMultiplier, lockReason, applyAgeHp,
+  updateResearch, gatherMultiplier, lockReason, applyAgeHp, unitLockReason,
 } from './tech.js';
 
 // --- Tuning (local to this module; constants.js is read-only for me) --------
@@ -795,9 +796,12 @@ export function updateGates(world) {
     let hostile = false;
     forEachNear(world, b.x, b.y, GATE_ENEMY_RADIUS, (e) => {
       if (e.kind !== 'unit' || e.dead) return;
-      if (e.player === b.player) {
+      // An ally counts as a friend here. Without it the gate you built to keep
+      // the enemy out shuts in your team-mate's face, which reads as the wall
+      // being broken rather than as diplomacy.
+      if (sameTeam(world, e.player, b.player)) {
         if (edgeDist2(b, e.x, e.y) <= GATE_FRIEND_RADIUS * GATE_FRIEND_RADIUS) friend = true;
-      } else if (isHostile(b, e)) {
+      } else if (isHostile(world, b, e)) {
         hostile = true;
       }
     });
@@ -1004,6 +1008,16 @@ export function queueTrain(world, building, unitType) {
   const playerId = building.player;
   const p = playerOf(world, playerId);
   if (!p) return false;
+
+  // The age gate. A Feudal Stable can train a scout and cannot yet train a
+  // Knight — see AGE_UNITS in tech.js for why the building's own age is not a
+  // sufficient answer. Checked before the queue and the purse so the refusal a
+  // player gets is the real reason rather than "queue is full".
+  const locked = unitLockReason(world, playerId, unitType);
+  if (locked) {
+    world.events.emit(EV.TOAST, { text: locked, tone: 'warn' });
+    return false;
+  }
 
   if (building.queue.length >= MAX_QUEUE) {
     world.events.emit(EV.TOAST, { text: 'Queue is full', tone: 'warn' });

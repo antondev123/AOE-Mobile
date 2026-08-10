@@ -15,7 +15,7 @@ import {
   createWorld, reindex, ownedBy, recomputePop, removeEntity, spawnUnit,
 } from '../src/core/world.js';
 import { generateMap } from '../src/core/mapgen.js';
-import { SIM_DT, PLAYER, ENEMY } from '../src/core/constants.js';
+import { SIM_DT, PLAYER, ENEMY, mapSizeFor } from '../src/core/constants.js';
 import { updateUnits, commandUnits } from '../src/systems/unitAI.js';
 import { updateCombat } from '../src/systems/combat.js';
 import { garrisonUnit } from '../src/systems/combat.js';
@@ -326,11 +326,42 @@ test('a save from an incompatible version is refused, not half-loaded', () => {
   assert.throws(() => restoreGame(null), /empty/i);
   assert.throws(() => restoreGame({ v: SAVE_VERSION }), /entities/i);
 
-  // A map size this build does not play is refused for the same reason, and
-  // before a single entity has been built out of it.
+  // A save whose stated map size disagrees with the terrain it carries is
+  // refused, and before a single entity has been built out of it.
+  //
+  // This used to assert "a map size this build does not play", which was a real
+  // category when every match was 96x96 and is not one now — the map is a lobby
+  // decision, so 48 is a size this build plays perfectly well. What is still
+  // wrong, and still worth catching, is a payload that contradicts itself.
   const wrongMap = JSON.parse(JSON.stringify(serializeGame(world)));
   wrongMap.width = 48;
-  assert.throws(() => restoreGame(wrongMap), /48x/);
+  assert.throws(() => restoreGame(wrongMap), /terrain/i);
+
+  // And one claiming more seats than the build supports.
+  const tooMany = JSON.parse(JSON.stringify(serializeGame(world)));
+  tooMany.players = new Array(99).fill(tooMany.players[0]);
+  assert.throws(() => restoreGame(tooMany), /players/i);
+});
+
+test('a save round-trips an eight-player world with teams', () => {
+  const world = createWorld(77, {
+    playerCount: 8,
+    width: mapSizeFor(8),
+    height: mapSizeFor(8),
+    teams: [1, 1, 1, 1, 2, 2, 2, 2],
+  });
+  generateMap(world);
+  world.vision.update();
+
+  const payload = JSON.parse(JSON.stringify(serializeGame(world)));
+  const back = restoreGame(payload).world;
+
+  assert.equal(back.players.length, 8);
+  assert.equal(back.width, mapSizeFor(8));
+  assert.equal(back.height, mapSizeFor(8));
+  assert.deepEqual(back.players.map((p) => p.team), [1, 1, 1, 1, 2, 2, 2, 2]);
+  assert.equal(back.units.length, world.units.length, 'every villager came back');
+  assert.equal(back.buildings.length, world.buildings.length, 'every town center came back');
 });
 
 test('storage refuses an incompatible payload with a sentence, and offers nothing', () => {
@@ -441,9 +472,35 @@ test('tech, fog and the allocation manager come back exactly', () => {
 
   const beforeHp = tc.maxHp;
   const beforeAlloc = allocationState(world, PLAYER);
+  // Make the memory rather than hope for it.
+  //
+  // This used to assert that 1400 steps of ordinary villager work had left
+  // something remembered, and on the seed it was written against it had. That
+  // is a coincidence, not a fixture: memory is written at the instant a tile
+  // stops being visible, so whether any exists depends entirely on whether some
+  // unit happened to walk away from something it had uncovered — and the day
+  // the map generator changed (rock outcrops moved every resource on this seed)
+  // this test failed for a reason that had nothing to do with saving or
+  // loading. A test whose subject is "does memory round-trip" must not be able
+  // to fail because of where the berries landed.
+  //
+  // So: walk a villager out to bare ground and back. Out uncovers tiles it has
+  // never seen; back conceals them again, which is exactly the moment vision.js
+  // writes a snapshot. Assert it worked before relying on it.
+  const walker = ownedBy(world, PLAYER, 'unit')[0];
+  const home = { x: walker.x, y: walker.y };
+  commandUnits(world, [walker], { type: 'move', gx: walker.x + 12, gy: walker.y + 12 });
+  run(world, ai, 400);
+  commandUnits(world, [walker], { type: 'move', gx: home.x, gy: home.y });
+  run(world, ai, 400);
+
+  // Captured after the walk, not before: the walk is what uncovers the ground,
+  // so a snapshot taken ahead of it would be compared against a world that has
+  // since explored more and would fail for the fixture's own reasons.
   const beforeExplored = Array.from(world.vision.state(PLAYER).explored);
   const beforeMemory = world.vision.state(PLAYER).memory.length;
-  assert.ok(beforeMemory > 0, 'the fixture remembers nothing');
+  assert.ok(beforeMemory > 0,
+    'the fixture was supposed to create memory by walking a unit out and back');
 
   const payload = JSON.parse(JSON.stringify(serializeGame(world, { ai: ai.serialize() })));
   const { world: loaded } = restoreGame(payload);

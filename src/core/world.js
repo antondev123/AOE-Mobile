@@ -5,10 +5,11 @@
 // can be exercised headlessly in tests.
 
 import {
-  MAP_W, MAP_H, TERRAIN, RES, STARTING_RESOURCES, MAX_POP_CAP,
-  UNIT_STATS, BUILDING_STATS, NODE_AMOUNT, PLAYER, ENEMY,
+  DEFAULT_MAP_W, DEFAULT_MAP_H, MAX_PLAYERS, TERRAIN, RES, STARTING_RESOURCES,
+  MAX_POP_CAP, UNIT_STATS, BUILDING_STATS, NODE_AMOUNT,
   isWallType, isGateType,
 } from './constants.js';
+import { isHostile as teamsHostile } from './teams.js';
 import { EventBus, EV } from './events.js';
 import { makeRng } from './rng.js';
 import { dist2 } from './iso.js';
@@ -22,8 +23,27 @@ const BUCKET_SIZE = 4;
 // Side of one bucket in the units-only index. See _unitBuckets below.
 const UNIT_BUCKET_SIZE = 2;
 
-export function createWorld(seed = 12345) {
+/**
+ * Build an empty world.
+ *
+ * Everything that used to be a compile-time fact about a match — how many
+ * players, how big the map — is an argument now, and the defaults are the 1v1
+ * this game shipped as, so `createWorld(seed)` still means exactly what it
+ * always did.
+ *
+ * @param {number} seed
+ * @param {object} [opts]
+ * @param {number} [opts.playerCount]  2..MAX_PLAYERS
+ * @param {number} [opts.width]        tiles; defaults to the 2-player map
+ * @param {number} [opts.height]
+ * @param {number[]} [opts.teams]      team per seat; omit for a free-for-all
+ */
+export function createWorld(seed = 12345, opts = {}) {
   const rng = makeRng(seed);
+
+  const playerCount = clampPlayers(opts.playerCount);
+  const MAP_W = Math.max(16, Math.round(opts.width || DEFAULT_MAP_W));
+  const MAP_H = Math.max(16, Math.round(opts.height || DEFAULT_MAP_H));
 
   const world = {
     seed,
@@ -44,6 +64,13 @@ export function createWorld(seed = 12345) {
     terrain: new Uint8Array(MAP_W * MAP_H),
     // See BLOCK_* below: 0 walkable, 1 static object, 2 terrain, 3 closed gate.
     blocked: new Uint8Array(MAP_W * MAP_H),
+    // 1 where a rock outcrop stands. Written by mapgen's scatterCliffs, read by
+    // the renderer to pick the connected cliff sprite. It carries no
+    // passability of its own — the tiles are marked BLOCK_TERRAIN in `blocked`
+    // like water is, and every system that cares asks that grid. This one is
+    // purely "what does this tile look like", which is why the renderer can
+    // have it and the pathfinder never needs to know it exists.
+    cliff: new Uint8Array(MAP_W * MAP_H),
     // Entity id occupying each tile (0 = none). Lets units find what blocks them.
     occupant: new Int32Array(MAP_W * MAP_H),
     // Who owns the gate on each tile, as playerId + 1 (0 = no gate here). This
@@ -56,7 +83,12 @@ export function createWorld(seed = 12345) {
     buildings: [],
     resources: [],
 
-    players: [makePlayer(PLAYER), makePlayer(ENEMY)],
+    // Seat index IS player id, always, everywhere — including for a seat nobody
+    // is sitting in. The lobby closes a slot by marking that player defeated
+    // from tick zero rather than by leaving it out of this array, so there is
+    // never a mapping between "slot 5" and "player 3" for anything to get wrong.
+    players: Array.from({ length: playerCount },
+      (_, i) => makePlayer(i, opts.teams ? opts.teams[i] : undefined)),
 
     selection: new Set(),
 
@@ -107,9 +139,18 @@ export function createWorld(seed = 12345) {
   return world;
 }
 
-function makePlayer(id) {
+function clampPlayers(n) {
+  const v = Number.isFinite(n) ? Math.round(n) : 2;
+  return Math.max(2, Math.min(MAX_PLAYERS, v));
+}
+
+function makePlayer(id, team) {
   return {
     id,
+    // Which side this seat plays for. Defaulting to the seat's own number is
+    // what makes "no teams mentioned" a free-for-all rather than a special case
+    // every caller has to check — see core/teams.js.
+    team: team === undefined || team === null ? id : team,
     resources: { ...STARTING_RESOURCES },
     pop: 0,
     // Recomputed from standing buildings by applyPopBonus as soon as the Town
@@ -716,12 +757,16 @@ export function findNearestGlobal(world, gx, gy, list, pred) {
   return best;
 }
 
-export function isHostile(a, b) {
-  return (
-    a.player !== null && b.player !== null &&
-    a.player !== undefined && b.player !== undefined &&
-    a.player !== b.player
-  );
+/**
+ * May `a` attack `b`?
+ *
+ * This was `a.player !== b.player`, took no world, and was the entire diplomacy
+ * model. It is core/teams.js's question now — the signature gained a `world`
+ * because the answer depends on the roster rather than on the two entities
+ * alone. Re-exported from here because every caller already looks for it here.
+ */
+export function isHostile(world, a, b) {
+  return teamsHostile(world, a, b);
 }
 
 /** All live entities owned by a player, optionally filtered by kind/type. */

@@ -31,9 +31,89 @@
   --safe-l: env(safe-area-inset-left, 0px);
   --safe-r: env(safe-area-inset-right, 0px);
 
-  --panel: linear-gradient(180deg, #3a2919 0%, #241a11 60%, #1d150e 100%);
-  --panel-btn: linear-gradient(180deg, #4a351f 0%, #2f2114 100%);
+  /* --- Material ---------------------------------------------------------------
+     Everything in this HUD is meant to be a piece of carved, banded wood with a
+     brass edge, and until this pass it was a flat vertical gradient with a 1px
+     border — competent, and readable, and completely without surface. Three
+     tokens carry the difference, and they are tokens rather than a hundred
+     hand-written rules so that a control added tomorrow is made of the same
+     stuff as the rest without its author having to know any of this.
+
+     --grain is the surface: a diagonal sheen with a very faint woodgrain under
+     it, both plain gradients. No asset and no filter — a noise texture would
+     have meant either a data-URI PNG in a file that ships no images, or an SVG
+     feTurbulence rasterised per element, which is a real cost on a phone for
+     something the player will only ever notice the absence of.
+
+     --bevel is the lit top edge and the shadowed bottom one, which is what
+     makes a panel read as a *slab* rather than a rectangle. It is an inset
+     shadow, so it also costs nothing and never changes a box's size — which
+     matters here more than it looks: the whole bottom bar is measured into
+     --hud-h and the top bar into --topbar-h, and a polish pass that quietly
+     added two pixels to either would move every sheet on the screen. */
+  --grain:
+    /* The sheen first: one soft diagonal wash of warm light off the top-left
+       corner, which is where every other highlight in this HUD implies the
+       light is coming from. It is doing most of the work — a surface with a
+       gradient of light across it reads as a surface, where a flat fill reads
+       as a swatch. */
+    linear-gradient(157deg, rgba(255, 238, 205, 0.055) 0%, rgba(255, 238, 205, 0) 46%),
+    /* Then the grain itself, and it is deliberately almost invisible. The first
+       cut of this was four times the contrast on a 2px period, which at DPR 2
+       and 3 stopped being wood and became scanlines — a moiré pattern across
+       the resource bar, which is the one strip of this HUD a player reads
+       numbers off. At ~1% over a 7px period it is texture you notice only if
+       you go looking, which is the correct amount of texture. */
+    repeating-linear-gradient(93deg,
+      rgba(255, 236, 200, 0.010) 0 3px,
+      rgba(0, 0, 0, 0.016) 3px 7px);
+  --bevel:
+    inset 0 1px 0 rgba(255, 232, 188, 0.11),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.45);
+
+  --panel: var(--grain), linear-gradient(180deg, #3a2919 0%, #241a11 60%, #1d150e 100%);
+  --panel-btn: var(--grain), linear-gradient(180deg, #4a351f 0%, #2f2114 100%);
   --shadow: 0 3px 10px rgba(0, 0, 0, 0.55);
+
+  /* How long a press takes to sink and to come back. Short enough that the
+     button is already down before the finger registers having pressed it —
+     anything over ~90ms reads as lag rather than as weight. */
+  --press: 90ms;
+  /* The height of one train card, and therefore the height of the rack that
+     holds them: three of these plus the gaps and the padding is the rack's
+     ceiling (see .train-rack). It is a token because the two numbers have to
+     agree exactly — a card one pixel taller than the ceiling assumes makes a
+     full rack claim it has more below and paint a fade over nothing. 45 rather
+     than the 44px touch floor because that is what the contents measure: a
+     10px name, a 24px portrait and 6px of padding. */
+  --train-card-h: 45px;
+  /* HOW TALL A TRANSIENT SHEET MAY GET, and the reason it is one number.
+     The build menu was already held to 46% of the viewport; the menu, the jobs
+     sheet and the market were on 52, each justified by a comment saying it was
+     "the same ceiling the other two sheets use", which had stopped being true.
+     Measured on a 360x640 phone with the jobs sheet open and a late-game bank
+     wrapping the resource strip to two lines, 52% left twenty-two pixels of
+     map — 3% of the screen — against a stylesheet header that promises the
+     chrome stays near 30% and a suite that budgets 96%. That measurement did
+     not change in this pass; what changed is that it is now the number the
+     tests actually see, because the sheets settle into place before anything
+     looks at them rather than still drifting the last pixel.
+
+     46 for all four, so the answer to "how much of the map survives a sheet" is
+     one number in one place. The sheets already scroll; a sheet that is 38px
+     shorter on a small phone scrolls 38px more, which costs a swipe, and the
+     map underneath is the game.
+
+     The `100%` in the min() is the bound that actually protects the layout —
+     the thumb stack is bounded top and bottom, so `100%` is the free band and a
+     sheet can never grow past it. The dvh figure is the taste; the fallback
+     line above it exists for a browser that has not shipped dvh. */
+  --sheet-max-fallback: min(46vh, 100%);
+  --sheet-max: min(46dvh, 100%);
+  /* How a sheet arrives. One token so the build menu, the market, the jobs
+     sheet, the placement bar and the menu cannot drift apart; the curve is
+     argued for beside @keyframes sheetin. */
+  --sheet-in: sheetin 190ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 * { box-sizing: border-box; }
@@ -97,18 +177,54 @@ body {
   border: 1px solid var(--edge);
   background: var(--panel-btn);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   cursor: pointer;
+  /* Lettering cut INTO the wood rather than printed on it: one pixel of black
+     under every glyph. It is the cheapest thing in this file — no layout, no
+     repaint cost worth measuring — and it is most of the difference between
+     parchment text that sits on a brown rectangle and parchment text that
+     belongs to it. Kept off the 8px blurbs by weight of contrast alone: at
+     that size the shadow is a sixth of a pixel and simply does not show. */
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.55);
+  /* Only the two properties the press changes. `transition: all` here would
+     also animate the affordability grey-out, and a button that fades from
+     "affordable" to "too expensive" over 90ms is a button that lies for 90ms
+     about whether the tap you are making will work. */
+  transition: transform var(--press) ease-out, box-shadow var(--press) ease-out,
+              filter var(--press) ease-out;
 }
 
-.hud button:active { filter: brightness(1.35); transform: translateY(1px); }
+/* THE PRESS.
+   It used to be `translateY(1px)` and a brightness bump, which is the press a
+   web page makes: the button gets lighter and hops. This one is meant to feel
+   like pushing a wooden tile into its socket, because that is what the whole
+   HUD is pretending to be — so it sinks two pixels, loses a little of its
+   width (0.97 reads as depth, not as a shrink, at these sizes), gives up its
+   drop shadow for an inset one so the light stops coming from underneath, and
+   brightens by a third as much as it used to. The old +35% brightness was
+   doing all the work on its own and blew out the parchment lettering.
+
+   `transition` on the way in and out, so a fast tap still shows the whole
+   movement rather than being missed between two frames. */
+.hud button:active {
+  filter: brightness(1.12);
+  transform: translateY(2px) scale(0.97);
+  box-shadow:
+    inset 0 2px 6px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 232, 188, 0.05),
+    0 0 0 1px rgba(0, 0, 0, 0.4);
+}
 .hud button[disabled],
 .hud button.off {
   opacity: 0.42;
   filter: grayscale(0.7);
   cursor: default;
 }
-.hud button[disabled]:active, .hud button.off:active { transform: none; filter: grayscale(0.7); }
+.hud button[disabled]:active, .hud button.off:active {
+  transform: none;
+  filter: grayscale(0.7);
+  box-shadow: var(--bevel), var(--shadow);
+}
 
 /* --- Top row: the standing numbers ------------------------------------------
    Read-only. Nothing here is tappable any more — see the note in index.html —
@@ -149,6 +265,7 @@ body {
 .res-bar {
   /* Read-only, like the strip that holds it — see .hud-top. */
   pointer-events: none;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.55);
   display: flex;
   flex-wrap: wrap;
   gap: 0;
@@ -167,7 +284,7 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
 }
 
 .res {
@@ -183,7 +300,25 @@ body {
   border-radius: 6px;
   transition: background-color 140ms linear, color 140ms linear;
 }
-.res span { min-width: 1.6em; }
+.res span {
+  min-width: 1.6em;
+  /* Slower than the 140ms the chip's background uses. The glow below is a
+     "money is coming in" signal and it should fade like one — a hard cut back
+     to parchment the instant a roll finishes reads as a glitch. */
+  transition: color 220ms linear, text-shadow 220ms linear;
+}
+
+/* INCOME ARRIVING. The counter is mid-roll and climbing (see updateResources),
+   so its digits borrow the gold the age chip uses for "this is the good news".
+   It is deliberately only for the rising direction: spending is already
+   announced by the button that did it and by the price on that button, and a
+   second colour in a bar that six things already live in would be noise rather
+   than information. Text only — no background, no size change — because this
+   strip is 34px of a 844px phone and nothing in it may reflow. */
+.res.rising span {
+  color: #ffe6a8;
+  text-shadow: 0 1px 1px rgba(0, 0, 0, 0.55), 0 0 7px rgba(217, 171, 79, 0.6);
+}
 /* One pixel smaller than everywhere else the pips are used. It is not a style
    choice: five of them sit in a row that is 14px short of fitting a late-game
    stockpile, and 5px of icon is 5px the numbers do not have to give up. The
@@ -202,13 +337,27 @@ body {
 
 .res.low span { color: #ffb4a6; }
 
-/* Simple geometric resource icons — no external assets. */
+/* Simple geometric resource icons — no external assets.
+
+   The pips are the only iconography in the top strip and they were flat
+   gradients sitting on a flat bar. A lit top edge and a hairline of shadow
+   underneath is all it takes to make each one read as a physical token rather
+   than a coloured dot, and at 13px that is the entire difference between a
+   toolbar and a game. It costs no layout: an inset shadow never changes a box.
+
+   The stone pip is clipped (see .ico-stone) and a clip-path takes the shadow
+   with it, so it goes without — which is fine, because the chipped silhouette
+   is already doing the work of telling it apart from gold. */
 .ico {
   display: inline-block;
   width: 13px;
   height: 13px;
   flex: none;
   border-radius: 3px;
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.30),
+    inset 0 -1px 1px rgba(0, 0, 0, 0.30),
+    0 1px 1px rgba(0, 0, 0, 0.45);
 }
 .ico-food { border-radius: 50%; background: radial-gradient(circle at 34% 30%, #ff9a8a, #9e2318); }
 .ico-wood { border-radius: 2px; background: linear-gradient(90deg, #6a3f1d, #b07c42 45%, #5d3717); }
@@ -401,7 +550,7 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   pointer-events: auto;
   touch-action: none;
   line-height: 0;
@@ -447,39 +596,77 @@ body {
   border: 1px solid var(--edge);
   border-left: 4px solid var(--gold);
   color: var(--parch);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   animation: toastin 160ms ease-out;
 }
 .toast.warn { border-left-color: var(--danger); color: #ffd9d1; }
-/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
-   The exit is a 260ms fade, and for those 260ms the box kept its full height in
-   the flex column — so a stack the HUD believes is two lines tall is briefly
-   four, and the stack sits over the top-left of the map, which is where the
-   player's own base usually is. Measured at 176px against a 96px contract.
-   Collapsing max-height alongside the fade keeps the animation and gives the
-   map back on the frame the toast is retired; the 120px start is simply larger
-   than any toast this stack holds (the alert, the tallest, is 54). */
-/* A TOAST ON ITS WAY OUT MUST STOP TAKING UP THE SCREEN AT ONCE.
-   The exit is a 260ms fade, and for those 260ms the box kept its full place in
-   the flex column — so a stack the HUD believes is two lines tall is really
-   three or four, over the top-left of the map, which is where the player's own
-   base usually is. Measured at 176px against the 96px this stack is allowed.
+/* A TOAST ON ITS WAY OUT MUST NEVER PAINT OVER THE ONE THAT REPLACED IT.
+   This rule used to read `position: absolute; left: 0; right: 0`, on the theory
+   that leaving the flow would let the survivors slide up at once while the
+   retired line faded "exactly where it was". It does not fade where it was. The
+   static position of an absolutely positioned child of a FLEX CONTAINER is the
+   container's own content-box corner — the flex algorithm never ran for it — so
+   every retiring toast jumped to the TOP of the stack and spent its whole exit
+   painted across whatever was now sitting there.
 
-   Taking it out of flow rather than collapsing its height is what keeps the
-   animation honest: an animated max-height gives the space back gradually,
-   which is no good to a test or to a player who is looking at the map *now*.
-   Out of flow, the survivors slide up immediately and the retired line fades
-   over them, which is what a crossfade looks like anyway. It keeps its static
-   position, so it fades exactly where it was. */
+   That is the defect a whole-game review put first: three coaching sentences in
+   700-weight parchment, all reporting y≈48 on a 390x844 phone, 41px of mutual
+   overlap, unreadable. It only shows up when the picture is taken during those
+   260ms, so it read as intermittent and got blamed on whatever changed last.
+
+   In flow, collapsing, is the version that cannot do that. Overlap is
+   impossible by construction: the box is still a flex item, so the ones under
+   it are laid out below it for as long as it exists, and it exists for 200ms
+   while its height runs to zero. The space does come back over 200ms rather
+   than on the frame — the honest cost of the fix, and the reason the exit is
+   200ms rather than 260 — but the alternative is not "the space back sooner",
+   it is "the space back sooner and three sentences in the same box".
+
+   --toast-h is measured and set by killToast, because max-height has no `auto`
+   to animate from and this stack holds boxes from one line to three. */
 .toast.out {
-  animation: toastout 260ms ease-in forwards;
-  position: absolute;
-  left: 0;
-  right: 0;
+  animation: toastout 200ms ease-in forwards;
+  overflow: hidden;
   pointer-events: none;
 }
-@keyframes toastin  { from { opacity: 0; transform: translateX(-14px); } }
-@keyframes toastout { to   { opacity: 0; transform: translateY(-8px); } }
+/* A TOAST MUST NOT ARRIVE FROM OFF THE SCREEN.
+   This used to slide in from translateX(-14px), and the stack it lives in is
+   pinned 8px from the left edge — so for the 160ms of the animation the box
+   genuinely was at x = -6, outside the viewport, which is the one thing the
+   mobile layout contract forbids outright. It is also a thing that only fails
+   when a toast happens to be mid-flight as the screen is measured, so it fails
+   intermittently and blames whatever changed last.
+
+   It now drops down out from under the resource bar instead, which is where
+   the stack hangs anyway and where the player is already looking after an
+   action. Every pixel of the travel is inside the screen. */
+@keyframes toastin  { from { opacity: 0; transform: translateY(-6px) scale(0.97); } }
+/* Opacity goes first and height follows, so the line is unreadable well before
+   the box has finished shrinking — a half-height box with half a sentence in it
+   is the thing this whole section exists to avoid. Everything that contributes
+   height is animated, not just max-height: padding and border are 10px of the
+   41px a one-line toast occupies, and leaving them behind ends the run on a
+   visible 10px sliver. */
+@keyframes toastout {
+  from {
+    opacity: 1;
+    max-height: var(--toast-h, 120px);
+  }
+  60% {
+    opacity: 0;
+  }
+  to {
+    opacity: 0;
+    max-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-top-width: 0;
+    border-bottom-width: 0;
+    /* Eats the column's 4px gap on the way out, so the survivors do not sit in
+       a hole for the length of the animation. */
+    margin-bottom: -4px;
+  }
+}
 
 /* The under-attack alert. Nothing about it reads like a routine toast: the
    others are parchment on dark wood and sit still, this one is red, bigger,
@@ -565,9 +752,14 @@ body {
   letter-spacing: 0.2px;
 }
 .toast.alert:active { filter: brightness(1.3); transform: translateY(1px); }
-/* The shared exit animation must still win when the toast is retired. */
-.toast.alert.out { animation: toastout 260ms ease-in forwards; }
-@keyframes alertin { from { opacity: 0; transform: translateX(-14px) scale(0.96); } }
+/* The shared exit animation must still win when the toast is retired — the
+   alert's own entrance and pulse would otherwise go on running under it. Same
+   200ms as everything else in the stack: see .toast.out. */
+.toast.alert.out { animation: toastout 200ms ease-in forwards; }
+/* Same rule as toastin above, and it matters more here: the alert is the one
+   toast that goes full width, so a leftward entrance put a 344px box six
+   pixels off the edge of a 360px phone. */
+@keyframes alertin { from { opacity: 0; transform: translateY(-6px) scale(0.95); } }
 @keyframes alertpulse {
   0%, 100% { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 16px rgba(255, 47, 24, 0.35); }
   50%      { box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55), 0 5px 22px rgba(255, 47, 24, 0.95); }
@@ -604,9 +796,13 @@ body {
 .mode-chip.is-done .glyph, .mode-chip.is-done .lbl { color: var(--gold); }
 .mode-chip.is-box .glyph, .mode-chip.is-box .lbl { color: var(--gold); }
 
+/* Every keyframe that touches box-shadow has to re-state --bevel, because a
+   shadow list replaces the whole list: without it a button that pulses loses
+   its lit top edge for the length of the animation and flattens out exactly
+   while it is asking to be looked at. */
 @keyframes idlepulse {
-  0%, 100% { box-shadow: var(--shadow); }
-  50%      { box-shadow: 0 0 0 3px rgba(217, 171, 79, 0.28), var(--shadow); }
+  0%, 100% { box-shadow: var(--bevel), var(--shadow); }
+  50%      { box-shadow: var(--bevel), 0 0 0 3px rgba(217, 171, 79, 0.28), var(--shadow); }
 }
 
 /* --- Bottom bar: selection + commands --------------------------------------- */
@@ -646,7 +842,7 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   padding: 5px 6px;
   min-height: 96px;
 }
@@ -782,6 +978,31 @@ body {
   align-items: center;
   gap: 4px;
   margin-bottom: 4px;
+  position: relative;
+}
+/* A carved rule under the name, so the panel reads as a titled plate rather
+   than as a list whose first row happens to be bigger. Two hairlines — dark
+   then light — which is what an incised line looks like when the light falls
+   from above, as it does everywhere else in this file.
+
+   IT COSTS NO HEIGHT, AND THAT IS NOT AN OPTIMISATION. Drawn honestly, as a
+   border with padding under it, this was five pixels — and five pixels on the
+   selection panel is five on the bottom bar, which is measured into --hud-h,
+   which sets where every sheet in the thumb stack starts. Measured: it took the
+   360x640 sheet states from 96% of the viewport to 97%, against a budget of 96
+   that the layout pass had left with no room in it at all. A decoration must
+   never be able to do that, so it is a pseudo-element floating in the 4px
+   margin that was already there and the panel is exactly as tall as before. */
+.sel-head::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 1px;
+  background: rgba(0, 0, 0, 0.5);
+  box-shadow: 0 1px 0 rgba(255, 232, 188, 0.07);
+  pointer-events: none;
 }
 .sel-title {
   font-weight: 800;
@@ -864,9 +1085,12 @@ body {
 }
 .chip.foe .portrait { background-color: rgba(224, 49, 49, 0.32); }
 .chip.neutral .portrait { background-color: rgba(156, 138, 99, 0.28); }
-/* The queues only ever show your own things, and the strip is busy enough
-   without a row of blue plates in it. */
-.qslot .portrait, .bq-chip .portrait {
+/* The queues and the train rack only ever show your own things, and both are
+   busy enough without a row of blue plates in them. 24px rather than 26 is
+   also load-bearing in the rack: the card is a grid with a 24px picture column
+   and three rows of card is exactly the rack's ceiling, so a portrait two
+   pixels too tall makes every full rack claim it has more below. */
+.qslot .portrait, .bq-chip .portrait, .cbtn.train .portrait {
   width: 24px;
   height: 24px;
   background-color: rgba(255, 255, 255, 0.06);
@@ -884,6 +1108,10 @@ body {
   display: block;
   height: 100%;
   background: linear-gradient(180deg, #7fc45c, #3f7a28);
+  /* The same lit-from-above rule the panels follow. On a 6px bar it is one
+     pixel, and it is the pixel that stops the bar looking like a coloured
+     rectangle in a hole. */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.30);
 }
 .hpbar.mid > i { background: linear-gradient(180deg, #e6c860, #a58a23); }
 .hpbar.low > i { background: linear-gradient(180deg, #e8705c, #a02b1b); }
@@ -950,8 +1178,8 @@ body {
 .cbtn.attack.armed .label { color: #ffe3db; }
 .cbtn.attack.armed .cost { color: #ffb9a9; }
 @keyframes armpulse {
-  0%, 100% { box-shadow: var(--shadow); }
-  50%      { box-shadow: 0 0 0 3px rgba(209, 69, 47, 0.45), var(--shadow); }
+  0%, 100% { box-shadow: var(--bevel), var(--shadow); }
+  50%      { box-shadow: var(--bevel), 0 0 0 3px rgba(209, 69, 47, 0.45), var(--shadow); }
 }
 
 /* Demolish. The only irreversible button in the game, so it is the only one
@@ -1088,6 +1316,211 @@ body {
 .rally-note.is-gather .flag { color: var(--gold); }
 .rally-note.is-build { color: #cbd9a8; }
 .rally-note.is-hint { opacity: 0.85; }
+/* Several producers in hand aimed at different places. It is a warning, not a
+   status, because the group order the player is about to give will not do what
+   the one flag on the map suggests. */
+.rally-note.is-mixed { color: #e8c2a0; }
+.rally-note.is-mixed .flag { color: #e8a06a; }
+
+/* --- The train rack ----------------------------------------------------------
+   Every unit the selection can make, in one bounded, scrolling well.
+
+   IT IS A BOX WITH A CEILING, AND THAT IS THE WHOLE DESIGN. Before the six
+   military buildings landed, "what can this train" was two or three buttons
+   loose in the command panel and there was nothing to bound. A Barracks, an
+   Archery Range and a Stable is six; add the Siege Workshop and the Monastery
+   and it is ten, at ~46px a card and two to a row — 250px, which is more than
+   the entire command panel is allowed (min(30dvh, 240px)) and would have
+   pushed the queue, the rally line and the research buttons off the bottom of
+   a panel most players never scroll. So the cards get their own scroller with
+   a three-row ceiling: the realistic worst case (all three Feudal military
+   buildings, six units) is shown whole, and past that the rack scrolls with
+   the same chevron-in-a-fade the rest of the HUD uses to admit there is more.
+
+   Recessed rather than raised — an inset shadow and a darker ground — because
+   it is a *tray of things you may take*, and everything else in the panel is a
+   button that does something. That difference has to survive a glance. */
+.train-rack {
+  flex: 1 1 100%;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 5px;
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  background:
+    var(--grain),
+    linear-gradient(180deg, rgba(11, 8, 5, 0.55), rgba(20, 15, 10, 0.34));
+  box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.5), inset 0 -1px 0 rgba(255, 232, 188, 0.05);
+  /* Three rows of card, plus two gaps, plus the padding. Written out rather
+     than as a round number so that changing the card height changes one line
+     and not two. A card whose price wrapped to a second line (the two siege
+     engines, see below) is taller than this reckoning, which is correct: when
+     one is in the rack there really is more below and the fade should say so. */
+  max-height: calc((var(--train-card-h) * 3) + (5px * 2) + 8px);
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+/* The same "there is more below" fade the command panel and the sheets use.
+   Toggled by the HUD (markCut) rather than left on, for the same reason: a
+   permanent gradient would dim the bottom row of the rack that fits, which is
+   most of them. */
+.train-rack.is-cut::after {
+  content: "";
+  flex: 1 1 100%;
+  position: sticky;
+  bottom: -4px;
+  height: 22px;
+  margin-top: -22px;
+  pointer-events: none;
+  background-image:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='9' viewBox='0 0 16 9'%3E%3Cpath d='M1 1l7 6 7-6' fill='none' stroke='%23d9ab4f' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round' opacity='0.85'/%3E%3C/svg%3E"),
+    linear-gradient(180deg, rgba(17, 12, 8, 0) 0%, rgba(17, 12, 8, 0.92) 80%);
+  background-repeat: no-repeat, no-repeat;
+  background-position: center calc(100% - 2px), center;
+}
+
+/* A train card: the name across the top, the picture and the price under it.
+   Two to a row, which is what the ~207px command panel affords once a 44px
+   touch target is honoured in both directions.
+
+   THE PICTURE IS NOT DECORATION. The panel now offers up to ten units from
+   five buildings, several of which are one word apart at 10px (Skirmisher and
+   Spearman, Scout Cavalry and Scorpion). The sprite is the thing a player
+   actually recognises at thumb speed; the name is the confirmation. */
+.cbtn.train {
+  flex: 1 1 calc(50% - 3px);
+  min-width: 0;
+  min-height: var(--train-card-h);
+  /* A two-row grid: the NAME TAKES THE WHOLE TOP ROW and the picture sits
+     beside the price underneath it.
+
+     The obvious arrangement — picture on the left spanning both rows, name and
+     price stacked beside it — was the first cut and it does not survive the
+     measurements. Two cards to a row leaves 95px, and once the 24px portrait
+     and the gaps are out of it the name has 52. "Skirmisher" needs 64 and
+     "Battering Ram" 66, so every second unit in the game either broke mid-word
+     or painted over the edge of its own card. Given the whole row instead they
+     have 85px and every name in the roster fits on one line — which is what
+     the card is for. */
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  grid-template-rows: auto auto;
+  align-items: center;
+  /* 4px of gutter and 4px of padding, not 6 and 5. It buys the price row six
+     pixels, which is exactly the margin between "25 food 35 wood fits beside
+     the portrait" and "every second card in the rack is two lines tall". */
+  column-gap: 4px;
+  row-gap: 1px;
+  padding: 3px 4px;
+  text-align: left;
+}
+.cbtn.train .label { grid-area: 1 / 1 / 2 / 3; align-self: end; }
+.cbtn.train > .portrait, .cbtn.train > .ab { grid-area: 2 / 1 / 3 / 2; }
+.cbtn.train .cost  { grid-area: 2 / 2 / 3 / 3; align-self: center; }
+/* A building that makes exactly one thing — the Town Center, the Monastery —
+   gives its card the whole row rather than leaving half the rack empty beside
+   it. The Villager card is the most-tapped control in the game and there is no
+   second card competing for the space.
+
+   At 197px the two-row squeeze that the stacked layout exists to solve is
+   gone, so the card unfolds into the shape the Build button beside it already
+   uses: picture, name, and the price pushed out to the right margin. Same
+   height, same touch target, four times the area.
+
+   (`:only-child` is safe: the scroll fade is a pseudo-element, and a rack with
+   one card in it can never be scrolled anyway.) */
+.train-rack .cbtn.train:only-child {
+  flex: 1 1 100%;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-rows: auto;
+  column-gap: 8px;
+  padding: 3px 10px 3px 6px;
+}
+.train-rack .cbtn.train:only-child > .portrait,
+.train-rack .cbtn.train:only-child > .ab { grid-area: 1 / 1 / 2 / 2; }
+.train-rack .cbtn.train:only-child .label {
+  grid-area: 1 / 2 / 2 / 3;
+  align-self: center;
+  font-size: 12px;
+}
+.train-rack .cbtn.train:only-child .cost {
+  grid-area: 1 / 3 / 2 / 4;
+  align-self: center;
+  flex-wrap: nowrap;
+  font-size: 10px;
+}
+
+/* The three-letter fallback, for a roster entry the atlas has no art for yet.
+   Sized and framed exactly like the portrait it stands in for, so a rack that
+   is half pictures and half codes still reads as one row of cards. */
+.cbtn.train .ab {
+  width: 24px; height: 24px;
+  border-radius: 5px;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 9px; font-weight: 900; letter-spacing: -0.3px;
+  color: #f0e2c4;
+  background: rgba(255, 255, 255, 0.07);
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+/* Every name in the roster fits the 85px top row on one line at 10px, but the
+   backstop is spelled out rather than left to chance: a unit added tomorrow
+   with a longer name wraps, and if a single word is longer than the card it
+   breaks inside the word. Neither is pretty; both are better than a name that
+   paints over its neighbour, and far better than an ellipsis in a list whose
+   entire job is telling two similar units apart. */
+.cbtn.train .label {
+  white-space: normal;
+  overflow-wrap: anywhere;
+  line-height: 1.15;
+  font-size: 10px;
+  min-width: 0;
+}
+/* Three-digit siege prices (160 wood and 135 gold) are still wider than the
+   row they share with the portrait, even after the gutters above were trimmed
+   for them. They wrap onto a second line rather than overflowing, which grows
+   those two cards by ten pixels and leaves every other card in the rack alone.
+   Overflowing instead would put a number under the card beside it, which is
+   the one thing a price may never do. */
+.cbtn.train .cost { flex-wrap: wrap; gap: 3px; font-size: 9.5px; }
+
+/* A unit the age has not unlocked yet — a Knight in a Feudal Stable.
+   Deliberately identical to a locked building in the build menu (see
+   `.build-menu .cbtn.locked`): dashed cool edge, flat wash, the age where the
+   price goes. They are the same fact about the same tech tree, and a player
+   who has learned to read one must not have to learn the other. Not greyscale
+   — that is what "cannot afford" looks like, and waiting for gold you already
+   have is the confusion this is avoiding. */
+.cbtn.train.locked {
+  opacity: 0.5;
+  filter: none;
+  border-color: #3d4a5c;
+  border-style: dashed;
+}
+.cbtn.train.locked .label { color: #9fb0c4; }
+.cbtn.train.locked .ab { color: #9fb0c4; }
+/* NO PADLOCK ON THE NAME, and it was tried. A locked building in the build
+   menu does not carry one either — the dashed cool edge, the wash and the age
+   printed where the price goes are the whole vocabulary, and the point of this
+   card is that a player who has read one has read the other. It also does not
+   fit: the glyph plus a space pushes "Battering Ram" onto a second line, and a
+   flex row is as tall as its tallest card, so one padlock made the whole row
+   eleven pixels taller and the rack overflow its own ceiling. */
+.cbtn.train.locked .cost.need {
+  color: #9fb0c4;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  font-size: 9px;
+}
+/* It carries no `.off`, so it keeps the ordinary press — a locked card is a
+   button that explains itself when tapped, and a tap with no response reads as
+   a missed tap. The brightness is turned up over the standard 1.12 only
+   because the card is already at half opacity and the standard flash does not
+   show through it. */
+.cbtn.train.locked:active { filter: brightness(1.3); }
 
 /* --- Training queue ---------------------------------------------------------
    Three questions, in the order a player asks them: what is coming out of this
@@ -1129,6 +1562,25 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .qhead .behind { font-size: 10px; font-weight: 700; color: var(--parch-dim); }
+/* WHICH building this block is about, and only when the answer is not obvious
+   — several producers in hand (see renderQueue). Without it the bar and the
+   cancel chips would be an unattributed claim in a panel holding six
+   buildings, and the first thing a player would do is cancel the wrong unit. */
+.qwho {
+  flex: 1 1 100%;
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--parch-dim);
+  opacity: 0.85;
+}
+/* Everything queued at the producers this block is *not* about. Quiet, because
+   it is bookkeeping — but present, because three taps spent on a second
+   Barracks would otherwise leave no mark on the HUD at all, which is
+   indistinguishable from three taps that did nothing. */
+.queue-elsewhere { flex: 1 1 100%; font-size: 10px; opacity: 0.85; }
+.queue-elsewhere.is-quiet { opacity: 0.6; }
 .qprog {
   flex: 1 1 100%;
   height: 8px;
@@ -1140,6 +1592,12 @@ body {
 .qprog > i {
   display: block; height: 100%;
   background: linear-gradient(180deg, var(--gold), var(--gold-dim));
+  /* Lit edge, plus a soft bloom off the leading end. Production is the one bar
+     on this panel that is *going somewhere*, and a faint glow is what makes a
+     glance register movement without having to watch it. */
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.35),
+    0 0 6px rgba(217, 171, 79, 0.40);
   transition: width 90ms linear;
 }
 .qslots { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 4px; }
@@ -1234,20 +1692,59 @@ body {
 
 /* --- Build menu sheet -------------------------------------------------------- */
 
+/* A GRID, NOT A WRAP.
+   This was `display: flex; flex-wrap: wrap` with `flex: 1 1 0` on the buttons,
+   which is the layout you write when you want "as many per row as fit" and it
+   is not what a catalogue wants. Flex sizes each row on its own, so the row's
+   button count decided the button width: measured at 390x844 the five shelves
+   came out 4, 5, 2, 5 and 4 across, at 86, 68, 178, 68 and 86px. The Blacksmith
+   and the Market, alone on their row, were 178px wide — twice the width of the
+   House — which reads as emphasis nobody meant, and a review read the whole
+   sheet as "flex-wrap, not a designed grid" because that is exactly what it was.
+
+   Four fixed columns fixes it by construction: every cell in the sheet is the
+   same width whatever row it lands in, rows line up down the sheet, and a shelf
+   with seven buildings in it ends with a short row instead of stretching three
+   of them. Four rather than three or five because 4 x 85px on a 390px phone is
+   the widest cell that still fits "Lumber Camp" on two lines without either
+   shrinking the type or spilling the shelves down the screen. */
 .build-menu {
   padding: 7px;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 6px;
   align-items: stretch;
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   pointer-events: auto;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
 }
-@keyframes sheetin { from { opacity: 0; transform: translateY(10px); } }
+/* A SHEET ARRIVES, IT DOES NOT APPEAR.
+   The old curve was 140ms of linear-ish ease-out over a 10px rise, which on a
+   400px sheet is a jump with a blur on it. This is the same distance spent
+   over 190ms on a strongly decelerating curve — most of the travel happens in
+   the first 60ms, so it still feels immediate under the thumb, and the last
+   third is a settle rather than a stop.
+
+   IT MUST NEVER OVERSHOOT. An eased-back curve that goes past 0 would carry
+   the top of the sheet above its final position, and this stack is bounded at
+   both ends precisely because a sheet that leaves the top of the screen takes
+   its own scroller with it. Rising from +12px with no overshoot can only ever
+   be *below* where it lands.
+
+   AND IT MUST NOT SCALE. The first cut of this grew the sheet from 0.985, which
+   looks lovely and is quietly illegal: a transform scales everything inside the
+   box, so for the length of the animation every 44px control in the sheet is a
+   43.3px control. The layout sweep in tests/touchui.browser.mjs measures the
+   moment it is told to and caught all of them at once — the jobs sliders, the
+   menu rows, the market's Close, the build-queue chips. A control that is under
+   the touch floor for 190ms is under the touch floor exactly when the player is
+   reaching for it, so the entrance moves the sheet and never resizes it. */
+@keyframes sheetin {
+  from { opacity: 0; transform: translateY(12px); }
+}
 
 .build-menu .title {
   flex: 1 1 100%;
@@ -1278,8 +1775,8 @@ body {
    tech tree, and a sheet tall enough for three shelves of buildings would cover
    the base the player is standing in. */
 .build-menu {
-  max-height: min(46vh, 100%);
-  max-height: min(46dvh, 100%);
+  max-height: var(--sheet-max-fallback);
+  max-height: var(--sheet-max);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -1319,9 +1816,9 @@ body {
   background: var(--panel);
   border: 1px solid var(--gold);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   pointer-events: auto;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
 }
 /* Pinned under the resource bar while placement is armed. See the note beside
    placeBar in ui/hud.js: this bar used to sit in the bottom stack, dead centre
@@ -1357,7 +1854,7 @@ body {
    attack-move" is readable at a glance from across the room. */
 .place-bar.attack {
   border-color: var(--danger);
-  animation: sheetin 140ms ease-out, armpulse 1.1s ease-in-out infinite;
+  animation: var(--sheet-in), armpulse 1.1s ease-in-out infinite;
 }
 .place-bar.attack .txt { color: #ffd9d1; }
 .place-bar.attack .txt small { color: #e0a99d; }
@@ -1372,9 +1869,9 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   pointer-events: auto;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
 }
 .menu-sheet button {
   min-height: var(--tap);
@@ -1384,11 +1881,10 @@ body {
   padding: 0 10px;
 }
 /* The menu sheet grows sections once sound lives in it, so it needs a heading
-   and a scroller. 52vh is the same ceiling the other two sheets use — the map
-   underneath has to stay more than half visible whatever is open over it. */
+   and a scroller — under the ceiling every transient sheet now shares. */
 .menu-sheet {
-  max-height: min(52vh, 100%);
-  max-height: min(52dvh, 100%);
+  max-height: var(--sheet-max-fallback);
+  max-height: var(--sheet-max);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
@@ -1530,10 +2026,10 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
+  box-shadow: var(--bevel), var(--shadow);
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
   /* A HORIZONTAL SCROLLER NEEDS TO SAY SO. This strip is 364px wide at 390 and
      the title and Clear take 130 of it, so about four 49px chips fit — and the
      feature it exists for is placing a whole row of houses in one arming. iOS
@@ -1550,7 +2046,7 @@ body {
    timelines are unsupported. */
 @supports (animation-timeline: scroll(self inline)) {
   .build-queue {
-    animation: sheetin 140ms ease-out, bqfade linear;
+    animation: var(--sheet-in), bqfade linear;
     animation-timeline: auto, scroll(self inline);
   }
   @keyframes bqfade {
@@ -1605,12 +2101,12 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
-  max-height: min(52vh, 100%);
-  max-height: min(52dvh, 100%);
+  box-shadow: var(--bevel), var(--shadow);
+  max-height: var(--sheet-max-fallback);
+  max-height: var(--sheet-max);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
 }
 .alloc-sheet .head {
   display: flex;
@@ -1746,12 +2242,12 @@ body {
   background: var(--panel);
   border: 1px solid var(--edge);
   border-radius: var(--r);
-  box-shadow: var(--shadow);
-  max-height: min(52vh, 100%);
-  max-height: min(52dvh, 100%);
+  box-shadow: var(--bevel), var(--shadow);
+  max-height: var(--sheet-max-fallback);
+  max-height: var(--sheet-max);
   overflow-y: auto;
   -webkit-overflow-scrolling: touch;
-  animation: sheetin 140ms ease-out;
+  animation: var(--sheet-in);
 }
 .market-sheet .head {
   display: flex;
@@ -1853,11 +2349,46 @@ body {
 }
 
 .market-sheet .why { font-size: 10px; line-height: 1.35; color: var(--parch-dim); }
+/* Giving something to an ally. One row per ally, four things you can send. The
+   buttons are deliberately the same height as everything else that a thumb has
+   to hit, which on four-across at 390px leaves them narrow but not short. */
+.tribute-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+}
+.tribute-row .who {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--parch);
+}
+.tribute-give {
+  flex: 0 0 auto;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 5px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 11px;
+  font-weight: 800;
+}
+.tribute-give .n { margin-left: 2px; }
+.tribute-give:disabled { opacity: 0.4; }
+
 .market-sheet .foot { display: flex; gap: 5px; }
 .market-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
 
 /* A capped, scrolling sheet must SCROLL, not squeeze.
-   All three sheets are flex columns with `max-height: 52vh; overflow-y: auto`,
+   All three sheets are flex columns with `max-height: var(--sheet-max)` and
+   `overflow-y: auto`,
    and a flex item's default `flex-shrink: 1` means that once the content passes
    that cap the rows are compressed instead — which took the market sheet's Close
    button to 43.99px and tripped the 44px floor in tests/touchui.browser.mjs. It
@@ -2028,6 +2559,149 @@ body {
   font-weight: 600;
   letter-spacing: 0.2px;
   opacity: 0.75;
+}
+
+/* The invite card. It replaces the buttons rather than sitting under them:
+   once a match exists there is exactly one thing to do with this screen, which
+   is get the link to the other person. The URL is a real anchor so a long-press
+   offers "Share" on a phone, where the clipboard API is the least reliable
+   thing on the platform. */
+.invite {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid #574a2c;
+  border-radius: 10px;
+  background: rgba(20, 16, 10, 0.6);
+  text-align: left;
+}
+.invite-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+.invite-url {
+  display: block;
+  /* A match URL has no spaces to break at, so it has to be told it may break
+     anywhere — otherwise it runs off the side of a 390px phone. */
+  word-break: break-all;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--gold, #d8b45a);
+  text-decoration: none;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.35);
+}
+.invite-copy {
+  margin-top: 8px;
+  width: 100%;
+  min-height: 44px;
+  border-radius: 8px;
+  border: 1px solid #574a2c;
+  background: linear-gradient(180deg, #37301f, #241e13);
+  color: var(--parch, #e8dcc0);
+  font: inherit;
+  font-weight: 700;
+}
+.invite-state {
+  margin: 8px 0 0;
+  font-size: 12.5px;
+  opacity: 0.8;
+}
+.invite-state.error { color: #e08a6a; opacity: 1; }
+.invite.ready { border-color: #7fa05a; }
+
+/* Who is in the room.
+   
+   This was two rows whose only moving part was the word on the right. It is up
+   to eight now, each carrying a colour, a name, what kind of player it is and
+   whose side they are on — four things on a 390px phone, which is why the row is
+   a grid rather than a space-between: the columns have to line up down the list
+   or eight rows read as noise. The name is the only one allowed to grow.
+   
+   Every control here is 44px tall for the same reason everything else in this
+   file is. */
+.lobby-setup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.lobby-label { font-size: 13px; font-weight: 800; color: var(--parch); }
+.lobby-map { margin-left: auto; font-size: 12px; color: var(--parch-dim); }
+.lobby-setup .seg {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 18px;
+  font-weight: 800;
+}
+.lobby-setup .seg:disabled { opacity: 0.4; }
+
+.lobby-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  flex: 0 0 auto;
+}
+.lobby-who {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.lobby-you { color: var(--gold); font-weight: 800; }
+.lobby-kind, .lobby-team, .lobby-sit {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 11.5px;
+  font-weight: 800;
+}
+.lobby-kind:disabled, .lobby-team:disabled {
+  opacity: 0.75;
+  border-color: transparent;
+  background: none;
+}
+.lobby-sit { background: linear-gradient(180deg, #4a6b2c, #33501d); border-color: #7fa05a; }
+.lobby-start { margin-top: 10px; }
+.lobby-start:disabled { opacity: 0.5; }
+
+.lobby-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+}
+.lobby-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  font-size: 13.5px;
+  background: rgba(0, 0, 0, 0.25);
+}
+.lobby-row + .lobby-row { margin-top: 5px; }
+.lobby-status { opacity: 0.65; }
+.lobby-row.is-ready { background: rgba(80, 110, 55, 0.35); }
+.lobby-row.is-ready .lobby-status { color: #a8cc7a; opacity: 1; font-weight: 700; }
+.ready-btn.is-on {
+  background: linear-gradient(180deg, #4a6b2c, #33501d);
+  border-color: #7fa05a;
 }
 
 .boot-help {

@@ -83,6 +83,19 @@
            one irreversible thing this card can do. -->
       <button id="btn-resume" class="start-btn" hidden>Resume match</button>
       <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
+      <!-- The invite link is the lobby. There is no room list and no account:
+           you get a URL, you send it to one person, they open it and they are
+           sitting opposite you. -->
+      <button id="btn-friend" class="start-btn secondary" hidden>Play a friend<span class="sub">creates a link to send</span></button>
+      <button id="btn-skirmish" class="start-btn secondary" hidden>Set up a match<span class="sub">up to eight, humans or computers</span></button>
+      <!-- The lobby. Every chair, its team and its Start button are drawn by
+           src/ui/lobby.js into this one node, from whatever the server last
+           said about the room — so eight phones show the same lobby, and the
+           rules live once, in server/room.js. It is also the offline setup
+           screen, with no server involved. -->
+      <div id="invite" class="invite" hidden>
+        <div id="lobby-root"></div>
+      </div>
       <!-- The one copy of the rules in the whole game. It was written for this
            card and then became unreachable the moment the match started, which
            made it a tutorial nobody could consult and — collapsed by default —
@@ -99,6 +112,11 @@
           <li><b>Two fingers</b> always pan, and pinch to zoom.</li>
           <li>Villagers gather food, wood, gold and stone, and drop off at the nearest place that takes it.</li>
           <li>Build houses for population, a barracks for soldiers, then go win.</li>
+          <li>Each arm has its own building. <b>Barracks</b> for infantry, <b>Archery Range</b> for archers and skirmishers, <b>Stable</b> for cavalry. You cannot afford all three at once &mdash; scout what they built, then answer it.</li>
+          <li><b>Spearmen</b> beat cavalry, <b>skirmishers</b> beat archers, <b>archers</b> beat infantry, <b>cavalry</b> runs archers down. Tap any unit to read what it is strong against.</li>
+          <li>Reached the Castle Age? A <b>Siege Workshop</b> builds rams to break walls and <b>mangonels</b> to break formations &mdash; a mangonel hurts everything near where the rock lands, <i>including your own men</i>, and cannot hit anything standing right next to it. Keep it behind the line and spread out.</li>
+          <li>A <b>Blacksmith</b> upgrades every soldier you already own, and a <b>Monastery</b> trains monks who heal them. Monks never fight.</li>
+          <li><b>Rock cannot be walked through.</b> Neither can water. Use both &mdash; a wall only has to cover the gap between two outcrops.</li>
           <li>Select the <b>Town Center</b> and <b>advance the age</b> &mdash; it unlocks the gathering and blacksmith upgrades, and every building of yours gets tougher.</li>
           <li>Select a <b>Mill</b>, <b>Lumber Camp</b>, <b>Mining Camp</b> or <b>Barracks</b> to research upgrades there. They apply to everything you already own.</li>
           <li>Long walk home? Put a <b>Lumber Camp</b> by the trees or a <b>Mining Camp</b> by the gold &mdash; villagers switch to it on their own.</li>

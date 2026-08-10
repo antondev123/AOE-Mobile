@@ -64,8 +64,8 @@ function stepUntil(world, pred, max = 400) {
   }
   return n;
 }
-function fresh() {
-  return createWorld(4242);
+function fresh(opts) {
+  return createWorld(4242, opts);
 }
 
 // --- inRange / canAttack ----------------------------------------------------
@@ -77,14 +77,31 @@ test('canAttack: hostile units only, no friendly fire, no resources', () => {
   const foe = spawnUnit(w, 'villager', ENEMY, 5.5, 5);
   const tree = w.resources[0] || null;
 
-  assert(canAttack(mine, foe), 'should attack an enemy unit');
-  assert(!canAttack(mine, friend), 'must not attack an ally');
-  assert(!canAttack(mine, mine), 'must not attack itself');
-  assert(!canAttack(foe, foe), 'self check both ways');
-  if (tree) assert(!canAttack(mine, tree), 'must not attack resources');
+  assert(canAttack(w, mine, foe), 'should attack an enemy unit');
+  assert(!canAttack(w, mine, friend), 'must not attack one of your own');
+  assert(!canAttack(w, mine, mine), 'must not attack itself');
+  assert(!canAttack(w, foe, foe), 'self check both ways');
+  if (tree) assert(!canAttack(w, mine, tree), 'must not attack resources');
   const foeTc = spawnBuilding(w, 'towncenter', ENEMY, 20, 20);
-  assert(canAttack(mine, foeTc), 'buildings are attackable');
-  assert(!canAttack(foeTc, mine), 'buildings do not fight back');
+  assert(canAttack(w, mine, foeTc), 'buildings are attackable');
+  assert(!canAttack(w, foeTc, mine), 'buildings do not fight back');
+});
+
+// The claim the name of the test above has always made and could not check
+// until there were teams: an *ally* is a different player, and still not a
+// target. See core/teams.js.
+test('canAttack: no friendly fire between allies on the same team', () => {
+  const w = fresh({ playerCount: 4, teams: [1, 1, 2, 2] });
+  const mine = spawnUnit(w, 'militia', 0, 5, 5);
+  const ally = spawnUnit(w, 'villager', 1, 5.5, 5);
+  const foe = spawnUnit(w, 'villager', 2, 6, 5);
+
+  assert(!canAttack(w, mine, ally), 'must not attack an ally');
+  assert(!canAttack(w, ally, mine), 'and the ally must not attack back');
+  assert(canAttack(w, mine, foe), 'the other team is still a target');
+
+  const allyTc = spawnBuilding(w, 'towncenter', 1, 20, 20);
+  assert(!canAttack(w, mine, allyTc), "nor an ally's buildings");
 });
 
 test('inRange: melee reaches a 3x3 Town Center by its edge, not its centre', () => {

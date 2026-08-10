@@ -16,9 +16,25 @@
 // costs 9216 byte writes — a rounding error next to the ~2000 node pips this
 // map already paints.
 
-import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN, PLAYER } from '../core/constants.js';
+import { HALF_W, HALF_H, TERRAIN, PLAYER_COLORS, PLAYER_COLORS_DARK } from '../core/constants.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
+import { sameTeam } from '../core/teams.js';
 
-const SPAN = MAP_W + MAP_H;
+/**
+ * The minimap's projection, for one world.
+ *
+ * These three numbers were module constants, which is what made the minimap a
+ * 96x96 minimap rather than a minimap. `span` is the diagonal of the isometric
+ * diamond in tiles: the whole projection is (gx - gy) across and (gx + gy) down,
+ * and both fit in w + h.
+ */
+function miniDims(world) {
+  const w = world.width;
+  const h = world.height;
+  return { w, h, span: w + h };
+}
 
 const TERRAIN_COLOR = {
   [TERRAIN.GRASS]: '#3d6430',
@@ -26,6 +42,10 @@ const TERRAIN_COLOR = {
   [TERRAIN.WATER]: '#25456f',
   [TERRAIN.SAND]:  '#9c8a5b',
 };
+
+// Rock outcrops. Not a TERRAIN value — a cliff sits on ordinary dirt and lives
+// on its own grid (see world.cliff) — so it needs its own entry here.
+const CLIFF_COLOR = '#8e93a0';
 
 // Node colours. Stone is deliberately the palest, coolest pip on the map: at
 // two pixels it has to separate from gold's warm yellow *and* from the blue-grey
@@ -46,8 +66,25 @@ const RES_COLOR = {
 const NODE_SIZE = { tree: 1 };
 const NODE_SIZE_DEFAULT = 2;
 
-const TEAM = ['#5aa2ff', '#ff5a5a'];
-const TEAM_DARK = ['#1c56ab', '#a01f1f'];
+// Player colours, derived rather than restated.
+//
+// These were two hand-written hex pairs — a second copy of PLAYER_COLORS that
+// happened to be slightly different shades, and that indexed `undefined` the
+// moment a third player existed. Deriving them means one table to keep honest
+// and eight entries for free. The minimap lifts them slightly: a three-pixel pip
+// under a fog wash needs more punch than a forty-pixel sprite in daylight.
+const hex = (n) => `#${n.toString(16).padStart(6, '0')}`;
+const TEAM = PLAYER_COLORS.map((c) => hex(lift(c, 0.18)));
+const TEAM_DARK = PLAYER_COLORS_DARK.map((c) => hex(c));
+
+/** Move a colour toward white by `t`, so a pip reads against dark ground. */
+function lift(c, t) {
+  const r = (c >> 16) & 255;
+  const g = (c >> 8) & 255;
+  const b = c & 255;
+  const up = (v) => Math.round(v + (255 - v) * t);
+  return (up(r) << 16) | (up(g) << 8) | up(b);
+}
 
 // --- Unit pips ---------------------------------------------------------------
 // Units are binned rather than drawn one per unit. A ten-strong raid used to be
@@ -112,31 +149,36 @@ function now() {
 }
 
 /** Grid -> minimap pixels (0..size). */
-export function gridToMini(gx, gy, size) {
+function gridToMini(gx, gy, size, d) {
   return {
-    x: ((gx - gy + MAP_H) / SPAN) * size,
-    y: ((gx + gy) / SPAN) * size,
+    x: ((gx - gy + d.h) / d.span) * size,
+    y: ((gx + gy) / d.span) * size,
   };
 }
 
 /** World pixels -> minimap pixels. */
-function worldToMini(wx, wy, size) {
+function worldToMini(wx, wy, size, d) {
   return {
-    x: ((wx + MAP_H * HALF_W) / (SPAN * HALF_W)) * size,
-    y: (wy / (SPAN * HALF_H)) * size,
+    x: ((wx + d.h * HALF_W) / (d.span * HALF_W)) * size,
+    y: (wy / (d.span * HALF_H)) * size,
   };
 }
 
 /** Minimap pixels -> grid coordinates. */
-export function miniToGrid(px, py, size) {
-  const a = (px / size) * SPAN - MAP_H; // gx - gy
-  const b = (py / size) * SPAN;         // gx + gy
+function miniToGrid(px, py, size, d) {
+  const a = (px / size) * d.span - d.h; // gx - gy
+  const b = (py / size) * d.span;       // gx + gy
   return { x: (a + b) / 2, y: (b - a) / 2 };
 }
 
 export function createMinimap(canvas, world) {
   const size = canvas.width || 160;
   const ctx = canvas.getContext('2d');
+  // The world's own dimensions, not the old module constants. Everything below
+  // that projects, bins or walks the terrain reads these.
+  const d = miniDims(world);
+  const MAP_W = d.w;
+  const MAP_H = d.h;
 
   // --- Bake terrain -------------------------------------------------------
   const bg = document.createElement('canvas');
@@ -146,7 +188,8 @@ export function createMinimap(canvas, world) {
 
   // --- Fog layer ----------------------------------------------------------
   const vision = world.vision || null;
-  const fogState = vision ? vision.state(PLAYER) : null;
+  // The team's mask, not the seat's — see viewState in systems/vision.js.
+  const fogState = vision ? vision.viewState(PLAYER) : null;
   const fogW = MAP_W + FOG_PAD * 2;
   const fogH = MAP_H + FOG_PAD * 2;
   let fogCanvas = null;
@@ -183,7 +226,7 @@ export function createMinimap(canvas, world) {
     // grid -> minimap is x = k(gx - gy) + MAP_H*k, y = k(gx + gy). Handing that
     // straight to the canvas transform means the fog pixels land on the tile
     // diamonds rather than on a screen-aligned grid rotated across them.
-    const k = size / SPAN;
+    const k = size / d.span;
     const smooth = ctx.imageSmoothingEnabled;
     ctx.imageSmoothingEnabled = true;
     ctx.setTransform(k, k, -k, k, MAP_H * k, 0);
@@ -226,12 +269,16 @@ export function createMinimap(canvas, world) {
   const binRows = Math.ceil(MAP_H / UNIT_BIN);
   const binCount = binCols * binRows;
   const binStamp = new Int32Array(binCount);
-  const binN = [new Int16Array(binCount), new Int16Array(binCount)];
-  const binSx = [new Float32Array(binCount), new Float32Array(binCount)];
-  const binSy = [new Float32Array(binCount), new Float32Array(binCount)];
+  // One set per seat. These were literal two-element arrays, which indexed
+  // undefined and threw the moment a third player owned a unit.
+  const seats = world.players.length;
+  const perSeat = (Type) => Array.from({ length: seats }, () => new Type(binCount));
+  const binN = perSeat(Int16Array);
+  const binSx = perSeat(Float32Array);
+  const binSy = perSeat(Float32Array);
   // Set when any unit in the bin is a soldier, so an incoming raid can be drawn
   // hotter than a line of villagers walking to a woodline.
-  const binMil = [new Uint8Array(binCount), new Uint8Array(binCount)];
+  const binMil = perSeat(Uint8Array);
   const binTouched = [];
   let binGen = 0;
 
@@ -252,10 +299,12 @@ export function createMinimap(canvas, world) {
       const i = by * binCols + bx;
       if (binStamp[i] !== binGen) {
         binStamp[i] = binGen;
-        binN[0][i] = binN[1][i] = 0;
-        binSx[0][i] = binSx[1][i] = 0;
-        binSy[0][i] = binSy[1][i] = 0;
-        binMil[0][i] = binMil[1][i] = 0;
+        for (let p = 0; p < seats; p++) {
+          binN[p][i] = 0;
+          binSx[p][i] = 0;
+          binSy[p][i] = 0;
+          binMil[p][i] = 0;
+        }
         binTouched.push(i);
       }
       const p = u.player;
@@ -269,10 +318,10 @@ export function createMinimap(canvas, world) {
     ctx.save();
     ctx.lineWidth = 1;
     for (const i of binTouched) {
-      for (let p = 0; p < 2; p++) {
+      for (let p = 0; p < seats; p++) {
         const n = binN[p][i];
         if (!n) continue;
-        const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size);
+        const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size, d);
         // sqrt, so the pip grows quickly from one unit to a squad and then
         // levels off: the difference between 1 and 8 units matters far more
         // than the difference between 40 and 60.
@@ -280,7 +329,9 @@ export function createMinimap(canvas, world) {
         const x = c.x - s / 2;
         const y = c.y - s / 2;
         // Threat ring first, so the pip sits inside it rather than under it.
-        if (p !== PLAYER && binMil[p][i]) {
+        // Hostile, not merely "not mine": an ally's army marching past should
+        // not read as an incoming raid, which is the one thing this ring means.
+        if (binMil[p][i] && !sameTeam(world, PLAYER, p)) {
           ctx.beginPath();
           ctx.arc(c.x, c.y, s * THREAT_RING_SCALE, 0, Math.PI * 2);
           ctx.strokeStyle = THREAT_RING;
@@ -333,7 +384,7 @@ export function createMinimap(canvas, world) {
       const age = t - p.at;
       const fade = 1 - age / PING_LIFE;          // whole marker dies away
       const phase = (age % PING_PERIOD) / PING_PERIOD;
-      const c = gridToMini(p.gx, p.gy, size);
+      const c = gridToMini(p.gx, p.gy, size, d);
       // The two colours swap every half pulse. Whichever way round they are,
       // white and alarm-red are both on screen at once, so the marker separates
       // itself from the enemy's red pips *and* from pale sand in every frame.
@@ -362,18 +413,42 @@ export function createMinimap(canvas, world) {
     ctx.globalAlpha = 1;
   }
 
-  /** One resource pip. Shared by the live pass and the memory pass. */
+  /**
+   * One resource pip. Shared by the live pass and the memory pass.
+   *
+   * DRAWN FAINT, AND THAT IS THE WHOLE POINT. The colours above are carefully
+   * separated from each other and from the team colours, and separating them
+   * was not enough: a whole-game review looked at a midgame minimap and called
+   * it "confetti — a rainbow of pink/yellow/purple dots. You cannot find your
+   * own army on it."
+   *
+   * That is a hierarchy problem, not a hue problem. A map holds around 114
+   * berry bushes, dozens of gold and stone piles and 1600 trees, against maybe
+   * twenty things that are alive and matter this second. Painting all of them
+   * at full strength gives the standing scenery the same voice as the moving
+   * army, and the army loses because it is outnumbered fifty to one.
+   *
+   * So resources are laid down as *texture*: enough to tell you where the wood
+   * and the gold are when you go looking, not enough to compete with a unit pip
+   * for attention. Units and buildings keep full opacity and are now the only
+   * things on this surface that do.
+   */
+  const NODE_ALPHA = 0.5;
+
   function node(type, gx, gy) {
-    const p = gridToMini(gx, gy, size);
+    const p = gridToMini(gx, gy, size, d);
     const s = NODE_SIZE[type] || NODE_SIZE_DEFAULT;
+    const prev = ctx.globalAlpha;
+    ctx.globalAlpha = prev * NODE_ALPHA;
     ctx.fillStyle = RES_COLOR[type] || '#888';
     ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+    ctx.globalAlpha = prev;
   }
 
   /** One building block. Shared by the live pass and the memory pass. */
   function building(type, player, fw, complete, gx, gy) {
-    const p = gridToMini(gx, gy, size);
-    const s = Math.max(3, Math.round((fw / SPAN) * size * 2));
+    const p = gridToMini(gx, gy, size, d);
+    const s = Math.max(3, Math.round((fw / d.span) * size * 2));
     ctx.fillStyle = complete ? TEAM[player] : TEAM_DARK[player];
     ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
     ctx.strokeStyle = 'rgba(0,0,0,0.7)';
@@ -429,7 +504,7 @@ export function createMinimap(canvas, world) {
         const e = world.entities.get(id);
         if (!e || e.dead) continue;
         if (e.kind === 'building' ? !litBuilding(e) : !lit(e.x, e.y)) continue;
-        const p = gridToMini(e.x, e.y, size);
+        const p = gridToMini(e.x, e.y, size, d);
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
       }
     }
@@ -437,8 +512,8 @@ export function createMinimap(canvas, world) {
     // Camera viewport.
     if (camera && camera.worldView) {
       const v = camera.worldView;
-      const a = worldToMini(v.x, v.y, size);
-      const b = worldToMini(v.x + v.width, v.y + v.height, size);
+      const a = worldToMini(v.x, v.y, size, d);
+      const b = worldToMini(v.x + v.width, v.y + v.height, size, d);
       ctx.strokeStyle = 'rgba(255,255,255,0.92)';
       ctx.lineWidth = 1.5;
       ctx.strokeRect(
@@ -453,10 +528,18 @@ export function createMinimap(canvas, world) {
     drawPings();
   }
 
-  return { draw, size, ping, pings };
+  // toGrid rather than an exported miniToGrid: the projection depends on this
+  // world's dimensions, so it belongs to a minimap built for that world and not
+  // to the module. The HUD's tap-to-jump is the only caller.
+  const toGrid = (px, py) => miniToGrid(px, py, size, d);
+
+  return { draw, size, ping, pings, toGrid };
 }
 
 function bake(g, world, size) {
+  const d = miniDims(world);
+  const MAP_W = d.w;
+  const MAP_H = d.h;
   // Everything outside the playable diamond is open sea you can never set foot
   // on, so under fog of war it is permanently unexplored and it is painted in
   // the fog's own black rather than in water. The main view does exactly the
@@ -469,10 +552,10 @@ function bake(g, world, size) {
   // The playable area is a diamond; fill it with grass, then paint the tiles
   // that differ. That is a few hundred fills instead of MAP_W*MAP_H.
   const corners = [
-    gridToMini(0, 0, size),
-    gridToMini(MAP_W, 0, size),
-    gridToMini(MAP_W, MAP_H, size),
-    gridToMini(0, MAP_H, size),
+    gridToMini(0, 0, size, d),
+    gridToMini(MAP_W, 0, size, d),
+    gridToMini(MAP_W, MAP_H, size, d),
+    gridToMini(0, MAP_H, size, d),
   ];
   g.beginPath();
   g.moveTo(corners[0].x, corners[0].y);
@@ -486,8 +569,28 @@ function bake(g, world, size) {
       const t = world.terrain[ty * MAP_W + tx];
       if (t === TERRAIN.GRASS) continue;
       g.fillStyle = TERRAIN_COLOR[t] || '#444';
-      tileDiamond(g, tx, ty, size);
+      tileDiamond(g, tx, ty, size, d);
       g.fill();
+    }
+  }
+
+  // Rock, painted last and over everything, because a cliff is the one thing on
+  // this map that decides where an army can walk. The terrain under it is
+  // ordinary dirt (mapgen dries the ground out around an outcrop), so the
+  // terrain pass above cannot draw it and it has to come off its own grid.
+  //
+  // A cool grey, deliberately lighter than any of the four terrains and the
+  // only cool colour on a warm map: the question this answers at a glance is
+  // "can I get there from here", and the answer has to survive being a
+  // two-pixel diamond under a fog wash.
+  if (world.cliff) {
+    g.fillStyle = CLIFF_COLOR;
+    for (let ty = 0; ty < MAP_H; ty++) {
+      for (let tx = 0; tx < MAP_W; tx++) {
+        if (!world.cliff[ty * MAP_W + tx]) continue;
+        tileDiamond(g, tx, ty, size, d);
+        g.fill();
+      }
     }
   }
 
@@ -502,11 +605,11 @@ function bake(g, world, size) {
 }
 
 
-function tileDiamond(g, tx, ty, size) {
+function tileDiamond(g, tx, ty, size, d) {
   // Grown by a hair so neighbouring tiles do not leave hairline seams.
-  const c = gridToMini(tx + 0.5, ty + 0.5, size);
-  const hw = (1 / SPAN) * size + 0.35;
-  const hh = (1 / SPAN) * size + 0.35;
+  const c = gridToMini(tx + 0.5, ty + 0.5, size, d);
+  const hw = (1 / d.span) * size + 0.35;
+  const hh = (1 / d.span) * size + 0.35;
   g.beginPath();
   g.moveTo(c.x, c.y - hh);
   g.lineTo(c.x + hw, c.y);

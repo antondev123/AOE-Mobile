@@ -7,7 +7,9 @@
 // emitted the event.
 
 import { EV } from '../core/events.js';
-import { HALF_W, HALF_H, MAP_W, MAP_H, PLAYER } from '../core/constants.js';
+import { HALF_W, HALF_H } from '../core/constants.js';
+// The local seat, as a live binding — see core/viewpoint.js.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import {
   ATLAS, unitFrame, glyphFrame, GLYPH_METRICS, GLYPH_PX,
 } from './textures.js';
@@ -264,14 +266,17 @@ export function createFx(scene, world, opts) {
   // The mask is read straight off the vision system each time rather than
   // cached, because effects are spawned from events and the events arrive
   // between frames.
-  const visMask = world.vision ? world.vision.state(PLAYER).visible : null;
+  const visMask = world.vision ? world.vision.viewState(PLAYER).visible : null;
+
+  const MW = world.width;
+  const MH = world.height;
 
   function lit(gx, gy) {
     if (!visMask) return true;
     const tx = gx | 0;
     const ty = gy | 0;
-    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
-    return visMask[ty * MAP_W + tx] === 1;
+    if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) return false;
+    return visMask[ty * MW + tx] === 1;
   }
 
   /** A building is lit if any tile of its footprint is. */
@@ -279,8 +284,8 @@ export function createFx(scene, world, opts) {
     if (!visMask || !e) return true;
     if (e.kind === 'building' && e.tiles) {
       for (const [tx, ty] of e.tiles) {
-        if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
-        if (visMask[ty * MAP_W + tx]) return true;
+        if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) continue;
+        if (visMask[ty * MW + tx]) return true;
       }
       return false;
     }
@@ -523,6 +528,35 @@ export function createFx(scene, world, opts) {
     if (p && p.building && litEntity(p.building)) builtPulse(p.building);
   });
 
+  // A monk mending somebody. Gentle on purpose and drawn on the patient rather
+  // than on the healer: what the player needs to find in a crowd is the man
+  // being put back together, not the man doing it. Rising motes rather than a
+  // ring, because a ring at this size is indistinguishable from a selection
+  // marker, and the one thing this must never be mistaken for is something the
+  // player did.
+  // textures.js bakes a dedicated white mote for this; fall back to the generic
+  // dot if the atlas has not grown one, the same way the projectile art does.
+  const healFrame = origins && origins.get('fx_heal') ? 'fx_heal' : 'fx_dot';
+  on(EV.HEAL, (p) => {
+    const t = p && p.target;
+    if (!t || !litEntity(t)) return;
+    const x = wx(t.x, t.y);
+    const y = wy(t.x, t.y) - 12;
+    const n = scaled(2);
+    for (let i = 0; i < n; i++) {
+      spawn(healFrame, x + (Math.random() - 0.5) * 14, y + (Math.random() - 0.5) * 6, {
+        vx: (Math.random() - 0.5) * 8,
+        vy: -22 - Math.random() * 12,
+        life: 0.6 + Math.random() * 0.25,
+        s0: 0.5, s1: 0.15,
+        a0: 0.9, a1: 0,
+        tint: 0xbfe9ff,
+        depth: depthOf(t.x, t.y, 720),
+        blend: Phaser.BlendModes.ADD,
+      });
+    }
+  });
+
   on(EV.PROJECTILE, (p) => {
     const f = p && p.from;
     if (!f) return;
@@ -585,11 +619,153 @@ export function createFx(scene, world, opts) {
 
   // --- projectiles ---------------------------------------------------------
 
+  // --- What a shot looks like -----------------------------------------------
+  //
+  // Everything that flew used to be `fx_arrow`, which was fine while everything
+  // that flew was an arrow. A mangonel throwing a rock the size of a man and a
+  // scorpion loosing a six-foot bolt are not arrows, and drawing them as one
+  // erases the single most important thing a player needs to read off a siege
+  // line at a glance: which engine is shooting at them.
+  //
+  // Resolved once per type and cached, with a fallback to the arrow for any
+  // frame the atlas does not have. The fallback is not defensive
+  // decoration — it is what lets this file name frames the bake has not grown
+  // yet without turning a missing frame into an invisible projectile.
+  const PROJ_ART = {
+    mangonel: { frame: 'fx_boulder', spin: true, scale: 1.0 },
+    scorpion: { frame: 'fx_bolt', spin: false, scale: 1.0 },
+  };
+  const ARROW = { frame: 'fx_arrow', spin: false, scale: 1 };
+  const projArtCache = new Map();
+  function projArt(type) {
+    let a = projArtCache.get(type);
+    if (a === undefined) {
+      const want = PROJ_ART[type];
+      a = want && origins && origins.get(want.frame) ? want : ARROW;
+      projArtCache.set(type, a);
+    }
+    return a;
+  }
+
+  // --- Impacts --------------------------------------------------------------
+  //
+  // A boulder that lands with no more ceremony than an arrow is the difference
+  // between siege that is in the game and siege that is in the stat table. The
+  // shot needs a moment at the end of it: dust thrown up, chips of masonry, and
+  // — for the heavy engines only — a knock on the camera.
+  //
+  // NOTICED HERE RATHER THAN ANNOUNCED BY THE SIMULATION. combat.js does not
+  // emit an impact event, and it deliberately does not get one for this:
+  // nothing in the simulation needs to know, and an event that exists only so
+  // the decoration can hear it is a field on the hot path paid for by every
+  // peer in a lockstep match. A projectile disappearing from world.projectiles
+  // IS the impact, and this file is already walking that array every frame.
+  //
+  // What that costs is precision, not correctness: an impact that happens while
+  // the tab is backgrounded is never drawn, because no frame ran to see it.
+  // That is the right trade — a dust puff for a shot the player was not looking
+  // at is worth nothing.
+  const inFlight = new Map();   // projectile object -> { x, y, type, splash }
+  let flightMark = 0;
+
+  function reapImpacts() {
+    for (const [pr, rec] of inFlight) {
+      if (rec.mark === flightMark) continue;
+      inFlight.delete(pr);
+      if (!lit(rec.x, rec.y)) continue;
+      impact(rec);
+    }
+  }
+
+  /**
+   * Debris thrown out from a point, in every direction.
+   *
+   * Distinct from chips(), which throws splinters from a resource node *toward*
+   * the villager working it — that one is directional by design and is the
+   * wrong shape entirely for something landing.
+   */
+  function debris(gx, gy, count, tint, force) {
+    const x = wx(gx, gy);
+    const y = wy(gx, gy) - 10;
+    const n = scaled(count);
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const sp = force * (0.45 + Math.random() * 0.75);
+      spawn('fx_chip', x, y, {
+        // The 0.55 on the vertical is the projection, not a fudge: a tile is
+        // twice as wide as it is tall, so debris scattering evenly on the
+        // ground has to move half as far up the screen as across it.
+        vx: Math.cos(a) * sp,
+        vy: Math.sin(a) * sp * 0.55 - force * 0.55,
+        ay: 300,
+        life: 0.5 + Math.random() * 0.35,
+        s0: 1.1, s1: 0.65,
+        a0: 1, a1: 0.05,
+        rot: Math.random() * 360,
+        vr: (Math.random() - 0.5) * 820,
+        tint,
+        depth: depthOf(gx, gy, 700),
+      });
+    }
+  }
+
+  function impact(rec) {
+    const heavy = rec.splash > 0;
+    if (!heavy) {
+      // An arrow or a bolt: a puff and a couple of splinters, no more. This
+      // fires on every arrow in the game, so it has to be nearly free.
+      debris(rec.x, rec.y, 2, 0xd8cbb0, 55);
+      return;
+    }
+    // A boulder. Dust first and widest, because dust is what says "that landed
+    // on the ground" rather than "that hit a man"; then the debris; then a
+    // short bright flash of grit at the centre.
+    dust(rec.x, rec.y, 14, 0xbfae8b);
+    debris(rec.x, rec.y, 9, 0x9c9484, 130);
+    sparks(rec.x, rec.y, 4, 0xffe9b0);
+    // The camera knock, kept small and short on purpose. This is a phone: a
+    // shake big enough to be exciting is a shake big enough to make a player
+    // lose the unit they were about to tap, and the game is played with the
+    // thumb that is holding it. 1.4px for a sixth of a second reads as weight
+    // and costs nobody an order.
+    if (camera && camera.shake && !reducedMotion()) {
+      camera.shake(160, 0.0016 / Math.max(0.35, camera.zoom || 1), false);
+    }
+  }
+
+  // Honoured for the camera knock, which is the one effect here that moves the
+  // whole screen — the same thing hud.css already turns off for these users.
+  let reducedMotionQuery = null;
+  function reducedMotion() {
+    if (reducedMotionQuery === null) {
+      reducedMotionQuery = typeof matchMedia === 'function'
+        ? matchMedia('(prefers-reduced-motion: reduce)')
+        : { matches: false };
+    }
+    return !!reducedMotionQuery.matches;
+  }
+
   function syncProjectiles() {
     const list = world.projectiles || [];
     let n = 0;
+    flightMark++;
     for (let i = 0; i < list.length; i++) {
       const pr = list[i];
+
+      // Remembered before the fog test, not after. A shot fired out of the dark
+      // can still land somewhere you can see, and that impact is one you are
+      // entitled to — it is the arrival of the thing, not the position of the
+      // archer. Visibility is decided again at impact, on the impact point.
+      let rec = inFlight.get(pr);
+      if (rec === undefined) {
+        rec = { x: pr.x, y: pr.y, splash: pr.splashRadius || 0, mark: flightMark };
+        inFlight.set(pr, rec);
+      } else {
+        rec.x = pr.x;
+        rec.y = pr.y;
+        rec.mark = flightMark;
+      }
+
       // An arrow arcing out of the dark would draw a line straight back to an
       // archer you are not supposed to know about, so an arrow in fog simply is
       // not drawn. Sprites are packed down rather than skipped in place, or the
@@ -601,6 +777,8 @@ export function createFx(scene, world, opts) {
         s.setOrigin(0.5, 0.5);
         projSprites.push(s);
       }
+      const art = projArt(pr.owner && pr.owner.type);
+      if (s.frame.name !== art.frame) s.setFrame(art.frame);
       // Prefer the projectile's own position; fall back to interpolating
       // start -> target with its elapsed/duration if the sim keeps x/y static.
       let gx = pr.x;
@@ -615,21 +793,31 @@ export function createFx(scene, world, opts) {
       const t = dur > 0 ? Math.min(1, (pr.elapsed || 0) / dur) : 0;
       const dx = tx - gx;
       const dy = ty - gy;
-      // Slight ballistic arc so arrows read as thrown, not slid.
-      const arc = dur > 0 ? Math.sin(Math.PI * t) * Math.min(22, dur * 26) : 0;
+      // Slight ballistic arc so arrows read as thrown, not slid. A boulder gets
+      // a much taller one: the whole reason a mangonel out-ranges the thing it
+      // is shooting at is that it lobs, and a rock travelling flat reads as a
+      // very large arrow. The arc is proportional to flight time either way, so
+      // a short shot still stays low.
+      const lob = art.spin ? 92 : 26;
+      const arc = dur > 0 ? Math.sin(Math.PI * t) * Math.min(art.spin ? 74 : 22, dur * lob) : 0;
       const px = (gx - gy) * HALF_W;
       const py = (gx + gy) * HALF_H - arc;
       const sdx = (dx - dy) * HALF_W;
       const sdy = (dx + dy) * HALF_H;
       s.setVisible(true);
       s.setPosition(px, py);
-      s.setRotation(Math.atan2(sdy, sdx));
+      // A bolt and an arrow point where they are going. A rock does not point
+      // anywhere — it tumbles, and the tumble is what sells the weight.
+      s.setRotation(art.spin ? (pr.elapsed || 0) * 7.5 : Math.atan2(sdy, sdx));
       s.setDepth(depthOf(gx, gy, 800));
       n++;
     }
     for (let i = n; i < projSprites.length; i++) {
       if (projSprites[i].visible) projSprites[i].setVisible(false);
     }
+    // Anything in the map that this pass did not touch is no longer in flight,
+    // which means it arrived somewhere between the last frame and this one.
+    reapImpacts();
     return n;
   }
 

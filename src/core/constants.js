@@ -9,16 +9,54 @@ export const HALF_W = TILE_W / 2;
 export const HALF_H = TILE_H / 2;
 
 // --- Map --------------------------------------------------------------------
-// AoE2's smallest two-player map is 120x120. 96 is the largest square that
-// still keeps this honest on a phone: the A* grid is 9216 tiles (four times the
-// old 48x48, still well inside the search budget in pathfinding.js), the baked
-// terrain is 6272x3168 world pixels, and the two bases end up ~85 tiles apart —
-// about 75 seconds of marching for a militia, which is the point. At 48 the
-// enemy's first wave was on top of you before you had finished walling your
+//
+// AoE2's smallest two-player map is 120x120. 96 is the largest square that still
+// keeps a *two-player* match honest on a phone: the A* grid is 9216 tiles (four
+// times the old 48x48, still well inside the search budget in pathfinding.js),
+// the baked terrain is 6272x3168 world pixels, and the two bases end up ~85 tiles
+// apart — about 75 seconds of marching for a militia, which is the point. At 48
+// the enemy's first wave was on top of you before you had finished walling your
 // wood line, and there was nowhere to expand to because the whole map was your
 // two starting corners touching in the middle.
-export const MAP_W = 96;
-export const MAP_H = 96;
+//
+// THESE ARE DEFAULTS, NOT THE MAP. They were `MAP_W`/`MAP_H` and were imported
+// directly by a dozen files, which is why a match had exactly one possible size.
+// The world carries its own `width`/`height` now and everything that draws,
+// paths, bins or indexes must read those. The rename is the enforcement: a site
+// that still wants the constant has to say `DEFAULT_` out loud, and a site that
+// forgot to be updated throws a ReferenceError at import rather than quietly
+// laying out a 192-tile map on a 96-tile grid — which does not crash, it just
+// makes half the world invisible to the spatial index.
+export const DEFAULT_MAP_W = 96;
+export const DEFAULT_MAP_H = 96;
+
+/** Most seats a match can have. Eight is AoE2's, and the atlas budget's. */
+export const MAX_PLAYERS = 8;
+
+/**
+ * How big a map should be for a given number of players.
+ *
+ * Area per player is held at what two players get on 96x96, because that is the
+ * figure everything else in this file was tuned against: the walk to the middle,
+ * how long a militia takes to cross, how much wood is inside a base's pocket,
+ * and how far apart `BASE_OFFSET` puts two town centers. Scaling area linearly
+ * with the roster keeps all of that true at any seat count — eight players get
+ * four times the tiles of two, and each of them still opens on the same amount
+ * of ground.
+ *
+ * Rounded to a multiple of 8 so both bucket grids in core/world.js divide evenly
+ * (4 tiles a cell for the mixed index, 2 for the units-only one), and capped at
+ * 192: past that the terrain bake and the per-player fog masks start costing
+ * more than a phone has, and the far corners are further away than a ten-minute
+ * match can reach anyway.
+ *
+ *   2 -> 96   3 -> 120   4 -> 136   5 -> 152   6 -> 168   7 -> 176   8 -> 192
+ */
+export function mapSizeFor(playerCount) {
+  const n = Math.max(2, Math.min(MAX_PLAYERS, playerCount | 0));
+  const side = DEFAULT_MAP_W * Math.sqrt(n / 2);
+  return Math.max(DEFAULT_MAP_W, Math.min(192, Math.round(side / 8) * 8));
+}
 
 export const TERRAIN = {
   GRASS: 0,
@@ -28,11 +66,48 @@ export const TERRAIN = {
 };
 
 // --- Players ----------------------------------------------------------------
+//
+// PLAYER and ENEMY are seat *numbers*, and they survive only as the default
+// two-seat roster's names — for mapgen's fallback, for tests that want to say
+// "the other one", and for the single-player skirmish. Nothing that draws or
+// decides should use them to mean "me": the local seat is ME in
+// core/viewpoint.js, and with eight seats "the enemy" is a question about teams
+// rather than a constant. See core/teams.js.
 export const PLAYER = 0;
 export const ENEMY = 1;
 
-export const PLAYER_COLORS = [0x3d8bfd, 0xe03131];
-export const PLAYER_COLORS_DARK = [0x1f5fbf, 0x9c1c1c];
+// Eight colours, and every one of them has to survive three hostile conditions:
+// a 160x160 minimap where a player is three pixels, the fog's dimming, and a
+// phone screen outdoors. So they are picked around the hue circle at high
+// chroma, avoiding the two hues the map itself already owns — the grass greens
+// and the sand/dirt tans — which is why there is no green and no brown here.
+//
+// The first two are unchanged. A 1v1 must look exactly as it always has, and
+// blue-against-red is the one pairing every RTS player already reads without
+// being told.
+export const PLAYER_COLORS = [
+  0x3d8bfd, // 1 blue
+  0xe03131, // 2 red
+  0xf4b400, // 3 gold
+  0xa64dd6, // 4 purple
+  0x18b3a8, // 5 teal
+  0xff7a1a, // 6 orange
+  0xf06fb0, // 7 pink
+  0xd8dee9, // 8 grey
+];
+// The shaded half of every sprite, and the minimap's incomplete-building fill.
+// Each is its colour taken down in value and slightly in chroma, rather than
+// blended toward black, so a unit reads as one material lit from one side.
+export const PLAYER_COLORS_DARK = [
+  0x1f5fbf, // 1
+  0x9c1c1c, // 2
+  0xa87a06, // 3
+  0x6f2f95, // 4
+  0x0d7a72, // 5
+  0xb04f07, // 6
+  0xa8447a, // 7
+  0x8d94a1, // 8
+];
 
 // --- Resources --------------------------------------------------------------
 export const RES = { FOOD: 'food', WOOD: 'wood', GOLD: 'gold', STONE: 'stone' };
@@ -219,6 +294,125 @@ export const UNIT_STATS = {
     lineOfSight: 3,
     military: true,
   },
+  // The anti-archer skirmisher. Cheap, wood-and-food, and deliberately terrible
+  // at everything except shooting other missile troops: 3 attack against a
+  // militia's 45 hitpoints is a fight it loses standing still. It exists so
+  // that massing archers is answerable by someone who has not built a Stable,
+  // which matters now that the three arms live in three different buildings.
+  skirmisher: {
+    name: 'Skirmisher',
+    hp: 32, speed: 1.1, radius: 0.32,
+    attack: 3, range: 4.0, attackCooldown: 1.6, armor: 1,
+    cost: { food: 25, wood: 35, gold: 0 },
+    buildTime: 22,
+    pop: 1,
+    projectile: true,
+    armorClass: ARMOR_CLASS.ARCHER,
+    lineOfSight: 6,
+    military: true,
+  },
+  // Castle Age heavy cavalry, and the payoff for taking the Stable line. 100
+  // hitpoints and 10 attack is the hardest single body in the game, which is
+  // exactly why the spearman's +12 is aimed at it: a knight that walks into
+  // pikes dies, and a knight that walks around them ends the game.
+  knight: {
+    name: 'Knight',
+    hp: 100, speed: 1.55, radius: 0.42,
+    attack: 10, range: 0.9, attackCooldown: 1.4, armor: 2,
+    cost: { food: 75, wood: 0, gold: 75 },
+    buildTime: 30,
+    pop: 1,
+    armorClass: ARMOR_CLASS.CAVALRY,
+    lineOfSight: 6,
+    military: true,
+  },
+
+  // --- Siege ------------------------------------------------------------------
+  //
+  // The ram above is siege that walks up to a wall. These two are siege that
+  // stands back, and they are the reason `splashRadius` and `minRange` had to
+  // become things the combat system understands.
+  //
+  // A note on SPREAD. The formation table at the bottom of this file has always
+  // promised "Loose, against area damage", and SPREAD_SPACING has always been
+  // justified as "far enough that one mangonel shot cannot reach two bodies" —
+  // written against a mangonel that did not exist and a splash mechanic that
+  // was never implemented. Both are real now, and the 2.2 spacing was chosen
+  // correctly: it is comfortably outside the 1.4 splash radius below.
+  mangonel: {
+    name: 'Mangonel',
+    hp: 130, speed: 0.6, radius: 0.46,
+    attack: 14, range: 7.0, attackCooldown: 4.0, armor: 3,
+    cost: { food: 0, wood: 160, gold: 135 },
+    buildTime: 42,
+    pop: 2,
+    projectile: true,
+    armorClass: ARMOR_CLASS.SIEGE,
+    // Eight against a range of seven, keeping the invariant every unit obeys:
+    // see further than you shoot, or you fire into black ground.
+    lineOfSight: 8,
+    military: true,
+    // The boulder hurts everything within this many tiles of where it lands,
+    // OWNERS INCLUDED. Friendly fire is not an oversight here, it is the whole
+    // balancing weight of the unit — a mangonel behind your own line kills your
+    // own line, so it has to be placed, and a mass of them cannot simply be
+    // sent forward with everything else.
+    splashRadius: 1.4,
+    // Damage falls to this fraction at the edge of the splash. The centre takes
+    // the full number.
+    splashFalloff: 0.4,
+    // It cannot depress its arm far enough to hit what is standing on it. This
+    // is what stops a mangonel being a better archer than an archer: anything
+    // that closes inside two tiles is safe from it and it has to walk away.
+    minRange: 2.0,
+  },
+  // The bolt thrower: a fast, flat, cheap shot that is murder on massed
+  // infantry and does nothing to masonry. It is the scorpion's job to punish
+  // the thing the mangonel is too slow to catch.
+  scorpion: {
+    name: 'Scorpion',
+    hp: 90, speed: 0.7, radius: 0.42,
+    attack: 8, range: 6.0, attackCooldown: 2.2, armor: 2,
+    cost: { food: 0, wood: 75, gold: 45 },
+    buildTime: 30,
+    pop: 1,
+    projectile: true,
+    armorClass: ARMOR_CLASS.SIEGE,
+    lineOfSight: 7,
+    military: true,
+    minRange: 1.5,
+  },
+
+  // --- Support ----------------------------------------------------------------
+  //
+  // The monk is the first unit in this game that is not a worker and not a
+  // soldier, and the roster tables have had to learn the difference (see
+  // `support` below and MILITARY_TYPES underneath).
+  //
+  // It cannot attack. Not "attacks weakly" — `attack: 0`, no swing, no target
+  // acquisition, ever. A healer that can also fight is a healer nobody uses as
+  // a healer, and 100 gold for a body that can only follow an army is the
+  // decision the unit is made of: that gold was two thirds of a knight.
+  monk: {
+    name: 'Monk',
+    hp: 40, speed: 1.0, radius: 0.32,
+    attack: 0, range: 0, attackCooldown: 0, armor: 0,
+    cost: { food: 0, wood: 0, gold: 100 },
+    buildTime: 30,
+    pop: 1,
+    armorClass: ARMOR_CLASS.INFANTRY,
+    lineOfSight: 5,
+    // Not military. It carries no attack, so it must not be in MILITARY_TYPES —
+    // the AI's roster, the army census and the "select all soldiers" control
+    // all read that list and all of them would be wrong about a monk.
+    military: false,
+    support: true,
+    // Hit points restored per second to one wounded friendly unit within reach.
+    // Deliberately close to the garrison rate (1.5/s): a monk is a garrison you
+    // can take with you, and it should not be strictly better than walking home.
+    heal: 2.0,
+    healRange: 3.5,
+  },
 };
 
 /**
@@ -252,16 +446,55 @@ export const BONUS_DAMAGE = {
   // for one ram — long enough that the defender gets to answer it, short enough
   // that bringing two is a plan.
   ram: { building: 40 },
+  // The skirmisher's whole reason to exist. +4 on a base 3 more than doubles it
+  // against the one class it is for, and leaves it at 3 against everything else.
+  skirmisher: { archer: 4, siege: 2 },
+  // A knight is not a counter to anything — it is the thing counters are aimed
+  // at. The small bonus against siege is the same clause every mobile unit
+  // carries: an unescorted engine dies to whatever finds it.
+  knight: { siege: 3 },
+  // Ten against masonry, a quarter of the ram's forty. A mangonel can knock a
+  // house down if it must, but the wall it is parked in front of is still the
+  // ram's job — which keeps both siege units worth building.
+  mangonel: { building: 10 },
+  // Flat, fast and aimed at bodies. Nothing against buildings at all: a
+  // scorpion firing at a Town Center should feel like a waste of a scorpion.
+  scorpion: { infantry: 4, archer: 3 },
 };
 
-/** Every unit type that counts as an army, in table order. */
+/**
+ * Every unit type that counts as an army, in table order.
+ *
+ * Read by the enemy AI's roster, the army census, and the HUD's "select every
+ * soldier" control. The filter is `military`, not "has an attack" and not "is
+ * not a villager", because the monk is neither a worker nor a soldier: it
+ * belongs to an army without being one, and every list above would be wrong
+ * about it. See SUPPORT_TYPES.
+ */
 export const MILITARY_TYPES = Object.keys(UNIT_STATS).filter((t) => UNIT_STATS[t].military);
+
+/** Units that follow an army without fighting — today, the monk. */
+export const SUPPORT_TYPES = Object.keys(UNIT_STATS).filter((t) => UNIT_STATS[t].support);
 
 /** Is this unit type a soldier rather than a worker? */
 export function isMilitaryType(type) {
   const s = UNIT_STATS[type];
   return !!(s && s.military);
 }
+
+/** Is this unit type a non-combatant that still belongs with an army? */
+export function isSupportType(type) {
+  const s = UNIT_STATS[type];
+  return !!(s && s.support);
+}
+
+/**
+ * Everything a player would call "my army" — soldiers and the monks with them.
+ * Distinct from MILITARY_TYPES on purpose: this is the selection and
+ * army-movement list, MILITARY_TYPES is the fighting-strength list.
+ */
+export const ARMY_TYPES = Object.keys(UNIT_STATS)
+  .filter((t) => UNIT_STATS[t].military || UNIT_STATS[t].support);
 
 export const BUILDING_STATS = {
   towncenter: {
@@ -305,8 +538,91 @@ export const BUILDING_STATS = {
     // The ram is deliberately *not* here. A barracks building a siege engine is
     // a step too far, and unlike cavalry the ram's absence costs the counter
     // triangle nothing.
-    trains: ['militia', 'spearman', 'archer', 'scout'],
+    // Infantry only, at last. The Archery Range and the Stable exist now, and
+    // the archer and the scout have gone to them — see the block below. What
+    // stayed is what a barracks is actually for.
+    trains: ['militia', 'spearman'],
     lineOfSight: 5,
+  },
+
+  // --- The military buildings -------------------------------------------------
+  //
+  // These four are the ones the Barracks was standing in for. Until this pass
+  // the archer and the scout were trained at the Barracks as an admitted
+  // stopgap (the comment above used to say so at length), which meant the
+  // counter triangle had no cost structure behind it: one 175-wood building put
+  // all three arms on the map, so "what did he build" was never a question with
+  // an answer. Three buildings at 175 wood each is the answer — you cannot
+  // afford every arm in the Feudal Age, so you pick, and picking is what makes
+  // the other player's pick worth scouting.
+  //
+  // All three are 3x3 and 175 wood, deliberately identical to each other and to
+  // the Barracks. They are alternatives, not a ladder, and a price difference
+  // between them would be a thumb on the scale of a choice that should be about
+  // what you are facing.
+  archeryrange: {
+    name: 'Archery Range',
+    hp: 700, fw: 3, fh: 3,
+    cost: { food: 0, wood: 175, gold: 0 },
+    buildTime: 38,
+    trains: ['archer', 'skirmisher'],
+    lineOfSight: 5,
+  },
+  stable: {
+    name: 'Stable',
+    hp: 700, fw: 3, fh: 3,
+    cost: { food: 0, wood: 175, gold: 0 },
+    buildTime: 38,
+    trains: ['scout', 'knight'],
+    lineOfSight: 5,
+  },
+  // No `trains` at all. The Blacksmith is the one building whose entire output
+  // is research, and it has been waiting to exist for a while: ten techs in
+  // tech.js already name it first in their `at` list and have been falling back
+  // to the Barracks. The day this entry appears they move here by themselves,
+  // with no edit there — which is what that indirection was built for.
+  blacksmith: {
+    name: 'Blacksmith',
+    hp: 650, fw: 3, fh: 3,
+    cost: { food: 0, wood: 150, gold: 0 },
+    buildTime: 40,
+    trains: [],
+    lineOfSight: 5,
+  },
+  // Castle Age, and the reason stone walls stopped being the end of the
+  // argument. Everything it trains is slow, fragile against anything that
+  // reaches it, and murderous against the thing it is pointed at — see the
+  // siege block in UNIT_STATS.
+  siegeworkshop: {
+    name: 'Siege Workshop',
+    hp: 750, fw: 3, fh: 3,
+    cost: { food: 0, wood: 200, gold: 0 },
+    buildTime: 45,
+    trains: ['ram', 'mangonel', 'scorpion'],
+    lineOfSight: 5,
+  },
+  // The second research building, and the one that makes a defensive game
+  // playable: Ballistics and Chemistry are what turn a line of towers from
+  // decoration into a position, and Masonry is what makes a Castle worth its
+  // 250 stone. No units — a University that trained something would be a
+  // fourth military building with a different hat on.
+  university: {
+    name: 'University',
+    hp: 700, fw: 3, fh: 3,
+    cost: { food: 0, wood: 200, gold: 0 },
+    buildTime: 50,
+    trains: [],
+    lineOfSight: 6,
+  },
+  // The support building. One unit, which cannot fight at all — see `monk` in
+  // UNIT_STATS and the note there about why a healer is worth a building.
+  monastery: {
+    name: 'Monastery',
+    hp: 650, fw: 3, fh: 3,
+    cost: { food: 0, wood: 175, gold: 0 },
+    buildTime: 45,
+    trains: ['monk'],
+    lineOfSight: 6,
   },
   farm: {
     name: 'Farm',
@@ -572,13 +888,16 @@ export function wallFamily(type) {
 //   * what survives is gated by age (systems/tech.js, AGE_UNLOCKS), which is
 //     what actually decides whether the player may place it today.
 //
-// The second half of the list is deliberately forward-declared: the Castle, the
-// walls, the tower, the Market and the military buildings are landing from
-// another pass, and naming them here — with the two or three plausible keys
-// each, since their spelling is not settled — means the build menu, the age
-// gating and the placement rules all pick them up with no edit. An unrecognised
-// key is inert; a duplicate is impossible because BUILDING_STATS has one entry
-// per building whatever it is called.
+// Most of this list used to be forward-declared — named here before the
+// buildings existed, so that the build menu, the age gating and the placement
+// rules would pick each one up with no edit the day it arrived. That worked
+// exactly as intended: the Castle, the walls, the tower, the Market and now the
+// six military and research buildings all landed with no change to this list.
+//
+// What is left forward-declared is 'palisadewall', 'tower', 'wall', 'gate' and
+// 'keep' — alternative spellings and one building nobody has built yet. An
+// unrecognised key is inert; a duplicate is impossible because BUILDING_STATS
+// has one entry per building whatever it is called.
 export const BUILDABLE = [
   // Standing today.
   'house', 'farm', 'mill', 'lumbercamp', 'miningcamp', 'barracks', 'towncenter',

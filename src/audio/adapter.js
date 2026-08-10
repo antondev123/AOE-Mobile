@@ -92,7 +92,12 @@ export function createAudioAdapter(world, audio, opts = {}) {
 
   on(EV.PROJECTILE, (p) => {
     const from = p && (p.from || p.entity);
-    if (from) audio.play('arrowLoose', at(from));
+    if (!from) return;
+    // A mangonel is not a bow. The test is the splash the shot carries rather
+    // than the unit's name, so the day something else throws a rock it sounds
+    // like one with no edit here.
+    const s = UNIT_STATS[from.type];
+    audio.play(s && s.splashRadius > 0 ? 'siegeLoose' : 'arrowLoose', at(from));
   });
 
   on(EV.DAMAGE, (p) => {
@@ -106,7 +111,22 @@ export function createAudioAdapter(world, audio, opts = {}) {
     const stats = attacker
       ? (attacker.kind === 'building' ? BUILDING_STATS : UNIT_STATS)[attacker.type]
       : null;
+    // A splash shot damages several bodies in one tick and would otherwise fire
+    // one impact per body. `siegeImpact` coalesces at 0.18s, which is far
+    // longer than a blast takes to resolve, so a boulder landing in a crowd is
+    // one boom — which is what it is.
+    if (stats && stats.splashRadius > 0) {
+      audio.play('siegeImpact', at(target));
+      return;
+    }
     audio.play(stats && stats.projectile ? 'arrowHit' : 'meleeHit', at(target));
+  });
+
+  // Mending. Emitted on a fixed half-second beat by combat.js rather than per
+  // step, so this is already rate-limited before it reaches the mixer.
+  on(EV.HEAL, (p) => {
+    const t = p && p.target;
+    if (t) audio.play('heal', at(t));
   });
 
   on(EV.DEATH, (p) => {

@@ -5,7 +5,9 @@
 // ids are pruned in one place.
 
 import { EV } from '../core/events.js';
-import { PLAYER } from '../core/constants.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 
 /** Live entities that are currently selected (dead/removed ids are dropped). */
 export function selectedEntities(world) {

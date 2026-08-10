@@ -20,6 +20,9 @@
 //               for hp-bar flash and retaliation
 //   postLeash   how far this particular engagement may be chased (see engage)
 //   attackMove  true while the unit is under an attack-move order — see below
+//   healTarget  the friendly unit a support unit is currently mending, or null.
+//               Written here, read by the HUD and the FX layer; see the healing
+//               section at the bottom of this file
 //   stance      'aggressive' | 'defensive' | 'standGround' | 'noAttack'. Absent
 //               on a unit nobody has set one on; read it through stanceOf(),
 //               never directly, so the default is applied in one place
@@ -28,6 +31,18 @@
 //               section — so nothing in this file's main loop ever sees one
 //
 // world.projectiles is owned here and only read by the renderer.
+//
+// --- Siege: splash, and the hole in the middle of a siege engine's range -----
+// Two mechanics that only siege uses, both declared per unit type in
+// constants.js and both no-ops for everything that does not declare them:
+//
+//   splashRadius / splashFalloff — the shot hurts everything near where it
+//     LANDS, friend and foe alike. See applySplash().
+//   minRange — the engine cannot depress its arm far enough to hit what is
+//     standing on top of it. See minAttackReach() and tooClose().
+//
+// A unit with neither field pays two property reads and behaves exactly as it
+// did before either existed.
 //
 // --- Attack-move -------------------------------------------------------------
 // A unit is "attack-moving" when either `unit.attackMove` is true or its task is
@@ -58,7 +73,7 @@ import {
   edgeDist, edgeDist2, forEachNear, isHostile, removeEntity, findNearestGlobal,
   inBounds, isBlocked, snapshotUnits,
 } from '../core/world.js';
-import { dist, dirIndex } from '../core/iso.js';
+import { dist, dirIndex, hyp } from '../core/iso.js';
 import { attackBonus, armorBonus } from './tech.js';
 
 // --- Tuning (feel) ----------------------------------------------------------
@@ -138,16 +153,68 @@ export function attackReach(attacker, target) {
   return r + ar + tr;
 }
 
+/**
+ * The distance below which `attacker` cannot bring its weapon to bear at all,
+ * surface to surface. Zero for everything that does not declare a `minRange`,
+ * which is every unit in the game except the two siege engines.
+ *
+ * Built the same way attackReach is — the declared figure plus both radii — so
+ * that the two bounds are measured against the same edgeDist2 in the same
+ * units. The reach a player reads off the unit card is the gap between the two
+ * bodies, not the gap between their centres, at both ends of the band.
+ *
+ * BUILDINGS ARE EXEMPT, and this is the whole reason the target is inspected
+ * rather than only the attacker. A mangonel's minimum range is a fact about the
+ * arc a counterweight throws a boulder on — it cannot drop one on the man
+ * standing against its wheel. A wall is not a man standing against the wheel:
+ * it is thirty feet of masonry the engine has been rolled up to, and the shot
+ * that matters is the one fired point blank into it. Applying the minimum to
+ * masonry would mean a mangonel parked against a Town Center could not hit the
+ * Town Center, which is not a balance decision anybody would defend out loud —
+ * it is the unit failing to do the one thing its name promises. AoE2 makes the
+ * same exemption for the same reason.
+ */
+export function minAttackReach(attacker, target) {
+  if (!attacker || attacker.kind !== 'unit') return 0;
+  const s = UNIT_STATS[attacker.type];
+  const min = s && s.minRange;
+  if (!(min > 0)) return 0;
+  if (!target || target.kind !== 'unit') return 0;
+  return min + (attacker.radius || 0) + (target.radius || 0);
+}
+
+/**
+ * Is `target` *underneath* `attacker` — inside the minimum range, where the
+ * weapon is useless? Pure, and false for anything without a minimum range.
+ *
+ * Separate from inRange() because the two answers mean different things to the
+ * caller: out of range means walk closer, too close means walk away. unitAI
+ * reads this directly to decide which (see backAway there).
+ */
+export function tooClose(attacker, target) {
+  if (!attacker || !target) return false;
+  const min = minAttackReach(attacker, target);
+  if (min <= 0) return false;
+  return edgeDist2(target, attacker.x, attacker.y) < min * min;
+}
+
 /** Is `target` close enough for `attacker` to hit right now? Pure. */
 export function inRange(attacker, target) {
   if (!attacker || !target) return false;
   if (attacker.dead || target.dead) return false;
   const reach = attackReach(attacker, target);
-  return edgeDist2(target, attacker.x, attacker.y) <= reach * reach;
+  if (edgeDist2(target, attacker.x, attacker.y) > reach * reach) return false;
+  // The band has a floor as well as a ceiling. Everything that reads "can I
+  // swing right now" goes through this one predicate — the swing gate in
+  // updateCombat, unitAI's approach, the leash, the Stand Ground filter — so
+  // putting the minimum here is what makes a siege engine with a spearman on
+  // its face genuinely unable to fire, rather than unable to fire in the two
+  // places somebody remembered to check.
+  return !tooClose(attacker, target);
 }
 
 /** May `attacker` attack `target` at all (alive, hostile, attackable)? Pure. */
-export function canAttack(attacker, target) {
+export function canAttack(world, attacker, target) {
   if (!attacker || !target || attacker === target) return false;
   if (attacker.dead || target.dead) return false;
   if (attacker.kind !== 'unit') return false;       // buildings do not fight back
@@ -155,7 +222,7 @@ export function canAttack(attacker, target) {
   if (!(attacker.hp > 0)) return false;
   if (target.kind !== 'unit' && target.kind !== 'building') return false;
   if (!(target.hp > 0)) return false;
-  return isHostile(attacker, target);
+  return isHostile(world, attacker, target);
 }
 
 // --- Damage -----------------------------------------------------------------
@@ -366,7 +433,7 @@ function raiseAlert(world, attacker, target) {
   const player = target.player;
   if (player === null || player === undefined) return false;
   // Only an enemy attacking you is an alarm.
-  if (attacker && !isHostile(attacker, target)) return false;
+  if (attacker && !isHostile(world, attacker, target)) return false;
 
   const st = alertState(world, player);
   const now = world.time;
@@ -402,7 +469,7 @@ function raiseAlert(world, attacker, target) {
 function callForHelp(world, attacker, victim) {
   if (!attacker || attacker.dead) return;
   if (victim.player === null || victim.player === undefined) return;
-  if (!isHostile(attacker, victim)) return;
+  if (!isHostile(world, attacker, victim)) return;
   if (world.time - (victim._helpAt ?? -Infinity) < HELP_INTERVAL) return;
   victim._helpAt = world.time;
 
@@ -412,7 +479,7 @@ function callForHelp(world, attacker, victim) {
     if (isVillager(e) || e.fleeing) return;
     if (e.target) return;                        // already in a fight
     if (e.task && e.state !== 'idle') return;    // under orders — do not hijack
-    if (!canAttack(e, attacker)) return;
+    if (!canAttack(world, e, attacker)) return;
     // Answering a cry for help is still auto-acquisition: the same two gates
     // apply. A Stand Ground unit holds its spot however loudly its neighbour
     // shouts, a No Attack unit never joins, and nobody charges something their
@@ -442,7 +509,7 @@ function kill(world, e, killer) {
 /** Being hit makes soldiers angry and villagers scared. */
 function reactToDamage(world, attacker, target) {
   if (target.kind !== 'unit') return;
-  if (!attacker || attacker.dead || !isHostile(attacker, target)) return;
+  if (!attacker || attacker.dead || !isHostile(world, attacker, target)) return;
 
   if (isVillager(target)) {
     // Villagers do not trade with soldiers. If the player explicitly ordered
@@ -456,7 +523,7 @@ function reactToDamage(world, attacker, target) {
   // takes it rather than abandoning its post, and nothing charges an attacker
   // hidden in the dark — which is precisely the tower or the archer you have
   // not scouted yet.
-  if (!target.target && !target.task && canAttack(target, attacker)) {
+  if (!target.target && !target.task && canAttack(world, target, attacker)) {
     const stance = stanceOf(target);
     if (stance === STANCE.NO_ATTACK) return;
     if (stance === STANCE.STAND_GROUND && !inRange(target, attacker)) return;
@@ -486,7 +553,7 @@ function startFleeing(world, v, threat) {
   // No home to run to: just run directly away from the threat.
   let dx = v.x - threat.x;
   let dy = v.y - threat.y;
-  const d = Math.hypot(dx, dy) || 1;
+  const d = hyp(dx, dy) || 1;
   dx /= d; dy /= d;
   v.fleeTo = {
     x: clamp(v.x + dx * FLEE_DISTANCE, 0, world.width - 1),
@@ -571,7 +638,18 @@ export function updateCombat(world, dt) {
       u._autoFor = null;
     }
 
-    if (u.target && !canAttack(u, u.target)) dropTarget(u, false);
+    if (u.target && !canAttack(world, u, u.target)) dropTarget(u, false);
+
+    // Support units mend instead of fighting. Everything below this line is
+    // about swinging at something, and a monk does none of it: canAttack has
+    // already refused it a target (attack is 0), acquire would refuse it one
+    // again, and fire would have nothing to fire. Taking it out of the loop
+    // here says that in one place rather than three.
+    if (healRateOf(u) > 0) {
+      updateHealer(world, u, dt);
+      continue;
+    }
+
     // Whether a snapped leash walks the unit home is the difference between
     // Aggressive and Defensive: an aggressive unit holds the ground it took, a
     // defensive one goes back to the post it was covering. See returnsToPost.
@@ -634,14 +712,43 @@ function isRanged(u) {
   return !!(s && s.projectile);
 }
 
+/** The splash this unit's shot carries, or null. Two property reads. */
+function splashOf(u) {
+  if (!u || u.kind !== 'unit') return null;
+  const s = UNIT_STATS[u.type];
+  if (!s || !(s.splashRadius > 0)) return null;
+  return { radius: s.splashRadius, falloff: s.splashFalloff || 0 };
+}
+
 function launchProjectile(world, u, target, damage) {
+  const splash = splashOf(u);
   const d = dist(u.x, u.y, target.x, target.y);
   const p = {
     x: u.x,
     y: u.y,
     tx: target.x,
     ty: target.y,
-    target,
+    // A SPLASH WEAPON IS AIMED AT A PLACE, NOT AT A BODY, and that is why the
+    // target field is deliberately left empty here. `target` is what
+    // updateProjectiles homes on: an arrow leans after the archer's quarry as
+    // it walks, which is right for a bow and wrong for a counterweight the crew
+    // wound up eight seconds ago. A mangonel picks a spot on the ground, throws
+    // a rock at it, and hits whatever is standing there when it lands.
+    //
+    // Everything that makes the unit interesting falls out of that one line.
+    // Ordering a hit on a moving target and watching the boulder land behind it
+    // is the skill; a unit that walks out of the blast has genuinely dodged it;
+    // and both SPREAD formation and the minimum range above mean something,
+    // because both are about *where bodies are standing* rather than about who
+    // was aimed at. The renderer needs no change either — fx.js already falls
+    // back to tx/ty when a projectile has no target, so the boulder is drawn
+    // flying at the ground it is actually flying at.
+    target: splash ? null : target,
+    // Who the crew were shooting AT, all the same: a direct hit is a direct hit
+    // and takes the full number, undiminished by falloff. See applySplash.
+    aimedAt: target,
+    splashRadius: splash ? splash.radius : 0,
+    splashFalloff: splash ? splash.falloff : 0,
     // Snapshotted at launch, not at impact: an arrow already in the air was
     // loosed by the bow the archer had at the time. Flight is under a second,
     // so the difference is invisible — but "the arrow carries its damage" is
@@ -649,7 +756,17 @@ function launchProjectile(world, u, target, damage) {
     // would make a Fletching finishing mid-volley retroactively strengthen
     // arrows that had already left. The counter bonus is snapshotted with it and
     // for the same reason: the arrow was aimed at *this* target.
-    damage: damage === undefined ? effectiveAttack(world, u, target) : damage,
+    //
+    // A splash shot is the one exception, and it has to be: the counter bonus
+    // is a fact about the thing being hit, and this shot is about to hit five
+    // different things. So it carries the *sheet* number — base attack plus the
+    // blacksmith line, both of which are facts about the crew — and each body
+    // in the blast has its own bonus added at impact. The direct target ends up
+    // with exactly the number it would have got either way, which is the point:
+    // nothing about the ordinary case changes.
+    damage: damage === undefined
+      ? effectiveAttack(world, u, splash ? null : target)
+      : damage,
     owner: u,
     speed: PROJECTILE_SPEED,
     elapsed: 0,
@@ -658,6 +775,93 @@ function launchProjectile(world, u, target, damage) {
   world.projectiles.push(p);
   world.events.emit(EV.PROJECTILE, { from: u, to: target });
   return p;
+}
+
+// --- Area of effect ---------------------------------------------------------
+//
+// Reused between impacts. Splash is rare — one mangonel shot every four seconds
+// — but this is the same rule the rest of the file plays by: the steady state
+// allocates nothing. See snapshotUnits in core/world.js for the same trick.
+const SPLASH_SCRATCH = [];
+
+/**
+ * The boulder lands. Everything standing near the crater takes a share of it.
+ *
+ * FRIENDLY FIRE IS ON, ON PURPOSE, and it is not a detail — it is the entire
+ * balancing weight of the mangonel and the reason the unit is allowed to exist
+ * at 14 attack with a seven-tile reach. A siege engine that only hurt the enemy
+ * would be a better archer than an archer: you would build eight of them, put
+ * them in the middle of the army, and never think about them again. Because it
+ * hurts your own line too, a mangonel is a unit you have to *place* — behind
+ * the melee, off the flank, never in the middle — and a mass of them cannot
+ * simply be sent forward with everything else. constants.js says so out loud in
+ * the unit's own comment; this function is where that promise is kept.
+ *
+ * The sweep is over units AND buildings: a shot into a crowd at the gate should
+ * chip the gate, and a shot at the gate should catch the crowd at it. Resources
+ * are left alone — a boulder does not fell a tree, and letting it would mean a
+ * stray shot silently deleting a player's woodline.
+ *
+ * WHAT SCALES AND WHAT DOES NOT. Damage runs linearly from the full number at
+ * the impact point down to `splashFalloff` of it at the rim, measured surface to
+ * surface (edgeDist), so a big building caught by its corner takes the same
+ * share a unit standing at that corner would. The one body exempt from the
+ * falloff is the one the crew were aiming at — a direct hit is a direct hit —
+ * and the one body exempt from the blast entirely is the firing unit itself,
+ * because a mangonel that could kill itself with its own shot at minimum range
+ * is a bug wearing a mechanic's clothes.
+ *
+ * DETERMINISM. The sweep is collected first and then sorted by ascending id
+ * before a single point of damage is applied. Order matters and is not
+ * cosmetic: a kill inside the loop emits EV.DEATH, may raise an alert, may
+ * start a villager fleeing, and removeEntity walks world.units clearing
+ * references — so two peers that damaged the same five bodies in different
+ * orders would end the tick with different worlds. forEachNear's bucket walk is
+ * already deterministic given identical inputs, but it is deterministic by
+ * *coincidence of layout*: it depends on the bucket grid, which depends on the
+ * map size. Sorting by id costs one sort of five elements per shot and makes
+ * the ordering a property of the simulation rather than of the index.
+ */
+function applySplash(world, p) {
+  const r = p.splashRadius;
+  if (!(r > 0)) return;
+  const hits = SPLASH_SCRATCH;
+  hits.length = 0;
+
+  forEachNear(world, p.x, p.y, r, (e) => {
+    if (e.kind !== 'unit' && e.kind !== 'building') return;
+    if (e.dead || !(e.hp > 0)) return;
+    // Never the crew that threw it. Everyone else, whoever they belong to.
+    if (e === p.owner) return;
+    hits.push(e);
+  });
+  if (!hits.length) return;
+  hits.sort(byId);
+
+  const falloff = p.splashFalloff;
+  for (let i = 0; i < hits.length; i++) {
+    const e = hits[i];
+    // A body that died to an earlier hit in this same blast is gone; it must not
+    // be hit again on the way out.
+    if (e.dead || !world.entities.has(e.id)) continue;
+    let share = 1;
+    if (e !== p.aimedAt) {
+      // Linear from 1 at the centre to `falloff` at the rim. Clamped because a
+      // building's edge distance can sit a hair outside the radius the sweep
+      // accepted it at.
+      const t = Math.min(1, edgeDist(e, p.x, p.y) / r);
+      share = 1 + (falloff - 1) * t;
+    }
+    // The counter bonus is added here rather than snapshotted at launch, per the
+    // note in launchProjectile: this shot is hitting several different things
+    // and each of them is a different armour class.
+    applyDamage(world, p.owner, e, (p.damage + bonusDamage(p.owner, e)) * share);
+  }
+  hits.length = 0;
+}
+
+function byId(a, b) {
+  return a.id - b.id;
 }
 
 function updateProjectiles(world, dt) {
@@ -677,13 +881,14 @@ function updateProjectiles(world, dt) {
     p.elapsed += dt;
     const dx = p.tx - p.x;
     const dy = p.ty - p.y;
-    const d = Math.hypot(dx, dy);
+    const d = hyp(dx, dy);
     const step = p.speed * dt;
 
     if (d <= step || p.elapsed > p.duration + PROJECTILE_MAX_OVERTIME) {
       p.x = p.tx;
       p.y = p.ty;
-      if (p.target) applyDamage(world, p.owner, p.target, p.damage);
+      if (p.splashRadius > 0) applySplash(world, p);
+      else if (p.target) applyDamage(world, p.owner, p.target, p.damage);
       list.splice(i, 1);
       continue;
     }
@@ -790,11 +995,30 @@ function acquireRange(u, stance) {
   if (stance === STANCE.NO_ATTACK) return 0;
   const reach = (u.range || 0) + (u.radius || 0);
   if (stance === STANCE.STAND_GROUND) return reach + 1.0;
-  if (isAttackMoving(u)) return ENGAGE_RANGE;
   if (stance === STANCE.DEFENSIVE) {
     return Math.max(reach + 1.0, STANCE_LEASH[STANCE.DEFENSIVE]);
   }
-  return u.task ? AGGRO_RANGE : ENGAGE_RANGE;
+  // NEVER SCAN LESS FAR THAN YOU CAN SHOOT.
+  //
+  // The two passive stances above have always taken `reach + 1.0` as a floor;
+  // the aggressive and attack-move cases returned a flat constant, which was
+  // right for every unit that existed when it was written — an archer reaches
+  // 4.5 + 0.32 and ENGAGE_RANGE is 7.5, so the constant was always the larger.
+  //
+  // Siege broke that. A mangonel reaches 7.0 + 0.46 + its target's radius, or
+  // 7.82 against a militia, which is *further than the scan*. That leaves a
+  // live band between 7.5 and 7.82 where the engine can hit something it will
+  // never look for, and it is not a theoretical band: measured, a mangonel that
+  // killed its ordered target went idle with seven more militia standing 7.52
+  // tiles away and never fired again for the rest of the match. Two hundred and
+  // ninety-five resources of siege engine, sat down 0.02 tiles outside its own
+  // attention span.
+  //
+  // A floor rather than a replacement, so nothing that used to scan 7.5 now
+  // scans less, and a unit parked mid-order still only spares AGGRO_RANGE for
+  // its surroundings unless its own weapon reaches further than that.
+  if (isAttackMoving(u)) return Math.max(reach + 1.0, ENGAGE_RANGE);
+  return Math.max(reach + 1.0, u.task ? AGGRO_RANGE : ENGAGE_RANGE);
 }
 
 function acquire(world, u, dt) {
@@ -817,12 +1041,21 @@ function acquire(world, u, dt) {
   let best = null;
   let bestScore = Infinity;
   forEachNear(world, u.x, u.y, range, (e) => {
-    if (!canAttack(u, e)) return;
+    if (!canAttack(world, u, e)) return;
     // The fog gate. Never auto-acquire what your side cannot see.
     if (!canSee(world, u, e)) return;
     // Stand Ground fights only what has walked into its reach — it may not take
     // a single step, so a target it cannot hit from here is not a target.
     if (standing && !inRange(u, e)) return;
+    // THE FLOOR ON THE SCAN. acquireRange() below is a ceiling and always has
+    // been; a siege engine has a floor as well, and picking a fight it cannot
+    // start is worse than picking none. Without this a mangonel with a militia
+    // in its face would target the militia, refuse to fire (inRange is false),
+    // and — because a target is what unitAI's back-away is driven by — spend the
+    // fight walking backwards from a man it chose over the archer line it could
+    // actually have hit six tiles away. Something already inside the minimum is
+    // not this unit's problem; its escort's, or its legs'.
+    if (tooClose(u, e)) return;
     // Prefer live threats over masonry: buildings are pushed to the back.
     const bias = e.kind === 'building' ? range * range : 0;
     const score = edgeDist2(e, u.x, u.y) + bias;
@@ -1091,7 +1324,7 @@ function updateBuildings(world, dt) {
     const seen = [];
     forEachNear(world, b.x, b.y, w.range + Math.max(b.fw, b.fh) / 2, (e) => {
       if (e.kind !== 'unit' || e.dead || !(e.hp > 0)) return;
-      if (!isHostile(b, e)) return;
+      if (!isHostile(world, b, e)) return;
       if (edgeDist2(e, b.x, b.y) > w.range * w.range) return;
       // The same fog rule the units obey: a building does not shoot what its
       // owner cannot see.
@@ -1112,4 +1345,136 @@ function updateBuildings(world, dt) {
       launchProjectile(world, b, target, damage);
     }
   }
+}
+
+// --- Healing ----------------------------------------------------------------
+//
+// The monk is the first unit in the game that is not a worker and not a
+// soldier, and healing is the whole of what it does. Three rules carry it, and
+// all three are refusals:
+//
+//   IT NEVER ACQUIRES A TARGET. Not "rarely" and not "only when attacked" —
+//   never. canAttack() already refuses any attacker whose `attack` is not
+//   greater than zero, and the monk's is exactly 0, so the gate was in place
+//   before this section existed and every path into a fight goes through it:
+//   auto-acquisition, retaliation, answering a cry for help, and a target the
+//   player set by hand (updateCombat drops any target canAttack refuses on the
+//   very next step). There is deliberately no second check here — a rule
+//   enforced in two places is a rule with two ways to rot. See the monk test in
+//   tests/siege.test.mjs, which asserts it from the outside.
+//
+//   IT HEALS STANDING STILL. A monk walking with the army mends nobody; it has
+//   to stop. This is AoE2's rule and it is what keeps 2 hp/s from being simply
+//   free — the cost of healing is the tempo you give up standing in a field
+//   doing it, and a monk that healed while running would make retreating
+//   strictly better than fighting. `state === 'move'` is unitAI's own word for
+//   "this unit is walking", so the two systems cannot disagree about it.
+//
+//   IT NEVER OVERHEALS. Capped at the patient's maxHp, which is the field
+//   world.js stamps at spawn and the same one the garrison heal above respects.
+//
+// WHO GETS MENDED. The most wounded friendly unit in reach, by hitpoints
+// missing rather than by hitpoints left. Those pick different patients — a
+// knight at 60 of 100 is missing more than an archer at 12 of 32 — and missing
+// hitpoints is the right one because it is the measure of what the healing is
+// actually worth. Hitpoints restored are hitpoints restored whoever is standing
+// under them; picking the nearly-dead archer instead would spend the same two a
+// second on a body that is going to be missing 20 fewer of them in ten seconds'
+// time, and would leave the knight — 40 hitpoints and 75 food and 75 gold of
+// it — wounded for the whole fight.
+//
+// Ties break on ascending id, which matters for exactly one reason: two
+// villagers hurt for the same amount is the ordinary case, not the exotic one,
+// and a peer that picked a different one of them would fork the match.
+
+// How often a healer emits EV.HEAL. Healing is continuous and a glow is not —
+// the same argument HAMMER_PERIOD makes about hammer blows in unitAI.js. Half a
+// second is four pulses per swing of a militia's sword: enough that the FX
+// layer reads as a steady mending, few enough that a dozen monks in a stack do
+// not put 240 events a second on the bus.
+const HEAL_PULSE = 0.5;
+
+/** Hitpoints per second this unit restores, or 0. Two property reads. */
+export function healRateOf(u) {
+  if (!u || u.kind !== 'unit') return 0;
+  const s = UNIT_STATS[u.type];
+  const rate = s && s.heal;
+  return rate > 0 ? rate : 0;
+}
+
+/** How far this unit can mend from. Zero for anything that cannot mend. */
+export function healRange(u) {
+  if (!u || u.kind !== 'unit') return 0;
+  const s = UNIT_STATS[u.type];
+  return (s && s.healRange) || 0;
+}
+
+/**
+ * The friendly unit this healer should be looking after right now: the one
+ * missing the most hitpoints within reach, or null when nobody nearby is hurt.
+ *
+ * Exported because the HUD wants to draw the link and the enemy AI wants to
+ * know whether its monks have anything to do; both are read-only questions and
+ * this is pure.
+ */
+export function findPatient(world, healer) {
+  const range = healRange(healer);
+  if (!(range > 0)) return null;
+  let best = null;
+  let bestMissing = 0;
+  forEachNear(world, healer.x, healer.y, range, (e) => {
+    if (e === healer || e.kind !== 'unit' || e.dead) return;
+    // Friendly only, and "friendly" is the same player rather than "not
+    // hostile": an unowned body belongs to nobody and is nobody's to mend.
+    if (e.player === null || e.player === undefined) return;
+    if (e.player !== healer.player) return;
+    const missing = (e.maxHp || 0) - e.hp;
+    if (!(missing > 0)) return;
+    // Strictly greater, then ascending id — a total order over the candidates,
+    // so the answer does not depend on the order forEachNear happened to walk
+    // its buckets in.
+    if (missing > bestMissing || (missing === bestMissing && best && e.id < best.id)) {
+      bestMissing = missing;
+      best = e;
+    }
+  });
+  return best;
+}
+
+/**
+ * One step of a support unit's life. Called from updateCombat in place of
+ * everything a soldier does.
+ */
+function updateHealer(world, u, dt) {
+  const rate = healRateOf(u);
+  // Walking, panicking, or dead on its feet: no mending. The flee check is not
+  // decoration — a monk chased off by cavalry is running, and a monk that
+  // healed while running would never have to stop.
+  if (rate <= 0 || u.state === 'move' || u.fleeing) {
+    u.healTarget = null;
+    return;
+  }
+
+  const patient = findPatient(world, u);
+  u.healTarget = patient;
+  if (!patient) {
+    u._healPulse = 0;
+    u._healPulsed = 0;
+    return;
+  }
+
+  faceTarget(u, patient);
+  const before = patient.hp;
+  patient.hp = Math.min(patient.maxHp, patient.hp + rate * dt);
+  const healed = patient.hp - before;
+  if (healed <= 0) return;
+
+  // Pulsed rather than emitted every step: see HEAL_PULSE.
+  u._healPulsed = (u._healPulsed || 0) + healed;
+  u._healPulse = (u._healPulse || 0) + dt;
+  if (u._healPulse < HEAL_PULSE) return;
+  const amount = u._healPulsed;
+  u._healPulse = 0;
+  u._healPulsed = 0;
+  world.events.emit(EV.HEAL, { entity: u, target: patient, amount });
 }
