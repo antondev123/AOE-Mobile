@@ -1,15 +1,25 @@
-# The image is index.html, src/ and vendor/. Everything else in this repository
-# is for people working on the game, not for people playing it — and the two
-# biggest directories here (screenshots/ and node_modules/) are together far
-# larger than the thing being served.
+# The image carries the repo as-is (see Dockerfile), so this file is the only
+# thing keeping "as-is" from meaning "including a git history, a browser and
+# every screenshot ever committed".
+#
+# node_modules matters most: `npm ci --omit=dev` installs the runtime deps in
+# the layer above, and copying a local tree over the top would replace a clean
+# production install with whatever a dev machine happened to have — including
+# playwright, which is larger than everything else here put together.
+#
+# Note what is deliberately NOT here: package.json and package-lock.json. The
+# static nginx image this replaced excluded both, because it never installed
+# anything. This one runs `npm ci`, and a .dockerignore that hides the manifest
+# from the COPY that feeds it fails the build on the first layer.
 .git
 .github
 node_modules
-screenshots
+npm-debug.log
+.dockerignore
+
+# Dev-only tooling and output. None of it is reachable from index.html, and
+# screenshots/ alone is larger than everything being served.
 tests
 tools
+screenshots
 *.md
-package.json
-package-lock.json
-fly.toml
-.dockerignore

@@ -11,12 +11,15 @@
 // systems, and it reads world state. Selection changes go through ui/selection.js.
 
 import {
-  PLAYER, BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
+  BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
   MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
   FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
   isWallType, isGateType,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { ownedBy, forEachNear, edgeDist2, removeEntity } from '../core/world.js';
 
 import * as economy from '../systems/economy.js';
@@ -24,11 +27,13 @@ import * as unitAI from '../systems/unitAI.js';
 import * as tech from '../systems/tech.js';
 import * as alloc from '../systems/allocation.js';
 import * as market from '../systems/market.js';
+// Readers only. Everything in this file that used to change the world now asks
+// the bus to — see the note on `bus` in createHud, and core/command.js.
 import {
   stanceOf, garrisonCapacity, garrisonCount, isGarrisoned, nearestShelter,
-  ungarrisonAll,
 } from '../systems/combat.js';
 
+import { createLocalBus } from '../net/bus.js';
 import { createMinimap, miniToGrid } from './minimap.js';
 import { createPortraits } from './portraits.js';
 import {
@@ -268,6 +273,9 @@ const MINI_DRAG_SLOP = 6;
 export function createHud(scene, world, audio = null) {
   const doc = document;
   const win = window;
+  // Same seam as input.js: the HUD asks, it does not mutate. The fallback keeps
+  // a hand-built HUD (tests, the console) behaving as it did before the bus.
+  const bus = scene.bus || createLocalBus(world, PLAYER);
   /**
    * The click of a HUD control.
    *
@@ -1289,8 +1297,11 @@ export function createHud(scene, world, audio = null) {
         sub: `${inside} out`,
         aria: `Turn out all ${inside} units garrisoned here.`,
         onTap: () => {
-          let n = 0;
-          for (const b of shelters) n += ungarrisonAll(world, b);
+          // Optimistic over a network, where `out` is not known yet: the count
+          // we can promise is the one already on the button's own sub-label, and
+          // "nowhere to stand" is a refusal only the local path can see.
+          const res = bus.dispatch({ t: 'ungarrisonAll', ids: shelters.map((b) => b.id) });
+          const n = res.detail ? res.detail.out : inside;
           toast(n ? `${n} came out` : 'Nowhere to stand', n ? 'info' : 'warn');
           state.cmdSig = '';
         },
@@ -1428,7 +1439,7 @@ export function createHud(scene, world, audio = null) {
     if (!b || b.dead || b.kind !== 'building' || b.player !== PLAYER || b.complete) return;
     if (typeof economy.cancelFoundation !== 'function') return;
     const what = displayName(b);
-    if (!economy.cancelFoundation(world, b)) return;
+    if (!bus.dispatch({ t: 'cancelFoundation', id: b.id }).ok) return;
     toast(`${what} cancelled — cost refunded`, 'info');
     state.cmdSig = '';
     state.selSig = '';
@@ -1497,7 +1508,7 @@ export function createHud(scene, world, audio = null) {
       b && !b.dead && b.kind === 'building' && b.player === PLAYER && b.complete);
     if (!targets.length) return;
     const what = targets.length === 1 ? displayName(targets[0]) : `${targets.length} buildings`;
-    for (const b of targets) removeEntity(world, b);
+    for (const b of targets) bus.dispatch({ t: 'demolish', id: b.id });
     toast(`${what} demolished`, 'warn');
     state.cmdSig = '';
     state.selSig = '';
@@ -1603,8 +1614,7 @@ export function createHud(scene, world, audio = null) {
         s.setAttribute('aria-label', `Cancel ${uname}, number ${i + 1} in the queue. The cost is refunded.`);
         s.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          if (typeof economy.cancelTrain !== 'function') return;
-          if (economy.cancelTrain(world, q.building, i)) {
+          if (bus.dispatch({ t: 'cancelTrain', id: q.building.id, index: i }).ok) {
             toast(`${uname} cancelled — cost refunded`, 'info');
             state.cmdSig = ''; // force a re-render
           }
@@ -1713,10 +1723,9 @@ export function createHud(scene, world, audio = null) {
       flashRes(miss ? [miss] : RES_ORDER);
       return;
     }
-    if (typeof tech.queueResearch !== 'function') return;
     // tech.queueResearch raises its own toast on both success and refusal, so
     // this only has to force the panel to redraw with the new queue.
-    if (tech.queueResearch(world, building, opt.id)) state.cmdSig = '';
+    if (bus.dispatch({ t: 'research', id: building.id, techId: opt.id }).ok) state.cmdSig = '';
   }
 
   function renderResearchQueue(panel, b) {
@@ -1760,8 +1769,7 @@ export function createHud(scene, world, audio = null) {
         s.setAttribute('aria-label', `Cancel ${t ? t.name : entry.id}. The cost is refunded.`);
         s.addEventListener('click', (ev) => {
           ev.stopPropagation();
-          if (typeof tech.cancelResearch !== 'function') return;
-          if (tech.cancelResearch(world, q.building, i)) {
+          if (bus.dispatch({ t: 'cancelResearch', id: q.building.id, index: i }).ok) {
             toast(`${t ? t.name : 'Research'} cancelled — cost refunded`, 'info');
             state.cmdSig = '';
           }
@@ -1789,15 +1797,20 @@ export function createHud(scene, world, audio = null) {
       flashRes(miss ? [miss] : RES_ORDER);
       return;
     }
-    if (typeof economy.queueTrain !== 'function') return;
-    if (economy.queueTrain(world, building, unitType)) {
+    if (bus.dispatch({ t: 'train', id: building.id, unitType }).ok) {
       toast(`Training ${s.name}`, 'info');
       state.cmdSig = '';
     }
   }
 
+  // Ids, not references — see the note on the same function in input.js.
   function command(units, order) {
-    if (typeof unitAI.commandUnits === 'function') unitAI.commandUnits(world, units, order);
+    if (!units || !units.length) return;
+    const o = { ...order };
+    if (o.target && typeof o.target === 'object') o.target = o.target.id;
+    if (o.node && typeof o.node === 'object') o.node = o.node.id;
+    if (o.building && typeof o.building === 'object') o.building = o.building.id;
+    bus.dispatch({ t: 'order', units: units.map((u) => u.id), order: o });
   }
 
   // --- Build menu -----------------------------------------------------------
@@ -1967,8 +1980,7 @@ export function createHud(scene, world, audio = null) {
         `Cancel the queued ${name}, number ${i + 1} of ${list.length}. The cost is refunded.`);
       chip.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        if (typeof economy.cancelQueued !== 'function') return;
-        if (economy.cancelQueued(world, PLAYER, i)) {
+        if (bus.dispatch({ t: 'cancelQueued', index: i }).ok) {
           toast(`${name} cancelled — cost refunded`, 'info');
           state.bqSig = '';
           state.cmdSig = '';
@@ -1984,7 +1996,10 @@ export function createHud(scene, world, audio = null) {
         `Cancel all ${list.length} queued sites. Every cost is refunded.`);
       clear.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        const n = economy.clearBuildQueue(world, PLAYER);
+        // Locally the count comes back with the result; over a network the
+        // strip we are looking at is the honest estimate of it.
+        const res = bus.dispatch({ t: 'clearBuildQueue' });
+        const n = res.detail ? res.detail.cleared : list.length;
         if (n) toast(`${n} sites cancelled — costs refunded`, 'info');
         state.bqSig = '';
         state.cmdSig = '';
@@ -2484,7 +2499,11 @@ export function createHud(scene, world, audio = null) {
     toggle.appendChild(stateLbl);
     toggle.addEventListener('click', (ev) => {
       ev.stopPropagation();
-      const on = alloc.setAllocationOn(world, PLAYER, !alloc.isAllocationOn(world, PLAYER));
+      const want = !alloc.isAllocationOn(world, PLAYER);
+      const res = bus.dispatch({ t: 'allocationOn', on: want });
+      // Locally the manager reports where it landed; over a network what we
+      // asked for is the best available answer until the command comes round.
+      const on = res.detail && 'on' in res.detail ? res.detail.on : want;
       toast(on
         ? 'Villagers will be assigned to match the split'
         : 'Manual control — villagers stay where they are', 'info');
@@ -2513,7 +2532,7 @@ export function createHud(scene, world, audio = null) {
       slider.setAttribute('aria-label', `${ALLOC_LABEL[res]} share of villagers`);
       slider.addEventListener('input', (ev) => {
         ev.stopPropagation();
-        alloc.setSplit(world, PLAYER, res, Number(slider.value));
+        bus.dispatch({ t: 'allocationSplit', resource: res, pct: Number(slider.value) });
         state.allocSig = '';
         refreshAlloc();
       });
@@ -2549,7 +2568,9 @@ export function createHud(scene, world, audio = null) {
       // 25/25/25/25 rather than the opening ratio: "Even" is the one split a
       // player can predict before tapping it, and the opening ratio is already
       // where they started.
-      for (const res of alloc.ALLOC_ORDER) alloc.setSplit(world, PLAYER, res, 25);
+      for (const res of alloc.ALLOC_ORDER) {
+        bus.dispatch({ t: 'allocationSplit', resource: res, pct: 25 });
+      }
       state.allocSig = '';
       refreshAlloc();
     });
@@ -2726,8 +2747,11 @@ export function createHud(scene, world, audio = null) {
   }
 
   function trade(side, res) {
+    // Read the price BEFORE dispatching: buying pushes it up and selling pushes
+    // it down, so the number the toast quotes has to be the one the player was
+    // looking at when they tapped, not the one the trade just created.
     const before = market.tradeOptions(world, PLAYER).find((o) => o.res === res);
-    const ok = side === 'buy' ? market.buy(world, PLAYER, res) : market.sell(world, PLAYER, res);
+    const ok = bus.dispatch({ t: 'trade', side, resource: res }).ok;
     if (!ok) return;
     const name = (MARKET_LABEL[res] || res).toLowerCase();
     toast(side === 'buy'

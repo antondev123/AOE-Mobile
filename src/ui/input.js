@@ -52,9 +52,12 @@
 import {
   TAP_SLOP, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS, ORDER_PICK_RADIUS,
   ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
-  PLAYER, BUILDING_STATS, isWallType, isGateType, MILITARY_TYPES,
+  BUILDING_STATS, isWallType, isGateType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { screenDist, worldToGrid } from '../core/iso.js';
 import { placeBlockedBy, wallMaskAt } from '../core/world.js';
 
@@ -63,6 +66,7 @@ import * as economy from '../systems/economy.js';
 
 import { setSelection, clearSelection, selectedEntities } from './selection.js';
 import { rallyText } from './hud.js';
+import { createLocalBus } from '../net/bus.js';
 
 // --- Tuning that is local to gesture handling (the shared feel numbers live
 // in core/constants.js and must not be duplicated there). --------------------
@@ -138,6 +142,11 @@ export function createInput(scene, world, renderer, hud) {
   const game = scene.game;
   const canvas = game.canvas;
   const camera = (renderer && renderer.camera) || scene.cameras.main;
+
+  // Every action this file takes goes through the bus rather than into the
+  // world. The scene owns it; the fallback keeps a hand-built input (a test, the
+  // console) working exactly as it did before there was a bus at all.
+  const bus = scene.bus || createLocalBus(world, PLAYER);
 
   // World-pixel bounds of the playable diamond (see core/iso.js).
   const BOUNDS = {
@@ -397,9 +406,21 @@ export function createInput(scene, world, renderer, hud) {
 
   // ---------------------------------------------------------------- commands
 
+  // Orders name their units and their targets by id, because the object on this
+  // phone is not the object on the server. resolveOrderTargets() in command.js
+  // turns them back into references at the far end.
   function command(units, order) {
     if (!units.length) return;
-    if (typeof unitAI.commandUnits === 'function') unitAI.commandUnits(world, units, order);
+    bus.dispatch({ t: 'order', units: units.map((u) => u.id), order: idifyOrder(order) });
+  }
+
+  /** An order with its entity references flattened to ids, ready to be sent. */
+  function idifyOrder(order) {
+    const o = { ...order };
+    if (o.target && typeof o.target === 'object') o.target = o.target.id;
+    if (o.node && typeof o.node === 'object') o.node = o.node.id;
+    if (o.building && typeof o.building === 'object') o.building = o.building.id;
+    return o;
   }
 
   function fx(gx, gy, kind) {
@@ -902,13 +923,12 @@ export function createInput(scene, world, renderer, hud) {
       hud.toast(gh.reason || 'Cannot build there', 'warn');
       return; // stay in placement mode — the player just needs to move a bit
     }
-    if (typeof economy.placeFoundation !== 'function') return;
-    const f = economy.placeFoundation(world, PLAYER, gh.type, gh.gx, gh.gy);
-    if (!f) return; // economy already explained why
-
-    if (typeof economy.enqueueFoundation === 'function') economy.enqueueFoundation(world, f);
-    fx(f.x, f.y, 'build');
-
+    // Which villagers should start on this is a *local* decision — it reads the
+    // selection, which lives on this device and nowhere else — but it has to
+    // take effect on the authoritative path along with the placement itself.
+    // So the crew rides along in the command and command.js dispatches it the
+    // moment the foundation exists. One command, one tick, both machines.
+    //
     // Only send builders when nobody is already building. A batch is placed
     // faster than it is built, and re-ordering the same crew onto every new
     // site as it lands would walk them off the half-finished house to the one
@@ -916,7 +936,28 @@ export function createInput(scene, world, renderer, hud) {
     // foundations standing and one villager sprinting. They work the queue
     // through instead (onJobFinished in unitAI.js), and the only thing this has
     // to guarantee is that *somebody* starts.
-    dispatchBuilders([f]);
+    // Measured to the tile that was tapped, since the foundation does not exist
+    // yet — its centre is within half a tile of it either way.
+    const builders = pickBuilders(gh.gx, gh.gy);
+
+    const res = bus.dispatch({
+      t: 'place',
+      buildingType: gh.type,
+      gx: gh.gx,
+      gy: gh.gy,
+      builders: builders.map((u) => u.id),
+    });
+    if (!res.ok) return; // economy already explained why
+
+    // The tap gets its acknowledgement now either way. Locally the foundation
+    // already exists, so the flash lands on its centre exactly as it always
+    // has; over a network it is a few ticks out, and a flash that waited for it
+    // would read as the tap having been dropped — so it goes on the tapped
+    // tile, which for a 1x1 is the same place and for a Town Center is a tile
+    // off in a puff of dust nobody will measure.
+    const built = res.detail && world.entities.get(res.detail.id);
+    if (built) fx(built.x, built.y, 'build');
+    else fx(gh.gx, gh.gy, 'build');
 
     // Placement stays armed: the next tap places the next one. `Done` on the
     // placement bar (or Escape, or the build menu) is what ends the batch.
@@ -925,37 +966,38 @@ export function createInput(scene, world, renderer, hud) {
   }
 
   /**
-   * Put builders on a batch of fresh foundations, and say how many went.
+   * WHO would build at (gx, gy), without ordering anybody.
    *
-   * SPREAD, NOT STACKED. Everything used to be sent to the first site, which
-   * for a wall means twenty villagers converging on one 1x1 tile that has at
-   * most six standable neighbours. The surplus fail their approach four times
-   * over and unitAI drops them back to gathering — the "I sent everyone and
-   * half of them wandered off" complaint, and the open item at the end of
-   * HANDOFF-walls.md. One builder per site, in the order the run was drawn, is
-   * both the shape the wall wants (it goes up from one end) and the shape the
-   * pathing can actually deliver.
+   * This used to be dispatchBuilders(), which chose the crew AND gave it its
+   * orders. It cannot any more: a foundation is created by a command now, and
+   * over a network that command has not been applied — may not even have reached
+   * the server — by the time this returns. So the site cannot be pointed at, only
+   * *described*: the crew rides along in the command as a list of ids and
+   * core/command.js gives the order the instant the site is real, on every
+   * machine, on the same tick.
+   *
+   * Choosing the crew stays here, because it reads the selection, and the
+   * selection lives on this device and nowhere else.
+   *
+   * SPREAD, NOT STACKED, is now command.js's problem rather than this file's:
+   * everything used to be sent to the first site, which for a wall means twenty
+   * villagers converging on one 1x1 tile with at most six standable neighbours.
+   * The surplus fail their approach four times over and unitAI drops them back to
+   * gathering — the "I sent everyone and half of them wandered off" complaint,
+   * and the open item at the end of HANDOFF-walls.md.
    *
    * Nobody is sent while somebody is already building: a batch is placed faster
    * than it is built, and re-ordering the same crew onto every new site as it
    * lands would walk them off the half-finished house to the one you just
    * tapped. They work the queue through instead (onJobFinished in unitAI.js).
    */
-  function dispatchBuilders(sites) {
-    if (!sites.length || anyBuilding()) return 0;
-    let builders = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
-    if (!builders.length) {
-      // Nothing selected? Send the nearest villager rather than doing nothing.
-      const near = nearestVillager(sites[0].x, sites[0].y);
-      if (near) builders = [near];
-    }
-    if (!builders.length) return 0;
-    const n = Math.min(builders.length, sites.length);
-    for (let i = 0; i < builders.length; i++) {
-      const site = sites[Math.min(i, n - 1)];
-      command([builders[i]], { type: 'build', gx: site.x, gy: site.y, target: site });
-    }
-    return builders.length;
+  function pickBuilders(gx, gy) {
+    if (anyBuilding()) return [];
+    const sel = ownSelection().filter((e) => e.kind === 'unit' && e.type === 'villager');
+    if (sel.length) return sel;
+    // Nothing selected? Send the nearest villager rather than doing nothing.
+    const near = nearestVillager(gx, gy);
+    return near ? [near] : [];
   }
 
   function nearestVillager(gx, gy) {
@@ -1250,37 +1292,49 @@ export function createInput(scene, world, renderer, hud) {
       return; // stay armed — the player only has to move
     }
 
-    const res = economy.placeWallLine(world, PLAYER, type, tiles);
-    const n = res.placed.length;
-    if (!n) {
+    // As with a single foundation, the crew is chosen here (it reads the local
+    // selection) and dispatched there (it has to happen on the same tick as the
+    // placement, on both machines). See the 'placeWallLine' case in
+    // core/command.js, which also does the queueing.
+    const wallCrew = pickBuilders(w.tx0, w.ty0);
+    const res = bus.dispatch({
+      t: 'placeWallLine',
+      buildingType: type,
+      tiles,
+      builders: wallCrew.map((u) => u.id),
+    });
+    if (!res.ok) {
       hud.toast(res.reason || 'Cannot build there', 'warn');
       return;
     }
 
-    // The foundations are ordinary construction sites, so ordinary builders
-    // finish them — and they are now queued, in the order the run was drawn, so
-    // a villager that finishes one segment walks to the next along the line
-    // instead of going back to a tree. That is what HANDOFF-walls.md left open:
-    // the wall is still built from one end inwards, which is what makes it
-    // useful while it is going up, but the crew no longer has to be re-ordered
-    // segment by segment.
-    const first = res.placed[0];
-    if (typeof economy.enqueueFoundation === 'function') {
-      for (const b of res.placed) economy.enqueueFoundation(world, b);
-    }
-    const sent = dispatchBuilders(res.placed);
+    // Locally we know exactly how many segments went down. Over a network we do
+    // not yet, so the plan's own count — the same number the preview has been
+    // showing under the player's finger — stands in for it.
+    const n = res.detail ? res.detail.placed : plan.count;
+    const refused = res.detail ? res.detail.refused : 0;
+    const sent = wallCrew.length;
 
     const s = BUILDING_STATS[type];
     const label = `${n} ${s ? s.name : 'wall'}${n === 1 ? '' : 's'}`;
-    if (res.refused) hud.toast(`${label} — ${res.refused} could not be placed`, 'warn');
+    if (refused) hud.toast(`${label} — ${refused} could not be placed`, 'warn');
     // AND ONLY SAY IT WHEN IT IS TRUE. "villagers on the way" was printed
-    // unconditionally — including when somebody was already building and
-    // nobody was sent, and including when the player had no villagers left at
-    // all, in which case the wall simply never got built and the game had
-    // promised out loud that it would.
+    // unconditionally — including when somebody was already building and nobody
+    // was sent, and including when the player had no villagers left at all, in
+    // which case the wall simply never got built and the game had promised out
+    // loud that it would. The crew is picked on this device before the command
+    // goes out, so its size is knowable here even when the placement is not.
     else if (sent) hud.toast(`${label} — ${sent} villager${sent === 1 ? '' : 's'} on the way`, 'info');
     else hud.toast(`${label} — queued behind what is already building`, 'info');
-    fx(first.x, first.y, 'build');
+
+    // The queueing and the crew dispatch both happened inside the command — the
+    // wall is still built from one end inwards, which is what makes it useful
+    // while it is going up, and a villager finishing one segment walks to the
+    // next along the line instead of back to a tree. That is what
+    // HANDOFF-walls.md left open. All that is left here is the dust.
+    const first = res.detail && world.entities.get(res.detail.firstId);
+    if (first) fx(first.x, first.y, 'build');
+    else fx(w.tx0, w.ty0, 'build');
 
     // Stays armed, exactly as tapped placement now does: the next drag draws the
     // next run. Two fingers still abandons a run mid-draw, and Done on the

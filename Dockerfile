@@ -1,29 +1,55 @@
-# Age of Skirmish is a static page: an index.html, a stylesheet, a folder of ES
-# modules the browser loads directly, and a vendored Phaser. There is no server
-# side and no build step — `tools/build-standalone.mjs` exists for making a
-# single-file copy, not for producing what gets served — so the image is nginx
-# and the repo, and nothing else.
+# The match server, which also serves the game.
 #
-# The two things it does do are stamp the build (the boot card's footer is the
-# only place a bug report can read a version off, and it shipped reading
-# "__COMMIT_SHA__" because the GitHub Pages workflow does this substitution and
-# the Fly image never did) and answer /healthz, which fly.toml's http check
-# calls every 30s.
-FROM nginx:1.27-alpine
+# The image carries the repo as-is rather than a build artifact: index.html
+# loads the source modules and vendored Phaser directly, exactly as GitHub Pages
+# serves them today, so there is no bundle step to keep in sync with the deploy.
 
+FROM node:22-slim
+
+WORKDIR /app
+
+# Only `ws` is needed at runtime; esbuild and playwright are dev tooling and are
+# skipped so the image stays small and starts fast.
+COPY package.json package-lock.json ./
+
+# The optional `extra_ca` secret is an additional CA to trust *while installing*.
+# It is empty in every normal build and the line below is then exactly
+# `npm ci --omit=dev`. It exists because a build run behind a TLS-terminating
+# egress proxy — a corporate network, or a sandboxed CI agent — sees the proxy's
+# certificate rather than npm's and fails with SELF_SIGNED_CERT_IN_CHAIN. The
+# fix for that is to trust the proxy's CA, never to turn verification off, so
+# there is deliberately no `strict-ssl=false` anywhere near this file.
+#
+# Mounted as a secret rather than COPYed so it leaves no layer behind; a CA
+# certificate is public, but an image that carries someone's proxy root around
+# is still a thing nobody asked for.
+#
+#   docker build --secret id=extra_ca,src=/path/to/ca.crt .
+#   fly deploy --local-only --build-secret extra_ca="$(cat /path/to/ca.crt)"
+RUN --mount=type=secret,id=extra_ca,target=/tmp/extra-ca.crt \
+    if [ -s /tmp/extra-ca.crt ]; then \
+      export NODE_EXTRA_CA_CERTS=/tmp/extra-ca.crt; \
+    fi; \
+    npm ci --omit=dev
+
+COPY . .
+
+# Stamp the build.
+#
+# The boot card's footer is the only place a bug report can read a version off,
+# and it shipped reading the literal string "__COMMIT_SHA__" — because
+# .github/workflows/deploy.yml does this substitution for GitHub Pages and the
+# Fly image never did. Same two placeholders, same substitution, so the two
+# deployments of one commit report the same build.
 ARG COMMIT_SHA=unknown
 ARG BUILD_TIME=unknown
-
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-COPY index.html /usr/share/nginx/html/index.html
-COPY src /usr/share/nginx/html/src
-COPY vendor /usr/share/nginx/html/vendor
-
-# Same substitution as .github/workflows/deploy.yml, so the two deployments of
-# the same commit report the same build.
 RUN sed -i \
       -e "s|__COMMIT_SHA__|${COMMIT_SHA}|g" \
       -e "s|__BUILD_TIME__|${BUILD_TIME}|g" \
-      /usr/share/nginx/html/index.html
+      index.html
 
+ENV NODE_ENV=production
+ENV PORT=8080
 EXPOSE 8080
+
+CMD ["node", "server/server.js"]

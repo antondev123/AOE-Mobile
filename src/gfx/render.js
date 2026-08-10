@@ -18,9 +18,12 @@
 
 import {
   MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
-  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT, PLAYER,
+  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT,
   BUILDING_STATS, isWallType, isGateType,
 } from '../core/constants.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
 import {
