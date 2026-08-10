@@ -226,6 +226,56 @@ export function sell(world, playerId, resource) {
   return true;
 }
 
+// --- Tribute -----------------------------------------------------------------
+
+/** Lot sizes the HUD offers. AoE2 sends in hundreds; so does this. */
+export const TRIBUTE_LOTS = [100, 500];
+
+/**
+ * A tithe on every tribute, exactly as AoE2 charges one.
+ *
+ * It is not decoration. Without a cost, two allies are one player with two
+ * stockpiles: whoever is ahead simply funds whoever is behind, and every
+ * decision about which resource to gather stops mattering because any surplus
+ * converts to any shortage for free. Thirty percent is AoE2's untaxed rate
+ * rounded up a little, since a match here is ten minutes rather than forty and a
+ * gift has less time to be repaid.
+ */
+export const TRIBUTE_TAX = 0.3;
+
+/** What `to` actually receives when `from` sends `amount`. */
+export function tributeArrives(amount) {
+  return Math.floor(amount * (1 - TRIBUTE_TAX));
+}
+
+/**
+ * Send resources to an ally.
+ *
+ * The sender pays the full amount and the recipient gets what survives the
+ * tithe — which is the shape that makes a gift a decision rather than an
+ * accounting move. Refuses anything it cannot pay for outright: a partial
+ * tribute would be a surprise, and the HUD has already greyed the button.
+ *
+ * Ownership and alliance are checked by the caller (core/command.js), which is
+ * where every other "may this player do this" lives.
+ */
+export function tribute(world, fromId, toId, resource, amount) {
+  const n = Math.round(amount);
+  if (!TRADED.includes(resource) && resource !== RES.GOLD) return false;
+  if (!(n > 0)) return false;
+  const from = world.players[fromId];
+  const to = world.players[toId];
+  if (!from || !to || from === to) return false;
+  if (!((from.resources[resource] || 0) >= n)) return false;
+
+  from.resources[resource] -= n;
+  to.resources[resource] = (to.resources[resource] || 0) + tributeArrives(n);
+  world.events.emit(EV.TRIBUTE, {
+    from: fromId, to: toId, resource, sent: n, received: tributeArrives(n),
+  });
+  return true;
+}
+
 // --- Save and load -----------------------------------------------------------
 
 export function serializeMarket(world) {

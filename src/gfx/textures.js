@@ -595,7 +595,25 @@ export const OCEAN_DEEP = 0x0d2740;
  * Build every texture and pack it into a single atlas.
  * Returns { atlas, origins: Map<frame, {w,h,ox,oy}> }.
  */
-export function buildTextures(scene) {
+/**
+ * Build every texture and pack it into a single atlas.
+ *
+ * @param {Phaser.Scene} scene
+ * @param {object} [opts]
+ * @param {number} [opts.seats]  how many player colours to bake, 2..MAX_PLAYERS
+ */
+export function buildTextures(scene, opts = {}) {
+  // BAKE THE SEATS THIS MATCH HAS, NOT THE PALETTE. Every unit pose, building,
+  // wall mask, gate, foundation and marker is baked once per player colour, so
+  // this number multiplies most of the sheet. Bounding it on PLAYER_COLORS
+  // instead — which is what it did while there were exactly two of them —
+  // silently quadrupled the atlas the moment the palette grew to eight, and
+  // overflowed it: measured at 4567 rows of a 2048 sheet, which is not an error
+  // anybody sees, just units drawn with somebody else's arms.
+  //
+  // A 1v1 therefore bakes exactly what it always did.
+  const seats = Math.max(2, Math.min(PLAYER_COLORS.length,
+    Number.isFinite(opts.seats) ? Math.round(opts.seats) : PLAYER_COLORS.length));
   // 2048, up from 1024. The walls are what pushed it over: sixteen connected
   // variants per wall type per player is sixty-four extra frames, and with the
   // Castle's 4x4 body and the gates the atlas needs about 1.4M pixels of the
@@ -604,10 +622,12 @@ export function buildTextures(scene) {
   // second texture breaks the sprite batch every time the renderer alternates
   // between a wall and anything else, which on a walled base is every few
   // sprites. 16MB of texture memory buys back the single draw call.
-  const SIZE = 2048;
-  if (scene.textures.exists(ATLAS)) scene.textures.remove(ATLAS);
-  const canvasTex = scene.textures.createCanvas(ATLAS, SIZE, SIZE);
-  const ctx = canvasTex.getContext();
+  // The sheet grows to 4096 only when the pack actually needs it — see
+  // packHeight() below, which measures before anything is drawn. 4096 is 64MB
+  // of texture memory, a real cost on a phone, so a small roster must not pay
+  // it. The cheaper answer for a big one is to bake greyscale masters and tint
+  // at draw time, which would cut this eightfold and keep the single draw batch;
+  // that is a rewrite of 4000 lines of vector art, so it waits.
   const g = scene.make.graphics({ x: 0, y: 0, add: false });
   const rng = makeRng(0x5eed11);
 
@@ -639,18 +659,25 @@ export function buildTextures(scene) {
     queued.push({ name, w, h, ax, ay, paintFn });
   }
 
-  buildBuildings(put);
-  buildWalls(put);
-  buildFoundations(put);
+  buildBuildings(put, seats);
+  buildWalls(put, seats);
+  buildFoundations(put, seats);
   buildScaffolds(put);
   buildResources(put, rng);
-  buildUnits(put);
+  buildUnits(put, seats);
   buildTerrain(put, rng);
   buildDetails(put, rng);
   buildCliffs(put, rng);
-  buildMarkers(put);
+  buildMarkers(put, seats);
   buildFx(put);
-  buildGlyphs(putCanvas, ctx);
+  // buildGlyphs only *measures* with the context it is handed — it needs the
+  // browser's font metrics to size each digit's cell, and it paints later,
+  // through putCanvas, into whichever atlas the packer ends up creating. So it
+  // gets a scratch context rather than the atlas's: the atlas does not exist
+  // yet, because how tall it has to be is not known until every frame including
+  // these has declared its size.
+  const measureCanvas = document.createElement('canvas');
+  buildGlyphs(putCanvas, measureCanvas.getContext('2d'));
 
   // Stable sort by descending height: ties keep declaration order, so the same
   // build always produces the same atlas.
@@ -679,27 +706,73 @@ export function buildTextures(scene) {
   // The cost is O(frames x shelves): sixty-odd shelves against a thousand
   // frames is fifty thousand integer compares once at boot, which does not show
   // up next to the thousand canvas rasterisations happening alongside it.
-  const shelves = [];
-  const lost = [];
-  let usedPx = 0;
-
-  for (const q of queued) {
-    let sh = null;
-    for (let i = 0; i < shelves.length; i++) {
-      const s = shelves[i];
-      if (q.h <= s.h && s.x + q.w + 1 <= SIZE) { sh = s; break; }
-    }
-    if (sh === null) {
-      // A new shelf under everything opened so far. This is the one place the
-      // sheet can run out, and it must fail here rather than pretend.
-      if (shelf.y + q.h + 1 > SIZE) {
-        lost.push(q);
-        continue;
+  //
+  // PLACEMENT IS A PURE PASS, AND IT IS WHAT CHOOSES THE SHEET SIZE.
+  //
+  // A 1v1 must bake on 2048 and eight colours cannot: 4096 is 64MB of texture
+  // memory against 16MB, a real cost on a phone that a small roster must not
+  // pay. Which one is needed is not guessable — the first attempt at this
+  // hardcoded "2048 up to four players" and was wrong on its first run, because
+  // four colours want more rows than a 2048 sheet has.
+  //
+  // So ask the packer instead of a second, simpler copy of it. Measuring with a
+  // straight-line walk would under-report against this packer, which fills the
+  // ragged tails — and a measurement that does not place frames exactly where
+  // the drawing pass will is a fiction. This is the same code both times: run it
+  // to choose the sheet, and run it once more only if the first choice was too
+  // small. Two integer passes over a thousand frames, against a thousand canvas
+  // rasterisations that follow.
+  function place(side) {
+    const shelves = [];
+    const at = new Array(queued.length);
+    const lost = [];
+    let y = 1;
+    let usedPx = 0;
+    for (let qi = 0; qi < queued.length; qi++) {
+      const q = queued[qi];
+      let sh = null;
+      for (let i = 0; i < shelves.length; i++) {
+        const s = shelves[i];
+        if (q.h <= s.h && s.x + q.w + 1 <= side) { sh = s; break; }
       }
-      sh = { y: shelf.y, x: 1, h: q.h };
-      shelves.push(sh);
-      shelf.y += q.h + 1;
+      if (sh === null) {
+        // A new shelf under everything opened so far. This is the one place the
+        // sheet can run out, and it must say so rather than pretend.
+        if (y + q.h + 1 > side) {
+          lost.push(q);
+          at[qi] = null;
+          continue;
+        }
+        sh = { y, x: 1, h: q.h };
+        shelves.push(sh);
+        y += q.h + 1;
+      }
+      at[qi] = { x: sh.x, y: sh.y };
+      sh.x += q.w + 1;
+      usedPx += q.w * q.h;
     }
+    return { at, lost, usedPx, bottom: y, shelves: shelves.length };
+  }
+
+  let SIZE = 2048;
+  let pack = place(SIZE);
+  if (pack.lost.length) {
+    SIZE = 4096;
+    pack = place(SIZE);
+  }
+  const { at, lost, usedPx } = pack;
+  shelf.y = pack.bottom;
+
+  if (scene.textures.exists(ATLAS)) scene.textures.remove(ATLAS);
+  const canvasTex = scene.textures.createCanvas(ATLAS, SIZE, SIZE);
+  const ctx = canvasTex.getContext();
+
+  for (let qi = 0; qi < queued.length; qi++) {
+    const q = queued[qi];
+    const sh = at[qi];
+    // Placed nowhere, because the sheet ran out. The throw below reports the
+    // lot at once, which is more use than dying on the first one.
+    if (!sh) continue;
 
     if (q.paintFn) {
       // Painted in place. The atlas context is already at the right spot, and a
@@ -727,22 +800,29 @@ export function buildTextures(scene) {
     // reads, and no fallback to the art that does exist.
     canvasTex.add(q.name, 0, sh.x, sh.y, q.w, q.h);
     origins.set(q.name, { w: q.w, h: q.h, ox: q.ax / q.w, oy: q.ay / q.h });
-    sh.x += q.w + 1;
-    usedPx += q.w * q.h;
   }
 
+  // A HARD FAILURE, not a warning, and it can only be reached on the biggest
+  // sheet the game will make — place() has already retried at 4096.
+  //
+  // Overflow does not crash and does not look broken in any way that names
+  // itself: frames past the bottom edge come back empty, so a unit renders as
+  // a hole or as somebody else's sprite, and the only clue is a line in a
+  // console nobody has open on a phone. It went unnoticed twice — once when the
+  // palette grew, once when the art did.
   const budget = SIZE * SIZE;
   if (lost.length) {
     const overPx = lost.reduce((n, q) => n + q.w * q.h, 0);
     const names = lost.slice(0, 6).map((q) => q.name).join(', ');
     throw new Error(
       `[gfx] atlas overflow: ${lost.length} of ${queued.length} frames did not fit `
-      + `in the ${SIZE}x${SIZE} sheet — ${overPx} pixels over budget `
-      + `(${(overPx / 1e3).toFixed(1)}k, ${((overPx / budget) * 100).toFixed(2)}% of the sheet). `
+      + `in the ${SIZE}x${SIZE} sheet at ${seats} player colours — ${overPx} pixels `
+      + `over budget (${(overPx / 1e3).toFixed(1)}k, `
+      + `${((overPx / budget) * 100).toFixed(2)}% of the sheet). `
       + `Placed ${usedPx} px of ${budget} (${((usedPx / budget) * 100).toFixed(1)}%) in `
-      + `${shelves.length} shelves. Lost: ${names}${lost.length > 6 ? ', ...' : ''}. `
-      + 'Shrink a frame box, drop a variant, or raise SIZE — but do not ignore this: '
-      + 'an unregistered frame renders as nothing.',
+      + `${pack.shelves} shelves. Lost: ${names}${lost.length > 6 ? ', ...' : ''}. `
+      + 'Shrink a frame box, drop a variant, or bake fewer seats — but do not '
+      + 'ignore this: an unregistered frame renders as nothing.',
     );
   }
   // The budget, at info level, every boot. It is the only number that says how
@@ -1887,9 +1967,9 @@ function assertUnitArt() {
   if (bad.length) throw new Error(`[gfx] unit art tables disagree — ${bad.join('; ')}`);
 }
 
-function buildUnits(put) {
+function buildUnits(put, seats) {
   assertUnitArt();
-  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+  for (let p = 0; p < seats; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
     for (const type of Object.keys(UNIT_DRAW)) {
@@ -4043,9 +4123,9 @@ function assertFootprints() {
   }
 }
 
-function buildBuildings(put) {
+function buildBuildings(put, seats) {
   assertFootprints();
-  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+  for (let p = 0; p < seats; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
     for (const type of Object.keys(BSPEC)) {
@@ -7601,8 +7681,8 @@ function drawGate(g, cx, cy, axis, open, spec, col, colDark) {
   banner(g, near.x + 6, near.y - towerH + 4, col, colDark, 18);
 }
 
-function buildWalls(put) {
-  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+function buildWalls(put, seats) {
+  for (let p = 0; p < seats; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
     for (const type of Object.keys(WALL_SPEC)) {
@@ -7758,8 +7838,8 @@ function drawCastle(g, s, cx, cy, col, colDark) {
 
 // --- foundations ------------------------------------------------------------
 
-function buildFoundations(put) {
-  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+function buildFoundations(put, seats) {
+  for (let p = 0; p < seats; p++) {
     // 1 for a wall segment, 4 for the Castle. Before these existed the renderer
     // clamped every footprint into the 2-wide frame, which drew a wall under
     // construction as a site four times its own size and a Castle site as
@@ -9184,10 +9264,10 @@ function drawScaffold(g, cx, cy, hw, hh, H) {
 // Unit ground markers + selection
 // ---------------------------------------------------------------------------
 
-function buildMarkers(put) {
+function buildMarkers(put, seats) {
   // The team ellipse under each unit. This single element does more for
   // small-screen readability than anything else on the unit.
-  for (let p = 0; p < PLAYER_COLORS.length; p++) {
+  for (let p = 0; p < seats; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
     put(markerFrame(p), 40, 26, 20, 13, (g) => {

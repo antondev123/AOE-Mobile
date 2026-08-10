@@ -17,10 +17,13 @@
 // quad — see makeFog — darkens the ground. Nothing per-tile happens per frame.
 
 import {
-  MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
-  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT, PLAYER,
+  HALF_W, HALF_H, TILE_W, TILE_H,
+  ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT,
   BUILDING_STATS, isWallType, isGateType, TERRAIN,
 } from '../core/constants.js';
+// The local player's seat, as a live binding — see src/core/viewpoint.js for
+// why this is imported under the old name instead of threading a parameter.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
 import {
@@ -247,12 +250,19 @@ const FOG_DEPTH = 700000;
 let fogTextureSerial = 0;
 
 export function createRenderer(scene, world) {
-  const tex = buildTextures(scene);
+  // Only this match's seats get a colour variant baked. See buildTextures.
+  const tex = buildTextures(scene, { seats: world.players.length });
   const origins = tex.origins;
 
   const camera = scene.cameras.main;
 
   // --- camera --------------------------------------------------------------
+  // Read off the world, not off a constant: the map is as big as the roster
+  // needs it to be. Everything below that indexes, culls or bakes by tile has to
+  // agree with core/world.js's arrays or it silently addresses the wrong ones.
+  const MAP_W = world.width;
+  const MAP_H = world.height;
+
   // The playable diamond spans x in [-MAP_H*HALF_W, MAP_W*HALF_W] and
   // y in [0, (MAP_W+MAP_H)*HALF_H] (see the header of iso.js). Its bounding
   // box therefore has four empty corners, which used to show as raw canvas
@@ -521,8 +531,19 @@ export function createRenderer(scene, world) {
   // Other systems own the entity types; if one ever grows a type we have no
   // art for, fall back rather than spraying missing-frame warnings.
   const has = (frame) => origins.has(frame);
-  /** Clamp an owner id into the range we generated colours for. */
-  const pi = (player) => (player === 1 ? 1 : 0);
+  /**
+   * Clamp an owner id into the range we generated colours for.
+   *
+   * It used to be `player === 1 ? 1 : 0`, which is a clamp to {0,1} and was
+   * exactly right while the atlas held two colours: anything else drew as player
+   * 0, silently, so a third player's army would have been indistinguishable from
+   * your own. The atlas now bakes one variant per seat in the match (see
+   * buildTextures), so the clamp is against that count. Neutral things — a tree,
+   * a bush — arrive here as null and take seat 0's frame, which is what they
+   * always did and never shows, because nothing player-coloured is drawn for them.
+   */
+  const seatCount = world.players.length;
+  const pi = (player) => (player >= 0 && player < seatCount ? player : 0);
 
   /**
    * Which frame a unit shows, memoised on (type, player, back, pose).
@@ -1807,6 +1828,8 @@ function setFrame(s, frame, origins) {
 const INDEX_CELL = 8;
 
 function makeStaticIndex(world) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const cols = Math.ceil(MAP_W / INDEX_CELL);
   const rows = Math.ceil(MAP_H / INDEX_CELL);
   const cells = new Array(cols * rows);
@@ -2036,6 +2059,8 @@ function strokeDiamond(g, cx, cy, hw, hh) {
  * the world.
  */
 function makeFog(scene, world, rect) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const vision = world.vision;
   if (!vision) return null;
 
@@ -2122,7 +2147,7 @@ function makeFog(scene, world, rect) {
   quad.setRotation(Math.PI / 4);
   root.add(quad);
 
-  const st = vision.state(PLAYER);
+  const st = vision.viewState(PLAYER);
   let paintedRevision = -1;
   let since = FOG_REFRESH_INTERVAL;
 
@@ -2196,6 +2221,8 @@ function bakeTerrain(scene, world, rect) {
         ox: minX + cx * TERRAIN_CHUNK - CHUNK_PAD,
         oy: minY + cy * TERRAIN_CHUNK - CHUNK_PAD,
         rt: null,
+        // When this chunk was last within reach of the camera. Drives eviction.
+        used: 0,
       });
     }
   }
@@ -2239,21 +2266,63 @@ function bakeTerrain(scene, world, rect) {
    * stress scenario with twenty chunks resident, hiding the off-screen ones took
    * the frame from 27 draw calls to 13.
    */
+  /**
+   * How many baked chunks may exist at once.
+   *
+   * Lazy baking bounds what is resident only if something also lets go. Nothing
+   * did: a chunk painted on the way past was kept for the life of the scene, so
+   * a match that visited most of the map ended up holding most of the map. On
+   * the two-player 96x96 that is 91 chunks and about 100MB, which the comment
+   * above has always said and which a phone survives. On the eight-player
+   * 192x192 it is ~325 chunks and something like 350MB of GPU texture, which it
+   * does not — the context is lost, and a lost context is a black screen rather
+   * than a slow one.
+   *
+   * 64 is comfortably more than the viewport plus its prebake margin can want at
+   * the widest zoom, so in ordinary play nothing is ever evicted and this costs
+   * nothing. It only bites when the camera has been somewhere else entirely, and
+   * what it costs then is one re-bake of a chunk that is off screen anyway.
+   */
+  const MAX_RESIDENT = 64;
+  let paintClock = 0;
+
+  /** Throw away the chunks touched longest ago, keeping the budget. */
+  function evict(keepFrom) {
+    const live = [];
+    for (let i = 0; i < planned.length; i++) if (planned[i].rt) live.push(planned[i]);
+    if (live.length <= MAX_RESIDENT) return;
+    live.sort((a, b) => a.used - b.used);
+    for (let i = 0; i < live.length - MAX_RESIDENT; i++) {
+      const c = live[i];
+      // Never evict something the camera is looking at right now: re-baking it
+      // in the same frame would be a stutter for no memory saved.
+      if (c.used >= keepFrom) continue;
+      c.rt.destroy();
+      c.rt = null;
+    }
+  }
+
   function ensure(view) {
     const bx0 = view.x - PREBAKE_PAD;
     const by0 = view.y - PREBAKE_PAD;
     const bx1 = view.r + PREBAKE_PAD;
     const by1 = view.b + PREBAKE_PAD;
+    const now = ++paintClock;
+    let baked = 0;
     for (let i = 0; i < planned.length; i++) {
       const c = planned[i];
+      const near = !(c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0);
       if (!c.rt) {
-        if (c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0) continue;
+        if (!near) continue;
         paint(c);
+        baked++;
       }
+      if (near) c.used = now;
       const on = !(c.ox > view.r || c.ox + size < view.x
         || c.oy > view.b || c.oy + size < view.y);
       if (c.rt.visible !== on) c.rt.setVisible(on);
     }
+    if (baked) evict(now);
   }
 
   function destroy() {

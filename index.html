@@ -83,6 +83,19 @@
            one irreversible thing this card can do. -->
       <button id="btn-resume" class="start-btn" hidden>Resume match</button>
       <button id="btn-start" class="start-btn" hidden>Start Skirmish</button>
+      <!-- The invite link is the lobby. There is no room list and no account:
+           you get a URL, you send it to one person, they open it and they are
+           sitting opposite you. -->
+      <button id="btn-friend" class="start-btn secondary" hidden>Play a friend<span class="sub">creates a link to send</span></button>
+      <button id="btn-skirmish" class="start-btn secondary" hidden>Set up a match<span class="sub">up to eight, humans or computers</span></button>
+      <!-- The lobby. Every chair, its team and its Start button are drawn by
+           src/ui/lobby.js into this one node, from whatever the server last
+           said about the room — so eight phones show the same lobby, and the
+           rules live once, in server/room.js. It is also the offline setup
+           screen, with no server involved. -->
+      <div id="invite" class="invite" hidden>
+        <div id="lobby-root"></div>
+      </div>
       <!-- The one copy of the rules in the whole game. It was written for this
            card and then became unreachable the moment the match started, which
            made it a tutorial nobody could consult and — collapsed by default —

@@ -20,7 +20,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { boot, step } from './harness.mjs';
+import { boot, step, settle } from './harness.mjs';
 
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -98,6 +98,10 @@ const watchToasts = (page) => page.evaluate(() => {
 async function tapSlow(page, x, y) {
   await page.waitForTimeout(DOUBLE_TAP_MS + 60);
   await page.touchscreen.tap(x, y);
+  // The wait above separates this tap from the previous one; this one lets the
+  // HUD answer it. See settle() in harness.mjs for why reading the panel
+  // without it is a race the assertions used to win by luck.
+  await settle(page);
 }
 const DOUBLE_TAP_MS = 400; // must match ui/input.js
 
@@ -719,7 +723,8 @@ async function attackMoveRun() {
       const { spawnUnit } = await import('/src/core/world.js');
       const { findPath, nearestWalkable } = await import('/src/systems/pathfinding.js');
       const w = window.__game.world;
-      window.__game.scene.enemyAI.update = () => {};
+      // Every AI seat, not "the" AI: a match has one brain per 'ai' seat now.
+      for (const ai of window.__game.scene.ais || []) if (ai) ai.update = () => {};
 
       const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
       const etc = w.buildings.find((b) => b.player === 1 && b.type === 'towncenter');

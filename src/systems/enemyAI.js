@@ -7,7 +7,7 @@
 // 0.5 s "think" cadence, and the expensive villager rebalance on a 2 s cadence.
 //
 // No Phaser imports — this module is pure logic and runs headlessly under Node.
-// Every random draw goes through `world.rng`, never Math.random, so a seed
+// Every random draw goes through this AI's OWN rng, never Math.random, so a seed
 // reproduces a match exactly.
 //
 // The shape of the game it plays:
@@ -89,10 +89,23 @@
 // worse than no gate at all.
 
 import {
-  UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES, PLAYER,
+  UNIT_STATS, BUILDING_STATS, MAX_POP_CAP, RES,
   MILITARY_TYPES as ROSTER, BONUS_DAMAGE,
 } from '../core/constants.js';
+import { foesOf, isHostile } from '../core/teams.js';
 import { EV } from '../core/events.js';
+import { makeRng } from '../core/rng.js';
+
+/**
+ * A per-seat seed. Math.imul is exactly defined by the spec, unlike anything
+ * trigonometric, so this mixes identically on every engine — see core/iso.js.
+ */
+function mixSeed(seed, playerId) {
+  let h = (seed >>> 0) ^ Math.imul(playerId + 1, 0x9e3779b1);
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0 || 1;
+}
 import {
   ownedBy, findNearestGlobal, forEachNear, canPlace,
 } from '../core/world.js';
@@ -243,6 +256,17 @@ const LUMBER_CAMP_VILLAGERS = 8;
 // seeds: at a float of 60 the camp landed in time on one seed in five, and at 30
 // it landed on four.
 const LUMBER_CAMP_WOOD_FLOAT = 30;
+// Wood above which the fields stand down until the first Lumber Camp is paid
+// for. See the wishlist entry: lowering the float was not enough on its own,
+// because the camp does not lose a race for the wood — it never gets to run.
+// Every entry ahead of it is cheaper (a House is 30, a field is 60) and
+// wantsFarm() comes back true within a minute of every field, so 60 wood is
+// skimmed off the top forever and a 130-wood entry behind it is never reached.
+// Measured on the raze-at-250s scenario, seed 12345: the AI passed the camp's
+// time and villager gates at 150s and was still on 80 wood at 250s, having put
+// up fields the whole way. 60 is one field: below that the wait would be
+// minutes and the food line would notice, above it the camp is seconds away.
+const LUMBER_CAMP_SAVING_FLOOR = 60;
 // The Feudal military building — an Archery Range or a Stable, whichever
 // answers what we can see (see nextArmBuilding).
 //
@@ -568,6 +592,18 @@ const RAID_OTHER = 0.9;
 
 const STAGING_DIST = 5.5;      // rally point, tiles from the TC toward the foe
 const DEFEND_RADIUS = 13;      // hostiles this close to home trigger defence
+
+// --- Choosing which enemy to fight (see pickFoe) -----------------------------
+//
+// Only meaningful past two players, and both numbers exist to stop the same
+// failure: an army that walks back and forth across the middle of the map
+// because two enemies are at nearly equal range and the nearer one keeps
+// changing. The margin means a rival has to be four tiles closer to steal the
+// target, and the memory means whoever is actually hitting us wins outright for
+// twenty seconds regardless of geometry — being raided is a fact about who to
+// fight that distance cannot express.
+const FOE_SWITCH_MARGIN = 4;
+const AGGRESSOR_MEMORY = 20;
 const DEFEND_CLEAR_TIME = 12;  // all-clear delay before resuming offence
 // How badly the home guard has to be outnumbered before a push is abandoned to
 // come and help.
@@ -970,9 +1006,31 @@ class EnemyAI {
   constructor(world, playerId) {
     this.world = world;
     this.id = playerId;
-    this.foeId = playerId === PLAYER ? 1 : PLAYER;
+    // Who this AI is currently marching at. It was `playerId === PLAYER ? 1 : 0`
+    // — "the other one", which is the only enemy a 1v1 has and is wrong the
+    // moment there are three seats: seven AIs would all pick player 0 or 1 and
+    // ignore each other. pickFoe() chooses now, on the ordinary think cadence.
+    // Everything downstream still reads this one field.
+    this.foeId = null;
 
-    this.acc = 0;
+    // A PRIVATE GENERATOR, not world.rng.
+    //
+    // Two reasons, and the first is the one that bites. Drawing from the shared
+    // stream makes every AI's decisions depend on how many *other* AIs are in
+    // the match and what order they thought in: add a seat and everybody else's
+    // build spots move. Second, checksum() mixes world.rng.getState(), so with
+    // the AI drawing from it the digest stops being a pure function of the
+    // simulation and starts encoding how many times the brains happened to roll
+    // — which is exactly the signal you need to be clean when bisecting a
+    // desync. Seeded off the world seed and the seat, so it still replays.
+    this.rng = makeRng(mixSeed(world.seed, playerId));
+
+    // Thinks are staggered across the roster. THINK_PERIOD is the same for
+    // everyone, so seven AIs built in one breath would land every think on the
+    // same tick — a 25-35ms spike twice a second, which on a phone is a visible
+    // hitch rather than a cost. Spreading the initial accumulator spreads them
+    // for the whole match, and costs one multiplication at construction.
+    this.acc = (playerId * THINK_PERIOD) / Math.max(1, world.players.length);
     this.rebalanceAcc = 0;
     this.think = 0;
 
@@ -1013,6 +1071,7 @@ class EnemyAI {
     this.motion = new Map();
 
     this.lastDamageTime = -999;
+    this.lastAggressor = null;
     this.lastDamageAt = null;
     this.defendingUntil = -999;
 
@@ -1066,6 +1125,12 @@ class EnemyAI {
         if (!victim || victim.player !== this.id) return;
         this.lastDamageTime = world.time;
         this.lastDamageAt = { x: victim.x, y: victim.y };
+        // Remember WHO, not just when. With more than one enemy, "something is
+        // hitting me" is not enough to decide who to hit back.
+        const by = p.attacker || p.source;
+        if (by && by.player !== null && by.player !== undefined && by.player !== this.id) {
+          this.lastAggressor = by.player;
+        }
       });
     }
   }
@@ -1107,6 +1172,9 @@ class EnemyAI {
 
   tick(step) {
     this.refreshHome();
+    // Before anything reads foeId — the roster changes as players are knocked
+    // out, and a dead enemy is not a place to send an army.
+    this.pickFoe();
     this.refreshAvailability();
     this.trackWaveProgress();
     this.assessThreat();
@@ -1185,7 +1253,7 @@ class EnemyAI {
     for (let i = 0; i < 6; i++) {
       // A seeded direction from the literal table rather than a seeded angle
       // through cos/sin, which are not identical across engines.
-      const d = dirVec(w.rng.int(0, DIR_COUNT - 1));
+      const d = dirVec(this.rng.int(0, DIR_COUNT - 1));
       const gx = Math.round(u.x + d[0] * 2.5);
       const gy = Math.round(u.y + d[1] * 2.5);
       if (gx < 1 || gy < 1 || gx >= w.width - 1 || gy >= w.height - 1) continue;
@@ -1237,15 +1305,75 @@ class EnemyAI {
     if (!this.staging || !this.stagingStillGood()) this.staging = this.computeStaging();
   }
 
+  /** Every seat still in the match that is not on our side. */
+  hostiles() {
+    return foesOf(this.world, this.id);
+  }
+
+  /**
+   * Choose an enemy to point the army at.
+   *
+   * Nearest live base, with two forms of hysteresis, because an AI that
+   * re-targets on distance alone walks its army back and forth across the middle
+   * of the map forever: whoever hurt us most recently wins outright, and
+   * otherwise the current foe is kept unless someone else is meaningfully
+   * closer. A wave already in flight is not re-aimed — see trackWaveProgress.
+   */
+  pickFoe() {
+    const w = this.world;
+    const live = this.hostiles();
+    if (!live.length) { this.foeId = null; return; }
+
+    // Somebody attacking our town is the answer to this question regardless of
+    // what the geometry says.
+    if (this.lastAggressor !== null && this.lastAggressor !== undefined
+        && live.includes(this.lastAggressor)
+        && w.time - this.lastDamageTime < AGGRESSOR_MEMORY) {
+      this.foeId = this.lastAggressor;
+      return;
+    }
+
+    let best = null;
+    let bestD = Infinity;
+    for (const id of live) {
+      const p = this.baseOf(id);
+      if (!p) continue;
+      const d = dist(p.x, p.y, this.home.x, this.home.y);
+      if (d < bestD) { bestD = d; best = id; }
+    }
+    if (best === null) { this.foeId = live[0]; return; }
+
+    // Stick unless the newcomer is a real improvement. Without the margin, two
+    // enemies at nearly equal range make the target flip every half second.
+    if (this.foeId !== null && live.includes(this.foeId)) {
+      const cur = this.baseOf(this.foeId);
+      if (cur && dist(cur.x, cur.y, this.home.x, this.home.y) <= bestD + FOE_SWITCH_MARGIN) return;
+    }
+    this.foeId = best;
+  }
+
+  /** Where a given player's town is, or null if they have nothing left. */
+  baseOf(playerId) {
+    const w = this.world;
+    const tc = ownedBy(w, playerId, 'building', 'towncenter')[0];
+    if (tc) return { x: tc.x, y: tc.y };
+    const bs = ownedBy(w, playerId, 'building');
+    if (bs.length) return { x: bs[0].x, y: bs[0].y };
+    const us = ownedBy(w, playerId, 'unit');
+    if (us.length) return { x: us[0].x, y: us[0].y };
+    return null;
+  }
+
   foeBase() {
     const w = this.world;
-    const tc = ownedBy(w, this.foeId, 'building', 'towncenter')[0];
-    if (tc) return { x: tc.x, y: tc.y };
-    const bs = ownedBy(w, this.foeId, 'building');
-    if (bs.length) return { x: bs[0].x, y: bs[0].y };
-    const us = ownedBy(w, this.foeId, 'unit');
-    if (us.length) return { x: us[0].x, y: us[0].y };
-    // Mirror of our own corner, as a last resort.
+    if (this.foeId === null) this.pickFoe();
+    const at = this.foeId === null ? null : this.baseOf(this.foeId);
+    if (at) return at;
+    // Any hostile at all, then the mirror of our own corner as a last resort.
+    for (const id of this.hostiles()) {
+      const p = this.baseOf(id);
+      if (p) return p;
+    }
     return { x: w.width - this.home.x, y: w.height - this.home.y };
   }
 
@@ -1507,10 +1635,27 @@ class EnemyAI {
     // 3a. The first Lumber Camp, on the clock rather than on the haul. See
     //     LUMBER_CAMP_TIME: this is half income and half the one insurance
     //     policy a base with a single wood drop-off cannot do without.
+    //
+    //     It saves up, the way the Archery Range below does, and for a sharper
+    //     version of the same reason. Being last in the queue is survivable for
+    //     an entry that only costs income; it is not survivable for this one,
+    //     because the thing it insures against is permanent. Every entry ahead
+    //     of it is cheaper and one of them is a standing order, so on a base
+    //     that is keeping up with its fields the camp's wood threshold is never
+    //     reached at all — the AI passes the time and villager gates and then
+    //     sits below the price for the rest of the match. That is not a race it
+    //     loses; it is a race it never runs.
+    let savingForCamp = false;
     if (w.time >= LUMBER_CAMP_TIME && villagers >= LUMBER_CAMP_VILLAGERS &&
-        anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD) &&
-        wood >= BUILDING_STATS.lumbercamp.cost.wood + LUMBER_CAMP_WOOD_FLOAT) {
-      wish('lumbercamp', this.campAnchorFor(this.available.wood));
+        anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD)) {
+      const price = BUILDING_STATS.lumbercamp.cost.wood + LUMBER_CAMP_WOOD_FLOAT;
+      if (wood >= price) wish('lumbercamp', this.campAnchorFor(this.available.wood));
+      // Bounded the same three ways the Archery Range's saving is: only above a
+      // floor, and never while the type is backed off for want of ground — that
+      // last one is what stops a camp nobody can site from cancelling the
+      // fields for the rest of the match.
+      else if (wood >= LUMBER_CAMP_SAVING_FLOOR &&
+               w.time >= (this.blockedUntil.get('lumbercamp') || 0)) savingForCamp = true;
     }
 
     // 3b. The Feudal military building, and the most important entry added
@@ -1619,7 +1764,7 @@ class EnemyAI {
     //     it takes to pay for the first Archery Range or Stable; see above, and
     //     note that the *starving* case at 1b is ahead of all of this and is
     //     never suspended.
-    if (this.wantsFarm() && !savingForArm) wish('farm');
+    if (this.wantsFarm() && !savingForArm && !savingForCamp) wish('farm');
 
     // 4. Second barracks to feed bigger waves — but never while an arm we do not
     //    own is buildable, which is the ordering the old code got wrong for free
@@ -1935,7 +2080,7 @@ class EnemyAI {
     if (!s) return null;
     // Deterministic rotating start point, shared by both bands so successive
     // buildings fan around the base instead of stacking on one side.
-    this.placeCursor = (this.placeCursor + this.world.rng.int(1, 17)) % 4096;
+    this.placeCursor = (this.placeCursor + this.rng.int(1, 17)) % 4096;
     return this.scanBand(s, anchor, PLACEMENT_NEAR, MAX_REACH_CHECKS)
       || this.scanBand(s, anchor, PLACEMENT_FAR, FAR_REACH_CHECKS);
   }
@@ -2793,7 +2938,11 @@ class EnemyAI {
   foeArmorMix() {
     const mix = {};
     let total = 0;
-    for (const u of ownedBy(this.world, this.foeId, 'unit')) {
+    // Every hostile's army, because what we have to counter is what can arrive,
+    // and on an eight-player map that is not one roster.
+    const pool = [];
+    for (const id of this.hostiles()) pool.push(...ownedBy(this.world, id, 'unit'));
+    for (const u of pool) {
       if (!isMilitary(u) || isGarrisoned(u)) continue;
       const cls = armorClassOf(u);
       mix[cls] = (mix[cls] || 0) + 1;
@@ -3104,7 +3253,11 @@ class EnemyAI {
     let sx = 0;
     let sy = 0;
     forEachNear(w, this.home.x, this.home.y, DEFEND_RADIUS, (e) => {
-      if (e.kind !== 'unit' || e.player !== this.foeId) return;
+      // ANY hostile, not just the one we are marching at. A raid from the
+      // third player is exactly as much of an emergency as one from the second,
+      // and reading only `foeId` here meant an AI could be dismantled by
+      // somebody it had not happened to pick.
+      if (e.kind !== 'unit' || !isHostile(w, { player: this.id }, e)) return;
       count++;
       sx += e.x;
       sy += e.y;
@@ -3245,11 +3398,10 @@ class EnemyAI {
   }
 
   nearestFoeNear(point) {
-    return findNearestGlobal(
-      this.world, point.x, point.y,
-      ownedBy(this.world, this.foeId, 'unit'),
-      () => true,
-    );
+    const w = this.world;
+    let pool = [];
+    for (const id of this.hostiles()) pool = pool.concat(ownedBy(w, id, 'unit'));
+    return findNearestGlobal(w, point.x, point.y, pool, () => true);
   }
 
   /**
@@ -3259,6 +3411,11 @@ class EnemyAI {
    */
   chooseWaveTarget(from, raiding = false) {
     const w = this.world;
+    // Deliberately the chosen foe alone, unlike threat assessment: a wave has
+    // to arrive somewhere, and one aimed at the average of every enemy on an
+    // eight-player map marches into the middle and dies to whoever is there.
+    if (this.foeId === null) this.pickFoe();
+    if (this.foeId === null) return null;
     const foeUnits = ownedBy(w, this.foeId, 'unit');
     const foeBuildings = ownedBy(w, this.foeId, 'building');
 
@@ -3681,7 +3838,7 @@ class EnemyAI {
   }
 
   waveInterval() {
-    return this.world.rng.range(WAVE_INTERVAL_MIN, WAVE_INTERVAL_MAX);
+    return this.rng.range(WAVE_INTERVAL_MIN, WAVE_INTERVAL_MAX);
   }
 
   /**
@@ -3780,6 +3937,9 @@ class EnemyAI {
       lostLastWave: this.lostLastWave,
       motion: Array.from(this.motion.entries()).map(([id, r]) => [id, { ...r }]),
       lastDamageTime: this.lastDamageTime,
+      lastAggressor: this.lastAggressor,
+      rng: this.rng.getState(),
+      foeId: this.foeId,
       lastDamageAt: this.lastDamageAt ? { ...this.lastDamageAt } : null,
       defendingUntil: this.defendingUntil,
       garrisonUntil: this.garrisonUntil || 0,
@@ -3861,6 +4021,9 @@ class EnemyAI {
       (data.motion || []).filter(([id]) => live_(id)).map(([id, r]) => [id, { ...r }]),
     );
     this.lastDamageTime = Number.isFinite(data.lastDamageTime) ? data.lastDamageTime : -999;
+    this.lastAggressor = Number.isInteger(data.lastAggressor) ? data.lastAggressor : null;
+    if (Number.isFinite(data.rng)) this.rng.setState(data.rng);
+    this.foeId = Number.isInteger(data.foeId) ? data.foeId : null;
     this.lastDamageAt = data.lastDamageAt ? { ...data.lastDamageAt } : null;
     this.defendingUntil = Number.isFinite(data.defendingUntil) ? data.defendingUntil : -999;
     this.garrisonUntil = data.garrisonUntil || 0;

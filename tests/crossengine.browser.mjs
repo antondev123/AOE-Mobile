@@ -30,17 +30,18 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium, firefox, webkit } from 'playwright-core';
-import { serve } from './harness.mjs';
+import { serve, CHROMIUM } from './harness.mjs';
 
 const args = process.argv.slice(2);
 const arg = (n, d) => { const i = args.indexOf(`--${n}`); return i >= 0 ? args[i + 1] : d; };
 const TICKS = Number(arg('ticks', 6000));
 const SEEDS = [4242, 99];
 
-// The repo pins Chromium to a path; the other two came from `playwright install`
-// and are found by playwright-core's own registry.
+// Chromium comes from harness.mjs, which knows the three places it might be;
+// the other two came from `playwright install` and are found by playwright-core's
+// own registry.
 const ENGINES = [
-  { name: 'chromium (V8)', type: chromium, opts: { executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', args: ['--no-sandbox', '--disable-dev-shm-usage'] } },
+  { name: 'chromium (V8)', type: chromium, opts: { executablePath: CHROMIUM, args: ['--no-sandbox', '--disable-dev-shm-usage'] } },
   { name: 'firefox (SpiderMonkey)', type: firefox, opts: {} },
   { name: 'webkit (JavaScriptCore)', type: webkit, opts: {} },
 ];

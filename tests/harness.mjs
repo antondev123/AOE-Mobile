@@ -43,7 +43,50 @@ export function serve(port = 0) {
   });
 }
 
-export const CHROMIUM = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+/**
+ * Where Chromium is.
+ *
+ * This was one hardcoded path, which is fine on the machine it was written on
+ * and false everywhere else — including a CI runner, where nothing lives under
+ * /opt/pw-browsers and every browser test would fail to launch before running a
+ * single assertion. `playwright-core` deliberately ships no browser of its own,
+ * so somebody has to say where one is; the three answers below are the three
+ * ways that question gets answered in practice, in the order they should win.
+ *
+ *   1. CHROMIUM_PATH, for anyone who knows better than this file
+ *   2. the preinstalled sandbox browser, when it is actually there
+ *   3. undefined — hand the question back to playwright-core
+ *
+ * (3) is the important one and it is deliberately *not* a path. Returning a
+ * guess that does not exist produces "Failed to launch chromium because
+ * executable doesn't exist at /opt/pw-browsers/..." on a machine that never had
+ * that directory, which sends the reader looking for a browser instead of at the
+ * real problem. Leaving `executablePath` unset makes playwright resolve its own
+ * registry and, when that is empty, print its own message naming the install
+ * command — which is the actionable one.
+ *
+ * Note the registry is version-locked: the browser build id is tied to the
+ * playwright-core in node_modules, so browsers installed by a *different*
+ * playwright version resolve to a directory that is not there. Install with this
+ * package's own CLI (see .github/workflows/test.yml) rather than with an npx
+ * version pin, or this returns undefined on a machine that just downloaded 100MB
+ * of Chromium.
+ */
+function findChromium() {
+  const fromEnv = process.env.CHROMIUM_PATH;
+  if (fromEnv) return fromEnv;
+  const sandbox = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+  if (fs.existsSync(sandbox)) return sandbox;
+  try {
+    const own = chromium.executablePath();
+    if (own && fs.existsSync(own)) return own;
+  } catch {
+    // playwright-core with no browsers registered.
+  }
+  return undefined;
+}
+
+export const CHROMIUM = findChromium();
 
 export const PHONE = {
   viewport: { width: 390, height: 844 },
@@ -134,9 +177,48 @@ export async function snapshot(page) {
   });
 }
 
-/** Synthesise a touch tap at screen coordinates. */
+/**
+ * Wait for the HUD to have drawn whatever the last input did.
+ *
+ * The HUD is frame-driven on purpose: ui/hud.js computes a selection signature
+ * once per update() and only touches the DOM when it changed, which is what
+ * keeps a 3000-line panel off the critical path at 60fps. So a synthetic tap
+ * mutates world.selection *synchronously* and the DOM catches up on the next
+ * frame, and a test that reads the panel in the same breath as the tap is
+ * racing a design decision rather than observing one.
+ *
+ * That race was real and latent for as long as these tests have existed: the
+ * assertions won it by accident, on the timing of whatever the sim happened to
+ * be doing. Making the simulation bit-identical across engines shifted the
+ * per-frame work enough to lose it, and four bush-panel checks started failing
+ * with world.selection holding the bush and the panel still reading "Nothing
+ * selected" — a diagnosis that costs an afternoon if you go looking for it in
+ * the HUD, where there is nothing wrong.
+ *
+ * Two frames, not one: the first is the one the tap's own handler may already
+ * be inside, the second is the one that draws its consequences.
+ */
+export async function settle(page, frames = 2) {
+  await page.evaluate(
+    (n) => new Promise((resolve) => {
+      let left = n;
+      const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
+      requestAnimationFrame(tick);
+    }),
+    frames,
+  );
+}
+
+/**
+ * Synthesise a touch tap at screen coordinates, and let the UI answer it.
+ *
+ * The settle() is part of the gesture as far as a test is concerned: "the
+ * player tapped" and "the screen has responded" are one event to anyone reading
+ * an assertion, and separating them only invites the race described above.
+ */
 export async function tap(page, x, y) {
   await page.touchscreen.tap(x, y);
+  await settle(page);
 }
 
 /** Synthesise a touch drag (for box-select and panning). */

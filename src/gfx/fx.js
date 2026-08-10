@@ -7,7 +7,9 @@
 // emitted the event.
 
 import { EV } from '../core/events.js';
-import { HALF_W, HALF_H, MAP_W, MAP_H, PLAYER } from '../core/constants.js';
+import { HALF_W, HALF_H } from '../core/constants.js';
+// The local seat, as a live binding — see core/viewpoint.js.
+import { ME as PLAYER } from '../core/viewpoint.js';
 import {
   ATLAS, unitFrame, glyphFrame, GLYPH_METRICS, GLYPH_PX,
 } from './textures.js';
@@ -264,14 +266,17 @@ export function createFx(scene, world, opts) {
   // The mask is read straight off the vision system each time rather than
   // cached, because effects are spawned from events and the events arrive
   // between frames.
-  const visMask = world.vision ? world.vision.state(PLAYER).visible : null;
+  const visMask = world.vision ? world.vision.viewState(PLAYER).visible : null;
+
+  const MW = world.width;
+  const MH = world.height;
 
   function lit(gx, gy) {
     if (!visMask) return true;
     const tx = gx | 0;
     const ty = gy | 0;
-    if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) return false;
-    return visMask[ty * MAP_W + tx] === 1;
+    if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) return false;
+    return visMask[ty * MW + tx] === 1;
   }
 
   /** A building is lit if any tile of its footprint is. */
@@ -279,8 +284,8 @@ export function createFx(scene, world, opts) {
     if (!visMask || !e) return true;
     if (e.kind === 'building' && e.tiles) {
       for (const [tx, ty] of e.tiles) {
-        if (tx < 0 || ty < 0 || tx >= MAP_W || ty >= MAP_H) continue;
-        if (visMask[ty * MAP_W + tx]) return true;
+        if (tx < 0 || ty < 0 || tx >= MW || ty >= MH) continue;
+        if (visMask[ty * MW + tx]) return true;
       }
       return false;
     }

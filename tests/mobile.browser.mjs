@@ -285,12 +285,51 @@ async function gestures() {
       g.world.events.emit('selection', { ids: [...g.world.selection] });
       const lead = own[0];
       g.input.centerOnGrid(lead.x, lead.y);
-      // ~26px away: outside the 18px order radius, well inside the 34px
-      // selection radius that used to swallow this tap and replace the whole
-      // selection with whichever of your own bodies was nearest.
       const p = g.input._toScreen(lead.x, lead.y);
-      ev('pointerdown', 1, p.x + 26, p.y + 4);
-      ev('pointerup', 1, p.x + 26, p.y + 4, window);
+
+      // FIND GROUND, rather than assuming a fixed offset is ground.
+      //
+      // This used to tap a flat 26px right and 4px down from the lead villager:
+      // outside the 18px order radius, inside the 34px selection radius, which
+      // is precisely the gap the check exists to defend. But that is only ground
+      // if nothing of ours is standing there, and the sim runs between these
+      // statements, so on a slower machine the crowd has walked somewhere else
+      // and the tap lands on something — which selects it, correctly, and
+      // reports "1 of 3 selected" as though the contract were broken.
+      //
+      // What counts as "something" is wider than it looks. orderPick uses an
+      // 18px radius with the CURRENT SELECTION EXCLUDED, so the three villagers
+      // in hand cannot take the tap however close they are — but the Town Center
+      // can, and it is nine tiles of building right beside where they spawn.
+      // Aiming only away from the villagers put the tap straight into it.
+      //
+      // So: sweep rings outward and take the first point clear of everything of
+      // ours that is not already selected. Same gesture, same gap, no longer a
+      // test of where the crowd happened to be standing.
+      const bodies = g.world.units
+        .filter((u) => !u.dead && u.player === 0 && !g.world.selection.has(u.id))
+        .map((u) => ({ s: g.input._toScreen(u.x, u.y), r: 24 }));
+      const walls = g.world.buildings
+        .filter((b) => !b.dead && b.player === 0)
+        // A building is picked by its footprint, not its centre: half of a 3x3
+        // Town Center is ~1.5 tiles, and a tile is 64px wide before zoom.
+        .map((b) => ({ s: g.input._toScreen(b.x, b.y), r: 24 + Math.max(b.fw, b.fh) * 34 }));
+      const clear = bodies.concat(walls);
+
+      let aim = null;
+      for (const dist of [26, 40, 56, 76]) {
+        for (let deg = 0; deg < 360 && !aim; deg += 15) {
+          const a = (deg * Math.PI) / 180;
+          const q = { x: p.x + Math.cos(a) * dist, y: p.y + Math.sin(a) * dist };
+          if (q.x < 8 || q.y < 8 || q.x > innerWidth - 8 || q.y > innerHeight - 120) continue;
+          if (clear.every((c) => Math.hypot(c.s.x - q.x, c.s.y - q.y) > c.r)) aim = q;
+        }
+        if (aim) break;
+      }
+      if (!aim) return { skip: true, why: 'no clear ground beside the crowd' };
+
+      ev('pointerdown', 1, aim.x, aim.y);
+      ev('pointerup', 1, aim.x, aim.y, window);
       return {
         want: own.length,
         selected: g.world.selection.size,
