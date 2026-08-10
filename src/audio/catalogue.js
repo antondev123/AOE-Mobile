@@ -198,6 +198,73 @@ export const SOUNDS = {
     },
   },
 
+  // --- Siege ------------------------------------------------------------------
+  //
+  // A siege engine has to sound like machinery rather than like a big bow, and
+  // the two halves of that are timber and mass. Both sounds below are built
+  // low, slow and loud relative to everything else in this file, because a
+  // mangonel firing is the loudest thing that happens in a match and the player
+  // is entitled to hear it from off screen — it is often the first warning that
+  // a push has arrived.
+
+  // The throw. Three events in about a fifth of a second: the arm released (a
+  // wooden knock), the beam whipping over (a broad noise sweep upward, which is
+  // the only rising sweep in this catalogue and is what makes it read as a
+  // throw rather than an impact), and the frame taking the recoil.
+  siegeLoose: {
+    // Priority 2, not higher. It is the loudest thing in the game and the most
+    // dramatic, and neither of those is a reason to let it push the
+    // under-attack alert (priority 3) out of a saturated mixer — the alert is
+    // the one cue that changes what a player does next.
+    gain: 0.8, priority: 2, coalesce: 0.1, maxVoices: 2,
+    render(k) {
+      const f = k.rand(0.92, 1.08);
+      // The trigger: hardwood on hardwood, no ring.
+      k.tone({ type: 'triangle', freq: 190 * f, to: 88 * f, glide: 0.05,
+        peak: 0.5, attack: 0.002, decay: 0.1, lp: 900 });
+      // The arm through the air.
+      k.hiss({ buf: 'pink', bp: 700 * f, toFreq: 2300 * f, sweep: 0.16, q: 0.9,
+        peak: 0.3, attack: 0.02, decay: 0.16, delay: 0.02 });
+      // The frame slamming against its stops.
+      k.tone({ type: 'sine', freq: 96 * f, to: 44, glide: 0.1,
+        peak: 0.55, attack: 0.003, decay: 0.24, lp: 400, delay: 0.11 });
+    },
+  },
+
+  // The boulder landing. Brown noise is the bed the synth notes is for "rubble
+  // and rumble" and this is what it was waiting for: a deep thud with a long
+  // gravel tail, and a bit of high grit on top so it still cuts through on a
+  // phone speaker that cannot reproduce the bottom octave at all.
+  siegeImpact: {
+    gain: 0.9, priority: 2, coalesce: 0.18, maxVoices: 2,
+    render(k) {
+      const f = k.rand(0.9, 1.1);
+      k.tone({ type: 'sine', freq: 120 * f, to: 38, glide: 0.13,
+        peak: 0.85, attack: 0.002, decay: 0.34, lp: 500 });
+      k.hiss({ buf: 'brown', bp: 420 * f, toFreq: 150 * f, sweep: 0.3, q: 0.8,
+        peak: 0.55, attack: 0.002, decay: 0.36 });
+      // Grit and splinters, the part a small speaker actually renders.
+      k.hiss({ buf: 'white', bp: 3100 * f, toFreq: 1200 * f, sweep: 0.1, q: 1.4,
+        peak: 0.22, attack: 0.001, decay: 0.12, delay: 0.01 });
+    },
+  },
+
+  // A monk mending somebody. The only sound in the game with no noise component
+  // at all, which is the whole idea: everything else here is wood, stone, metal
+  // or breath, so a clean stack of sine partials is instantly not-of-this-world
+  // without needing to be loud. Quiet and long, because it repeats every half
+  // second for as long as the healing lasts and must never become nagging.
+  heal: {
+    gain: 0.3, priority: 1, coalesce: 0.24, maxVoices: 2,
+    render(k) {
+      const f = k.rand(0.99, 1.01);
+      k.stack([523.25 * f, 784 * f, 1046.5 * f], {
+        type: 'sine', peak: 0.16, falloff: 0.55,
+        attack: 0.03, decay: 0.5, spread: 0.006,
+      });
+    },
+  },
+
   // A unit falls. Deliberately not gory: a short breath (bandpassed pink noise
   // sweeping down) over a falling sine. It reads as "gone" without being a
   // scream, which matters in a game a child might play on a phone.
