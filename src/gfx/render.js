@@ -27,7 +27,7 @@ import {
   buildTextures, ATLAS, TILE_TEX_W, TILE_TEX_H, TILE_TEX_OFF_X, TILE_TEX_OFF_Y,
   terrainFrame, unitFrame, unitAnim, buildingFrame, foundationFrame, resourceFrame,
   markerFrame, farmFrame, farmFoundationFrame, wallFrame, gateFrame, scaffoldFrame,
-  oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME,
+  oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME, waterFrame,
   TERRAIN_VARIANTS, RESOURCE_VARIANTS, DETAIL_VARIANTS, DETAIL_BOX, detailFrame,
   TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
   CLIFF_H, CLIFF_VARIANTS,
@@ -208,6 +208,14 @@ const FOG_MEMORY_ALPHA = 0.85;
 // a 45x22 pixel blob on screen. At 12Hz the edge still slides smoothly under a
 // walking unit and the upload cost drops by half.
 const FOG_REFRESH_INTERVAL = 1 / 12;
+// Frames per second for the water caustics. Slow on purpose: four frames at 6fps
+// is a two-thirds-of-a-second cycle, which reads as a slow swell. Faster and it
+// is a boiling pot; slower and the eye catches each frame as a separate picture.
+const WATER_FPS = 6;
+// The overlay is a highlight, not the water. At 0.34 it lifts the surface and
+// leaves the baked depth banding underneath doing the work of saying how deep it
+// is; at 1.0 it replaces the pond with a light show.
+const WATER_ALPHA = 0.34;
 // Above every entity, every effect and the terrain; below the overlay Graphics
 // (800000), which draws selection rings and bars for things you can see.
 const FOG_DEPTH = 700000;
@@ -317,7 +325,31 @@ export function createRenderer(scene, world) {
   // and does nothing at all when there isn't one.
   let cliffs = buildCliffList(world);
 
+  // --- moving water ---------------------------------------------------------
+  //
+  // THE MAP HAS NEVER MOVED. Terrain is baked once into chunk RenderTextures
+  // and never touched again, which is the whole reason it is cheap — and it is
+  // also the loudest remaining "this is a mock-up" signal in a screenshot, well
+  // above any individual sprite. A still frame of a game and a still frame of a
+  // diorama are the same picture; the difference only exists in motion, and
+  // nothing here supplied any.
+  //
+  // Water is the cheapest place to buy it. textures.js bakes four caustic
+  // frames on transparency (waterFrame 0..3), each a quarter-cycle later with
+  // the threads drifting, so cycling them travels rather than flickers. They
+  // are laid over the baked water at low alpha as ordinary sprites, which is
+  // the only way to animate something the bake has already flattened.
+  //
+  // ONLY INTERIOR WATER. The out-of-bounds ocean shelf is eight rings of tiles
+  // around the whole map and would be hundreds of quads for scenery nobody
+  // looks at; the ponds are two per map and are the water a player actually
+  // stands beside. Bounded by construction rather than by a cap, which is the
+  // difference between a budget and a hope.
+  const waterTiles = buildWaterList(world);
+  let waterPhase = 0;
+
   // --- pools ---------------------------------------------------------------
+  const waterPool = makePool(() => mkImage(scene, waterFrame(0), -999000));
   const cliffPool = makePool(() => mkImage(scene, cliffFrame(0, 0), -1));
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
   const unitPool = makePool(() => mkImage(scene, unitFrame('villager', 0, false), -1));
@@ -688,6 +720,7 @@ export function createRenderer(scene, world) {
     terrain.ensure(viewRect);
     perfEnd('render.terrain', _tTerrain);
 
+    waterPool.reset();
     cliffPool.reset();
     markerPool.reset();
     unitPool.reset();
@@ -708,6 +741,7 @@ export function createRenderer(scene, world) {
     bodyN = 0;
 
     const _tCliffs = perfBegin('render.cliffs');
+    drawWater(dt);
     drawCliffs();
     perfEnd('render.cliffs', _tCliffs);
     const _tRes = perfBegin('render.resources');
@@ -730,6 +764,7 @@ export function createRenderer(scene, world) {
     drawGhost();
     drawWallRun();
 
+    waterPool.trim();
     cliffPool.trim();
     markerPool.trim();
     unitPool.trim();
@@ -807,6 +842,32 @@ export function createRenderer(scene, world) {
    * stays on your map — the fog overlay darkens it along with everything else,
    * which is exactly the treatment the ground under it gets.
    */
+  /**
+   * The caustic overlay on interior water.
+   *
+   * Driven by the render clock rather than by world.time, so the water keeps
+   * moving while the simulation is paused — a frozen pond in a paused game
+   * reads as a bug, and this layer is decoration that no peer has to agree
+   * about.
+   *
+   * Not fog-gated: water is terrain, and terrain you have seen once stays on
+   * your map. The fog quad above darkens it along with the ground it sits on,
+   * which is exactly the treatment the baked water underneath gets.
+   */
+  function drawWater(dt) {
+    if (!waterTiles.length) return;
+    waterPhase += dt * WATER_FPS;
+    const frame = waterFrame(waterPhase | 0);
+    for (let i = 0; i < waterTiles.length; i++) {
+      const t = waterTiles[i];
+      if (!visible(t.wx, t.wy)) continue;
+      const s = waterPool.get();
+      setFrame(s, frame, origins);
+      s.setPosition(t.wx, t.wy);
+      s.setAlpha(WATER_ALPHA);
+    }
+  }
+
   function drawCliffs() {
     for (let i = 0; i < cliffs.length; i++) {
       const c = cliffs[i];
@@ -2159,7 +2220,12 @@ function buildTerrainOps(world) {
         // (h >>> shift) & 7 gives each edge its own three bits, so the four
         // edges of one tile do not all get the same strength.
         const bits = (h >>> (e * 3)) & 7;
-        push(edgeBlendFrame(e), 0.5 + bits * (0.5 / 7), TERRAIN_BASE[nId]);
+        // The variant is what stops a fifty-tile boundary rhyming. Four shapes
+        // per edge, chosen by the same hash that sets the strength but a
+        // different slice of it, so shape and strength do not correlate into a
+        // visible pattern of their own.
+        push(edgeBlendFrame(e, (h >>> (18 + e * 2)) & 3),
+          0.5 + bits * (0.5 / 7), TERRAIN_BASE[nId]);
       }
 
       // The second rank: this tile is not adjacent to the other terrain, but
@@ -2174,7 +2240,7 @@ function buildTerrainOps(world) {
           if (TERRAIN_PRIORITY[farId] <= mine) continue;
           if (((h >>> (12 + e * 2)) & 3) !== 0) continue;   // one tile in four
           tilePos(tx, ty, p);
-          push(edgeBlendFrame(e), 0.3, TERRAIN_BASE[farId]);
+          push(edgeBlendFrame(e, (h >>> 26) & 3), 0.3, TERRAIN_BASE[farId]);
           break;
         }
       }
@@ -2202,7 +2268,8 @@ function buildTerrainOps(world) {
           tilePos(tx, ty, p);
           placed = true;
         }
-        push(shoreFrame(e), 0.75, 0xdff1ff);
+        push(shoreFrame(e, (tileHash(tx * 5 + 3, ty * 7 + 1) >>> (e * 2)) & 3),
+          0.75, 0xdff1ff);
       }
     }
   }
@@ -2305,6 +2372,32 @@ function buildTerrainOps(world) {
  * draws the tile grid across the rock in black — the exact failure this frame
  * set exists to avoid.
  */
+/**
+ * Every interior water tile, flattened once into screen positions.
+ *
+ * "Interior" means inside the playable grid — the out-of-bounds ocean shelf is
+ * drawn by the terrain bake and is deliberately left still. See the note at the
+ * water pool for why.
+ */
+function buildWaterList(world) {
+  const out = [];
+  const W = world.width;
+  const H = world.height;
+  for (let ty = 0; ty < H; ty++) {
+    for (let tx = 0; tx < W; tx++) {
+      if (world.terrain[ty * W + tx] !== TERRAIN.WATER) continue;
+      // Exactly tilePos(): the overlay has to land on the same pixels the
+      // baked water underneath it occupies, and these frames share the
+      // terrain frames' top-left anchor.
+      out.push({
+        wx: (tx - ty) * HALF_W - TILE_TEX_W / 2 + TILE_TEX_OFF_X,
+        wy: (tx + ty + 1) * HALF_H - TILE_TEX_H / 2 + TILE_TEX_OFF_Y,
+      });
+    }
+  }
+  return out;
+}
+
 function buildCliffList(world) {
   const grid = world.cliff;
   const out = [];

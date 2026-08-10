@@ -529,6 +529,9 @@ export function createFx(scene, world, opts) {
   // ring, because a ring at this size is indistinguishable from a selection
   // marker, and the one thing this must never be mistaken for is something the
   // player did.
+  // textures.js bakes a dedicated white mote for this; fall back to the generic
+  // dot if the atlas has not grown one, the same way the projectile art does.
+  const healFrame = origins && origins.get('fx_heal') ? 'fx_heal' : 'fx_dot';
   on(EV.HEAL, (p) => {
     const t = p && p.target;
     if (!t || !litEntity(t)) return;
@@ -536,7 +539,7 @@ export function createFx(scene, world, opts) {
     const y = wy(t.x, t.y) - 12;
     const n = scaled(2);
     for (let i = 0; i < n; i++) {
-      spawn('fx_dot', x + (Math.random() - 0.5) * 14, y + (Math.random() - 0.5) * 6, {
+      spawn(healFrame, x + (Math.random() - 0.5) * 14, y + (Math.random() - 0.5) * 6, {
         vx: (Math.random() - 0.5) * 8,
         vy: -22 - Math.random() * 12,
         life: 0.6 + Math.random() * 0.25,
