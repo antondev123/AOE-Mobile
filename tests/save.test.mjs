@@ -441,8 +441,6 @@ test('tech, fog and the allocation manager come back exactly', () => {
 
   const beforeHp = tc.maxHp;
   const beforeAlloc = allocationState(world, PLAYER);
-  const beforeExplored = Array.from(world.vision.state(PLAYER).explored);
-
   // Make the memory rather than hope for it.
   //
   // This used to assert that 1400 steps of ordinary villager work had left
@@ -465,6 +463,10 @@ test('tech, fog and the allocation manager come back exactly', () => {
   commandUnits(world, [walker], { type: 'move', gx: home.x, gy: home.y });
   run(world, ai, 400);
 
+  // Captured after the walk, not before: the walk is what uncovers the ground,
+  // so a snapshot taken ahead of it would be compared against a world that has
+  // since explored more and would fail for the fixture's own reasons.
+  const beforeExplored = Array.from(world.vision.state(PLAYER).explored);
   const beforeMemory = world.vision.state(PLAYER).memory.length;
   assert.ok(beforeMemory > 0,
     'the fixture was supposed to create memory by walking a unit out and back');

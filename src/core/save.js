@@ -380,9 +380,18 @@ export function restoreGame(data) {
   world.projectiles.length = 0;
   for (const rec of data.projectiles || []) {
     const p = unpackValue(rec, byId);
+    if (!p) continue;
     // A projectile whose target died between the save and the load has nothing
     // to hit. combat.js copes, but there is no reason to restore one.
-    if (p && p.target) world.projectiles.push(p);
+    //
+    // A SPLASH SHOT IS THE EXCEPTION AND HAS TO BE. A mangonel's boulder
+    // deliberately carries no target at all — it is thrown at a *place*, which
+    // is what makes minimum range and the SPREAD formation mean anything (see
+    // launchProjectile in combat.js). Testing for a target alone therefore
+    // silently deleted every boulder in the air across a save, which is the
+    // sort of thing nobody notices until a player reloads mid-siege and their
+    // shot never lands.
+    if (p.target || p.splashRadius > 0) world.projectiles.push(p);
   }
 
   restoreTech(world, data.tech);

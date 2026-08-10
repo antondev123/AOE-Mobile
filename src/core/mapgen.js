@@ -53,6 +53,8 @@ export function generateMap(world) {
     putToWork(world, b, built.villagers);
   }
 
+  revealStartingGround(world, bases);
+
   for (const p of world.players) recomputePop(world, p.id);
   return { bases };
 }
@@ -293,6 +295,55 @@ function scatterBerries(world, bases) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
     placeCluster(world, cx, cy, 'berry', rng.int(3, 5), bases, NEUTRAL_MIN_BASE_DIST);
+  }
+}
+
+// How far around its Town Center each player starts having *seen*.
+//
+// THIS IS A FIRST-IMPRESSION FIX AND IT IS WORTH BEING PRECISE ABOUT WHAT IT
+// CHANGES. A Town Center sees 8 tiles and a villager 4, so the opening frame
+// was a small lit disc surrounded by unexplored black — at the default 0.7 zoom
+// the screen was well over half empty. That is a correct rendering of what the
+// player knows and a terrible picture of what the player is looking at: the
+// first thing anyone sees of this game was mostly a hole.
+//
+// What this marks is `explored`, NOT `visible`. The distinction is the whole
+// point and it costs the player nothing:
+//
+//   explored  you have seen this ground. The terrain, and the trees and rock
+//             standing on it, are drawn dimmed under the fog wash.
+//   visible   you can see it right now. Units and buildings on it are live.
+//
+// So the opening now shows the *place* — the woodline, the berries, the shape
+// of the ground — and still shows nothing that moves. No enemy, no unit, no
+// building of anyone else's, and the fog closes over anything that changes out
+// of sight exactly as before. It is the difference between waking up in a
+// valley you walked into yesterday and waking up in a cave.
+//
+// Sixteen tiles is a little under one screen at the default zoom, and about the
+// radius AoE2 grants around a starting position for the same reason.
+const START_REVEAL = 16;
+
+function revealStartingGround(world, bases) {
+  if (!world.vision) return;
+  const W = world.width;
+  const H = world.height;
+  const r2 = START_REVEAL * START_REVEAL;
+  for (const b of bases) {
+    const st = world.vision.state(b.player);
+    if (!st) continue;
+    for (let y = Math.max(0, b.y - START_REVEAL); y <= Math.min(H - 1, b.y + START_REVEAL); y++) {
+      for (let x = Math.max(0, b.x - START_REVEAL); x <= Math.min(W - 1, b.x + START_REVEAL); x++) {
+        const dx = x - b.x;
+        const dy = y - b.y;
+        if (dx * dx + dy * dy > r2) continue;
+        st.explored[y * W + x] = 1;
+      }
+    }
+    // The fog texture and the minimap both skip their rebuild unless this
+    // changes, so a reveal that forgot to bump it would not appear until the
+    // first villager took a step.
+    st.revision++;
   }
 }
 
