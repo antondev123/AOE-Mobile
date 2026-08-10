@@ -1,0 +1,56 @@
+# Run the tests on every push and pull request.
+#
+# There was no CI at all until now: the only workflow deployed to Pages on a push
+# to main, so nothing ever ran the suite and a test could rot indefinitely without
+# anybody finding out. Two did. `tests/multiplayer.browser.mjs` had been unable to
+# pass since the commit that introduced the lobby — it waited thirty seconds for a
+# world the lobby deliberately withholds — and four checks in `ui.browser.mjs`
+# were winning a race against the HUD's frame gate by luck.
+#
+# That matters more from here than it did behind us. The simulation has to stay
+# bit-identical across JavaScript engines or networked play silently forks, and
+# `determinism.test.mjs` is the only thing that says so. It is not a test anybody
+# should have to remember to run.
+name: Tests
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  headless:
+    name: Unit and simulation tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # The unit suite is Phaser-free by design — src/core and src/systems import
+      # nothing from the engine — so it runs under bare node with no browser.
+      - run: npm test
+      - run: npm run smoke
+
+  browser:
+    name: Browser and multiplayer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      # playwright-core ships no browser of its own; `install --with-deps` is the
+      # supported way to get one plus the system libraries Chromium needs on a
+      # bare runner. tests/harness.mjs then finds it through PLAYWRIGHT_BROWSERS_PATH.
+      - run: npx --yes playwright@1.49.0 install --with-deps chromium
+      - run: npm run test:browser
+      # Not in the test:browser script, and that is exactly how it went stale.
+      # It is also the only end-to-end proof of the netcode: two real browsers,
+      # two seats, both worlds hashing identically after ~3000 ticks.
+      - run: node tests/multiplayer.browser.mjs

@@ -43,7 +43,39 @@ export function serve(port = 0) {
   });
 }
 
-export const CHROMIUM = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+/**
+ * Where Chromium is.
+ *
+ * This was one hardcoded path, which is fine on the machine it was written on
+ * and false everywhere else — including a CI runner, where nothing lives under
+ * /opt/pw-browsers and every browser test would fail to launch before running a
+ * single assertion. `playwright-core` deliberately ships no browser of its own,
+ * so somebody has to say where one is; the three answers below are the three
+ * ways that question gets answered in practice, in the order they should win.
+ *
+ *   1. CHROMIUM_PATH, for anyone who knows better than this file
+ *   2. the preinstalled sandbox browser, when it is actually there
+ *   3. playwright's own resolution, which is what `playwright install` populates
+ *
+ * Falling through to (3) rather than throwing matters: an unresolvable path
+ * fails at launch with a message about the browser, which is the truth, instead
+ * of failing here with a message about this constant, which is not.
+ */
+function findChromium() {
+  const fromEnv = process.env.CHROMIUM_PATH;
+  if (fromEnv) return fromEnv;
+  const sandbox = '/opt/pw-browsers/chromium-1194/chrome-linux/chrome';
+  if (fs.existsSync(sandbox)) return sandbox;
+  try {
+    const own = chromium.executablePath();
+    if (own && fs.existsSync(own)) return own;
+  } catch {
+    // playwright-core with no browsers registered. Fall through.
+  }
+  return sandbox;
+}
+
+export const CHROMIUM = findChromium();
 
 export const PHONE = {
   viewport: { width: 390, height: 844 },
