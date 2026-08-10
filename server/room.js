@@ -33,7 +33,12 @@ export const DIFFICULTIES = ['easy', 'normal', 'hard'];
 function makeSlot(index) {
   return {
     index,
-    kind: index === 0 ? 'open' : index === 1 ? 'ai' : 'closed',
+    // Both of the first two chairs are OPEN. That is the invite flow: you make
+    // a link and send it, and the person who opens it sits down. Defaulting the
+    // second to 'ai' would have made a friend arriving at your link a spectator
+    // at their own match. Everything past the second starts closed, so a fresh
+    // lobby is the 1v1 this game shipped as and growing it is deliberate.
+    kind: index < 2 ? 'open' : 'closed',
     // Teams default to "everybody for themselves", which is the free-for-all the
     // simulation already treats as the no-teams case.
     team: index + 1,
@@ -44,7 +49,7 @@ function makeSlot(index) {
   };
 }
 
-/** A fresh two-seat lobby: one chair open, one AI. The classic skirmish. */
+/** A fresh two-seat lobby, both chairs open: the invite this game shipped as. */
 export function createConfig(seed = 1) {
   return {
     seed,

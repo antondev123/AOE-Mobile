@@ -48,7 +48,6 @@ const MAX_CATCHUP_TICKS = 60;
  * @param {string} opts.url                 ws:// or wss:// endpoint
  * @param {(snap: object) => void} opts.onSnapshot  rebuild the world from this
  * @param {(info: object) => void} [opts.onWelcome]
- * @param {(seats: string[]) => void} [opts.onSeats]
  * @param {(winner: number) => void} [opts.onOver]
  * @param {(reason: string) => void} [opts.onError]
  * @param {(state: string) => void} [opts.onStatus]
@@ -60,7 +59,6 @@ export function createNetClient({
   onWelcome = null,
   onLobby = null,
   onStart = null,
-  onSeats = null,
   onOver = null,
   onError = null,
   onStatus = null,
@@ -77,6 +75,9 @@ export function createNetClient({
   const state = {
     playerId: null,
     spectator: false,
+    host: false,
+    phase: 'lobby',
+    roster: null,
     matchId: null,
     seed: null,
     commandDelay: 4,
@@ -117,16 +118,24 @@ export function createNetClient({
 
     switch (msg.type) {
       case 'welcome': {
-        state.playerId = msg.playerId;
-        state.spectator = !!msg.spectator;
+        // `you` replaces the old flat playerId/spectator pair, because a client
+        // now also has to know whether it is the host and which phase the room
+        // is in — and grouping them stopped the welcome growing a fourth and
+        // fifth loose field.
+        const you = msg.you || {};
+        state.playerId = you.slot === undefined ? null : you.slot;
+        state.spectator = !!you.spectator;
+        state.host = !!you.host;
+        state.phase = msg.phase || 'lobby';
         state.matchId = msg.matchId;
         state.seed = msg.seed;
         if (typeof msg.commandDelay === 'number') state.commandDelay = msg.commandDelay;
         state.serverTick = msg.tick || 0;
         state.serverAt = Date.now();
-        state.started = !!msg.started;
+        state.started = state.phase === 'running' || state.phase === 'over';
+        state.roster = msg.roster || null;
         if (onWelcome) onWelcome({ ...msg, snapshot: undefined });
-        if (msg.lobby && onLobby) onLobby({ seats: msg.lobby, started: state.started });
+        if (msg.lobby && onLobby) onLobby(msg.lobby);
         // A match already in progress is a reconnect: build the world now. One
         // still in its lobby does not — the world it would build is the one at
         // tick zero, and the authoritative copy of that arrives with the start
@@ -142,14 +151,27 @@ export function createNetClient({
       }
 
       case 'lobby':
-        state.started = !!msg.started;
+        state.phase = msg.phase || state.phase;
+        state.started = state.phase === 'running' || state.phase === 'over';
         if (onLobby) onLobby(msg);
+        break;
+
+      // Which chair the server put us in, after a claim or a leave. The lobby
+      // payload deliberately carries no per-recipient field, so this is the only
+      // thing that ever moves `playerId`.
+      case 'you':
+        state.playerId = msg.slot === undefined ? null : msg.slot;
+        state.spectator = !!msg.spectator;
+        state.host = !!msg.host;
+        if (onLobby) onLobby(null);
         break;
 
       case 'start': {
         // Everyone is here and everyone said go. This is the first tick of the
         // match proper, and both clients build it from the same bytes.
         state.started = true;
+        state.phase = 'running';
+        state.roster = msg.roster || null;
         state.serverTick = msg.tick || 0;
         state.serverAt = Date.now();
         schedule.clear();
@@ -161,10 +183,13 @@ export function createNetClient({
         break;
       }
 
+      // Batched by tick. One message per command amplified badly with eight
+      // seats, and everything stamped for a tick is known at the same moment.
       case 'sched':
         if (typeof msg.at === 'number') {
           if (!schedule.has(msg.at)) schedule.set(msg.at, []);
-          schedule.get(msg.at).push(msg.cmd);
+          const list = schedule.get(msg.at);
+          for (const c of (msg.cmds || (msg.cmd ? [msg.cmd] : []))) list.push(c);
         }
         break;
 
@@ -175,6 +200,7 @@ export function createNetClient({
         break;
 
       case 'snapshot':
+        state.roster = msg.roster || state.roster;
         // The answer to our resync. Rebuild, then re-arm whatever was already
         // stamped past the snapshot's tick.
         schedule.clear();
@@ -185,10 +211,6 @@ export function createNetClient({
         stampSchedule(msg.pending);
         state.resyncing = false;
         status('resynced');
-        break;
-
-      case 'seats':
-        if (onSeats) onSeats(msg.seats);
         break;
 
       case 'over':
@@ -264,6 +286,13 @@ export function createNetClient({
       const theirs = sums.get(tick);
       sums.delete(tick);
       return theirs === localSum;
+    },
+
+    /** Ask the server for a change of lobby. Refusals come back as `error`. */
+    lobby(msg) {
+      if (socket.readyState !== 1) return false;
+      socket.send(JSON.stringify(msg));
+      return true;
     },
 
     /** Tell the server whether this player is ready to begin. */

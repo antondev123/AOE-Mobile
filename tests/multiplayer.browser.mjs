@@ -158,6 +158,11 @@ async function connectPage(browser, base, matchId, tag) {
  */
 async function readyUp(pages) {
   await Promise.all(pages.map((p) => p.page.evaluate(() => window.__net.setReady(true))));
+  // And the host presses Start. Readying up no longer begins the match on its
+  // own: with AI chairs "everyone is ready" can be true the instant a room
+  // exists, so the host needs the moment to fill the empty ones first.
+  await pages[0].page.waitForFunction(() => window.__net && window.__net.state.host === true);
+  await pages[0].page.evaluate(() => window.__net.lobby({ type: 'start' }));
   await Promise.all(pages.map((p) => p.page.waitForFunction(
     () => window.__game && window.__game.world && window.__game.net,
     null,

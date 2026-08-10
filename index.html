@@ -87,13 +87,14 @@
            you get a URL, you send it to one person, they open it and they are
            sitting opposite you. -->
       <button id="btn-friend" class="start-btn secondary" hidden>Play a friend<span class="sub">creates a link to send</span></button>
+      <button id="btn-skirmish" class="start-btn secondary" hidden>Set up a match<span class="sub">up to eight, humans or computers</span></button>
+      <!-- The lobby. Every chair, its team and its Start button are drawn by
+           src/ui/lobby.js into this one node, from whatever the server last
+           said about the room — so eight phones show the same lobby, and the
+           rules live once, in server/room.js. It is also the offline setup
+           screen, with no server involved. -->
       <div id="invite" class="invite" hidden>
-        <p class="invite-label">Send this link to your friend</p>
-        <a id="invite-url" class="invite-url" href="#"></a>
-        <button id="invite-copy" class="invite-copy">Copy link</button>
-        <ul id="lobby-list" class="lobby-list"></ul>
-        <button id="btn-ready" class="invite-copy ready-btn" hidden>I'm ready</button>
-        <p id="invite-state" class="invite-state"></p>
+        <div id="lobby-root"></div>
       </div>
       <!-- The one copy of the rules in the whole game. It was written for this
            card and then became unreachable the moment the match started, which

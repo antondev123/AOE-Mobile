@@ -2084,8 +2084,72 @@ body {
 .invite-state.error { color: #e08a6a; opacity: 1; }
 .invite.ready { border-color: #7fa05a; }
 
-/* Who is in the room. Two rows, and the only thing that changes is the word on
-   the right — which is what a player is actually watching for. */
+/* Who is in the room.
+   
+   This was two rows whose only moving part was the word on the right. It is up
+   to eight now, each carrying a colour, a name, what kind of player it is and
+   whose side they are on — four things on a 390px phone, which is why the row is
+   a grid rather than a space-between: the columns have to line up down the list
+   or eight rows read as noise. The name is the only one allowed to grow.
+   
+   Every control here is 44px tall for the same reason everything else in this
+   file is. */
+.lobby-setup {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+.lobby-label { font-size: 13px; font-weight: 800; color: var(--parch); }
+.lobby-map { margin-left: auto; font-size: 12px; color: var(--parch-dim); }
+.lobby-setup .seg {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 18px;
+  font-weight: 800;
+}
+.lobby-setup .seg:disabled { opacity: 0.4; }
+
+.lobby-swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  flex: 0 0 auto;
+}
+.lobby-who {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.lobby-you { color: var(--gold); font-weight: 800; }
+.lobby-kind, .lobby-team, .lobby-sit {
+  flex: 0 0 auto;
+  min-height: 44px;
+  padding: 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 11.5px;
+  font-weight: 800;
+}
+.lobby-kind:disabled, .lobby-team:disabled {
+  opacity: 0.75;
+  border-color: transparent;
+  background: none;
+}
+.lobby-sit { background: linear-gradient(180deg, #4a6b2c, #33501d); border-color: #7fa05a; }
+.lobby-start { margin-top: 10px; }
+.lobby-start:disabled { opacity: 0.5; }
+
 .lobby-list {
   list-style: none;
   margin: 10px 0 0;
@@ -2093,9 +2157,9 @@ body {
 }
 .lobby-row {
   display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 7px 8px;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
   border-radius: 6px;
   font-size: 13.5px;
   background: rgba(0, 0, 0, 0.25);

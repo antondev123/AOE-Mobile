@@ -27,8 +27,8 @@ function lobbyOf(n) {
 test('a fresh lobby is the skirmish this game shipped as', () => {
   const c = createConfig(1);
   assert.equal(c.slots.length, 2);
-  assert.equal(c.slots[0].kind, 'open', 'a chair for whoever opened the link');
-  assert.equal(c.slots[1].kind, 'ai', 'and an opponent');
+  assert.equal(c.slots[0].kind, 'open', 'a chair for whoever made the link');
+  assert.equal(c.slots[1].kind, 'open', 'and one for whoever opens it');
   assert.deepEqual(mapDimsFor(c), { width: mapSizeFor(2), height: mapSizeFor(2), auto: true });
 });
 

@@ -78,6 +78,9 @@ export class GameScene extends Phaser.Scene {
     // Who is in every chair: [{ kind, team }], seat-indexed. The server sends it
     // with the start signal; a skirmish makes the classic one up.
     this.roster = (data && data.roster) || null;
+    // Map dimensions, when the lobby chose them. Absent for a resumed save (the
+    // save carries its own) and for a networked match (the snapshot does).
+    this.worldOpts = (data && data.world) || null;
     // Point the client's whole view — HUD, fog, selection, minimap — at that
     // seat. This must happen in init() and not in create(): the renderer and
     // the HUD read the binding as they are constructed, so a player two who
@@ -105,8 +108,23 @@ export class GameScene extends Phaser.Scene {
       }
     }
     if (!world) {
-      world = createWorld(this.seed);
+      // Built to the lobby's roster. A plain skirmish passes none of this and
+      // gets the two-player 96x96 default, which is the game as it shipped.
+      const roster = this.roster;
+      world = createWorld(this.seed, {
+        playerCount: roster ? roster.length : undefined,
+        width: this.worldOpts ? this.worldOpts.width : undefined,
+        height: this.worldOpts ? this.worldOpts.height : undefined,
+        teams: roster ? roster.map((r, i) => (r && r.team !== undefined ? r.team : i)) : undefined,
+      });
       generateMap(world);
+      // A closed chair is out from tick zero and owns nothing — see the note on
+      // compaction in server/room.js.
+      if (roster) {
+        for (let i = 0; i < roster.length; i++) {
+          if (roster[i] && roster[i].kind === 'closed') world.players[i].defeated = true;
+        }
+      }
       for (const p of world.players) recomputePop(world, p.id);
     }
     this.world = world;

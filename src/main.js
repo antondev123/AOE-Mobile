@@ -3,17 +3,14 @@
 import { GameScene } from './scenes/GameScene.js';
 import { saveInfo, clearSave } from './core/save.js';
 import { createNetClient } from './net/client.js';
+import { createLobby, clientToken } from './ui/lobby.js';
 
 const bootStatus = document.getElementById('boot-status');
 const startBtn = document.getElementById('btn-start');
 const resumeBtn = document.getElementById('btn-resume');
 const friendBtn = document.getElementById('btn-friend');
+const skirmishBtn = document.getElementById('btn-skirmish');
 const invite = document.getElementById('invite');
-const inviteUrl = document.getElementById('invite-url');
-const inviteCopy = document.getElementById('invite-copy');
-const inviteState = document.getElementById('invite-state');
-const lobbyList = document.getElementById('lobby-list');
-const readyBtn = document.getElementById('btn-ready');
 const bootCard = document.getElementById('boot');
 const hud = document.getElementById('hud');
 
@@ -31,7 +28,7 @@ window.addEventListener('unhandledrejection', (e) => fail('Startup error', e.rea
 let game = null;
 let net = null;
 
-function launch(seed, resume = null, netClient = null, roster = null) {
+function launch(seed, resume = null, netClient = null, roster = null, world = null) {
   if (game) {
     game.destroy(true);
     game = null;
@@ -62,7 +59,7 @@ function launch(seed, resume = null, netClient = null, roster = null) {
   };
 
   game = new Phaser.Game(config);
-  game.scene.start('game', { seed, resume, net: netClient, roster });
+  game.scene.start('game', { seed, resume, net: netClient, roster, world });
   window.__phaser = game;
   return game;
 }
@@ -96,7 +93,11 @@ function resume(payload) {
 /** ws:// for http, wss:// for https, same host either way. */
 function socketUrl(matchId) {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${location.host}/ws?m=${encodeURIComponent(matchId)}`;
+  // The token rides in the query string rather than behind a handshake, so
+  // `welcome` stays the first message and the server can seat a reconnecting
+  // player before it has said anything. See clientToken in ui/lobby.js.
+  const t = encodeURIComponent(clientToken());
+  return `${proto}//${location.host}/ws?m=${encodeURIComponent(matchId)}&t=${t}`;
 }
 
 function inviteLink(matchId) {
@@ -143,16 +144,21 @@ function joinMatch(matchId, { onFail = null } = {}) {
       }
     },
     onWelcome: (info) => {
-      mySeat = info.playerId;
-      if (info.spectator) setInviteState('Match is full — watching');
+      const you = info.you || {};
+      mySeat = you.slot === undefined ? null : you.slot;
+      lobby().setSeat(mySeat, you.host);
+      if (you.spectator) lobby().setNotice('This match is full — you are watching.');
     },
-    onLobby: (msg) => renderLobby(msg.seats, client),
+    onLobby: (msg) => {
+      lobby().setSeat(client.state.playerId, client.state.host);
+      lobby().onLobby(msg);
+    },
     onSeats: null,
     onError: (reason) => {
       const msg = reason === 'no-such-match'
         ? 'That match has finished or expired. Start a new one.'
         : `Connection problem: ${reason}`;
-      setInviteState(msg, true);
+      lobby().setNotice(msg);
       if (onFail) onFail(reason);
     },
   });
@@ -162,105 +168,62 @@ function joinMatch(matchId, { onFail = null } = {}) {
   return client;
 }
 
-function setInviteState(text, isError = false) {
-  if (!inviteState) return;
-  inviteState.textContent = text;
-  inviteState.classList.toggle('error', !!isError);
-}
-
 // Which seat the server gave us, so the lobby can say "you" rather than making
 // somebody count chairs.
 let mySeat = null;
 
-/**
- * Draw the lobby: who is here, who has readied, and the button to ready up.
- *
- * The whole point is that this screen *waits*. The previous version connected
- * and launched in the same breath, so the invite link existed for about one
- * frame — long enough to see, nowhere near long enough to send to anybody.
- */
-function renderLobby(seats, client) {
-  if (!lobbyList) return;
-  lobbyList.textContent = '';
-  for (const s of seats) {
-    const row = document.createElement('li');
-    row.className = `lobby-row${s.ready ? ' is-ready' : ''}`;
-    const who = document.createElement('span');
-    who.textContent = `Player ${s.seat + 1}${s.seat === mySeat ? ' (you)' : ''}`;
-    const status = document.createElement('span');
-    status.className = 'lobby-status';
-    status.textContent = !s.filled ? 'not here yet' : s.ready ? 'ready' : 'not ready';
-    row.append(who, status);
-    lobbyList.appendChild(row);
+// The lobby screen, built on demand. It owns eight chairs, their teams and the
+// Start button; see ui/lobby.js. Everything it draws comes from the server's
+// `lobby` broadcast, so eight phones show the same room.
+let lobbyView = null;
+function lobby() {
+  if (!lobbyView) {
+    lobbyView = createLobby({
+      root: document.getElementById('lobby-root'),
+      net,
+      onLaunch: (cfg) => startOffline(cfg),
+    });
   }
-
-  const everyone = seats.every((s) => s.filled);
-  const me = seats.find((s) => s.seat === mySeat);
-  if (readyBtn) {
-    readyBtn.hidden = mySeat === null;
-    readyBtn.disabled = false;
-    readyBtn.classList.toggle('is-on', !!(me && me.ready));
-    readyBtn.textContent = me && me.ready ? "Ready — tap to cancel" : "I'm ready";
-    readyBtn.onclick = () => {
-      const next = !(me && me.ready);
-      client.setReady(next);
-      // Optimistic, because the round trip is short and a button that does
-      // nothing for 80ms feels broken. The server's lobby message redraws it.
-      readyBtn.classList.toggle('is-on', next);
-      readyBtn.textContent = next ? 'Ready — tap to cancel' : "I'm ready";
-    };
-  }
-
-  if (!everyone) setInviteState('Waiting for your friend to open the link…');
-  else if (!seats.every((s) => s.ready)) setInviteState('Both here. Ready up to begin.');
-  else setInviteState('Starting…');
-  if (invite) invite.classList.toggle('ready', everyone);
+  return lobbyView;
 }
 
-function showInvite(matchId) {
-  if (!invite) return;
-  const url = inviteLink(matchId);
-  invite.hidden = false;
-  if (inviteUrl) {
-    inviteUrl.textContent = url;
-    inviteUrl.href = url;
-  }
+/** Open the lobby card, hiding the buttons that led here. */
+function showLobby() {
+  if (invite) invite.hidden = false;
   if (startBtn) startBtn.hidden = true;
   if (resumeBtn) resumeBtn.hidden = true;
   if (friendBtn) friendBtn.hidden = true;
-  if (inviteCopy) {
-    inviteCopy.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(url);
-        inviteCopy.textContent = 'Copied';
-      } catch {
-        // Clipboard is gated on a permission a phone may refuse. The link is on
-        // screen and selectable, so this is a downgrade, not a failure.
-        inviteCopy.textContent = 'Copy failed — select it';
-      }
-    };
-  }
+  if (skirmishBtn) skirmishBtn.hidden = true;
+  lobby();
+}
+
+/** An offline match, built from the lobby's own roster. */
+function startOffline(cfg) {
+  clearSave();
+  enterGame();
+  launch(cfg.seed, null, null, cfg.roster, { width: cfg.width, height: cfg.height });
 }
 
 /** "Play a friend": ask the server for a room, show the link, take a seat. */
 async function playAFriend() {
   if (friendBtn) friendBtn.disabled = true;
-  setInviteState('Creating a match…');
-  if (invite) invite.hidden = false;
+  showLobby();
+  lobby().setNotice('Creating a match…');
   try {
     const res = await fetch('/api/match', { method: 'POST' });
     if (!res.ok) throw new Error(`server said ${res.status}`);
     const { id } = await res.json();
     // The link goes up before the socket does, so it can be sent while this
     // player is still connecting.
-    showInvite(id);
+    showLobby();
+    lobby().setInvite(inviteLink(id));
     history.replaceState(null, '', inviteLink(id));
     joinMatch(id);
   } catch (err) {
     if (friendBtn) friendBtn.disabled = false;
-    setInviteState(
-      `Could not start a match: ${err.message}. This build needs the match server ` +
-      '(npm run server) — a static host cannot do multiplayer.', true);
+    lobby().setNotice(
+      `Could not start a match: ${err.message}. This build needs the match server `
+      + '(npm run server) — a static host cannot do multiplayer.');
   }
 }
 
@@ -330,6 +293,17 @@ function boot() {
     friendBtn.addEventListener('click', playAFriend);
   }
 
+  // The same lobby, offline. "Start Skirmish" is still one tap to the classic
+  // 1v1; this is the door to everything the roster can now be — eight seats, two
+  // teams, seven computers — without a server in the way.
+  if (skirmishBtn) {
+    skirmishBtn.hidden = false;
+    skirmishBtn.addEventListener('click', () => {
+      showLobby();
+      lobby().setNotice('');
+    });
+  }
+
   const again = document.getElementById('btn-again');
   again.addEventListener('click', () => {
     document.getElementById('endcard').hidden = true;
@@ -348,8 +322,9 @@ function boot() {
   // to a friend's match did not come here to resume their own.
   if (params.has('m')) {
     const matchId = params.get('m');
-    showInvite(matchId);
-    setInviteState('Joining…');
+    showLobby();
+    lobby().setInvite(inviteLink(matchId));
+    lobby().setNotice('Joining…');
     joinMatch(matchId);
     return;
   }

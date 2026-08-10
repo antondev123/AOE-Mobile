@@ -116,7 +116,7 @@ export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = 
   const history = [];
   let over = null;
 
-  world.events.on(EV.GAME_OVER, ({ winner }) => { over = { winner }; });
+  world.events.on(EV.GAME_OVER, ({ winner, winnerTeam }) => { over = { winner, team: winnerTeam ?? null }; });
 
   /** Stamp a command for a future tick and return the tick it will fire on. */
   function submit(cmd, { delay = COMMAND_DELAY } = {}) {

@@ -51,6 +51,22 @@ async function newMatch(port) {
   return res.json();
 }
 
+/**
+ * Take a lobby to a running match.
+ *
+ * The room holds no world until this happens: player count and map size are
+ * lobby decisions, so there is nothing to build until the roster settles. And
+ * beginning is the host pressing a button rather than a side effect of the last
+ * person readying up, because with AI chairs "everyone is ready" can be true the
+ * instant the room exists.
+ */
+async function begin(clients) {
+  for (const c of clients) c.send({ type: 'ready', ready: true });
+  await new Promise((r) => setTimeout(r, 120));
+  clients[0].send({ type: 'start' });
+  await Promise.all(clients.map((c) => c.await((m) => m.type === 'start')));
+}
+
 test('two clients join one match, get different seats, and exchange commands', async (t) => {
   const { server, port, rooms } = await startServer(0);
   t.after(() => server.close());
@@ -62,13 +78,15 @@ test('two clients join one match, get different seats, and exchange commands', a
 
   assert.equal(a.hello.type, 'welcome');
   assert.equal(b.hello.type, 'welcome');
-  assert.equal(a.hello.playerId, 0);
-  assert.equal(b.hello.playerId, 1);
+  assert.equal(a.hello.you.slot, 0);
+  assert.equal(b.hello.you.slot, 1);
   assert.equal(a.hello.seed, b.hello.seed, 'players were given different seeds');
-  assert.ok(a.hello.snapshot, 'no snapshot for a joining player');
+  assert.equal(a.hello.phase, 'lobby', 'a fresh room waits in its lobby');
+  assert.equal(a.hello.snapshot, null, 'and has no world to hand out yet');
 
-  // Both seats are now human.
+  // Both seats are now human, and the host starts the match.
   const room = rooms.get(id);
+  await begin([a, b]);
   assert.deepEqual(room.match.roster.map((s) => s.kind), ['human', 'human']);
 
   // A command from A must reach B, stamped with A's seat and with a tick that
@@ -79,8 +97,8 @@ test('two clients join one match, get different seats, and exchange commands', a
   const sentAt = room.match.tick;
   a.send({ type: 'cmd', cmd: { t: 'order', units: mine.slice(0, 2), order: { type: 'move', gx: 44, gy: 44 } } });
 
-  const sched = await b.await((m) => m.type === 'sched' && m.cmd.t === 'order');
-  assert.equal(sched.cmd.p, 0, 'the command did not carry the sender seat');
+  const sched = await b.await((m) => m.type === 'sched' && m.cmds[0].t === 'order');
+  assert.equal(sched.cmds[0].p, 0, 'the command did not carry the sender seat');
   assert.ok(sched.at > sentAt, 'the command was scheduled for a tick already gone');
 });
 
@@ -93,11 +111,13 @@ test('the server assigns the seat, so a forged one is ignored', async (t) => {
   const b = await connect(port, id);
   t.after(async () => { await a.close(); await b.close(); });
 
+  await begin([a, b]);
+
   // B (seat 1) claims to be seat 0.
   b.send({ type: 'cmd', cmd: { t: 'allocationOn', p: 0, on: true } });
 
-  const sched = await b.await((m) => m.type === 'sched' && m.cmd.t === 'allocationOn');
-  assert.equal(sched.cmd.p, 1, 'a client forged another players seat');
+  const sched = await b.await((m) => m.type === 'sched' && m.cmds[0].t === 'allocationOn');
+  assert.equal(sched.cmds[0].p, 1, 'a client forged another players seat');
 });
 
 test('a third client may watch but never gets a seat', async (t) => {
@@ -110,9 +130,8 @@ test('a third client may watch but never gets a seat', async (t) => {
   const c = await connect(port, id);
   t.after(async () => { await a.close(); await b.close(); await c.close(); });
 
-  assert.equal(c.hello.spectator, true);
-  assert.equal(c.hello.playerId, null);
-  assert.ok(c.hello.snapshot, 'a spectator got no world to watch');
+  assert.equal(c.hello.you.spectator, true);
+  assert.equal(c.hello.you.slot, null);
 });
 
 // The seat used to go to an AI here, which read better and was wrong: a client
@@ -131,16 +150,16 @@ test('a disconnect frees the seat without letting an AI desync it, and rejoining
   t.after(async () => { await a.close(); });
 
   const room = rooms.get(id);
-  assert.deepEqual(room.match.roster.map((s) => s.kind), ['human', 'human']);
+  assert.deepEqual(room.config.slots.map((s) => s.kind), ['human', 'human']);
 
   await b.close();
-  await a.await((m) => m.type === 'seats' && m.seats[1] === 'open');
-  assert.equal(room.match.roster[1].kind, 'open', 'the empty seat was not freed');
+  await a.await((m) => m.type === 'lobby' && m.slots[1].kind === 'open');
+  assert.equal(room.config.slots[1].kind, 'open', 'the empty seat was not freed');
 
   const b2 = await connect(port, id);
   t.after(async () => { await b2.close(); });
-  assert.equal(b2.hello.playerId, 1, 'the freed seat was not handed back');
-  assert.equal(room.match.roster[1].kind, 'human');
+  assert.equal(b2.hello.you.slot, 1, 'the freed seat was not handed back');
+  assert.equal(room.config.slots[1].kind, 'human');
 });
 
 test('joining a match that does not exist is refused, not crashed', async (t) => {
@@ -167,15 +186,19 @@ test('the match clock is held in the lobby and advances once both players are re
   const b = await connect(port, id);
   t.after(async () => { await a.close(); await b.close(); });
 
-  assert.equal(a.hello.started, false, 'the match started before anybody was ready');
+  assert.equal(a.hello.phase, 'lobby', 'the match started before anybody was ready');
   await new Promise((r) => setTimeout(r, 400));
-  assert.equal(room.match.tick, 0, 'the clock ran while the room was still in its lobby');
+  assert.equal(room.match, null, 'a world was built while the room was still a lobby');
 
   a.send({ type: 'ready', ready: true });
   await new Promise((r) => setTimeout(r, 150));
-  assert.equal(room.started, false, 'one player readying up started the match');
+  assert.equal(room.phase, 'lobby', 'one player readying up started the match');
 
+  // The host presses Start. With AI chairs "everyone ready" can be true the
+  // instant a room exists, so beginning is a decision rather than a side effect.
   b.send({ type: 'ready', ready: true });
+  await new Promise((r) => setTimeout(r, 150));
+  a.send({ type: 'start' });
   await b.await((m) => m.type === 'start');
 
   const t0 = room.match.tick;
