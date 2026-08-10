@@ -46,18 +46,22 @@ async function play(page, seconds) {
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
 }
 
-/** Point the camera at a world position and settle the zoom. */
-async function look(page, wx, wy, zoom) {
+/**
+ * Point the camera at a GRID position and settle the zoom.
+ *
+ * Grid, not world pixels — renderer.centerOn takes tile coordinates and does
+ * the projection itself. Handing it pixels puts the camera several thousand
+ * tiles off the map and produces a screenshot of the background colour, which
+ * is exactly what the first run of this tool produced.
+ *
+ * Zoom is set first so that centerOn is clamping against the viewport the shot
+ * will actually be taken at.
+ */
+async function look(page, gx, gy, zoom) {
   await page.evaluate(([x, y, z]) => {
-    const g = window.__game;
-    if (g.renderer && g.renderer.centerOn) g.renderer.centerOn(x, y);
-    else {
-      const cam = window.__phaser.scene.scenes[0].cameras.main;
-      cam.centerOn(x, y);
-      if (z) cam.setZoom(z);
-    }
     if (z) window.__phaser.scene.scenes[0].cameras.main.setZoom(z);
-  }, [wx, wy, zoom]);
+    window.__game.renderer.centerOn(x, y);
+  }, [gx, gy, zoom]);
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => r())));
 }
 
@@ -82,15 +86,12 @@ async function reveal(page) {
   await page.evaluate(() => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r))));
 }
 
-/** World pixel position of a player's first building of a type. */
+/** Grid position of a player's first building of a type. */
 function findBuilding(page, player, type) {
   return page.evaluate(([p, t]) => {
     const w = window.__game.world;
     const b = w.buildings.find((e) => !e.dead && e.player === p && (!t || e.type === t));
-    if (!b) return null;
-    const HALF_W = 32;
-    const HALF_H = 16;
-    return { wx: (b.x - b.y) * HALF_W, wy: (b.x + b.y) * HALF_H, x: b.x, y: b.y };
+    return b ? { x: b.x, y: b.y } : null;
   }, [player, type]);
 }
 
@@ -109,11 +110,11 @@ try {
   if (want('economy')) {
     await play(page, 150);
     const tc = await findBuilding(page, 0, 'towncenter');
-    if (tc) await look(page, tc.wx, tc.wy, 0.7);
+    if (tc) await look(page, tc.x, tc.y, 0.7);
     await shot(page, 'economy-070', 'two and a half minutes in, default zoom');
-    if (tc) await look(page, tc.wx, tc.wy, 1.2);
+    if (tc) await look(page, tc.x, tc.y, 1.2);
     await shot(page, 'economy-120', 'the same town, zoomed in');
-    if (tc) await look(page, tc.wx, tc.wy, 0.55);
+    if (tc) await look(page, tc.x, tc.y, 0.55);
     await shot(page, 'economy-055', 'the same town, zoomed out');
   }
 
@@ -121,12 +122,11 @@ try {
   // The middle of the map is most of what a player looks at while moving an
   // army, and it is the frame with nothing in it to distract from the ground.
   if (want('terrain')) {
-    await page.evaluate(() => {
+    const mid = await page.evaluate(() => {
       const w = window.__game.world;
-      const cam = window.__phaser.scene.scenes[0].cameras.main;
-      cam.centerOn(((w.width / 2) - (w.height / 2)) * 32, ((w.width / 2) + (w.height / 2)) * 16);
-      cam.setZoom(0.7);
+      return { x: w.width / 2, y: w.height / 2 };
     });
+    await look(page, mid.x, mid.y, 0.7);
     await reveal(page);
     await shot(page, 'terrain-mid', 'the middle of the map — ground, rock and water (fog lifted)');
   }
@@ -135,7 +135,7 @@ try {
   if (want('midgame') || want('battle')) {
     await play(page, 210);
     const tc = await findBuilding(page, 0, 'towncenter');
-    if (tc) await look(page, tc.wx, tc.wy, 0.7);
+    if (tc) await look(page, tc.x, tc.y, 0.7);
     await shot(page, 'midgame', 'six minutes in — a built-up base');
   }
 
@@ -164,7 +164,7 @@ try {
       return best;
     });
     if (hot) {
-      await look(page, (hot.x - hot.y) * 32, (hot.x + hot.y) * 16, 0.85);
+      await look(page, hot.x, hot.y, 0.85);
       await shot(page, 'battle', `the busiest ground on the map (${hot.n} units)`);
     }
   }

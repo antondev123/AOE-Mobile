@@ -25,7 +25,7 @@
 // worked, emptied and retasked away from identically; the only difference is
 // that a farm is a building, so distances to it use edgeDist().
 
-import { dirIndex, hyp, dirForId } from '../core/iso.js';
+import { dirIndex, hyp, dirForId, dirVec } from '../core/iso.js';
 import {
   UNIT_STATS, ARMOR_CLASS, STANCE, FORMATION, DEFAULT_FORMATION,
   FORMATION_SPACING, SPREAD_SPACING,
@@ -46,7 +46,7 @@ import {
 import {
   inRange, canAttack, attackReach, stanceOf, setStance, isGarrisoned,
   garrisonUnit, garrisonRefusal, garrisonCount, garrisonCapacity,
-  nearestShelter, ungarrisonUnit,
+  nearestShelter, ungarrisonUnit, tooClose, minAttackReach,
 } from './combat.js';
 
 // --- Tuning -----------------------------------------------------------------
@@ -146,6 +146,29 @@ const SEP_DEADBAND = 0.02;
 // is chosen deliberately (see sidestep below).
 const HEAD_ON_DOT = -0.5;
 const SIDESTEP_MIN = 0.35;
+
+// Backing off a target that has closed inside a siege engine's minimum range.
+//
+// The margin is how far PAST the minimum the engine tries to get, and it is not
+// zero for two reasons. Stopping exactly on the boundary means the next step the
+// enemy takes puts the engine back inside it, so a mangonel and a knight would
+// spend the fight shuffling a tile back and forth and the mangonel would never
+// finish a four-second reload. And separation steering shoves units around by
+// up to a third of a step, which on its own is enough to cross a line drawn that
+// finely. Three quarters of a tile is comfortably more than either, and still
+// well inside the seven tiles the engine can shoot: it backs up a step and
+// fires, it does not run away.
+const BACKPEDAL_MARGIN = 0.75;
+// How far the thing being backed away from has to move before the retreat is
+// re-planned. Same figure the approach uses (a target that shifts a tile has not
+// changed the problem), and paid for the same reason: A* is rationed.
+const BACKPEDAL_REPATH = 1.2;
+// How many headings are tried when the straight line away from the target is
+// blocked, fanned off it by BACKPEDAL_FAN_STEP a time (see withdrawPoint). A
+// siege engine with its back to a wall should sidle along the wall rather than
+// give up and stand there being killed; six candidates covers a 67 degree arc
+// to either side, which is every direction that is still meaningfully "away".
+const BACKPEDAL_FANS = 6;
 
 // How close a unit has to get to a building before it can step inside it. The
 // same order of magnitude as BUILD_REACH — you garrison from the doorstep, not
@@ -638,11 +661,24 @@ function orderAttack(world, list, order, ctx) {
     u.target = t;
     // Move now; the state machine stops the unit the moment it is in range.
     if (!inRange(u, t)) {
-      const p = approachPoint(world, u, t);
-      requestPath(world, u, p.x, p.y, ctx, true);
-      u.state = 'move';
-      task.lastX = t.x;
-      task.lastY = t.y;
+      // Out of range in one of two directions. A siege engine told to shoot
+      // something already standing on it has to walk the other way, and it has
+      // to do it on the step the order was given like every other order does —
+      // tickAttack would correct an approach on the next step, but the unit
+      // would have taken a stride toward the thing it is trying to get away
+      // from, and the player would have watched it do that.
+      const back = tooClose(u, t);
+      const p = back ? withdrawPoint(world, u, t) : approachPoint(world, u, t);
+      if (p) requestPath(world, u, p.x, p.y, ctx, true);
+      u.state = p ? 'move' : 'idle';
+      if (back) {
+        task.backingOff = true;
+        task.backFromX = t.x;
+        task.backFromY = t.y;
+      } else {
+        task.lastX = t.x;
+        task.lastY = t.y;
+      }
     } else {
       clearMovement(u);
       u.state = 'attack';
@@ -696,6 +732,128 @@ function approachPoint(world, u, target) {
     if (stand) return stand;
   }
   return { x: target.x, y: target.y };
+}
+
+// --- Minimum range ----------------------------------------------------------
+//
+// A mangonel cannot depress its arm far enough to hit what is standing on it,
+// and combat.js says so: inRange() is false for anything inside minAttackReach.
+// That refusal on its own would be a bug rather than a mechanic — the engine
+// would hold a target, be told it cannot fire, and stand there being killed by
+// it while a four-second reload it can never spend ticks over. The mechanic is
+// the other half, and it lives here because *moving is this module's job*: the
+// engine walks backwards until the fight is at a distance it can shoot into.
+//
+// Which is also what makes the whole thing a real decision rather than a
+// penalty. A knight that reaches a mangonel has genuinely taken it out of the
+// battle for as long as it stays on it; the answer is to escort the engine, and
+// the counterplay is to send something fast at it. Nothing else in the roster
+// has any of this: tooClose() returns false on the first property read for
+// every unit that declares no minRange, which is all of them but two.
+
+// A sixteenth of a turn, in dirVec's 64-direction table: 22.5 degrees.
+const BACKPEDAL_FAN_STEP = 4;
+
+/**
+ * Where to stand so that `target` is back outside the minimum range — the
+ * mirror of approachPoint above, and deliberately shaped like it.
+ *
+ * The first candidate is straight back along the line from the target, which is
+ * what a crew shoving an engine away from a swordsman actually does. When that
+ * ground is not walkable (a wall, the sea, the map edge) the heading is fanned
+ * off to either side in 22.5 degree steps, so an engine with its back to a wall
+ * sidles along the wall instead of grinding into it. Alternating left and right
+ * off the straight line rather than sweeping one way keeps the answer symmetric:
+ * two mangonels in the same spot back away the same distance, not one of them
+ * around a corner.
+ *
+ * Returns null when there is genuinely nowhere to go, which the caller has to
+ * handle — an engine cornered in a pocket is a unit that has been caught, and
+ * pretending otherwise would have it walking into masonry forever.
+ */
+function withdrawPoint(world, u, target) {
+  const want = minAttackReach(u, target) + BACKPEDAL_MARGIN;
+  let ax = u.x - target.x;
+  let ay = u.y - target.y;
+  let d = hyp(ax, ay);
+  if (d <= 1e-6) {
+    // Standing exactly on top of it — which happens, because units overlap
+    // while separation is unpicking a crowd. Any heading will do provided every
+    // peer picks the SAME one, and that is exactly what dirForId is for: a
+    // stable direction per entity id, with no call into the world's RNG stream
+    // and no transcendental. See the note on it in core/iso.js.
+    const v = dirForId(u.id);
+    ax = v[0];
+    ay = v[1];
+    d = 1;
+  }
+  ax /= d;
+  ay /= d;
+
+  for (let i = 0; i <= BACKPEDAL_FANS; i++) {
+    // 0, -22.5, +22.5, -45, +45, ... off the straight line away from the target.
+    const k = ((i + 1) >> 1) * BACKPEDAL_FAN_STEP * (i % 2 === 0 ? 1 : -1);
+    const rot = dirVec(k);
+    // Rotating a vector by a table entry is four multiplies and two adds —
+    // arithmetic the spec pins to the bit. Never Math.cos/Math.sin here.
+    const dx = ax * rot[0] - ay * rot[1];
+    const dy = ax * rot[1] + ay * rot[0];
+    const p = walkablePoint(
+      world,
+      clamp(target.x + dx * want, 0, world.width - 1),
+      clamp(target.y + dy * want, 0, world.height - 1),
+    );
+    if (p) return p;
+  }
+  return null;
+}
+
+/**
+ * Walk out of the hole in the middle of this unit's range, then fight.
+ *
+ * Shaped like the approach in tickAttack — one path request, re-planned only
+ * when the thing being backed away from has actually moved — because it is the
+ * same problem with the sign flipped and it has to be rationed the same way.
+ * The task carries the bookkeeping (`backingOff`, `backFromX/Y`) so that an
+ * ordered attack and an attack-move can both use it without either one growing
+ * a second state machine.
+ */
+function backAway(world, u, target, t, ctx) {
+  u.target = target;
+  const moved = t.backFromX === undefined
+    ? Infinity
+    : hyp(target.x - t.backFromX, target.y - t.backFromY);
+
+  if (!t.backingOff || !u.dest || (moved > BACKPEDAL_REPATH && u.repathTimer <= 0)) {
+    t.backingOff = true;
+    t.backFromX = target.x;
+    t.backFromY = target.y;
+    u.repathTimer = REPATH_COOLDOWN;
+    // A retreat is not a failed advance: whatever the approach had counted
+    // against this task is about a different destination entirely.
+    u.aiFails = 0;
+    const p = withdrawPoint(world, u, target);
+    if (!p) {
+      // Cornered. Hold still rather than shuffle: the unit keeps its target, so
+      // the moment the enemy steps back out of the minimum it fires.
+      clearMovement(u);
+      u.state = 'idle';
+      return;
+    }
+    requestPath(world, u, p.x, p.y, ctx, false);
+  }
+  u.state = 'move';
+}
+
+/** Done backing off: forget the retreat so the approach re-plans from here. */
+function endBackAway(u, t) {
+  if (!t.backingOff) return;
+  t.backingOff = false;
+  t.backFromX = undefined;
+  t.backFromY = undefined;
+  t.lastX = undefined;
+  t.lastY = undefined;
+  clearMovement(u);
 }
 
 function beginGatherTask(world, u, node, ctx, stand) {
@@ -1123,12 +1281,23 @@ function tickMove(world, u, dt, ctx) {
     const target = u.target;
     if (target && canAttack(u, target)) {
       if (inRange(u, target)) {
+        endBackAway(u, t);
         clearMovement(u);
         u.state = 'attack';
         u.facing = dirIndex(target.x - u.x, target.y - u.y);
         t.engaging = true;
         return;
       }
+      // Inside the minimum range: open the distance first. `engaging` stays
+      // true through the retreat, so when the fight ends the unit picks the
+      // advance back up from wherever it backed off to rather than treating the
+      // retreat as the order it was given.
+      if (tooClose(u, target)) {
+        t.engaging = true;
+        backAway(world, u, target, t, ctx);
+        return;
+      }
+      endBackAway(u, t);
       // Close the gap. Repath only when the quarry has actually moved, exactly
       // as an ordered attack does.
       const moved = t.lastX === undefined
@@ -1148,6 +1317,7 @@ function tickMove(world, u, dt, ctx) {
     if (t.engaging) {
       // Nothing left to fight here — resume the advance from where we stand.
       t.engaging = false;
+      t.backingOff = false;
       t.lastX = undefined;
       t.lastY = undefined;
       u.aiFails = 0;
@@ -1490,6 +1660,7 @@ function tickAttack(world, u, dt, ctx) {
   }
 
   if (inRange(u, target)) {
+    endBackAway(u, t);
     clearMovement(u);
     // combat.js sets facing while swinging; set it now so the very first frame
     // of the engagement already looks at the enemy.
@@ -1510,6 +1681,17 @@ function tickAttack(world, u, dt, ctx) {
     u.state = 'idle';
     return;
   }
+
+  // Out of range in the *other* direction: something has walked inside this
+  // unit's minimum and the weapon will not bear. Backing off is checked after
+  // Stand Ground on purpose — a unit told to hold its ground holds it, and a
+  // siege engine that retreated from its post while standing ground would be
+  // the stance quietly meaning something else for two units in the roster.
+  if (tooClose(u, target)) {
+    backAway(world, u, target, t, ctx);
+    return;
+  }
+  endBackAway(u, t);
 
   u.target = target;
   u.state = 'move';

@@ -49,6 +49,11 @@ export const EV = {
 
   // { entity, target, amount } — damage actually applied (post-armor)
   DAMAGE: 'damage',
+  // { entity, target, amount } — a healer restored hitpoints. Emitted on a fixed
+  // beat (HEAL_PULSE in systems/combat.js) rather than once per sim step, for
+  // the same reason BUILD_TICK is: mending is continuous, a glow is not.
+  // `amount` is the hitpoints restored since the previous pulse.
+  HEAL: 'heal',
   // { player, entity, gx, gy } — one of this player's things is being attacked.
   // Throttled by the emitter: this drives an alert, not a damage log.
   UNDER_ATTACK: 'underAttack',

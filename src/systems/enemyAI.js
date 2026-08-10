@@ -16,12 +16,36 @@
 //   0:00  first House the moment wood allows (the TC alone only gives 5 pop)
 //   ~1:30 gold assignment opens up so military is affordable
 //   ~1:45 Barracks; Mill if the berries are a long walk
+//   ~2:30 Lumber Camp — half for the haul, half because a base whose only wood
+//         drop-off is its Town Center cannot rebuild after losing it
 //   ~3:00 Farms, once the berries within working range thin out — and from then
 //         on continuously, because a farm is spent as fast as it is worked
-//   ~2:00 militia + archers train continuously, aiming at 2:1 melee:ranged
+//   ~2:00 militia + spearmen train continuously (the Barracks trains nothing
+//         else now), aiming at whatever the counter table says
 //   ~2:55 first wave: 5 units, sent as one group at a soft edge of your base
 //         (it lands on your town around 3:45)
 //   then  a wave every 90-125 s, +2 units each wave, capped at 16
+//   ~7:00 Feudal Age (6:20-9:20 across seeds), and immediately the building that
+//         turns it into units: an Archery Range or a Stable, whichever answers
+//         what the player has been seen fielding. Then the Blacksmith, then the
+//         second of the two arms.
+//   ~9:00 Castle Age (8:10-11:10, on five seeds out of six): Knights out of the
+//         Stable, and a Siege Workshop for the scorpions and rams that finish a
+//         town the waves keep bouncing off.
+//
+// Both ages are *saved up for* rather than waited for — see the age-up push
+// under AGE_PUSH_VILLAGERS. Before it existed the Feudal Age landed at 8:40 and
+// the Castle Age did not land at all, because the economy consumed its own
+// surplus at exactly the rate it produced it, and everything above from 7:00
+// onwards was content no player ever saw.
+//
+// A note on why the Feudal Age matters so much more than it used to. The archer
+// and the scout used to be Barracks units, so a single 175-wood building put all
+// three arms on the map in the Dark Age. They are Archery Range and Stable units
+// now, and both are Feudal — so until the age-up this AI's army is genuinely,
+// correctly infantry-only, and the age-up is the moment its composition problem
+// becomes solvable. An AI that never built the second building would field
+// militia and spearmen for ten minutes; see buildingWishlist.
 //
 // Measured over eight seeds: 4-5 waves in ten minutes, gaps 95-120 s, every
 // wave reaching the player's town. A wave that gets wiped costs it ~135 s of
@@ -48,7 +72,7 @@ import { commandUnits, isIdle } from './unitAI.js';
 import { armorClassOf, isGarrisoned, garrisonCapacity, garrisonCount, ungarrisonAll } from './combat.js';
 import {
   AGE, TECHS, currentAge, hasTech, techsAt, queueResearch, researchRefusal,
-  nextAgeTech,
+  nextAgeTech, unitUnlocked,
 } from './tech.js';
 import { hyp, dirVec, DIR_COUNT } from '../core/iso.js';
 
@@ -99,23 +123,32 @@ const ORDERS_PER_STEP = 2;
 //
 // So food does not set the cap any more; population does — but not the engine's
 // any more either. MAX_POP_CAP is now 200 (AoE2's default), and this AI does not
-// try to fill it: MAX_HOUSES below holds it to a 50-pop economy, which is the
+// try to fill it: MAX_HOUSES below holds it to a 65-pop economy, which is the
 // shape of opening that is actually tested. A wave tops out at MAX_WAVE_SIZE
 // (16) and the AI wants a standing army of roughly that plus replacements — call
-// it 26 pop — to keep launching full-sized waves while absorbing losses. 50 - 26
-// = 24 villagers, which is also about what this economy can keep employed: ~10
-// on food (2-3 farms running), ~8 on wood (farms and houses to pay for) and ~6
-// on gold. Growing past that is the enemy AI upgrade's job, not this pass's.
+// it 26 pop — to keep launching full-sized waves while absorbing losses, which
+// leaves 24 villagers with room to spare. Twenty-four is also about what this
+// economy can keep employed: ~13 on food (3-4 farms running), ~6 on wood (farms
+// and houses to pay for) and ~4 on gold.
 const MAX_VILLAGERS = 24;
 // ...but not before there is a Barracks. Villagers arrive faster than houses do,
 // and an economy booming to 24 keeps pushing "we are 2 off the cap, build a
 // house" in front of the Barracks, which pushed the first wave from ~4:15 out to
 // ~6:00. 16 is the old cap and the opening it produces is the tested one.
 const PRE_BARRACKS_VILLAGERS = 16;
-// TC(5) + 9 x 5 = 50 pop. This is the AI's own ceiling, not the engine's (see
+// TC(5) + 12 x 5 = 65 pop. This is the AI's own ceiling, not the engine's (see
 // MAX_VILLAGERS above): the pop cap is 200, and stopping here is a deliberate
 // choice about how large an economy this opening knows how to run.
-const MAX_HOUSES = 9;
+//
+// Nine houses (50 pop) was that choice while the roster was three units wide,
+// and the Castle Age is what broke it. 24 villagers and a full-sized army of
+// militia and spearmen *is* fifty population, so the AI arrived in the Castle
+// Age with no room to put a Knight in: measured over six seeds, the Castle Age
+// landed on five of them and not one trained a single Castle Age unit, because
+// every slot had already been filled with the cheapest thing the Barracks made.
+// Three more houses are 75 wood and fifteen population, which is the room the
+// last three minutes of a match need to look different from the first three.
+const MAX_HOUSES = 12;
 const FOOD_SCAN = 26;          // how far out we count food still in the ground
 
 // Farms. FARM_SCAN is the radius that counts as "berries we can actually work
@@ -131,6 +164,139 @@ const MAX_FARMS = 8;
 const BARRACKS_TIME = 105;     // earliest barracks (seconds)
 const BARRACKS2_TIME = 330;    // second barracks, for wave escalation
 const MILL_MIN_WALK = 5.0;     // build a Mill if berries are further than this
+
+// --- The rest of the build order --------------------------------------------
+//
+// Everything below arrived with the tech tree that split the Barracks up. Until
+// that pass one 175-wood building put all three arms on the map and the build
+// order could stop at "a Barracks, then a second Barracks"; it cannot now. The
+// Barracks trains militia and spearmen and nothing else, so an AI that builds
+// only Barracks fields an infantry-only army for the whole match — no ranged
+// unit, no cavalry, nothing that answers a player who masses either.
+//
+// THE FIRST LUMBER CAMP, as a matter of course rather than as the haul
+// optimisation campWanted() treats it as. Two reasons, and the second is the one
+// that made it a wishlist entry:
+//
+//   * income. It is the first building in every real AoE2 build order for a
+//     reason — the woodline is what every other building is priced in, and 100
+//     wood back into a shorter round trip is the cheapest compounding purchase
+//     on the list.
+//   * insurance, and this is not theoretical. While the Town Center is the only
+//     building that can bank a log, losing it is *unrecoverable*: every villager
+//     sent to the trees fills its pack, finds nowhere to put it and stands
+//     there, and the only building that fixes that costs 100 wood the AI can no
+//     longer earn. Measured before this entry existed, on the raze-at-250s
+//     scenario in tests/enemyai.test.mjs: the AI was left holding 82 wood, sat
+//     on it for the remaining six minutes, banked 1200 food it could not spend
+//     and never rebuilt anything. A camp standing before the raid is the whole
+//     difference, and it is 100 wood the AI was going to spend on a camp anyway.
+//
+// 150s puts it after the Barracks (105s) rather than in front of the opening,
+// and eight villagers is the point at which the workforce is large enough that
+// a shorter haul is worth more than one more House.
+const LUMBER_CAMP_TIME = 150;
+const LUMBER_CAMP_VILLAGERS = 8;
+// Wood that must survive the purchase, per building. This is the answer to the
+// standing objection against putting any of these ahead of the economy in the
+// wishlist: an entry that only fires with the float still in the bank cannot be
+// accused of taking the wood the next House (25) or field (60) was waiting on.
+//
+// The camp's own float is one field's worth and no more, deliberately. It is
+// the entry that has to fire *early* to be worth anything at all — a camp built
+// at 5:00 is a camp bought after the walk it was meant to shorten, and the
+// insurance half of the argument only pays if the camp is standing before the
+// raid rather than after it. Measured on the raze-at-250s scenario across five
+// seeds: at a float of 60 the camp landed in time on one seed in five, and at 30
+// it landed on four.
+const LUMBER_CAMP_WOOD_FLOAT = 30;
+// The Feudal military building — an Archery Range or a Stable, whichever
+// answers what we can see (see nextArmBuilding).
+//
+// It is gated on the *age* and not on a clock, because the age is the clock: an
+// archer, a skirmisher and a scout are all Feudal units now (AGE_UNITS in
+// tech.js), so before the age-up there is nothing for either building to train
+// and the AI's army is correctly infantry-only. Measured across seeds the
+// Feudal Age lands at 5:30-8:00, so this is a fifth-minute decision, which is
+// where a competent player puts it: the age-up, then the building that turns
+// the age into units, then the upgrades.
+//
+// Ten villagers is the same gate the age-up itself uses (AGE_UP_VILLAGERS), so
+// this can never be the thing that stops the economy growing; the wood float is
+// what keeps it from taking the food line's timber. Sixty rather than the camp's
+// thirty because this one does not have to be early to be worth having — by the
+// time the age lands the AI is banking wood in the low hundreds, and measured
+// across five seeds the tighter float bought nothing: the Range went up within a
+// few seconds of the same moment either way.
+const ARM_BUILDING_VILLAGERS = 10;
+// Thirty, and the number is not free-floating: it has to leave this entry's
+// total bar (175 + 30 = 205) *below* the bar of every entry that sits behind it
+// in the wishlist, or the list order is a lie. The forward camp at 3d asks for
+// 220 (100 + CAMP_WOOD_RESERVE), and at a float of 60 the Range asked for 235 —
+// so in the fifteen-wood window between them the AI reliably put up a third
+// Lumber Camp instead of the building it was supposedly prioritising. Measured
+// on seed 12345: three Lumber Camps, no Archery Range, ten minutes.
+const ARM_BUILDING_WOOD_FLOAT = 30;
+// Wood below which saving for the first arm is a bad trade — see the wishlist.
+// A hundred is about forty seconds of this economy's wood income away from the
+// 205 the building costs, which is a wait the food line can absorb; from fifty
+// it would be a minute and a half of no fields.
+const ARM_SAVING_FLOOR = 100;
+// The *second* arm — a Stable behind an Archery Range or the other way round —
+// is a third military building drawing on one population cap and one purse, so
+// it waits for an economy that can carry it. Fourteen villagers and a float of
+// 160 is roughly "the first one is paid off and the next House is not waiting".
+const ARM2_BUILDING_VILLAGERS = 14;
+const ARM2_BUILDING_WOOD_FLOAT = 160;
+// The two arms the Barracks used to stand in for, in the order they are
+// *considered* — nextArmBuilding scores them, so this is not a priority list,
+// only the set. The Barracks is not in it: it has its own clock (it is the Dark
+// Age opening and comes 150 seconds before either of these can train anything),
+// and the Siege Workshop is not either — it is not an arm you counter with, it
+// is a building-breaker, and it has its own entry with its own gates.
+const ARM_BUILDINGS = ['archeryrange', 'stable'];
+
+// The named per-type counters in `stats`, for the handful of types a test or a
+// report asks about by name. Everything else is counted in `stats.started`,
+// which is keyed by type and needs no maintenance — see startBuilding.
+const STARTED_STAT = {
+  house: 'housesStarted',
+  barracks: 'barracksStarted',
+  mill: 'millsStarted',
+  farm: 'farmsStarted',
+  lumbercamp: 'lumberCampsStarted',
+  miningcamp: 'miningCampsStarted',
+};
+// The Blacksmith. Behind an army, exactly as manageTech's own military-upgrade
+// gate is (MILITARY_TECH_MIN_ARMY): +1 attack on four militia is worth less than
+// the wood that pays for the next eight. It is 150 wood for a building that
+// trains nothing at all, and the only reason it is worth that is the ten
+// attack/armour techs that now live there and nowhere else.
+const BLACKSMITH_VILLAGERS = 12;
+const BLACKSMITH_WOOD_FLOAT = 100;
+// Castle Age. The Siege Workshop is the answer to a player who has walled up or
+// whose Town Center the waves keep bouncing off, and it is the last building on
+// the list: 200 wood, and everything it trains walks at half an army's pace.
+// Sixteen villagers is an economy that is genuinely finished with the buildings
+// in front of this one — measured, the Castle Age lands at 8:10-11:10, so in a
+// ten-minute match this is the last thing the AI ever starts and in a
+// twelve-minute one it has two or three minutes of scorpions out of it.
+const SIEGE_VILLAGERS = 16;
+// Sixty, not the 160 this started at. The bar has to clear the same test every
+// other entry ahead of the fields does — it must be reachable by a bank that the
+// House and the field are also drinking from — and 360 wood never was: measured
+// over six seeds, the Castle Age landed on five of them and not one ever bought
+// a Siege Workshop, because the late-game wood bank oscillates between about 100
+// and 400 and every peak was spent on the next field before it got there. 260 is
+// still two Houses and two fields clear of the building's own price.
+const SIEGE_WOOD_FLOAT = 60;
+// The University is gated on there being a tech to research there at all (see
+// the wishlist), so these are the numbers for the day one lands rather than a
+// prediction that it will. Eighteen villagers is past this AI's own booming
+// target and 200 of float is a full building in reserve: a research-only
+// building is the last thing a ten-minute match has time for.
+const UNIVERSITY_VILLAGERS = 18;
+const UNIVERSITY_WOOD_FLOAT = 200;
 
 // Population the Town Center may not take once there is somewhere to train
 // soldiers.
@@ -201,7 +367,32 @@ const MAX_WAVE_SIZE = 16;
 const WAVE_INTERVAL_MIN = 90;
 const WAVE_INTERVAL_MAX = 125;
 const WAVE_REGROUP_AFTER_LOSS = 135; // longer pause after a wave is wiped
+// How long a wave may be out before it is called home as a failure.
+//
+// THIS IS A FLOOR, NOT THE ANSWER — see waveTimeout(). Eighty seconds was
+// measured against a militia (1.1 tiles/second) crossing the ~85 tiles between
+// the two bases, which is 77 seconds of walking: the wave arrived with three
+// seconds to spare and anything slower than a militia did not arrive at all.
+// The roster is nine units wide now and the Barracks trains the *spearman*,
+// which walks at 1.0 — 85 seconds, five seconds past the recall. Measured on
+// seed 12345 with this as a flat number: three waves launched, three waves
+// turned around 12.7 tiles short of the player's Town Center, and the AI's
+// closest approach in ten minutes was a wave that was still walking when it was
+// told to come home. A ram (0.65) would never have arrived at all.
 const WAVE_TIMEOUT = 80;
+// ...so the real timeout is the march the squad actually has to make, at the
+// pace of its slowest member, plus half again for the fighting, the pathing
+// around a base and the stragglers. 1.5 is deliberately generous: the cost of
+// being too patient is a wave that stands in the enemy's town for another
+// thirty seconds, and the cost of being too impatient is the whole attack.
+const WAVE_MARCH_SLACK = 1.5;
+// ...and a ceiling on the result, because the wave clock and the wave *schedule*
+// share one squad: manageArmy will not launch the next wave while this one is
+// out, so a budget of 212 seconds (which is what 85 tiles at a mangonel's 0.6
+// works out to) would quietly turn a 90-125 s cadence into a three-minute one.
+// A siege unit that is still walking at 150 seconds is not going to change the
+// outcome of the attack it was sent on; the pressure arriving on schedule will.
+const WAVE_TIMEOUT_MAX = 150;
 const WAVE_BREATHER = 15;      // minimum regroup before the next launch
 
 const STAGING_DIST = 5.5;      // rally point, tiles from the TC toward the foe
@@ -210,6 +401,10 @@ const DEFEND_CLEAR_TIME = 12;  // all-clear delay before resuming offence
 const STUCK_WINDOW = 1.5;      // seconds between motion samples
 const STUCK_DIST = 0.4;        // moved less than this while "moving" = jammed
 const BUILD_RETRY_DELAY = 6;   // no infinite placement retries
+// Build time at or above which a foundation gets two villagers. See
+// staffConstruction: the Barracks is 38s and is the cheapest thing that has
+// always been worth a pair.
+const HEAVY_BUILD_TIME = 36;
 const FOUNDATION_STALL = 60;   // abandon a foundation nobody is finishing
 // Ground searches allowed in one think. Each one that gets far enough costs up
 // to MAX_REACH_CHECKS path queries, so this is what stops a base with three
@@ -251,7 +446,55 @@ const MIX_CEILING = 0.55;
 // What the AI builds when it has seen nothing of the player at all — the fog
 // means that is the normal state early on. AoE2's own default opening mix:
 // mostly infantry, a third archers, a scout out front.
-const DEFAULT_MIX = { militia: 0.45, archer: 0.35, scout: 0.2 };
+//
+// READ THESE AS PREFERENCES WITHIN ONE BUILDING'S ROSTER, not as shares of the
+// army. chooseUnit only ever compares the entries belonging to the same
+// building's `trains` list — the Barracks weighs militia against spearman, the
+// Archery Range weighs archer against skirmisher — so what matters is the
+// ordering inside each group and the size of the gap, which is what a counter
+// score (COUNTER_WEIGHT x the bonus table) has to overcome to change the AI's
+// mind. Anything not named here falls to 0.1 in chooseUnit, which is the "I
+// will build this only when the counter maths tells me to" weight.
+//
+// Barracks. Militia is the generalist and the opening body; the spearman is
+// left at the default because it is deliberately bad in a straight fight (4
+// attack against a militia's 6) and should only ever be picked when there is
+// cavalry on the map for its +12 to land on.
+//
+// Archery Range. The archer at 0.35 is the arm this building exists for and is
+// good against two of the three classes. The skirmisher sits low on purpose:
+// 3 attack loses to everything that is not an archer, so it must arrive as an
+// *answer* (its +4 vs the archer class, worth 8.8 through COUNTER_WEIGHT when
+// the player has massed them) rather than as a habit.
+//
+// Stable. The scout keeps its old 0.2 — it is a Feudal harasser, not a line
+// unit. The knight is the highest weight in the table because it is the Castle
+// Age payoff for having taken this building at all: 100 hitpoints and 10 attack
+// is the hardest body in the game, and an AI that reached the Castle Age with a
+// Stable standing should be spending its gold here. The age gate in chooseUnit
+// is what stops that weight putting knights on the map in the Feudal Age.
+//
+// Siege Workshop. All three sit below the line units, and that is the whole
+// point of the building rather than a reservation about it: they are slow
+// (0.6-0.7 tiles/second against a militia's 1.1), two of them cost 2 population
+// each, and a wave that is a third siege arrives a minute after the wave that
+// left with it. The ordering inside the group is scorpion first — cheapest,
+// fastest, and 8 damage with +4 against infantry is the one siege engine that
+// pays for itself against bodies — then the ram, whose +40 against masonry is
+// what actually finishes a Town Center the waves keep bouncing off, then the
+// mangonel last: its splash hurts OUR line too (see splashRadius in
+// constants.js), and this AI has no formation micro to keep it out of its own
+// army.
+const DEFAULT_MIX = {
+  militia: 0.45,
+  archer: 0.35,
+  scout: 0.2,
+  skirmisher: 0.12,
+  knight: 0.4,
+  scorpion: 0.2,
+  ram: 0.16,
+  mangonel: 0.12,
+};
 // Wood the army is never allowed to spend.
 //
 // Two of the five units cost wood, where the old two-unit roster had one, and
@@ -292,17 +535,115 @@ const GARRISON_HOLD = 8;
 // well.
 //
 // These two clocks are the *earliest* the AI will consider it, not when it
-// happens. Measured over five seeds of a full ten-minute match, the age-up
-// actually lands at 5:30-8:00 for the Feudal Age and 8:15-9:30 for the Castle,
-// because the money gate below binds long before the clock does — the Town
-// Center is training villagers non-stop and the barracks is training soldiers,
-// so 400 spare food takes a while to appear. That is the right shape: a human
-// who *chooses* to stop making villagers for forty seconds gets there first,
-// which is exactly the trade the age is supposed to be.
+// happens: the money gate binds long before the clock does, because the Town
+// Center trains villagers non-stop and the Barracks trains soldiers, so 400
+// spare food takes a while to appear. What changed with the new tech tree is how
+// much that lateness costs. It used to buy an age whose unlocks this AI barely
+// used; it now buys the Archery Range, the Stable, the Knight and the Siege
+// Workshop, which is to say the entire second half of the game — so the AI
+// stopped waiting for a surplus and started saving for one. See the age-up push
+// under AGE_PUSH_VILLAGERS, and expect the Feudal Age at 6:20-9:20 and the
+// Castle Age at 8:10-11:10, measured over six seeds of a twelve-minute match.
+//
+// The Castle clock is 7:00 rather than the 8:15 it started at, and it is there
+// to be non-binding: on every measured seed the Feudal Age lands after it, so
+// the AI starts saving for the Castle the moment it can and the *money* decides,
+// which is the honest gate. A clock that fires after the thing it gates is a
+// clock that only ever adds a delay nobody chose.
 const FEUDAL_AGE_TIME = 255;
-const CASTLE_AGE_TIME = 495;
+const CASTLE_AGE_TIME = 420;
 const AGE_UP_VILLAGERS = 10;
 const AGE_UP_VILLAGERS_CASTLE = 18;
+// --- The age-up push --------------------------------------------------------
+//
+// The villager count the workforce stops at while an age-up is due and unpaid.
+// This is the single change that got this AI into the Castle Age at all.
+//
+// The clocks above are the *earliest* the AI will consider an age; what actually
+// decided when it happened was money, and the money never arrived. Measured over
+// twelve minutes on seed 4242, minute by minute: gross food income 150-500 a
+// minute, and training spending 170-290 of it — every minute, all match. The
+// Town Center trains a villager every 16 seconds and a villager is 50 food,
+// which is 190 food a minute on its own, so the economy was consuming its own
+// surplus at exactly the rate it produced it and a 400-food age-up was simply
+// never reachable. The Feudal Age landed at 8:39. The Castle Age did not land at
+// all, on either of two seeds, and every unit and building behind it — the
+// Knight, the mangonel, the scorpion, the Siege Workshop, the Monastery — was
+// content no player would ever see.
+//
+// So the AI does what a player does and stops growing to click up. Fourteen
+// villagers plus the six or seven soldiers it has by then is about twenty
+// population, which is the shape of an AoE2 Feudal age-up; twenty villagers for
+// the Castle. It is deliberately expressed as a *cap on the workforce* rather
+// than as "pause the Town Center", because a cap cannot deadlock: an AI that has
+// not reached the cap keeps booming, and one that has stops spending 190 food a
+// minute on itself until the age is bought. Below the cap nothing changes at
+// all, which is why the opening is untouched.
+const AGE_PUSH_VILLAGERS = 14;
+const AGE_PUSH_VILLAGERS_CASTLE = 20;
+// ...and both halves of the hold only engage once this fraction of the age's
+// food bill is already in the bank.
+//
+// The fraction is doing two jobs. The first is safety: an economy that never
+// gets there is never held back at all, so the starvation scenario in
+// tests/enemyai.test.mjs — every berry near the base deleted at 3:00 — cannot
+// freeze the workforce, which an earlier clock-based version of this did for
+// seven minutes straight.
+//
+// The second is that stopping villager production early is a *losing* trade, not
+// a neutral one. A villager costs 50 food and pays it back in about seventy
+// seconds, so pausing the Town Center three minutes from an age-up buys the age
+// one minute sooner and costs three villagers' worth of income for the rest of
+// the match — measured at 0.4, seed 12345's Feudal Age went *backwards* by
+// eighty seconds. Seven tenths is close enough that the pause is thirty to forty
+// seconds and the payback question does not arise.
+const AGE_PUSH_FOOD_START = 0.7;
+// The second half of the push: the last stretch of the saving is done with the
+// soldiers' food as well.
+//
+// Capping the workforce alone was not enough and the measurement says exactly
+// why. With the Town Center held at fourteen villagers the stockpile climbed to
+// 419 food — nine short of the 490 an age-up plus its reserve costs — and then
+// sat there for two full minutes, because a militia is 60 food and a spearman is
+// 35 and the Barracks was eating the surplus at precisely the rate the food line
+// produced it. Nine food short, for two minutes, is the whole Castle Age.
+//
+// So above this fraction of the bill, soldiers stop eating too. It is a fraction
+// rather than a flag because the cost of the hold is soldiers not built, and
+// that cost has to be *bounded*: from three quarters paid, the rest arrives in
+// fifteen to twenty-five seconds of this economy, which is at most one body out
+// of the next wave — while from zero it would be two minutes and the wave
+// schedule would visibly stutter. Below the fraction nothing is held back.
+//
+// Three quarters and not a half, and the difference is the quarter measured on
+// the schedule: at 0.5 the hold ran for over a minute on the slower seeds and
+// the AI launched two waves in ten minutes instead of three, with a 205-second
+// hole in the middle. Pressure that does not arrive costs the player more than
+// an age-up that arrives late. It sits just above AGE_PUSH_FOOD_START, so the
+// Town Center is always the first producer to be asked to stop and the army is
+// the last.
+const AGE_PUSH_FOOD_HOLD = 0.75;
+// ...and however far off the money is, the push gives up after this long and the
+// AI goes back to playing normally.
+//
+// Without a bound the workforce cap is a deadlock waiting for a bad map: the
+// starvation scenario in tests/enemyai.test.mjs deletes every berry near the
+// base at 3:00, the 400 food never arrives, and the AI sat frozen at fourteen
+// villagers for the remaining seven minutes. An AI that has decided to age up
+// and cannot must go back to growing, or it has traded the match for a decision
+// it could not carry out. Ninety seconds is longer than any push that has ever
+// succeeded needed; past that the answer is not "hold on a little longer", it is
+// "this economy cannot pay for it yet".
+const AGE_PUSH_MAX_HOLD = 90;
+// The same idea for the *research* hold, which is the cheap half of saving up:
+// two hundred seconds, because not buying an upgrade costs the AI a little
+// damage while not training villagers costs it the economy, and because a
+// 600-food Castle Age genuinely takes longer than ninety seconds to save out of
+// a mid-game surplus. Measured on seed 777 with both holds on the short clock:
+// the Feudal Age landed at 6:22, the ninety seconds expired, the whole Castle
+// Age fund went on Feudal-tier upgrades within the minute, and the AI finished
+// twelve minutes still in the Feudal Age.
+const AGE_SAVING_MAX_HOLD = 200;
 // A 400-food age-up is eight villagers the Town Center did not train. This
 // reserve is what stops it being taken out of the food the barracks is queued
 // on: the AI banks the cost *plus* a working float before it commits.
@@ -321,9 +662,25 @@ const TECH_RESERVE = { food: 120, wood: 90, gold: 80, stone: 0 };
 // second because it feeds the villagers doing the chopping; gold and stone last
 // because only soldiers and (later) defences spend them.
 const ECO_RESEARCH_BUILDINGS = ['lumbercamp', 'mill', 'miningcamp'];
+// Banked gold at which villagers start coming off the mine, and at which the
+// last of them do. See desiredSplit — the short version is that this AI spent
+// 250 gold of the 1100 it dug in a twelve-minute match, and the diggers were
+// the food villagers the age-up needed.
+const GOLD_COMFORTABLE = 250;
+const GOLD_SATURATED = 450;
 // Military upgrades come out of the same purse as the next wave, so they wait
 // until there is an army for them to improve.
-const MILITARY_RESEARCH_BUILDINGS = ['blacksmith', 'archeryrange', 'barracks'];
+//
+// Order is priority, and the first two entries are where the work is. Every one
+// of the ten attack/armour techs names the Blacksmith first in its `at` list, so
+// now that the building exists researchBuildingFor() sends all ten there and
+// techsAt('archeryrange') and techsAt('barracks') are both empty — which is
+// exactly why the Blacksmith had to enter the build order below. The last two
+// entries are not dead weight: `at` is a preference list, so if the Blacksmith
+// ever goes away (or a tech is added that names the Range first) they pick the
+// research back up with no edit here. The University is listed for the same
+// reason and is inert today — nothing in TECHS names it yet.
+const MILITARY_RESEARCH_BUILDINGS = ['blacksmith', 'university', 'archeryrange', 'barracks'];
 const MILITARY_TECH_MIN_ARMY = 6;
 // One think in four. Nothing here is expensive, but nothing here changes in
 // half a second either, and the pass walks every building the AI owns.
@@ -423,6 +780,9 @@ class EnemyAI {
     this.placeCursor = 0;
 
     this.wave = null;          // { ids, target, launchedAt, size }
+    // { age, since }: which age-up the workforce is currently being held back
+    // for, and when that hold started. See ageUpPushCap.
+    this.agePush = null;
     this.waveNumber = 0;
     this.nextWaveTime = FIRST_WAVE_TIME;
     this.lostLastWave = false;
@@ -444,6 +804,9 @@ class EnemyAI {
       farmsStarted: 0,
       lumberCampsStarted: 0,
       miningCampsStarted: 0,
+      // Every foundation started, keyed by building type. The named counters
+      // above are a subset kept for the tests that ask for them by name.
+      started: {},
       villagersQueued: 0,
       militaryQueued: 0,
       techsResearched: 0,
@@ -808,12 +1171,17 @@ class EnemyAI {
     }
     if (!foundation) return false;
 
-    if (type === 'house') this.stats.housesStarted++;
-    else if (type === 'barracks') this.stats.barracksStarted++;
-    else if (type === 'mill') this.stats.millsStarted++;
-    else if (type === 'farm') this.stats.farmsStarted++;
-    else if (type === 'lumbercamp') this.stats.lumberCampsStarted++;
-    else if (type === 'miningcamp') this.stats.miningCampsStarted++;
+    // Two counters, and the second is the one that will still be right next
+    // time the building table grows. The named fields are the observability
+    // contract (tests/enemyai.test.mjs reads farmsStarted; the smoke report
+    // prints the rest) and they stay; `started` is the same tally keyed by type,
+    // so an Archery Range, a Stable or anything else added later is counted
+    // without an edit here. The if/else chain this replaces silently dropped
+    // every type nobody had thought of — which is a poor way to find out that
+    // the AI has stopped building something.
+    this.stats.started[type] = (this.stats.started[type] || 0) + 1;
+    const named = STARTED_STAT[type];
+    if (named) this.stats[named]++;
 
     this.pending = {
       type, entity: foundation, since: w.time,
@@ -899,25 +1267,228 @@ class EnemyAI {
       wish('mill', this.millAnchor());
     }
 
-    // 3a. Forward drop-offs. This sits ahead of farms because it is the cheaper
+    const wood = p.resources.wood || 0;
+    const age = currentAge(w, this.id);
+
+    // 3a. The first Lumber Camp, on the clock rather than on the haul. See
+    //     LUMBER_CAMP_TIME: this is half income and half the one insurance
+    //     policy a base with a single wood drop-off cannot do without.
+    if (w.time >= LUMBER_CAMP_TIME && villagers >= LUMBER_CAMP_VILLAGERS &&
+        anyOf('lumbercamp') === 0 && this.hasNodeFor(RES.WOOD) &&
+        wood >= BUILDING_STATS.lumbercamp.cost.wood + LUMBER_CAMP_WOOD_FLOAT) {
+      wish('lumbercamp', this.campAnchorFor(this.available.wood));
+    }
+
+    // 3b. The Feudal military building, and the most important entry added
+    //     since the tech tree split the Barracks up. Without it the AI trains
+    //     militia and spearmen for the whole match: the archer moved to the
+    //     Archery Range and the scout to the Stable, so an AI that owns neither
+    //     has no ranged unit, no cavalry, and nothing to answer either with.
+    //
+    //     Ahead of the farms and the forward camps below on purpose. A farm is
+    //     60 wood and wantsFarm() is a standing order that is true again within
+    //     a minute of being satisfied, so an entry sitting behind it only gets
+    //     its turn in the gaps — which is how "the AI never built an Archery
+    //     Range" happens without anybody writing that rule down. The wood float
+    //     (ARM_BUILDING_WOOD_FLOAT, on top of the building's own 175) is what
+    //     makes that safe: this can only fire with the next House and the next
+    //     two fields still paid for.
+    const arm = this.nextArmBuilding(anyOf);
+    const firstArm = anyOf('archeryrange') + anyOf('stable') === 0;
+    let savingForArm = false;
+    if (arm && age >= AGE.FEUDAL && complete('barracks')) {
+      const needVills = firstArm ? ARM_BUILDING_VILLAGERS : ARM2_BUILDING_VILLAGERS;
+      const float = firstArm ? ARM_BUILDING_WOOD_FLOAT : ARM2_BUILDING_WOOD_FLOAT;
+      const price = BUILDING_STATS[arm].cost.wood + float;
+      if (villagers >= needVills) {
+        if (wood >= price) wish(arm);
+        // Not there yet, but close enough that saving is a matter of seconds
+        // rather than of minutes: hold the fields back until it is paid for.
+        //
+        // This is the one place the wishlist saves up instead of spending on the
+        // cheapest thing it wants, and it is here because the field is a
+        // *standing* order. wantsFarm() goes true again within a minute of every
+        // field that goes up, so 60 wood at a time is skimmed off the top
+        // forever and a 205-wood building is never reached — which is exactly
+        // what seed 12345 did: it spent the whole Feudal Age putting up its
+        // eleventh field and finished the match with no ranged unit at all. A
+        // player does the opposite without thinking about it: you stop making
+        // farms for thirty seconds and you put the Range down.
+        //
+        // Bounded three ways, because starving the food line is the worse
+        // failure: only the first arm earns it (a second is a luxury), only
+        // above ARM_SAVING_FLOOR (below that the wait is minutes, not seconds),
+        // and never while the type is backed off for want of ground — that last
+        // one is the release valve that stops an Archery Range nobody can site
+        // from quietly cancelling the farms for the rest of the match.
+        else if (firstArm && wood >= ARM_SAVING_FLOOR &&
+                 w.time >= (this.blockedUntil.get(arm) || 0)) savingForArm = true;
+      }
+    }
+
+    // 3c. The Blacksmith, once there is an army the ten attack/armour techs can
+    //     improve. It trains nothing, so it is pure upgrade money and it sits
+    //     behind the building that puts a second arm on the map — but ahead of
+    //     the fields, for the same standing-order reason as above.
+    if (age >= AGE.FEUDAL && anyOf('blacksmith') === 0 && techsAt('blacksmith').length &&
+        villagers >= BLACKSMITH_VILLAGERS && this.armySize() >= MILITARY_TECH_MIN_ARMY &&
+        wood >= BUILDING_STATS.blacksmith.cost.wood + BLACKSMITH_WOOD_FLOAT) {
+      wish('blacksmith');
+    }
+
+    // 3d. Castle Age. The Siege Workshop is the escalation for a base the waves
+    //    cannot finish: a ram's +40 against masonry turns a 900-hitpoint Town
+    //    Center from a two-minute chore into a thirty-second one, and that is
+    //    the difference between a wave that razes a town and a wave that is
+    //    still hitting a house when the march budget calls it home. It carries
+    //    the heaviest gates on the list — Castle Age, sixteen villagers, an army
+    //    already standing and 260 wood in the bank — because everything it
+    //    trains is slow enough to arrive after the wave it left with.
+    //
+    //    It still sits *ahead* of the fields, for the reason the Archery Range
+    //    does: wantsFarm() is a standing order that comes back true within a
+    //    minute of every field, so 60 wood at a time is skimmed off the top
+    //    forever and a 200-wood building behind it is never reached. Measured
+    //    with this entry last on the list: the Castle Age landed at 9:09 and the
+    //    AI spent the following three minutes putting up its thirteenth farm.
+    if (age >= AGE.CASTLE && anyOf('siegeworkshop') === 0 &&
+        villagers >= SIEGE_VILLAGERS && this.armySize() >= MILITARY_TECH_MIN_ARMY &&
+        wood >= BUILDING_STATS.siegeworkshop.cost.wood + SIEGE_WOOD_FLOAT) {
+      wish('siegeworkshop');
+    }
+
+    // 3e. The University, the day it is worth anything. Nothing in TECHS names it
+    //    yet — every tech that exists is researched at a Town Center, a Mill, a
+    //    Lumber Camp, a Mining Camp or a Blacksmith — so techsAt('university')
+    //    is empty and this never fires. That is the honest answer rather than a
+    //    missing entry: 200 wood for a building that would offer this AI nothing
+    //    to research is 200 wood spent on scenery. Written as a test against the
+    //    tech table rather than as a comment saying "add this later", so the day
+    //    Ballistics or Masonry lands there the AI starts building one by itself
+    //    — the same trick the `at` preference lists in tech.js are built on.
+    if (age >= AGE.CASTLE && anyOf('university') === 0 && techsAt('university').length &&
+        villagers >= UNIVERSITY_VILLAGERS &&
+        wood >= BUILDING_STATS.university.cost.wood + UNIVERSITY_WOOD_FLOAT) {
+      wish('university');
+    }
+
+    // 3f. Forward drop-offs. This sits ahead of farms because it is the cheaper
     //     fix for the same complaint: a farm converts wood into food, a camp
     //     converts a walk into everything. It is gated hard enough (see
     //     campWanted) that it can never take the wood a House or a field needs.
     const camp = this.campWanted();
     if (camp) wish(camp.type, camp.anchor);
 
-    // 3b. Farms, from the moment the local berries thin out and for the rest of
+    // 3g. Farms, from the moment the local berries thin out and for the rest of
     //     the match — a farm is consumed as fast as it is worked, so this is a
-    //     standing order, not a one-off building.
-    if (this.wantsFarm()) wish('farm');
+    //     standing order, not a one-off building. Suspended for the few seconds
+    //     it takes to pay for the first Archery Range or Stable; see above, and
+    //     note that the *starving* case at 1b is ahead of all of this and is
+    //     never suspended.
+    if (this.wantsFarm() && !savingForArm) wish('farm');
 
-    // 4. Second barracks to feed bigger waves.
+    // 4. Second barracks to feed bigger waves — but never while an arm we do not
+    //    own is buildable, which is the ordering the old code got wrong for free
+    //    when the Barracks was the only military building there was.
+    //
+    //    Both cost 175 wood and both add one production queue. The difference is
+    //    that the second Barracks adds another queue making the same two units,
+    //    and the Archery Range or Stable adds a queue making units this AI
+    //    currently cannot put on the map at all. Measured on seed 12345 with
+    //    this clause missing: the AI banked its way to 255 wood at 8:10, spent
+    //    it on a second Barracks nine seconds before the Feudal Age landed, and
+    //    then needed another eighty seconds to afford the Archery Range — so the
+    //    match ended with eleven militia, ten spearmen and no ranged unit at all.
+    //    Before the age-up the clause is inert (neither arm can train anything
+    //    yet), so the old 330s escalation is untouched.
+    //    The second half of the clause is the same thought about the sixty
+    //    seconds *before* the age lands. An age-up already in the research queue
+    //    is paid for and arrives in well under a minute, and the Archery Range
+    //    it unlocks cannot be placed until it does — so wood spent on a second
+    //    Barracks in that window is wood spent nine seconds before it had a
+    //    strictly better home. That is not a hypothetical either: it is exactly
+    //    what seed 12345 did.
+    const armMissing = ARM_BUILDINGS.some((t) => BUILDING_STATS[t] && anyOf(t) === 0);
+    const armPending = (age >= AGE.FEUDAL || this.ageUpInProgress()) && armMissing;
     if (w.time >= BARRACKS2_TIME && anyOf('barracks') === 1 && villagers >= 12 &&
-        p.resources.wood >= BUILDING_STATS.barracks.cost.wood + 80) {
+        !armPending && wood >= BUILDING_STATS.barracks.cost.wood + 80) {
       wish('barracks');
     }
 
+    // NO MONASTERY, deliberately. The monk is the one unit in the game with
+    // `military: false`, and every piece of army machinery in this file reads
+    // MILITARY_TYPES: militaryTrainers() would not count a Monastery as a
+    // producer, armyCensus() would not count a monk, and manageArmy() would
+    // leave one standing at the staging point for the rest of the match while
+    // the wave-size arithmetic ignored it. A 175-wood building whose output
+    // this AI cannot command is worse than no building, and healing wants a
+    // "keep the monk behind the line" behaviour that does not exist here yet.
+    // The unit and the building are both fine; it is the AI that is not ready,
+    // and pretending otherwise would break the wave census to no benefit.
+
     return out;
+  }
+
+  /**
+   * Which of the two Feudal arms to put down next: 'archeryrange', 'stable', or
+   * null when both are standing (or being built).
+   *
+   * The choice is made by the same counter machinery that picks the next unit,
+   * rather than by a hardcoded preference: each candidate is scored by the best
+   * its roster can do against what the player is actually fielding, with the
+   * default-mix weight as the tiebreaker. So a blind AI takes the Archery Range
+   * first — the archer is the generalist arm and answers two of the three
+   * armour classes — a player massing archers is answered with a Range for its
+   * skirmishers, and a Stable follows as the second building, becoming the
+   * obvious first pick again the moment the Castle Age puts a Knight in it.
+   *
+   * Units the current age forbids are skipped, so a Feudal Stable is judged on
+   * the scout it can actually train and not on the Knight it cannot.
+   */
+  nextArmBuilding(anyOf) {
+    let best = null;
+    let bestScore = -Infinity;
+    const foe = this.foeArmorMix();
+    for (const type of ARM_BUILDINGS) {
+      if (!BUILDING_STATS[type] || anyOf(type) > 0) continue;
+      let score = -Infinity;
+      for (const t of BUILDING_STATS[type].trains || []) {
+        if (!MILITARY_TYPES.includes(t)) continue;
+        if (!unitUnlocked(this.world, this.id, t)) continue;
+        const s = (DEFAULT_MIX[t] || 0.1) + COUNTER_WEIGHT * this.counterScore(t, foe);
+        if (s > score) score = s;
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        best = type;
+      }
+    }
+    return bestScore === -Infinity ? null : best;
+  }
+
+  /** Soldiers of ours standing on the map. Not queued — see armyCensus. */
+  armySize() {
+    return this.myUnits().filter(isMilitary).length;
+  }
+
+  /**
+   * Is an age-up sitting in one of our research queues right now?
+   *
+   * "Have we decided to age up" rather than "are we in the next age": the cost
+   * has already left the stockpile and the age lands in fifty seconds, so
+   * anything the next age unlocks is a better home for spare wood than anything
+   * this one does. Read off the queue rather than remembered in a field so a
+   * loaded save, where the AI's own memory of starting it is gone but the
+   * research is still ticking, gives the same answer.
+   */
+  ageUpInProgress() {
+    for (const b of this.myBuildings()) {
+      for (const e of b.research || []) {
+        const t = e && TECHS[e.id];
+        if (t && t.advancesTo !== undefined) return true;
+      }
+    }
+    return false;
   }
 
   /** Population headroom below which the next House goes up. See HOUSE_BUFFER. */
@@ -1187,8 +1758,20 @@ class EnemyAI {
   /** Put the right number of villagers on a foundation and keep them there. */
   staffConstruction(foundation) {
     if (!liveIn(this.world, foundation)) return;
-    const heavy = foundation.type === 'barracks' || foundation.type === 'towncenter';
-    const want = heavy ? 2 : 1;
+    // Two builders on anything slow, one on everything else — read off the
+    // build time rather than off a list of two type names. The old test named
+    // the Barracks and the Town Center, which were the only slow buildings that
+    // existed; the Archery Range, the Stable, the Blacksmith and the Siege
+    // Workshop are all 38-50 seconds and would every one of them have been
+    // built by a single villager, which is 45 seconds of one worker for a
+    // building the wave schedule is waiting on.
+    //
+    // The threshold sits just under the Barracks' 38s, so it covers every 3x3
+    // military and research building and leaves the Mill (24s), the camps (18s)
+    // and the farms (15s) on one builder, where a second would only be two
+    // villagers walking to save eight seconds.
+    const s = BUILDING_STATS[foundation.type];
+    const want = (s && (s.buildTime || 0) >= HEAVY_BUILD_TIME) ? 2 : 1;
 
     // Drop builders that died or wandered off the roster.
     for (const id of Array.from(this.builders)) {
@@ -1250,8 +1833,17 @@ class EnemyAI {
   desiredSplit() {
     const w = this.world;
     const r = this.res();
-    const hasBarracks = this.myBuildings('barracks').length > 0;
-    const wantsMilitary = hasBarracks || (this.pending && this.pending.type === 'barracks');
+    // Any building that trains a soldier, standing or still a foundation — the
+    // gold-heavy split is a reaction to "we are about to start paying for an
+    // army", and an Archery Range going up says that exactly as loudly as a
+    // Barracks does. (Archers and knights are the two most gold-hungry units in
+    // the game, so if anything the Range and the Stable say it louder.)
+    const trainsSoldiers = (t) => {
+      const s = BUILDING_STATS[t];
+      return !!s && (s.trains || []).some((u) => MILITARY_TYPES.includes(u));
+    };
+    const wantsMilitary = this.myBuildings().some((b) => !b.dead && trainsSoldiers(b.type)) ||
+      !!(this.pending && trainsSoldiers(this.pending.type));
 
     let food;
     let wood;
@@ -1276,7 +1868,35 @@ class EnemyAI {
     if (r.wood < 60) shift(F, W, 0.12);
     if (r.food < 60) shift(W, F, 0.12);
     if (wantsMilitary && r.gold < 60) shift(F, G, 0.10);
-    if (r.gold > 400) shift(G, F, 0.15);
+    // GOLD IS THE RESOURCE THIS AI SYSTEMATICALLY OVER-MINES, and it costs it
+    // the age-up. Measured over a twelve-minute match on seed 4242: 1100 gold
+    // came out of the ground and 250 of it was ever spent, so the stockpile
+    // climbed to 856 and three or four villagers spent the whole match digging
+    // money nobody needed. Those same villagers on food are ~110 food a minute,
+    // which is most of the surplus the 400-food age-up was waiting for — the AI
+    // was not short of food, it was short of *people on food*.
+    //
+    // The 0.30 gold share was set when the Barracks trained the archer (45 gold
+    // a body) and the roster was three units wide. The Barracks trains militia
+    // (20 gold) and the spearman (none at all) now, so Dark Age gold demand is
+    // barely a third of what this split was drawn for, and the money only starts
+    // being worth digging again when a Range or a Stable is standing.
+    //
+    // Two steps rather than one so the workforce drains back gradually: at 250
+    // banked there is a wave's worth of soldiers paid for and half the diggers
+    // can go; at 450 there is a Castle Age (200 gold) and a wave on top of it,
+    // and the rest can go. Both are thresholds on the *stockpile*, so the moment
+    // knights and archers start drinking it the villagers walk back.
+    //
+    // Both thresholds move up by whatever an age-up we are currently saving for
+    // is going to want. Gold that is already spoken for is not surplus, and
+    // forgetting that is how the AI reached ten minutes holding 798 food, 227
+    // gold and no Castle Age: the 200-gold half of the bill kept being mined
+    // away by archers while the villagers who would have replaced it had been
+    // sent to the berries by this very rule.
+    const spoken = this.ageUpGoldBill();
+    if (r.gold > GOLD_COMFORTABLE + spoken) shift(G, F, 0.15);
+    if (r.gold > GOLD_SATURATED + spoken) shift(G, F, 0.15);
     if (r.wood > 500) shift(W, F, 0.10);
 
     return { food: F.v, wood: W.v, gold: G.v };
@@ -1662,12 +2282,118 @@ class EnemyAI {
    */
   villagerTarget() {
     const r = this.res();
-    const hasBarracks = this.myBuildings('barracks').some((b) => b.complete);
-    if (!hasBarracks) return PRE_BARRACKS_VILLAGERS;
+    // "Somewhere to train a soldier", not "a Barracks". The two meant the same
+    // thing while the Barracks was the only military building in the game; now
+    // an AI that lost its Barracks but still owns an Archery Range would have
+    // been thrown back to the 16-villager opening cap with a full-sized army
+    // still to feed. militaryTrainers() answers the question that was always
+    // being asked.
+    if (!this.militaryTrainers().length) return PRE_BARRACKS_VILLAGERS;
     const budget = (r.food || 0) + this.foodInGround() + this.farmPotential();
-    if (budget < 200) return 8;
-    if (budget < 450) return 11;
-    return MAX_VILLAGERS;
+    let target = MAX_VILLAGERS;
+    if (budget < 200) target = 8;
+    else if (budget < 450) target = 11;
+    // ...and no further while an age-up is due and unpaid. See AGE_PUSH_VILLAGERS.
+    const push = this.ageUpPushCap();
+    return push === null ? target : Math.min(target, push);
+  }
+
+  /**
+   * The age-up this AI is currently saving for, or null when it is not saving
+   * for one. The tech object, so the caller can read the bill off it.
+   *
+   * "Due and unpaid" is three separate things and all three matter:
+   *   * the clock has come round (FEUDAL_AGE_TIME / CASTLE_AGE_TIME) and the
+   *     age's own villager gate is met, so this is an age the AI actually
+   *     intends to take rather than one it will get to eventually;
+   *   * it cannot pay for it yet — the moment it can, manageTech buys it on the
+   *     same pass and every hold below lifts by itself;
+   *   * it has not already bought it. An age-up ticking down in a research queue
+   *     is paid for, and holding anything back while it researches would be
+   *     fifty seconds of not playing for nothing.
+   *
+   * Also stamps when the saving started, which is what the two deadlines below
+   * are measured from. Stamped once per age and never restarted for the same
+   * one, so a push that is not working expires instead of holding the AI down
+   * for the rest of the match.
+   */
+  ageUpWanted() {
+    const w = this.world;
+    const id = nextAgeTech(w, this.id);
+    if (!id) return null;
+    const t = TECHS[id];
+    if (!t) return null;
+    const feudal = t.advancesTo === AGE.FEUDAL;
+    const due = feudal ? FEUDAL_AGE_TIME : CASTLE_AGE_TIME;
+    const need = feudal ? AGE_UP_VILLAGERS : AGE_UP_VILLAGERS_CASTLE;
+    if (w.time < due) return null;
+    if (this.myUnits('villager').length < need) return null;
+    if (this.ageUpInProgress()) return null;
+    if (this.affordWithReserve(t.cost, AGE_UP_RESERVE)) return null;
+    if (!this.agePush || this.agePush.age !== t.advancesTo) {
+      this.agePush = { age: t.advancesTo, since: w.time };
+    }
+    return t;
+  }
+
+  /** How long we have been saving for the current age-up. */
+  ageSavingFor() {
+    return this.agePush ? this.world.time - this.agePush.since : 0;
+  }
+
+  /**
+   * The villager count to stop at because an age-up is waiting on the food, or
+   * null when nothing is.
+   *
+   * Gated on the *bill*, not on a clock, and that is what makes it safe. A Town
+   * Center that is not training is an economy that is not growing, so this may
+   * never become a state the AI can be stuck in: it only engages once the
+   * stockpile has already climbed past AGE_PUSH_FOOD_START of what the age
+   * costs, which is evidence that the saving is working. On a map where the food
+   * never arrives — the starvation scenario in tests/enemyai.test.mjs deletes
+   * every berry near the base at 3:00 — the stockpile never gets there, the cap
+   * never engages, and the AI goes on booming. With an earlier version of this
+   * gated on a clock instead, that test finished with fourteen villagers and the
+   * workforce frozen for seven minutes.
+   */
+  ageUpPushCap() {
+    const t = this.ageUpWanted();
+    if (!t) return null;
+    if (!this.ageSavingPast(AGE_PUSH_FOOD_START)) return null;
+    return t.advancesTo === AGE.FEUDAL ? AGE_PUSH_VILLAGERS : AGE_PUSH_VILLAGERS_CASTLE;
+  }
+
+  /** Is this fraction of the age-up's food bill already banked? */
+  ageSavingPast(fraction) {
+    const t = this.ageUpWanted();
+    if (!t) return false;
+    const bill = (t.cost.food || 0) + (AGE_UP_RESERVE.food || 0);
+    return (this.res().food || 0) >= bill * fraction;
+  }
+
+  /**
+   * Gold the age-up we are saving for is going to want, or 0 when we are not
+   * saving for one. Read by desiredSplit, which must not send the last of the
+   * miners to the berries while 200 gold of the bill is still in the ground.
+   */
+  ageUpGoldBill() {
+    const t = this.ageUpWanted();
+    if (!t) return 0;
+    return (t.cost.gold || 0) + (AGE_UP_RESERVE.gold || 0);
+  }
+
+  /**
+   * Are we close enough to an age-up that the army should stop eating? See
+   * AGE_PUSH_FOOD_HOLD. False whenever there is no age being saved for, which
+   * is most of the match.
+   */
+  ageSavingBitesArmy() {
+    if (!this.ageUpWanted()) return false;
+    // The one hold that keeps a clock, and it keeps it for the wave schedule
+    // rather than for the economy: a wave that does not go out because there
+    // were two soldiers missing is the most visible thing this AI can get wrong.
+    if (this.ageSavingFor() > AGE_PUSH_MAX_HOLD) return false;
+    return this.ageSavingPast(AGE_PUSH_FOOD_HOLD);
   }
 
   /** Every completed building of ours that can put a soldier on the map. */
@@ -1733,6 +2459,35 @@ class EnemyAI {
     if (!barracks.length) return;
 
     const have = this.armyCensus();
+
+    // While an age-up is being saved for, the army stops growing past what the
+    // next wave actually wants.
+    //
+    // Nothing otherwise stops this loop except the population cap, so the AI
+    // fills every slot its houses open with whatever is cheapest — measured,
+    // twenty-six soldiers against an armyTarget of eighteen — and the eight
+    // extra are paid for out of the same food the age-up is waiting on. Eight
+    // militia are 480 food, which is a Feudal Age, and on the seeds where the
+    // Castle Age never arrived at all this was where it went: 250-350 food a
+    // minute of soldiers the wave schedule had not asked for.
+    //
+    // Two things keep this from becoming the wave-cadence bug it looks like.
+    // It only applies while there is an age to save for, so the ordinary state
+    // of the match is unaffected; and what it counts is the soldiers *at home*,
+    // because the squad currently out on a wave is spent whatever happens to it.
+    // Counting the wave instead was measured at three waves in twelve minutes
+    // with a two-hundred-second hole in the middle — the producer stood idle for
+    // the whole attack and had nothing ready when the next one was due.
+    if (this.ageUpWanted() && this.ageSavingFor() <= AGE_SAVING_MAX_HOLD) {
+      const away = new Set(this.wave ? this.wave.ids : []);
+      let athome = 0;
+      for (const u of this.myUnits()) if (isMilitary(u) && !away.has(u.id)) athome++;
+      for (const b of this.myBuildings()) {
+        for (const q of b.queue || []) if (q && MILITARY_TYPES.includes(q.type)) athome++;
+      }
+      if (athome >= this.armyTarget()) return;
+    }
+
     for (const b of barracks) {
       const state = this.popState();
       if (state.room <= 0) break;
@@ -1801,7 +2556,12 @@ class EnemyAI {
   /**
    * The next soldier out of this building.
    *
-   * Three filters, in the order they matter:
+   * Four filters, in the order they matter:
+   *   0. the age has to allow it. A Feudal Stable trains a scout and not a
+   *      Knight (AGE_UNITS in tech.js), and economy.queueTrain refuses anything
+   *      else with a toast — so without this test the AI would ask for a Knight
+   *      every think from the moment it owned a Stable, be refused every time,
+   *      and paper the player's screen with someone else's error messages;
    *   1. it has to be something this building trains and we can pay for;
    *   2. no type may pass MIX_CEILING of the army — the guard against building
    *      a perfect counter to one thing and losing to everything else;
@@ -1812,14 +2572,22 @@ class EnemyAI {
   chooseUnit(building, have, r, wantMoreVillagers) {
     const foe = this.foeArmorMix();
     const total = Object.values(have).reduce((a, b) => a + b, 0);
-    // When food dries up the mix has to drift toward whatever does not eat —
-    // the archer is the only soldier that costs no food at all.
+    // When food dries up the mix has to drift toward whatever does not eat.
+    // That used to be the archer alone; the roster now has four food-free
+    // soldiers (archer, ram, mangonel, scorpion), which is one more reason the
+    // Archery Range is worth owning before the berries run out.
     const foodTight = (r.food || 0) < 120 && this.foodInGround() < 150;
+    // The last stretch of an age-up is paid for out of the army's food as well
+    // as the Town Center's. Bounded and rare — see AGE_PUSH_FOOD_HOLD — and it
+    // does not stop the Archery Range or the Siege Workshop making the units
+    // that cost no food, which is most of the reason to own them.
+    const savingForAge = this.ageSavingBitesArmy();
 
     let best = null;
     let bestScore = -Infinity;
     for (const type of building.trains || []) {
       if (!MILITARY_TYPES.includes(type)) continue;
+      if (!unitUnlocked(this.world, this.id, type)) continue;
       const cost = UNIT_STATS[type] && UNIT_STATS[type].cost;
       if (!cost) continue;
       if (!this.affordUnit(type, r)) continue;
@@ -1827,7 +2595,7 @@ class EnemyAI {
       // growing the economy that pays for all of this.
       if (wantMoreVillagers && (cost.food || 0) > 0 &&
           r.food < (cost.food || 0) + UNIT_STATS.villager.cost.food) continue;
-      if (foodTight && (cost.food || 0) > 0) continue;
+      if ((foodTight || savingForAge) && (cost.food || 0) > 0) continue;
       // The same rule for the other resource a soldier can drink. See
       // MILITARY_WOOD_RESERVE: an army is worth nothing if it costs the base
       // the House it was about to build, or the ability to stand back up.
@@ -1851,9 +2619,10 @@ class EnemyAI {
     if (!best) {
       for (const type of building.trains || []) {
         if (!MILITARY_TYPES.includes(type)) continue;
+        if (!unitUnlocked(this.world, this.id, type)) continue;
         if (!this.affordUnit(type, r)) continue;
         const cost = UNIT_STATS[type].cost;
-        if (foodTight && (cost.food || 0) > 0) continue;
+        if ((foodTight || savingForAge) && (cost.food || 0) > 0) continue;
         if ((cost.wood || 0) > 0 && r.wood < (cost.wood || 0) + this.woodReserve()) continue;
         return type;
       }
@@ -1978,6 +2747,31 @@ class EnemyAI {
       }
     }
 
+    // 1b. ...and while we are saving for one, nothing else is bought at all.
+    //
+    //     The age was already "first" in this pass, and first was not enough: it
+    //     is also the most expensive thing on the list by a factor of three, so
+    //     every cheaper upgrade behind it kept skimming the food off the top and
+    //     the total never arrived. Measured on seed 4242 after the Feudal Age
+    //     landed: 175, 150, 300 and 100 food of Feudal-tier upgrades bought in
+    //     four consecutive minutes while the stockpile sat between 120 and 190,
+    //     and the 600-food Castle Age never happened on any seed. Forging is
+    //     worth +1 attack; the Castle Age is worth the Knight, the Siege
+    //     Workshop and everything in them.
+    //
+    //     Bounded by the same three tests as the workforce cap — clock, villager
+    //     gate, not already bought — so an AI that is not saving for anything
+    //     shops exactly as it did before.
+    //     The research hold gets a much longer leash than the workforce cap
+    //     above it, and it can afford one: not buying Forging costs the AI +1
+    //     attack, while not training villagers costs it the economy. Two
+    //     hundred seconds is long enough to save for a 600-food Castle Age out
+    //     of a mid-game surplus, which the ninety-second cap is not — measured
+    //     on seed 777, whose Feudal Age lands at 6:22 and which then spent its
+    //     entire Castle Age fund on Feudal upgrades the moment the short clock
+    //     expired, and never aged again.
+    if (this.ageUpWanted() && this.ageSavingFor() <= AGE_SAVING_MAX_HOLD) return;
+
     // 2. Economy upgrades, at whichever drop-off is free.
     for (const type of ECO_RESEARCH_BUILDINGS) {
       const b = this.freeResearcher(type);
@@ -2080,8 +2874,11 @@ class EnemyAI {
     );
     if (strays.length) this.command(strays, { type: 'move', gx: s.x, gy: s.y });
 
-    // Keep the barracks rally on the staging point too, for whatever honours it.
-    for (const b of this.myBuildings('barracks')) {
+    // Keep every military building's rally on the staging point too, for
+    // whatever honours it. Hardcoding 'barracks' here meant a Stable's cavalry
+    // came out of the door with no rally at all and waited for manageArmy to
+    // notice them the slow way, one strays-pass at a time.
+    for (const b of this.militaryTrainers()) {
       if (!b.rally || dist(b.rally.x || b.rally.gx || 0, b.rally.y || b.rally.gy || 0, s.x, s.y) > 2) {
         b.rally = { x: s.x, y: s.y, gx: s.x, gy: s.y };
       }
@@ -2176,15 +2973,37 @@ class EnemyAI {
       launchedAt: w.time,
       lastOrder: w.time,
       size: units.length,
+      // Worked out once, at launch, from the squad that is actually going: a
+      // wave of knights is given less rope than a wave with a ram in it, and
+      // both are given enough to get there. See waveTimeout().
+      timeout: this.waveTimeout(units, from, target),
     };
     this.waveNumber++;
     this.stats.wavesLaunched++;
     this.stats.lastWaveSize = units.length;
-    let mel = 0;
-    for (const u of units) if (u.type === 'militia') mel++;
+    // What actually walked out of the gate, by type.
+    //
+    // This used to be two numbers, `militia` and "everything else, called
+    // archers" — which was true of a two-unit roster and became a lie the moment
+    // there were nine. A wave of five spearmen was logged as four archers, which
+    // is precisely the sort of report that lets a regression like "the AI has
+    // not trained a ranged unit in six minutes" sit unnoticed in the test output.
+    //
+    // Built by walking MILITARY_TYPES rather than the squad, so the key order is
+    // the roster's order in every log line — the wave log goes into the
+    // determinism fingerprint, and key order is part of what JSON.stringify
+    // compares. Types with nobody in them are left out so the line stays short.
+    const mix = {};
+    for (const t of MILITARY_TYPES) {
+      let n = 0;
+      for (const u of units) if (u.type === t) n++;
+      if (n) mix[t] = n;
+    }
     this.stats.waveLog.push({
-      t: Math.round(w.time), size: units.length,
-      militia: mel, archers: units.length - mel,
+      t: Math.round(w.time), size: units.length, mix,
+      // Kept beside the mix because the wave report has always printed them:
+      // both are now honest counts of their own type rather than a split.
+      militia: mix.militia || 0, archers: mix.archer || 0,
       // True when the previous wave died out there, so this one waited for a
       // full rebuild rather than keeping the normal beat.
       afterLoss: this.lostLastWave,
@@ -2222,7 +3041,7 @@ class EnemyAI {
       return;
     }
 
-    if (w.time - wave.launchedAt > WAVE_TIMEOUT) {
+    if (w.time - wave.launchedAt > (wave.timeout || WAVE_TIMEOUT)) {
       // Grinding without result — come home. The next wave stays on the beat
       // set at launch; only a wipe earns a longer pause.
       const s = this.staging || this.home;
@@ -2264,6 +3083,31 @@ class EnemyAI {
 
   waveInterval() {
     return this.world.rng.range(WAVE_INTERVAL_MIN, WAVE_INTERVAL_MAX);
+  }
+
+  /**
+   * How long this particular wave is allowed to be out before it is written off
+   * and called home.
+   *
+   * The march the squad has to make, at the pace of its slowest member, times
+   * WAVE_MARCH_SLACK — and never less than WAVE_TIMEOUT, so a raid on something
+   * ten tiles away still gets a sensible minimum. Measuring it per wave rather
+   * than holding one number is what stops the recall firing on units that are
+   * simply still walking: the roster now spans 1.7 tiles a second (a scout) down
+   * to 0.6 (a mangonel), so one flat figure cannot be right for two of them at
+   * once, and the figure that was right for a militia was five seconds short for
+   * the spearman the Barracks trains today.
+   */
+  waveTimeout(units, from, target) {
+    let slowest = Infinity;
+    for (const u of units) {
+      const s = UNIT_STATS[u.type];
+      const v = s && s.speed > 0 ? s.speed : 1;
+      if (v < slowest) slowest = v;
+    }
+    if (!Number.isFinite(slowest) || slowest <= 0) slowest = 1;
+    const march = dist(from.x, from.y, target.x, target.y) / slowest;
+    return Math.min(WAVE_TIMEOUT_MAX, Math.max(WAVE_TIMEOUT, march * WAVE_MARCH_SLACK));
   }
 
   /** Record how close our soldiers actually get to the enemy base. */
@@ -2323,9 +3167,11 @@ class EnemyAI {
           launchedAt: this.wave.launchedAt,
           lastOrder: this.wave.lastOrder,
           size: this.wave.size,
+          timeout: this.wave.timeout,
           arrived: !!this.wave.arrived,
         }
         : null,
+      agePush: this.agePush ? { ...this.agePush } : null,
       waveNumber: this.waveNumber,
       nextWaveTime: this.nextWaveTime,
       lostLastWave: this.lostLastWave,
@@ -2386,10 +3232,15 @@ class EnemyAI {
           launchedAt: data.wave.launchedAt,
           lastOrder: data.wave.lastOrder,
           size: data.wave.size,
+          // A save written before waves carried their own march budget comes
+          // back with the old flat figure, which is the behaviour it was saved
+          // under.
+          timeout: Number.isFinite(data.wave.timeout) ? data.wave.timeout : WAVE_TIMEOUT,
           arrived: !!data.wave.arrived,
         };
       }
     }
+    this.agePush = data.agePush ? { ...data.agePush } : null;
     this.waveNumber = data.waveNumber || 0;
     this.nextWaveTime = Number.isFinite(data.nextWaveTime)
       ? data.nextWaveTime : FIRST_WAVE_TIME;

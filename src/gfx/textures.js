@@ -11,6 +11,7 @@
 import { makeRng } from '../core/rng.js';
 import {
   TILE_W, TILE_H, HALF_W, HALF_H, PLAYER_COLORS, PLAYER_COLORS_DARK,
+  BUILDING_STATS,
 } from '../core/constants.js';
 
 export const ATLAS = 'aoe-gfx';
@@ -23,6 +24,54 @@ export const TILE_TEX_OFF_X = -1;
 export const TILE_TEX_OFF_Y = -1;
 
 const OUT = 0x161009; // universal dark outline — what makes shapes read at 390px
+
+// ---------------------------------------------------------------------------
+// THE LIGHT
+// ---------------------------------------------------------------------------
+//
+// There was no light model in this file at all, and that flatness — one black
+// outline of one weight around everything, no gradients, no ambient occlusion,
+// no bounce — is the second-loudest "programmer art" tell after the tile grid.
+// Phaser's Graphics has no gradient fill, so a gradient here has to be built out
+// of stacked bands or stacked translucent shapes; that is what the helpers below
+// do, and it is why they exist rather than every call site rolling its own.
+//
+// ONE DIRECTION, AND WHICH ONE. The file used to claim upper-left in one comment
+// and upper-right in another, and the drawings split the difference: every piece
+// of *architecture* (isoBox, isoRoof, isoCylinder, prism — which is to say every
+// building, every wall and every gate) lights the right-hand face and shades the
+// left, while the *resources* (tree, gold, the rock decal) put their highlight
+// up and to the left. Architecture is far more surface area and far more code,
+// so the resources move: the sun in this world is up and to the RIGHT, roughly
+// 40 degrees above the horizon, and every solid in this file now says so.
+//
+// The three terms that come out of that, in the order they matter:
+//
+//   KEY      the lit plane. Faces whose normal points up-right take `shade(c,
+//            +KEY_LIFT)`, faces pointing down-left take `shade(c, -SHADE_DROP)`,
+//            and a face pointing at the camera sits between them. Three values
+//            on every prism, never two: two values on a curve reads as a folded
+//            box, and two on a box reads as a sticker.
+//   RIM      a warm bounce along the lit silhouette edge. Real skies are not the
+//            only light source — the ground throws warm light back up — and one
+//            pixel of warm on the sunward edge of a helmet does more to unflatten
+//            a 40px figure than any amount of interior shading.
+//   CONTACT  a soft dark ellipse where the object meets the ground, offset a
+//            little down-LEFT (away from the sun). Without it every sprite in
+//            the game is a sticker floating a millimetre above the map. It has
+//            to be soft — a hard ellipse is a second sticker.
+//
+// The unit sprites are mirrored by the renderer for four of the eight facings
+// (see FACE_FLIP in render.js), so a rim light baked on a unit's left edge shows
+// up on its right for half the compass. That is a real inaccuracy and it is the
+// right trade: the alternative is eight drawn facings, which quadruples the unit
+// half of the atlas to fix something invisible on a body 40 screen pixels tall.
+// Buildings, walls, terrain and resources are never mirrored, so for everything
+// that holds still the light is exactly consistent.
+const KEY_LIFT = 0.16;   // how much a sunward face is lifted
+const SHADE_DROP = 0.2;  // how much a shaded face is dropped
+const RIM = 0xffe6b4;    // warm bounce; always drawn at low alpha, never solid
+const SKY = 0xbcd4ee;    // cool sky fill, for the top planes of cold materials
 
 const SKIN = 0xf0c69c;
 const STEEL = 0xc3ccd6;
@@ -54,6 +103,78 @@ export function shade(c, f) {
 function clamp255(v) {
   v = Math.round(v);
   return v < 0 ? 0 : v > 255 ? 255 : v;
+}
+
+/**
+ * Mix two packed colours, `t` of the way from a to b.
+ *
+ * `shade` can only move a colour towards white or towards black, which is fine
+ * for a lit face of the same material and wrong for anything where the light
+ * itself is coloured — warm sun on cool stone, cool sky on warm timber. Those
+ * need a real mix, and having one here keeps the hue shifts consistent instead
+ * of every draw function inventing its own near-white.
+ */
+function mix(a, b, t) {
+  const ar = (a >> 16) & 255;
+  const ag = (a >> 8) & 255;
+  const ab = a & 255;
+  return (clamp255(ar + (((b >> 16) & 255) - ar) * t) << 16)
+    | (clamp255(ag + (((b >> 8) & 255) - ag) * t) << 8)
+    | clamp255(ab + ((b & 255) - ab) * t);
+}
+
+/** The sunward face of a solid, and the face turned away from the sun. */
+function lit(c) {
+  return mix(shade(c, KEY_LIFT), RIM, 0.1);
+}
+function dim(c) {
+  // Shadowed faces cool as well as darken: skylight is blue, and a shadow that
+  // is only "the same colour but darker" is the flattest thing a palette can do.
+  return mix(shade(c, -SHADE_DROP), 0x3a4a66, 0.12);
+}
+
+/**
+ * A soft contact shadow on the ground under something, offset away from the
+ * sun (down and a little left).
+ *
+ * Four stacked ellipses rather than one: Graphics cannot feather an edge, so
+ * the falloff has to be built out of rings, and four is where a 30px shadow
+ * stops showing its steps. `strength` scales the whole thing — a villager casts
+ * less than a Town Center.
+ */
+function contactShadow(g, x, y, w, h, strength = 1) {
+  const cx = x - w * 0.06;
+  for (let i = 4; i >= 1; i--) {
+    const t = i / 4;
+    g.fillStyle(0x0a0d14, 0.075 * strength);
+    g.fillEllipse(cx, y + h * 0.1, w * (0.55 + t * 0.55), h * (0.55 + t * 0.55));
+  }
+}
+
+/**
+ * A warm bounce along one edge, drawn as a translucent stroke just inside the
+ * silhouette. Call it *after* the dark outline, so the rim sits between the
+ * outline and the fill the way a real highlight does.
+ */
+function rimLine(g, ax, ay, bx, by, w = 1.6, a = 0.5) {
+  g.lineStyle(w, RIM, a);
+  g.beginPath();
+  g.moveTo(ax, ay);
+  g.lineTo(bx, by);
+  g.strokePath();
+}
+
+/**
+ * The outline weight for an edge, by which way it faces.
+ *
+ * A uniform black keyline of one weight around every shape is the classic
+ * flat-vector look, and it is most of why this game's sprites read as decals.
+ * Real ink varies: heavy where the form turns away from the light, light or
+ * absent where it turns into it. `outline(g, sunward)` picks the pair.
+ */
+function outline(g, sunward, w = 2.2) {
+  if (sunward) g.lineStyle(w * 0.7, mix(OUT, 0x6a5a3c, 0.35), 0.85);
+  else g.lineStyle(w, OUT, 1);
 }
 
 // --- frame-name helpers (the renderer calls these) --------------------------
@@ -141,25 +262,57 @@ export function oceanFrame(level) {
   return `oc_${level}`;
 }
 /**
- * A soft one-edge wash, drawn white so the bake can tint it with whatever
- * terrain is bleeding across. Edge order matches the diamond's corners:
- * 0 = top-right (neighbour -y), 1 = bottom-right (+x), 2 = bottom-left (+y),
- * 3 = top-left (-x).
+ * One tongue of a higher-priority terrain reaching across an edge, drawn white
+ * so the bake can tint it with whatever ground is bleeding over. Edge order
+ * matches the diamond's corners: 0 = top-right (neighbour -y), 1 = bottom-right
+ * (+x), 2 = bottom-left (+y), 3 = top-left (-x).
+ *
+ * `variant` is new and defaults to 0, so the existing single-argument call in
+ * render.js keeps working unchanged — but a boundary that runs for twenty tiles
+ * with the same tongue stamped on every one of them is a boundary with a
+ * pattern in it, and a pattern is exactly what a transition exists to destroy.
+ * Pass a per-tile hash (mod EDGE_BLEND_VARIANTS) and the same twenty tiles stop
+ * rhyming. See the note above buildEdgeBlends.
  */
-export function edgeBlendFrame(edge) {
-  return `eb_${edge}`;
+export function edgeBlendFrame(edge, variant = 0) {
+  return `eb_${edge}_${variant % EDGE_BLEND_VARIANTS}`;
 }
-/** Surf line laid along one edge of a coastal land tile. */
-export function shoreFrame(edge) {
-  return `sh_${edge}`;
+export const EDGE_BLEND_VARIANTS = 4;
+/**
+ * Surf line laid along one edge of a coastal land tile. Same variant story as
+ * edgeBlendFrame: one drawn wave repeated down a shoreline reads as corrugated
+ * iron, four do not.
+ */
+export function shoreFrame(edge, variant = 0) {
+  return `sh_${edge}_${variant % SHORE_VARIANTS}`;
 }
+export const SHORE_VARIANTS = 4;
+/**
+ * One frame of the water's surface animation: caustics and glints, drawn white
+ * over transparency so the renderer can lay it over a water tile, tint it and
+ * cycle it. The water tiles themselves are baked into the static terrain
+ * RenderTexture and cannot move; this is the layer that can.
+ */
+export function waterFrame(i) {
+  return `wa_${i % WATER_ANIM_FRAMES}`;
+}
+export const WATER_ANIM_FRAMES = 4;
 /** Big soft ellipse used to break up large flat regions at bake time. */
 export const BLOB_FRAME = 'tr_blob';
 
 // Grass, dirt, water, sand. Grass and dirt carry the map, so they get the most
 // variants: on a 96x96 map a four-variant grass repeats every couple of screens
 // and the eye finds the repeat long before it finds anything else.
-export const TERRAIN_VARIANTS = [7, 6, 4, 4];
+//
+// Grass went 7 -> 11 and dirt 6 -> 9 in the presentation pass, and sand 4 -> 6.
+// A terrain frame is 66x34 — 2244 pixels, about a twentieth of one 3x3 building
+// — so tile variety is the cheapest art in this file by a wide margin, and it
+// covers more of the screen than everything else put together. What the extra
+// variants buy is not more *detail*; it is more low-frequency variation: each
+// one carries a soft swell of light in a different direction (see `swell`
+// below), so a sheet of grass reads as ground that undulates rather than as one
+// flat sheet with blades stamped on it.
+export const TERRAIN_VARIANTS = [11, 9, 4, 6];
 export const RESOURCE_VARIANTS = { tree: 3, berry: 2, gold: 3, stone: 3 };
 
 /**
@@ -240,7 +393,9 @@ export function buildTextures(scene) {
   const rng = makeRng(0x5eed11);
 
   const origins = new Map();
-  const shelf = { x: 1, y: 1, h: 0 };
+  // The next unused scanline. Shelves are opened downwards from here; see the
+  // packing loop below.
+  const shelf = { y: 1 };
   const TMP = '__aoe_gfx_tmp';
 
   /**
@@ -283,17 +438,55 @@ export function buildTextures(scene) {
   queued.forEach((q, i) => { q._i = i; });
   queued.sort((a, b) => (b.h - a.h) || (a._i - b._i));
 
+  // --- packing ---------------------------------------------------------------
+  //
+  // Shelf packing, but every open shelf is a candidate rather than only the
+  // newest one. Because the queue is sorted tallest-first, any frame still to be
+  // placed fits the height of every shelf already opened, so the search reduces
+  // to "some shelf with horizontal room left" — and the effect is that the
+  // ragged tail every row ends with gets filled in by the small frames at the
+  // end of the queue instead of being thrown away.
+  //
+  // WHICH shelf barely matters, and that is worth writing down so nobody spends
+  // an afternoon on it twice. Searching oldest-first drops a short frame into a
+  // tall shelf and looks like it must be wasteful; searching newest-first is a
+  // best fit and looks like it must be better. Measured on this sheet the two
+  // differ by two scanlines out of sixteen hundred, because the queue is sorted
+  // by height and consecutive frames therefore already have near-identical
+  // heights — the shelves are uniform whichever end you start from. What is
+  // left over is the one-pixel gaps (about 130k pixels) and the ragged tail of
+  // each row, and neither is worth a smarter packer at this scale.
+  //
+  // The cost is O(frames x shelves): sixty-odd shelves against a thousand
+  // frames is fifty thousand integer compares once at boot, which does not show
+  // up next to the thousand canvas rasterisations happening alongside it.
+  const shelves = [];
+  const lost = [];
+  let usedPx = 0;
+
   for (const q of queued) {
-    if (shelf.x + q.w + 1 > SIZE) {
-      shelf.x = 1;
-      shelf.y += shelf.h + 1;
-      shelf.h = 0;
+    let sh = null;
+    for (let i = 0; i < shelves.length; i++) {
+      const s = shelves[i];
+      if (q.h <= s.h && s.x + q.w + 1 <= SIZE) { sh = s; break; }
     }
+    if (sh === null) {
+      // A new shelf under everything opened so far. This is the one place the
+      // sheet can run out, and it must fail here rather than pretend.
+      if (shelf.y + q.h + 1 > SIZE) {
+        lost.push(q);
+        continue;
+      }
+      sh = { y: shelf.y, x: 1, h: q.h };
+      shelves.push(sh);
+      shelf.y += q.h + 1;
+    }
+
     if (q.paintFn) {
       // Painted in place. The atlas context is already at the right spot, and a
       // round trip through a temporary texture would only cost a canvas.
       ctx.save();
-      ctx.translate(shelf.x, shelf.y);
+      ctx.translate(sh.x, sh.y);
       q.paintFn(ctx);
       ctx.restore();
     } else {
@@ -302,18 +495,49 @@ export function buildTextures(scene) {
       if (scene.textures.exists(TMP)) scene.textures.remove(TMP);
       g.generateTexture(TMP, q.w, q.h);
       const src = scene.textures.get(TMP).getSourceImage();
-      ctx.drawImage(src, shelf.x, shelf.y);
+      ctx.drawImage(src, sh.x, sh.y);
       scene.textures.remove(TMP);
     }
-    canvasTex.add(q.name, 0, shelf.x, shelf.y, q.w, q.h);
+    // Registered only now that the frame is known to have landed inside the
+    // sheet. THE OLD CODE REGISTERED IT REGARDLESS, and that is worth spelling
+    // out because of how quietly it failed: past y=2048 `ctx.drawImage` clips
+    // to the canvas and draws nothing, while `canvasTex.add` and `origins.set`
+    // still record the frame — so every `has(frame)` fallback in render.js was
+    // satisfied by a frame containing no pixels, and an overflowing sprite
+    // rendered as *nothing at all*, with no error, no warning that anybody
+    // reads, and no fallback to the art that does exist.
+    canvasTex.add(q.name, 0, sh.x, sh.y, q.w, q.h);
     origins.set(q.name, { w: q.w, h: q.h, ox: q.ax / q.w, oy: q.ay / q.h });
-    shelf.x += q.w + 1;
-    if (q.h > shelf.h) shelf.h = q.h;
+    sh.x += q.w + 1;
+    usedPx += q.w * q.h;
   }
 
-  if (shelf.y + shelf.h > SIZE) {
-    console.warn('[gfx] atlas overflow', shelf.y + shelf.h, 'of', SIZE);
+  const budget = SIZE * SIZE;
+  if (lost.length) {
+    const overPx = lost.reduce((n, q) => n + q.w * q.h, 0);
+    const names = lost.slice(0, 6).map((q) => q.name).join(', ');
+    throw new Error(
+      `[gfx] atlas overflow: ${lost.length} of ${queued.length} frames did not fit `
+      + `in the ${SIZE}x${SIZE} sheet — ${overPx} pixels over budget `
+      + `(${(overPx / 1e3).toFixed(1)}k, ${((overPx / budget) * 100).toFixed(2)}% of the sheet). `
+      + `Placed ${usedPx} px of ${budget} (${((usedPx / budget) * 100).toFixed(1)}%) in `
+      + `${shelves.length} shelves. Lost: ${names}${lost.length > 6 ? ', ...' : ''}. `
+      + 'Shrink a frame box, drop a variant, or raise SIZE — but do not ignore this: '
+      + 'an unregistered frame renders as nothing.',
+    );
   }
+  // The budget, at info level, every boot. It is the only number that says how
+  // much room the next piece of art has, and a number nobody prints is a number
+  // nobody knows until it is already too late.
+  const packedPx = shelf.y * SIZE;
+  console.info(
+    `[gfx] atlas ${SIZE}x${SIZE}: ${queued.length} frames, `
+    + `${(usedPx / 1e6).toFixed(3)}M px drawn (${((usedPx / budget) * 100).toFixed(1)}% of `
+    + `${(budget / 1e6).toFixed(2)}M), packed to y=${shelf.y} `
+    + `(${((packedPx / budget) * 100).toFixed(1)}% of the sheet occupied, `
+    + `${((usedPx / Math.max(1, packedPx)) * 100).toFixed(1)}% packing efficiency), `
+    + `${((budget - packedPx) / 1e6).toFixed(2)}M px of headroom left`,
+  );
 
   canvasTex.refresh();
   g.destroy();
@@ -346,15 +570,82 @@ function inDiamond(rng, w, h, inset) {
   return { x: w / 2, y: h / 2 };
 }
 
-// Variants sit close together in value on purpose: spread them out and the map
-// turns into a visible quilt of alternating diamonds.
-const GRASS = [0x537d38, 0x55803a, 0x4f7935, 0x577f3c, 0x5c8140, 0x4d7534, 0x59823c];
-const DIRT = [0x8a6a45, 0x866742, 0x8e6e49, 0x876b47, 0x8b6c48, 0x836540];
-const WATER = [0x2c6d9e, 0x2b6a99, 0x2f719f, 0x2a6b9b];
-const SAND = [0xd5bf82, 0xd1bb7e, 0xd8c288, 0xd3bd80];
+// ---------------------------------------------------------------------------
+// THE GROUND, AND WHY IT LOOKED LIKE GRAPH PAPER
+// ---------------------------------------------------------------------------
+//
+// Terrain is most of the screen, so it is most of the impression, and it was
+// failing in three separate ways at once. All three are fixed here and all three
+// are worth naming, because each of them is a mistake that is easy to make again:
+//
+// 1. THE GRID. Every tile drew a faint stroke around its own diamond — a helper
+//    literally called `edgeTint`, whose comment said it existed "so the iso grid
+//    is legible". That is backwards. The grid is a fact about the simulation, not
+//    about the world; drawing it turns a meadow into a sheet of graph paper, and
+//    at the zoom this game is played at the lines were the single loudest thing
+//    on screen. It is gone. The water tiles were worse still: they carried a
+//    bright `shade(base, 0.45)` stroke right round the diamond, so a pond was a
+//    stack of blue floor tiles with the grout picked out.
+//
+//    Killing the strokes is not enough on its own, because the *fill* leaves a
+//    grid too. Tiles are baked one pixel larger than a tile and blitted a pixel
+//    up-left so they overlap; where they overlap, the antialiased rim of the
+//    diamond — partial alpha — composites over the neighbour that was drawn
+//    before it, and a partial-alpha edge over an opaque interior is a visible
+//    seam whichever colours are involved. So `fillTile` now strokes the diamond
+//    in its own fill colour before anything else goes on top, which drives the
+//    rim to full opacity and buries it under the neighbour's overlap. That one
+//    line is the difference between "tiled ground" and "ground".
+//
+// 2. THE STAIRCASE. Where two terrains met, the boundary was the diamond grid
+//    itself: a perfect zigzag of 64x32 steps, with a soft airbrush over it that
+//    hid none of it. Terrain does not have corners. buildEdgeBlends now draws a
+//    real intrusion — an opaque tongue of the neighbouring ground with an
+//    irregular, lobed inner boundary that reaches past the tile's own corners,
+//    breaking up into speckle as it goes — and there are four variants of each
+//    edge so a long boundary does not repeat.
+//
+// 3. FLATNESS. Every tile was a flat plate of one colour with marks on it, so a
+//    field of grass was a field of flat plates. Each variant now carries a soft
+//    `swell` of light in a variant-specific direction, which costs one more
+//    ellipse at bake time and reads, across a dozen tiles, as ground that rises
+//    and falls. That plus the wider variant count (11 grass, 9 dirt, 6 sand) is
+//    what stops a hillside being one sheet of green.
+//
+// Variants still sit close together in value on purpose: spread them out and the
+// map turns into a visible quilt of alternating diamonds, which is the failure
+// mode on the *other* side of this one.
+const GRASS = [
+  0x537d38, 0x55803a, 0x4f7935, 0x577f3c, 0x5c8140, 0x4d7534, 0x59823c,
+  // Four more, added with the swell pass. The hue wanders a little further than
+  // the original seven — a touch of olive, a touch of blue-green — because a
+  // meadow is not one dye lot, and at this spacing the eye reads the spread as
+  // grass rather than as different terrain.
+  0x51803e, 0x5b7c33, 0x4b7331, 0x5e8543,
+];
+const DIRT = [
+  0x8a6a45, 0x866742, 0x8e6e49, 0x876b47, 0x8b6c48, 0x836540,
+  0x8f7150, 0x806040, 0x92714b,
+];
+// Deliberately darker than they were. The shallow band around a pond is no
+// longer painted by the water tile at all — it is the edge blend the *land*
+// receives (see TERRAIN_BASE below), so the tiles themselves are free to be the
+// deep part, and a pond finally has a bottom instead of being one flat blue.
+const WATER = [0x276a9a, 0x266795, 0x286d9d, 0x256898];
+const SAND = [0xd5bf82, 0xd1bb7e, 0xd8c288, 0xd3bd80, 0xdcc78e, 0xcdb679];
 
-// One representative colour per terrain id, for tinting the edge-blend wash.
-export const TERRAIN_BASE = [GRASS[0], DIRT[0], WATER[0], SAND[0]];
+/**
+ * One representative colour per terrain id, used to tint the edge-blend tongue
+ * that this terrain pushes across its boundaries.
+ *
+ * Water's entry is NOT the water tile colour, and that is the whole shoreline.
+ * Water outranks everything in TERRAIN_PRIORITY, so the tile that receives
+ * water's tongue is always a land tile at the water's edge — which is exactly
+ * where shallows belong. Tint that tongue with a bright shelf blue and every
+ * pond and every river in the game gets a lit rim that shelves down into the
+ * darker tiles behind it, at a cost of zero extra frames and zero extra draws.
+ */
+export const TERRAIN_BASE = [GRASS[0], DIRT[0], 0x35789f, SAND[0]];
 // Which terrain bleeds over which. A tile only ever receives the wash of a
 // *higher* priority neighbour, so each boundary is drawn exactly once.
 export const TERRAIN_PRIORITY = [0, 1, 3, 2]; // grass < dirt < sand < water
@@ -370,17 +661,26 @@ function buildTerrain(put, rng) {
   GRASS.forEach((base, i) => {
     put(terrainFrame(0, i), W, H, 0, 0, (g) => {
       fillTile(g, pts, base);
+      swell(g, W, H, base, i, 0.028);
       blotches(g, rng, W, H, base, 6, 0.075);
       // Grass tufts read as texture even when the tile is only ~20px on screen.
-      g.lineStyle(1, shade(base, 0.22), 0.55);
+      // Two tones of them, the paler one drawn second and slightly shorter, so a
+      // tuft has a lit side and a shaded side instead of being a single hair.
       for (let k = 0; k < 7; k++) {
         const p = inDiamond(rng, W, H, 0.3);
+        const lean = rng.range(-1.6, 1.6);
+        g.lineStyle(1, shade(base, -0.28), 0.4);
         g.beginPath();
         g.moveTo(p.x, p.y + 1);
-        g.lineTo(p.x + rng.range(-1.6, 1.6), p.y - 3);
+        g.lineTo(p.x + lean, p.y - 3);
+        g.strokePath();
+        g.lineStyle(1, shade(base, 0.24), 0.5);
+        g.beginPath();
+        g.moveTo(p.x + 0.7, p.y + 0.6);
+        g.lineTo(p.x + lean + 0.7, p.y - 2.6);
         g.strokePath();
       }
-      if (i === 3) {
+      if (i === 3 || i === 9) {
         // one variant carries a small flower cluster
         for (let k = 0; k < 3; k++) {
           const p = inDiamond(rng, W, H, 0.35);
@@ -388,7 +688,7 @@ function buildTerrain(put, rng) {
           g.fillCircle(p.x, p.y - 1, 1.2);
         }
       }
-      if (i === 4) {
+      if (i === 4 || i === 8) {
         // Sun-bleached patch: where the field is thinning to dry stalks. The
         // hue shift is small and the shape is soft, so a run of these reads as
         // one meadow drying out rather than as a different terrain type.
@@ -406,7 +706,7 @@ function buildTerrain(put, rng) {
           g.strokePath();
         }
       }
-      if (i === 5) {
+      if (i === 5 || i === 10) {
         // Deep, damp grass: darker mottling and a denser stand of blades.
         for (let k = 0; k < 3; k++) {
           const p = inDiamond(rng, W, H, 0.24);
@@ -431,24 +731,43 @@ function buildTerrain(put, rng) {
           g.fillCircle(p.x + 2.2, p.y + 0.8, 1.1);
         }
       }
-      edgeTint(g, pts, base);
+      if (i === 7) {
+        // A bare scuff worn through to the soil. One tile in eleven, so it is
+        // incident rather than another texture — the thing that stops a lawn
+        // being a lawn is a patch where the lawn has stopped.
+        for (let k = 0; k < 2; k++) {
+          const p = inDiamond(rng, W, H, 0.3);
+          g.fillStyle(0x6f6034, 0.3);
+          g.fillEllipse(p.x, p.y, rng.range(12, 18), rng.range(6, 9));
+          g.fillStyle(0x7d6c3c, 0.22);
+          g.fillEllipse(p.x + 1.5, p.y - 0.8, rng.range(7, 11), rng.range(3.5, 5.5));
+        }
+      }
     });
   });
 
   DIRT.forEach((base, i) => {
     put(terrainFrame(1, i), W, H, 0, 0, (g) => {
       fillTile(g, pts, base);
+      swell(g, W, H, base, i + 3, 0.026);
       blotches(g, rng, W, H, base, 7, 0.1);
       // Pebbles. Variant 3 trades some of them for dry cracks and a stray
       // weed, so a wide sheet of dirt is not the same five stones over and
-      // over — the flat-dirt regions were the quilt's dullest half.
-      const stones = i === 3 ? 2 : 5;
+      // over — the flat-dirt regions were the quilt's dullest half. Each stone
+      // is now a shadow, a body and a lit cap rather than two flat ellipses;
+      // at three pixels across that is the whole difference between a pebble
+      // and a smudge.
+      const stones = i === 3 ? 2 : i === 6 ? 3 : 5;
       for (let k = 0; k < stones; k++) {
         const p = inDiamond(rng, W, H, 0.32);
-        g.fillStyle(shade(base, -0.3), 0.8);
-        g.fillEllipse(p.x, p.y, rng.range(2.5, 4.5), rng.range(1.8, 2.8));
-        g.fillStyle(shade(base, 0.25), 0.7);
-        g.fillEllipse(p.x - 0.4, p.y - 0.7, 1.8, 1.2);
+        const rw = rng.range(2.5, 4.5);
+        const rh = rng.range(1.8, 2.8);
+        g.fillStyle(0x2a2118, 0.22);
+        g.fillEllipse(p.x - 0.8, p.y + 1.2, rw * 1.1, rh * 0.9);
+        g.fillStyle(shade(base, -0.3), 0.85);
+        g.fillEllipse(p.x, p.y, rw, rh);
+        g.fillStyle(shade(base, 0.28), 0.8);
+        g.fillEllipse(p.x + 0.5, p.y - 0.7, rw * 0.5, rh * 0.5);
       }
       if (i === 3) {
         g.lineStyle(1, shade(base, -0.34), 0.45);
@@ -485,7 +804,7 @@ function buildTerrain(put, rng) {
         g.lineTo(W - 2, H / 2 - 6);
         g.strokePath();
       }
-      if (i === 5) {
+      if (i === 5 || i === 8) {
         // Gravel: a scatter of small chips rather than five big stones.
         for (let k = 0; k < 14; k++) {
           const p = inDiamond(rng, W, H, 0.28);
@@ -493,19 +812,50 @@ function buildTerrain(put, rng) {
           g.fillEllipse(p.x, p.y, rng.range(1.4, 2.6), rng.range(1, 1.8));
         }
       }
-      edgeTint(g, pts, base);
+      if (i === 7) {
+        // Cracked, sun-baked mud: a polygonal crazing rather than the three
+        // straight fissures variant 3 gets.
+        g.lineStyle(1.1, shade(base, -0.38), 0.4);
+        for (let k = 0; k < 5; k++) {
+          const p = inDiamond(rng, W, H, 0.3);
+          const a = rng.range(0, Math.PI);
+          g.beginPath();
+          g.moveTo(p.x - Math.cos(a) * 5, p.y - Math.sin(a) * 2.4);
+          g.lineTo(p.x, p.y);
+          g.lineTo(p.x + Math.cos(a + 1.9) * 5, p.y + Math.sin(a + 1.9) * 2.4);
+          g.strokePath();
+        }
+      }
     });
   });
 
   WATER.forEach((base, i) => {
     put(terrainFrame(2, i), W, H, 0, 0, (g) => {
       fillTile(g, pts, base);
-      // Depth: darker toward the centre, lighter near the rim.
-      g.fillStyle(shade(base, -0.22), 0.55);
-      g.fillEllipse(W / 2, H / 2, W * 0.6, H * 0.6);
-      g.lineStyle(1.6, shade(base, 0.3), 0.5);
+      // Depth, built as a stack rather than a step. Graphics has no gradient
+      // fill, so five nested ellipses at low alpha is the gradient: the middle
+      // of a body of water is a good deal darker than its rim, and the falloff
+      // has to be smooth or the tile reads as a blue plate with a blue coin on
+      // it — which is what the single 0.55-alpha ellipse here used to do.
+      for (let k = 5; k >= 1; k--) {
+        const t = k / 5;
+        g.fillStyle(shade(base, -0.34), 0.16);
+        g.fillEllipse(W / 2, H / 2, W * 0.86 * t, H * 0.86 * t);
+      }
+      // Ripples: a dark trough with a lit crest just above it, so the surface
+      // has a direction to it. Deliberately low-contrast — the bright, animated
+      // glints live in the wa_* frames the renderer lays on top, and baking
+      // them here as well would double them up wherever the two agree.
       for (let k = 0; k < 3; k++) {
         const p = inDiamond(rng, W, H, 0.4);
+        g.lineStyle(1.6, shade(base, -0.3), 0.4);
+        g.beginPath();
+        g.moveTo(p.x - 5, p.y + 1);
+        g.lineTo(p.x - 1.5, p.y - 0.4);
+        g.lineTo(p.x + 2, p.y + 1);
+        g.lineTo(p.x + 5.5, p.y - 0.4);
+        g.strokePath();
+        g.lineStyle(1.3, shade(base, 0.34), 0.4);
         g.beginPath();
         g.moveTo(p.x - 5, p.y);
         g.lineTo(p.x - 1.5, p.y - 1.4);
@@ -513,27 +863,47 @@ function buildTerrain(put, rng) {
         g.lineTo(p.x + 5.5, p.y - 1.4);
         g.strokePath();
       }
-      g.lineStyle(1.5, shade(base, 0.45), 0.45);
-      g.strokePoints(diamondPts(W, H), true, true);
     });
   });
 
   SAND.forEach((base, i) => {
     put(terrainFrame(3, i), W, H, 0, 0, (g) => {
       fillTile(g, pts, base);
+      swell(g, W, H, base, i + 5, 0.022);
       blotches(g, rng, W, H, base, 5, 0.08);
       for (let k = 0; k < 8; k++) {
         const p = inDiamond(rng, W, H, 0.34);
         g.fillStyle(shade(base, -0.22), 0.55);
         g.fillCircle(p.x, p.y, 0.9);
       }
-      edgeTint(g, pts, base);
+      if (i === 4) {
+        // Wind ripples, running along one grid axis so a beach reads as combed
+        // rather than as static.
+        g.lineStyle(1.2, shade(base, -0.16), 0.4);
+        for (let k = -2; k <= 2; k++) {
+          g.beginPath();
+          g.moveTo(3, H / 2 + k * 4.5);
+          g.lineTo(W - 3, H / 2 + k * 4.5 - 2);
+          g.strokePath();
+        }
+      }
+      if (i === 5) {
+        // Shell grit and a couple of larger pebbles washed up.
+        for (let k = 0; k < 3; k++) {
+          const p = inDiamond(rng, W, H, 0.34);
+          g.fillStyle(shade(base, -0.3), 0.6);
+          g.fillEllipse(p.x, p.y + 0.6, 3.2, 2);
+          g.fillStyle(shade(base, 0.34), 0.75);
+          g.fillEllipse(p.x + 0.4, p.y - 0.3, 2, 1.2);
+        }
+      }
     });
   });
 
   buildOcean(put, rng);
   buildEdgeBlends(put, rng);
-  buildShores(put);
+  buildShores(put, rng);
+  buildWaterAnim(put, rng);
 
   // Big soft ellipse, drawn tinted and very faint over the baked ground so
   // large single-terrain regions get slow, map-scale variation instead of
@@ -554,9 +924,21 @@ function buildTerrain(put, rng) {
   });
 }
 
+/**
+ * Fill a tile diamond, and drive its antialiased rim to full opacity.
+ *
+ * The stroke is the important half and it is not decoration: see note 1 at the
+ * top of this section. `fillPoints` leaves the diamond's boundary at partial
+ * alpha, tiles overlap by a pixel or two, and a partial-alpha edge composited
+ * over an opaque neighbour is a seam — which, repeated across a hundred tiles,
+ * is the grid. Stroking the same path in the same colour first makes the rim
+ * solid, so the overlap has nothing to reveal.
+ */
 function fillTile(g, pts, base) {
   g.fillStyle(base, 1);
   g.fillPoints(pts, true, true);
+  g.lineStyle(2, base, 1);
+  g.strokePoints(pts, true, true);
 }
 
 function blotches(g, rng, W, H, base, n, amt) {
@@ -567,10 +949,41 @@ function blotches(g, rng, W, H, base, n, amt) {
   }
 }
 
-/** A whisper of an edge, so the iso grid is legible without looking drawn-on. */
-function edgeTint(g, pts, base) {
-  g.lineStyle(1, shade(base, -0.35), 0.055);
-  g.strokePoints(pts, true, true);
+/**
+ * A soft swell of light across the tile, leaning in a variant-specific
+ * direction.
+ *
+ * This is the cheapest possible substitute for a heightfield: no two adjacent
+ * tiles lean the same way, so a sheet of one terrain acquires slow variation
+ * instead of being one flat plate repeated.
+ *
+ * TWO THINGS ABOUT THE NUMBERS, both learned the hard way by looking at the
+ * result. First, the ellipses are much LARGER than the tile and centred well
+ * outside it, so what falls inside the diamond is a slice of a broad gradient —
+ * a ramp. Sized to the tile instead, the same code puts a bright blob in the
+ * middle of every diamond, which does not read as an undulation; it reads as a
+ * spotlight per tile, and it draws the grid more clearly than the stroke this
+ * whole pass removed. Second, the amplitude is tiny (four per cent) and stays
+ * tiny, because every pixel of value difference between one tile and the next
+ * lands exactly on the tile boundary, and value differences on a boundary are
+ * the definition of a quilt. Anything the player should actually notice at
+ * map scale belongs in the BLOB pass in render.js, which is six tiles wide and
+ * does not respect the grid at all.
+ *
+ * `dir` is an integer; consecutive variants get consecutive directions round the
+ * compass, which guarantees neighbouring variants never agree.
+ */
+function swell(g, W, H, base, dir, amt) {
+  const a = (Math.PI * 2 * (dir % 8)) / 8 + 0.4;
+  const ox = Math.cos(a) * W * 0.85;
+  const oy = Math.sin(a) * H * 0.85;
+  for (let k = 4; k >= 1; k--) {
+    const t = k / 4;
+    g.fillStyle(shade(base, amt), 0.055);
+    g.fillEllipse(W / 2 + ox, H / 2 + oy, W * 2.1 * t, H * 2.1 * t);
+    g.fillStyle(shade(base, -amt), 0.05);
+    g.fillEllipse(W / 2 - ox, H / 2 - oy, W * 2.1 * t, H * 2.1 * t);
+  }
 }
 
 // --- out-of-bounds sea -------------------------------------------------------
@@ -596,8 +1009,10 @@ function buildOcean(put, rng) {
       // The outermost ring must be perfectly flat: it butts onto the solid
       // fill, and any detail there would draw the eye to the changeover.
       if (i === OCEAN_LEVELS - 1) return;
-      g.fillStyle(shade(base, -0.2), 0.42 * (1 - deep));
-      g.fillEllipse(W / 2, H / 2, W * 0.62, H * 0.62);
+      for (let k = 4; k >= 1; k--) {
+        g.fillStyle(shade(base, -0.24), 0.13 * (1 - deep * 0.6));
+        g.fillEllipse(W / 2, H / 2, W * 0.8 * (k / 4), H * 0.8 * (k / 4));
+      }
       if (i <= 2) {
         g.lineStyle(1.5, shade(base, 0.3), 0.42 - i * 0.12);
         for (let k = 0; k < 2; k++) {
@@ -629,43 +1044,148 @@ function towards(p, c, t) {
 }
 
 /**
- * Soft one-edge washes. Terrain meets terrain at a hard diamond staircase
- * otherwise; these fade the higher-priority ground a little way across the
- * boundary and then dither out, which is what kills the quilted look. Drawn in
- * white so one set of four frames serves every terrain pair via tint.
+ * Real terrain transitions.
+ *
+ * WHAT WAS WRONG. Two terrains met along the tile grid: a perfect 64x32 zigzag,
+ * with a three-band airbrush laid over it that softened the colour without
+ * moving the boundary an inch. Softening a straight line gives a soft straight
+ * line. What kills a staircase is a boundary that does not follow it — one that
+ * bulges past the corners in some places and pulls back short of the edge in
+ * others, so the eye cannot find the 64x32 rhythm underneath.
+ *
+ * WHAT THIS DRAWS. For one edge of the diamond, an intruding tongue of the
+ * neighbour's ground, in three layers:
+ *
+ *   the tongue    an opaque polygon that follows the tile edge on the outside
+ *                 and an irregular lobed curve on the inside, sampled from two
+ *                 out-of-phase sines so it is smooth rather than jagged — soil
+ *                 creeps, it does not have teeth. It deliberately runs a little
+ *                 PAST both corners, which is what makes the tongue on one edge
+ *                 interlock with the tongue on the next one instead of leaving
+ *                 a notch at every corner.
+ *   the fringe    a second, fainter lobed band beyond the tongue, reaching
+ *                 roughly twice as deep and completely out of phase with it, so
+ *                 the boundary has two scales of irregularity rather than one.
+ *   the speckle   scattered ellipses past the fringe, thinning out with depth.
+ *                 This is the part the old version had, and on its own it is a
+ *                 dusting, not a transition.
+ *
+ * WHY GREY AND NOT ONLY WHITE. The frame is tinted with the neighbour's base
+ * colour, so white comes out as flat neighbour-colour with no texture in it at
+ * all — a plastic sheen next to ground that has stones and blades on it. Tint
+ * is a multiply, so anything darker than white comes out as a *darker shade of
+ * the neighbour*: mottling the tongue with a few greys gives the intruding
+ * ground its own value texture for free. Nothing can be made brighter than the
+ * tint, which is why the shore foam lives in its own frames.
+ *
+ * FOUR VARIANTS. One drawn tongue stamped along a fifty-tile boundary is a
+ * pattern, and a pattern is what this exists to destroy. Each variant shifts the
+ * phase and the amplitude of both sines. See edgeBlendFrame.
  */
 function buildEdgeBlends(put, rng) {
   const W = TILE_TEX_W;
   const H = TILE_TEX_H;
   const corners = diamondCorners(W, H);
   const C = { x: W / 2, y: H / 2 };
+  const STEPS = 14;
+
   for (let e = 0; e < 4; e++) {
     const P = corners[e];
     const Q = corners[(e + 1) % 4];
-    put(edgeBlendFrame(e), W, H, 0, 0, (g) => {
-      const bands = [[0, 0.15, 0.95], [0.15, 0.32, 0.62], [0.32, 0.52, 0.3]];
-      for (const [t0, t1, a] of bands) {
-        g.fillStyle(0xffffff, a);
-        g.fillPoints([
-          towards(P, C, t0), towards(Q, C, t0),
-          towards(Q, C, t1), towards(P, C, t1),
-        ], true, true);
-      }
-      // Dithered speckle past the band, the way AoE2 feathers its transitions.
-      for (let k = 0; k < 18; k++) {
-        const u = rng.range(0.04, 0.96);
-        const v = rng.range(0.5, 0.95);
-        const onEdge = { x: P.x + (Q.x - P.x) * u, y: P.y + (Q.y - P.y) * u };
-        const p = towards(onEdge, C, v);
-        g.fillStyle(0xffffff, 0.36 * (1 - (v - 0.5) / 0.45));
-        g.fillEllipse(p.x, p.y, rng.range(3, 6.5), rng.range(1.8, 3.2));
-      }
-    });
+    for (let v = 0; v < EDGE_BLEND_VARIANTS; v++) {
+      // Phases are derived from the edge and the variant rather than drawn from
+      // the rng, so the tongue on edge 1 is not a rotation of the tongue on
+      // edge 0 — two neighbouring tiles very often receive blends on adjacent
+      // edges, and if those matched the corner between them would show.
+      const ph0 = e * 1.7 + v * 2.3;
+      const ph1 = e * 0.9 + v * 3.1 + 1.1;
+      const amp = 0.055 + (v % 2) * 0.02;
+
+      // The inner boundary of a band, as a polyline from P's end to Q's end.
+      // `base` is how far in the band reaches at rest and `k` scales the wobble.
+      const inner = (base, k, phase) => {
+        const out = [];
+        for (let s = 0; s <= STEPS; s++) {
+          const u = s / STEPS;
+          const d = base
+            + Math.sin(u * 5.4 + phase) * amp * k
+            + Math.sin(u * 11.9 + phase * 1.7) * amp * k * 0.45;
+          // Overshoot the corners a little (u is stretched past 0 and 1) so the
+          // tongue laps round onto the neighbouring edges and no notch is left
+          // where two blends meet.
+          const eu = -0.06 + u * 1.12;
+          const onEdge = { x: P.x + (Q.x - P.x) * eu, y: P.y + (Q.y - P.y) * eu };
+          // The floor is negative on purpose: the outer lip is allowed to spill
+          // a little past the tile edge, where the frame clips it. Floor it at
+          // zero instead and the tongue stops a hair short of the edge all the
+          // way along, which puts a one-pixel line of the host terrain round
+          // every boundary — a new grid line, drawn by the code that exists to
+          // remove one.
+          out.push(towards(onEdge, C, Math.max(-0.05, d)));
+        }
+        return out;
+      };
+      put(edgeBlendFrame(e, v), W, H, 0, 0, (g) => {
+        // 1. the tongue — opaque, so the intruding ground actually replaces the
+        //    ground underneath rather than washing over it.
+        //
+        //    Its OUTER boundary wobbles too, and that is not symmetry for its
+        //    own sake. This frame is drawn on the tile that is being intruded
+        //    upon, so its outer lip lies exactly along the tile edge — which
+        //    means a boundary whose inner side is organic and whose outer side
+        //    is the lip still draws one perfectly straight 64x32 zigzag, and
+        //    the eye finds a straight line next to a wiggly one instantly. It
+        //    shows up worst on water, where a bright shelf against dark water
+        //    was a staircase picked out in the highest contrast on the map.
+        //    Letting the lip pull back inside the tile in places lets the host
+        //    ground poke through into the gap, and the waterline breaks up.
+        const outer = inner(0.045, 0.9, ph1 + 2.4);
+        const t1 = inner(0.30, 1, ph0);
+        g.fillStyle(0xffffff, 1);
+        g.fillPoints([...outer, ...t1.slice().reverse()], true, true);
+        // Value texture inside the tongue, in greys: after the tint these are
+        // darker shades of the intruding terrain, which is what keeps it from
+        // reading as a decal of flat colour.
+        for (let k = 0; k < 7; k++) {
+          const u = rng.range(0, 1);
+          const onEdge = { x: P.x + (Q.x - P.x) * u, y: P.y + (Q.y - P.y) * u };
+          const p = towards(onEdge, C, rng.range(0.04, 0.26));
+          g.fillStyle(rng.chance(0.5) ? 0xc8c8c8 : 0xe4e4e4, 0.55);
+          g.fillEllipse(p.x, p.y, rng.range(5, 11), rng.range(2.4, 4.6));
+        }
+
+        // 2. the fringe — out of phase with the tongue and reaching further, so
+        //    the boundary wobbles at two scales.
+        const t2 = inner(0.52, 1.6, ph1);
+        g.fillStyle(0xffffff, 0.5);
+        g.fillPoints([...t1, ...t2.slice().reverse()], true, true);
+
+        // 3. the speckle — the ground breaking up as it runs out.
+        for (let k = 0; k < 20; k++) {
+          const u = rng.range(-0.02, 1.02);
+          const vv = rng.range(0.42, 0.9);
+          const onEdge = { x: P.x + (Q.x - P.x) * u, y: P.y + (Q.y - P.y) * u };
+          const p = towards(onEdge, C, vv);
+          g.fillStyle(0xffffff, 0.42 * (1 - (vv - 0.42) / 0.5));
+          g.fillEllipse(p.x, p.y, rng.range(2.5, 6), rng.range(1.4, 3));
+        }
+      });
+    }
   }
 }
 
-/** Surf along one edge of a coastal tile. White; tinted pale at bake time. */
-function buildShores(put) {
+/**
+ * Surf along one edge of a coastal tile: a hard wet line at the water's edge, a
+ * broken foam crest a little up the beach, and a scatter of dying bubbles past
+ * that.
+ *
+ * These are drawn white and tinted pale, so unlike the edge blends they can be
+ * *brighter* than anything under them — which is why foam has to live here and
+ * not in the transition frames. Four variants for the same reason those have
+ * four: an identical wave stamped along thirty tiles of coast is corrugated
+ * iron, and a coast is the one boundary a player's eye follows all the way.
+ */
+function buildShores(put, rng) {
   const W = TILE_TEX_W;
   const H = TILE_TEX_H;
   const corners = diamondCorners(W, H);
@@ -673,29 +1193,106 @@ function buildShores(put) {
   for (let e = 0; e < 4; e++) {
     const P = corners[e];
     const Q = corners[(e + 1) % 4];
-    put(shoreFrame(e), W, H, 0, 0, (g) => {
-      const a0 = towards(P, C, 0.06);
-      const b0 = towards(Q, C, 0.06);
-      const a1 = towards(P, C, 0.2);
-      const b1 = towards(Q, C, 0.2);
-      g.fillStyle(0xffffff, 0.3);
-      g.fillPoints([a0, b0, b1, a1], true, true);
-      g.lineStyle(2.2, 0xffffff, 0.8);
-      g.beginPath();
-      g.moveTo(a0.x, a0.y);
-      g.lineTo(b0.x, b0.y);
-      g.strokePath();
-      // Broken foam a little further up the beach.
-      g.lineStyle(1.6, 0xffffff, 0.55);
-      for (let k = 0; k < 3; k++) {
-        const u = 0.14 + k * 0.3;
-        const s = towards({ x: P.x + (Q.x - P.x) * u, y: P.y + (Q.y - P.y) * u }, C, 0.3);
-        const t = towards({ x: P.x + (Q.x - P.x) * (u + 0.14), y: P.y + (Q.y - P.y) * (u + 0.14) }, C, 0.3);
+    const at = (u, t) => towards(
+      { x: P.x + (Q.x - P.x) * u, y: P.y + (Q.y - P.y) * u }, C, t,
+    );
+    for (let v = 0; v < SHORE_VARIANTS; v++) {
+      const ph = e * 1.3 + v * 2.7;
+      put(shoreFrame(e, v), W, H, 0, 0, (g) => {
+        // The wet band: solid at the waterline, its inner edge wandering.
+        const band = [];
+        for (let s = 0; s <= 10; s++) {
+          const u = -0.04 + (s / 10) * 1.08;
+          band.push(at(u, 0.16 + Math.sin(u * 6.1 + ph) * 0.05));
+        }
+        g.fillStyle(0xffffff, 0.34);
+        g.fillPoints([at(-0.04, 0.03), at(1.04, 0.03), ...band.slice().reverse()], true, true);
+        // The waterline itself.
+        g.lineStyle(2.4, 0xffffff, 0.85);
         g.beginPath();
-        g.moveTo(s.x, s.y);
-        g.lineTo(t.x, t.y);
+        g.moveTo(at(-0.04, 0.05).x, at(-0.04, 0.05).y);
+        g.lineTo(at(1.04, 0.05).x, at(1.04, 0.05).y);
+        g.strokePath();
+        // Broken foam crests further up the beach: three short arcs at
+        // variant-dependent positions, so no two coastal tiles rhyme.
+        g.lineStyle(1.8, 0xffffff, 0.6);
+        for (let k = 0; k < 3; k++) {
+          const u0 = 0.06 + k * 0.3 + (v % 2) * 0.08;
+          const d = 0.22 + Math.sin(k * 2.1 + ph) * 0.07;
+          g.beginPath();
+          g.moveTo(at(u0, d).x, at(u0, d).y);
+          g.lineTo(at(u0 + 0.09, d - 0.04).x, at(u0 + 0.09, d - 0.04).y);
+          g.lineTo(at(u0 + 0.18, d).x, at(u0 + 0.18, d).y);
+          g.strokePath();
+        }
+        // Dying bubbles.
+        for (let k = 0; k < 7; k++) {
+          const u = rng.range(0, 1);
+          const d = rng.range(0.26, 0.46);
+          const p = at(u, d);
+          g.fillStyle(0xffffff, 0.4 * (1 - (d - 0.26) / 0.22));
+          g.fillEllipse(p.x, p.y, rng.range(2, 4.5), rng.range(1.2, 2.2));
+        }
+      });
+    }
+  }
+}
+
+/**
+ * The water's moving surface, as a short overlay cycle.
+ *
+ * Water tiles are baked into the static terrain RenderTexture with everything
+ * else — that is what makes a 96x96 map cost nothing per frame — so the tiles
+ * themselves can never move. These four frames are the part that can: caustic
+ * threads and glints on transparency, meant to be laid over a water tile at low
+ * alpha and stepped a few times a second. Frame k is the same surface a quarter
+ * of a cycle later, so the threads drift steadily in one direction rather than
+ * flickering between four unrelated pictures — a cycle that does not *travel*
+ * reads as television static, which is worse than no animation at all.
+ */
+function buildWaterAnim(put, rng) {
+  const W = TILE_TEX_W;
+  const H = TILE_TEX_H;
+  // Fixed thread positions, shared by all four frames; only the phase moves.
+  const threads = [];
+  for (let k = 0; k < 7; k++) {
+    threads.push({
+      x: rng.range(6, W - 6),
+      y: rng.range(5, H - 5),
+      len: rng.range(7, 14),
+      amp: rng.range(0.8, 2.0),
+      sp: rng.range(0.7, 1.5),
+    });
+  }
+  for (let f = 0; f < WATER_ANIM_FRAMES; f++) {
+    const phase = (Math.PI * 2 * f) / WATER_ANIM_FRAMES;
+    put(waterFrame(f), W, H, 0, 0, (g) => {
+      for (const t of threads) {
+        // Drift along the +x screen axis and wrap, so the whole surface travels.
+        const dx = ((t.x + (f * W) / (WATER_ANIM_FRAMES * 2)) % (W - 8)) + 4;
+        const y = t.y + Math.sin(phase * t.sp) * t.amp;
+        // Only inside the diamond, or the glints spill onto the neighbouring
+        // land tile and the pond gets a halo.
+        const inside = Math.abs(dx - W / 2) / (W / 2) + Math.abs(y - H / 2) / (H / 2);
+        if (inside > 0.82) continue;
+        const a = 0.16 + 0.14 * (1 + Math.sin(phase * 2 + t.sp * 3)) * 0.5;
+        g.lineStyle(1.7, 0xffffff, a);
+        g.beginPath();
+        g.moveTo(dx - t.len / 2, y);
+        g.lineTo(dx - t.len / 6, y - 1.3);
+        g.lineTo(dx + t.len / 6, y);
+        g.lineTo(dx + t.len / 2, y - 1.3);
         g.strokePath();
       }
+      // One brighter glint per frame, moving round the tile, which is what
+      // makes the cycle read as sunlight on moving water rather than as noise.
+      const ga = phase + 0.6;
+      const gx = W / 2 + Math.cos(ga) * W * 0.2;
+      const gy = H / 2 + Math.sin(ga) * H * 0.2;
+      g.fillStyle(0xffffff, 0.3);
+      g.fillEllipse(gx, gy, 7, 2.6);
+      g.fillStyle(0xffffff, 0.5);
+      g.fillEllipse(gx, gy, 3.4, 1.4);
     });
   }
 }
@@ -732,38 +1329,91 @@ function buildShores(put) {
 //    would also turn six units into six rigs to maintain, for detail that is
 //    below the resolution the player actually sees.
 //
-// 3. THE PASSING POSE IS SHARED. A four-beat walk is contact-left, passing,
-//    contact-right, passing — three drawings played [0,1,2,1]. Actions that are
-//    the same motion get the same poses: a villager attacking swings the axe it
-//    gathers with, so `attack` reuses the gather pair rather than adding two
-//    frames per unit per team for a thing villagers do badly and rarely.
+// 3. ACTIONS THAT ARE THE SAME MOTION GET THE SAME POSES. A villager attacking
+//    swings the axe it gathers with, so `attack` reuses the gather pair rather
+//    than adding two frames per unit per team for a thing villagers do badly
+//    and rarely.
 //
-// The result is 10 poses for the villager and 8 for each of the five soldiers,
-// x2 facings x2 teams = 200 unit frames, against the 12 this file used to bake.
+// 4. POSE COUNT IS SPENT WHERE THE MOTION IS. The walk used to be three drawings
+//    played [w0, w1, w2, w1] — a four-beat cycle in which two of the four beats
+//    are the same picture, which is exactly the reason units read as sliding
+//    rather than walking. It is six drawings now, played straight through, for
+//    everything with legs.
+//
+//    SIX, AND WHY NOT MORE OR FEWER. The rig is two leg angles, a body offset
+//    and a weapon phase — no knees. Drive the legs from `A*sin(phase)` with the
+//    two legs exactly out of step and you cannot get more than *four* distinct
+//    drawings out of a cycle, because sin(60 degrees) equals sin(120 degrees)
+//    and the two poses come out identical; the sixth and fifth beats are wasted
+//    atlas. Giving the trailing leg a small phase lead — which is what double
+//    support actually is, both feet down for a moment either side of contact —
+//    breaks every tie and gets six genuinely different pictures out of the same
+//    four numbers. That is the whole of the walk improvement, and it costs data,
+//    not code.
+//
+//    Cavalry gets four (a gallop is a shorter, snappier cycle and the horse's
+//    barrel hides most of the leg travel anyway) and the wheeled engines get
+//    three, because what animates on those is a wheel and three phases of a
+//    spoke pattern is a rotation.
+//
+// The result is 13 poses for the villager, 11 for a foot soldier or a monk, 9
+// for a rider and 8 for an engine — x2 facings x2 teams.
 
 const UNIT_BOX = {
-  villager: { w: 36, h: 54, cx: 18, ft: 46 },
+  villager: { w: 36, h: 51, cx: 18, ft: 46 },
   // Box heights leave a few pixels of air above the tallest thing each unit
   // draws in any pose — a plume, a spear point, a rider's helmet. Get this
   // wrong and the clipping only shows up in one pose out of ten, which is
   // exactly the kind of bug a contact sheet catches and a play session does
   // not. tests/art.browser.mjs prints every pose of every unit for this reason.
-  militia: { w: 46, h: 64, cx: 23, ft: 56 },
+  militia: { w: 46, h: 61, cx: 23, ft: 56 },
   // Taller than the militia purely to fit the spear: the shaft rises well above
   // the head, and that vertical line over a body the player already recognises
   // as infantry is the whole of the spearman's silhouette.
-  spearman: { w: 48, h: 72, cx: 24, ft: 62 },
+  spearman: { w: 46, h: 72, cx: 22, ft: 62 },
   // Wider and taller than the others on purpose: the archer's whole identity is
   // the bow arc hanging off its left and the arrow fan off its right, and both
-  // need room outside the body to read at phone size.
-  archer: { w: 54, h: 64, cx: 27, ft: 54 },
+  // need room outside the body to read at phone size. (Cut from 54x64 once the
+  // contact sheet showed seven columns and six rows of empty pixels on every
+  // one of its frames; at forty-four frames per team that emptiness was 23k
+  // pixels of atlas, which is most of a monk.)
+  archer: { w: 45, h: 57, cx: 24, ft: 52 },
   // The only unit on the map wider than it is tall. That, not the rider, is what
   // makes cavalry findable in a crowd at 0.7 zoom without reading a label.
-  scout: { w: 62, h: 68, cx: 31, ft: 58 },
+  scout: { w: 61, h: 67, cx: 30, ft: 58 },
   // A machine, not a man: no head, no limbs, no tunic. A player has to know at a
   // glance that the thing crawling at their Town Center cannot be answered by
   // trading blows with it.
   ram: { w: 68, h: 66, cx: 34, ft: 58 },
+
+  // --- the new roster --------------------------------------------------------
+  //
+  // Five bodies, and between them they have to say four things a player must
+  // never have to tap to find out: which of these is a cheap missile trooper,
+  // which is the heavy cavalry that ends games, which two are engines that
+  // cannot answer a charge, and which one cannot fight at all.
+  //
+  // A skirmisher is a light infantryman with a bundle of javelins and a wicker
+  // shield — no bow arc anywhere on it, because the bow arc is the archer's and
+  // two missile units that both read "archer" is worse than one.
+  skirmisher: { w: 46, h: 62, cx: 23, ft: 54 },
+  // A barded warhorse. Taller and heavier than the scout in every dimension:
+  // the scout is a pony with a man in a cap, this is a wall of steel with a
+  // lance over it, and the difference has to survive the two of them standing
+  // next to each other.
+  knight: { w: 64, h: 74, cx: 32, ft: 62 },
+  // Both engines are wider than they are tall and both sit low, like the ram —
+  // that is the family they belong to, and the family is the first read. What
+  // separates them from each other is the throwing gear on top: the mangonel's
+  // arm rakes back over its own axle and its bucket is a bowl, the scorpion's
+  // is a flat horizontal bow with a bolt already in the groove.
+  mangonel: { w: 70, h: 68, cx: 35, ft: 58 },
+  scorpion: { w: 64, h: 58, cx: 32, ft: 50 },
+  // The narrowest body in the game, and deliberately the plainest: a robe to
+  // the ground, a cowl, and both hands on a book. No weapon, no helmet, no
+  // shield, nothing on the shoulders — a monk has to read as a non-combatant
+  // from its outline alone, at any zoom, in the middle of a melee.
+  monk: { w: 37, h: 56, cx: 17, ft: 52 },
 };
 
 /**
@@ -779,31 +1429,90 @@ const UNIT_BOX = {
  * the whole sprite about its feet and fading it out, which is what makes a death
  * read as a death and not as a despawn.
  */
+/**
+ * One beat of the six-drawing walk.
+ *
+ * `k` is the beat, 0..5. The near leg swings as A*sin(phase); the far leg swings
+ * as -A*sin(phase + LEAD), and that small lead is what makes six distinct
+ * drawings possible at all — see point 4 in the section header. It is also what
+ * a walk really does: for a moment either side of every footfall both feet are
+ * on the ground, and the trailing one has not finished pushing off.
+ *
+ * The body rises and falls twice per stride (once per footfall), which is why
+ * `by` keys off |sin| rather than sin, and it drifts a pixel or so forward and
+ * back over the weight-bearing foot, which is `bx`.
+ */
+function walkPose(k, n = 6) {
+  const ph = (Math.PI * 2 * k) / n;
+  const LEAD = 0.38;
+  const sw = Math.sin(ph);
+  const near = Math.sin(ph);
+  const far = -Math.sin(ph + LEAD);
+  return {
+    la: 0.60 * near,
+    lb: 0.60 * far,
+    bx: 0.62 * sw,
+    // Low at the footfalls, high through the passing beats. The cosine term is
+    // small and asymmetric on purpose: the body is still rising just after a
+    // footfall and already falling just before the next one, so beats 1 and 2
+    // of each half-stride — which share a leg angle — are told apart by a
+    // pixel of height as well. Without it those two beats differ only in the
+    // trailing leg and the cycle reads a beat shorter than it is.
+    by: 1.5 - 2.7 * Math.abs(sw) - 0.7 * Math.cos(ph),
+    swing: -0.17 * sw,
+  };
+}
+
 const POSE = {
   i: { la: 0.12, lb: -0.12, bx: 0, by: 0, swing: 0 },
-  w0: { la: 0.62, lb: -0.54, bx: 0.6, by: -1.2, swing: -0.16 },
-  w1: { la: 0.06, lb: 0.06, bx: 0, by: 1.5, swing: 0.04 },
-  w2: { la: -0.54, lb: 0.62, bx: -0.6, by: -1.2, swing: 0.16 },
+  w0: walkPose(0),
+  w1: walkPose(1),
+  w2: walkPose(2),
+  w3: walkPose(3),
+  w4: walkPose(4),
+  w5: walkPose(5),
+  // The four-beat gallop the riders use. Same generator, fewer samples: a
+  // cantering horse's legs travel further and faster than a man's, so four
+  // widely-spaced drawings read better than six closely-spaced ones, and the
+  // barrel of the horse hides the middle of the stride anyway.
+  c0: walkPose(0, 4),
+  c1: walkPose(1, 4),
+  c2: walkPose(2, 4),
+  c3: walkPose(3, 4),
   g0: { la: 0.22, lb: -0.30, bx: -1.6, by: -1.2, swing: -1.05 },
   g1: { la: 0.30, lb: -0.34, bx: 2.6, by: 2.6, swing: 0.85 },
   b0: { la: 0.16, lb: -0.20, bx: -1.0, by: -0.6, swing: -0.72 },
   b1: { la: 0.18, lb: -0.22, bx: 1.6, by: 1.8, swing: 0.34 },
   a0: { la: 0.36, lb: -0.44, bx: -2.2, by: -1.0, swing: -0.95 },
   a1: { la: 0.10, lb: -0.64, bx: 3.6, by: 1.4, swing: 0.82 },
+  // The monk's two working poses: h0 is the book raised and the free hand out,
+  // h1 is the hand lowered with the blessing given. Named apart from the
+  // villager's gather pair on purpose — they are the same *slot* in the
+  // animation table but a completely different motion, and sharing g0/g1 would
+  // have the monk chopping at the man it is healing.
+  h0: { la: 0.10, lb: -0.14, bx: -0.8, by: -1.4, swing: -0.7 },
+  h1: { la: 0.14, lb: -0.18, bx: 0.8, by: 0.6, swing: 0.5 },
   d0: { la: 0.78, lb: -0.32, bx: -3.4, by: -1.5, swing: -0.55 },
   d1: { la: 1.26, lb: -1.08, bx: -1.2, by: 9.5, swing: 1.5, dead: true },
 };
 
-const WORKER_POSES = ['i', 'w0', 'w1', 'w2', 'g0', 'g1', 'b0', 'b1', 'd0', 'd1'];
-const SOLDIER_POSES = ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'];
+const WALK6 = ['w0', 'w1', 'w2', 'w3', 'w4', 'w5'];
+const GALLOP4 = ['c0', 'c1', 'c2', 'c3'];
+const ENGINE3 = ['w0', 'w2', 'w4'];
+
+const WORKER_POSES = ['i', ...WALK6, 'g0', 'g1', 'b0', 'b1', 'd0', 'd1'];
+const SOLDIER_POSES = ['i', ...WALK6, 'a0', 'a1', 'd0', 'd1'];
+const RIDER_POSES = ['i', ...GALLOP4, 'a0', 'a1', 'd0', 'd1'];
+const ENGINE_POSES = ['i', ...ENGINE3, 'a0', 'a1', 'd0', 'd1'];
+const MONK_POSES = ['i', ...WALK6, 'h0', 'h1', 'd0', 'd1'];
 
 // Which pose each simulation state plays, and in what order. `deposit` is a walk
 // because a villager carrying wood home is walking; `gather` and `build` differ
 // so that a construction site does not look like a woodline.
 const WORKER_ANIM = {
   idle: ['i'],
-  move: ['w0', 'w1', 'w2', 'w1'],
-  deposit: ['w0', 'w1', 'w2', 'w1'],
+  move: WALK6,
+  deposit: WALK6,
   gather: ['g0', 'g1'],
   build: ['b0', 'b1'],
   attack: ['g0', 'g1'],
@@ -811,11 +1520,42 @@ const WORKER_ANIM = {
 };
 const SOLDIER_ANIM = {
   idle: ['i'],
-  move: ['w0', 'w1', 'w2', 'w1'],
-  deposit: ['w0', 'w1', 'w2', 'w1'],
+  move: WALK6,
+  deposit: WALK6,
   gather: ['i'],
   build: ['i'],
   attack: ['a0', 'a1'],
+  die: ['d0', 'd1'],
+};
+const RIDER_ANIM = {
+  idle: ['i'],
+  move: GALLOP4,
+  deposit: GALLOP4,
+  gather: ['i'],
+  build: ['i'],
+  attack: ['a0', 'a1'],
+  die: ['d0', 'd1'],
+};
+const ENGINE_ANIM = {
+  idle: ['i'],
+  move: ENGINE3,
+  deposit: ENGINE3,
+  gather: ['i'],
+  build: ['i'],
+  attack: ['a0', 'a1'],
+  die: ['d0', 'd1'],
+};
+// A monk never attacks — `attack` is here only because the renderer will ask
+// for it if the simulation ever puts one in that state, and answering with the
+// heal is far better than answering with a swing the unit cannot make.
+const MONK_ANIM = {
+  idle: ['i'],
+  move: WALK6,
+  deposit: WALK6,
+  gather: ['h0', 'h1'],
+  build: ['i'],
+  attack: ['h0', 'h1'],
+  heal: ['h0', 'h1'],
   die: ['d0', 'd1'],
 };
 
@@ -824,8 +1564,28 @@ const UNIT_ANIM = {
   militia: SOLDIER_ANIM,
   spearman: SOLDIER_ANIM,
   archer: SOLDIER_ANIM,
-  scout: SOLDIER_ANIM,
-  ram: SOLDIER_ANIM,
+  skirmisher: SOLDIER_ANIM,
+  scout: RIDER_ANIM,
+  knight: RIDER_ANIM,
+  ram: ENGINE_ANIM,
+  mangonel: ENGINE_ANIM,
+  scorpion: ENGINE_ANIM,
+  monk: MONK_ANIM,
+};
+
+/** Which pose list each unit type bakes. Must agree with UNIT_ANIM above. */
+const UNIT_POSES = {
+  villager: WORKER_POSES,
+  militia: SOLDIER_POSES,
+  spearman: SOLDIER_POSES,
+  archer: SOLDIER_POSES,
+  skirmisher: SOLDIER_POSES,
+  scout: RIDER_POSES,
+  knight: RIDER_POSES,
+  ram: ENGINE_POSES,
+  mangonel: ENGINE_POSES,
+  scorpion: ENGINE_POSES,
+  monk: MONK_POSES,
 };
 
 /**
@@ -838,28 +1598,85 @@ export function unitAnim(type) {
   return UNIT_ANIM[type] || WORKER_ANIM;
 }
 
+/**
+ * Type -> draw function. THIS TABLE IS WHAT THE BAKE ITERATES: a unit type that
+ * is missing from it bakes no frames at all, and render.js's fallback chain then
+ * quietly draws it as a villager — a mangonel that looks like a peasant, with no
+ * error anywhere. Adding a type means adding it here, to UNIT_BOX, to UNIT_POSES
+ * and to UNIT_ANIM; the four are checked against each other by assertUnitArt().
+ */
 const UNIT_DRAW = {
   villager: drawVillager,
   militia: drawMilitia,
   spearman: drawSpearman,
   archer: drawArcher,
+  skirmisher: drawSkirmisher,
   scout: drawScout,
+  knight: drawKnight,
   ram: drawRam,
+  mangonel: drawMangonel,
+  scorpion: drawScorpion,
+  monk: drawMonk,
 };
 
+/**
+ * The four unit tables have to agree, and nothing used to check that they did.
+ *
+ * The failure is silent in every direction. A type in UNIT_DRAW with no
+ * UNIT_BOX throws an unhelpful TypeError deep in the bake. A type in UNIT_ANIM
+ * with no UNIT_DRAW bakes nothing and renders as a villager. Worst of all, an
+ * animation naming a pose that is not in the type's UNIT_POSES list bakes a
+ * cycle with a hole in it: render.js falls the missing beat back to the idle
+ * frame, so the unit walks, walks, stands, walks — which looks like a physics
+ * bug rather than a missing frame, and is why this is a hard error.
+ */
+function assertUnitArt() {
+  const bad = [];
+  for (const type of Object.keys(UNIT_DRAW)) {
+    if (!UNIT_BOX[type]) bad.push(`${type}: in UNIT_DRAW with no UNIT_BOX`);
+    if (!UNIT_POSES[type]) bad.push(`${type}: in UNIT_DRAW with no UNIT_POSES`);
+    if (!UNIT_ANIM[type]) bad.push(`${type}: in UNIT_DRAW with no UNIT_ANIM`);
+  }
+  for (const type of Object.keys(UNIT_ANIM)) {
+    if (!UNIT_DRAW[type]) bad.push(`${type}: animated but never drawn`);
+    const poses = new Set(UNIT_POSES[type] || []);
+    for (const [state, seq] of Object.entries(UNIT_ANIM[type] || {})) {
+      for (const id of seq) {
+        if (!POSE[id]) bad.push(`${type}.${state}: pose '${id}' is not in POSE`);
+        else if (!poses.has(id)) bad.push(`${type}.${state}: pose '${id}' is never baked`);
+      }
+    }
+  }
+  if (bad.length) throw new Error(`[gfx] unit art tables disagree — ${bad.join('; ')}`);
+}
+
 function buildUnits(put) {
+  assertUnitArt();
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
     for (const type of Object.keys(UNIT_DRAW)) {
       const box = UNIT_BOX[type];
       const draw = UNIT_DRAW[type];
-      const poses = type === 'villager' ? WORKER_POSES : SOLDIER_POSES;
+      const poses = UNIT_POSES[type];
       for (const id of poses) {
         const P = POSE[id];
         for (const back of [false, true]) {
-          put(unitFrame(type, p, back, id), box.w, box.h, box.cx, box.ft, (g) =>
-            draw(g, col, dark, back, P));
+          put(unitFrame(type, p, back, id), box.w, box.h, box.cx, box.ft, (g) => {
+            // Every unit stands on the ground now. The team ellipse the renderer
+            // puts under a unit is drawn *below* the body sprite, so a shadow
+            // baked here lands on top of it — which is why this is a very soft,
+            // very wide wash rather than a hard ellipse: it has to read as the
+            // body occluding the light without dirtying the coloured disc that
+            // makes the unit findable in the first place. A dead unit gets none
+            // of it, because the renderer rotates the whole sprite flat about
+            // its feet and a shadow that rotates with the body is a black wing.
+            if (!P.dead) {
+              contactShadow(g, box.cx + P.bx * 0.4, box.ft - 1,
+                box.w * 0.42, box.h * 0.11, 0.85);
+            }
+            draw(g, col, dark, back, P);
+          });
         }
       }
     }
@@ -1532,6 +2349,839 @@ function drawRam(g, col, dark, back, P) {
   g.fillTriangle(bx, ridgeY - 11, bx + 6, ridgeY - 9.4, bx, ridgeY - 8);
 }
 
+/**
+ * Skirmisher — a light infantryman with javelins.
+ *
+ * The one thing this unit must not do is read as an archer, and the archer's
+ * whole identity is an arc. So there is no bow anywhere on it: what it carries
+ * is a fist of javelins held upright in the off hand and one cocked back over
+ * the shoulder, plus a large oval wicker shield that nothing else on the map
+ * has (the militia's is a round steel-bossed disc, half the area). A bundle of
+ * vertical sticks on one side and an oval on the other is a different shape
+ * from an arc at any size, which is the entire reason the unit is drawn this
+ * way rather than as "an archer in cheaper clothes".
+ */
+function drawSkirmisher(g, col, dark, back, P) {
+  const { cx, ft } = UNIT_BOX.skirmisher;
+  const WICKER = 0xbe9a5e;
+  const LEATHER = 0x77542f;
+  const bx = cx + P.bx;
+  const by = ft + P.by;
+  // How far back the throwing arm is cocked. Only a wound-up pose shows it;
+  // walking, the javelin rides on the shoulder.
+  const cock = Math.max(0, Math.min(1, -P.swing));
+
+  legPair(g, cx, ft, 0x6a5c44, P, 4.4, 12);
+
+  // --- the spare javelins, behind the body ---------------------------------
+  // Held as a sheaf in the shield hand, points up. Three shafts at slightly
+  // different angles so it reads as a bundle rather than as one thick pole.
+  for (let i = 0; i < 3; i++) {
+    const a = -0.26 + i * 0.2;
+    const rootX = bx - 9;
+    const rootY = by - 15;
+    const tipX = rootX + Math.sin(a) * 26;
+    const tipY = rootY - Math.cos(a) * 26;
+    stick(g, rootX, rootY, tipX, tipY, 1.7, WOOD);
+    g.fillStyle(STEEL, 1);
+    g.fillTriangle(tipX - 2.2, tipY + 2.6, tipX, tipY - 4.4, tipX + 2.2, tipY + 2.6);
+    g.lineStyle(1.1, OUT, 1);
+    g.strokeTriangle(tipX - 2.2, tipY + 2.6, tipX, tipY - 4.4, tipX + 2.2, tipY + 2.6);
+  }
+
+  // --- short tunic over a leather jerkin ------------------------------------
+  g.fillStyle(col, 1);
+  g.fillRoundedRect(bx - 8, by - 30, 16, 19, 4);
+  g.fillStyle(lit(col), 1);
+  g.fillRoundedRect(bx + 1, by - 29, 6, 17, 3);
+  g.fillStyle(LEATHER, 1);
+  g.fillRoundedRect(bx - 8, by - 26, 16, 8, 2.5);
+  g.fillStyle(shade(LEATHER, 0.22), 1);
+  g.fillRect(bx - 8, by - 25, 16, 2);
+  g.fillStyle(dark, 1);
+  g.fillRect(bx - 8, by - 16, 16, 3);
+  g.lineStyle(2, OUT, 1);
+  g.strokeRoundedRect(bx - 8, by - 30, 16, 19, 4);
+  rimLine(g, bx + 7, by - 28, bx + 7, by - 13, 1.4, 0.45);
+
+  head(g, bx, by - 34, 5.2, back);
+
+  // A soft cap with a feather rather than a helmet: cheap troops, and it keeps
+  // the head small so the shield and the sheaf dominate.
+  g.fillStyle(LEATHER, 1);
+  g.fillEllipse(bx, by - 37.4, 13, 8);
+  g.fillStyle(shade(LEATHER, 0.2), 1);
+  g.fillEllipse(bx + 1.6, by - 38.6, 7, 4);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeEllipse(bx, by - 37.4, 13, 8);
+  g.lineStyle(2.6, OUT, 1);
+  g.beginPath();
+  g.moveTo(bx + 4, by - 39);
+  g.lineTo(bx + 11, by - 46);
+  g.strokePath();
+  g.lineStyle(1.4, col, 1);
+  g.beginPath();
+  g.moveTo(bx + 4, by - 39);
+  g.lineTo(bx + 11, by - 46);
+  g.strokePath();
+
+  // --- the wicker shield, on the near arm -----------------------------------
+  const sx = (back ? bx + 1 : bx - 11) - P.swing * 1.4;
+  const sy = by - 22;
+  g.fillStyle(OUT, 1);
+  g.fillEllipse(sx, sy, 20, 27);
+  g.fillStyle(WICKER, 1);
+  g.fillEllipse(sx, sy, 17, 24);
+  g.fillStyle(shade(WICKER, 0.2), 1);
+  g.fillEllipse(sx - 1.5, sy - 2.5, 10, 14);
+  // Woven bands — the texture that says wicker rather than plank or steel.
+  g.lineStyle(1.1, shade(WICKER, -0.32), 0.8);
+  for (let k = -2; k <= 2; k++) {
+    g.beginPath();
+    g.moveTo(sx - 8, sy + k * 5);
+    g.lineTo(sx + 8, sy + k * 5);
+    g.strokePath();
+  }
+  // Team colour goes on the shield, not just on the tunic: the shield is two
+  // thirds of what the camera sees of this unit from the front, and a skirmisher
+  // whose only livery is a band of jerkin behind it is a skirmisher whose owner
+  // is a guess in a melee.
+  g.fillStyle(col, 1);
+  g.fillRect(sx - 2.6, sy - 11.5, 5.2, 23);
+  g.fillStyle(dark, 1);
+  g.fillEllipse(sx, sy, 6.5, 7.5);
+  g.fillStyle(col, 1);
+  g.fillEllipse(sx, sy, 4, 4.8);
+  g.lineStyle(1.6, dark, 0.9);
+  g.strokeEllipse(sx, sy, 15, 21.5);
+
+  // --- the javelin in hand, cocked and thrown --------------------------------
+  const hx = bx + 8;
+  const hy = by - 27;
+  const R = pivot(hx, hy, P.swing * 1.35);
+  const tail = R(bx + 1 - cock * 8, by - 22);
+  const tip = R(bx + 24, by - 33);
+  stick(g, tail.x, tail.y, tip.x, tip.y, 2.2, WOOD);
+  const dx = tip.x - tail.x;
+  const dy = tip.y - tail.y;
+  const l = Math.hypot(dx, dy) || 1;
+  const nx = dx / l;
+  const ny = dy / l;
+  const head0 = [
+    { x: tip.x + nx * 6, y: tip.y + ny * 6 },
+    { x: tip.x - ny * 2.8, y: tip.y + nx * 2.8 },
+    { x: tip.x + ny * 2.8, y: tip.y - nx * 2.8 },
+  ];
+  g.fillStyle(STEEL, 1);
+  g.fillPoints(head0, true, true);
+  g.lineStyle(1.5, OUT, 1);
+  g.strokePoints(head0, true, true);
+  g.fillStyle(SKIN, 1);
+  g.fillCircle(hx, hy, 2.5);
+  g.lineStyle(1.1, OUT, 1);
+  g.strokeCircle(hx, hy, 2.5);
+}
+
+/**
+ * Knight — the heavy cavalry, and it has to be told apart from the scout at a
+ * glance because one of them loses to spearmen and the other one wins games.
+ *
+ * Everything is bigger and harder: a grey destrier instead of a bay pony, a
+ * caparison in team colour hanging past the horse's knees where the scout has a
+ * bare hide and a saddle cloth, a rider in plate with a great helm and a plume,
+ * and — the read that carries at any zoom — a couched lance running the whole
+ * length of the sprite at a shallow angle, with a conical vamplate behind the
+ * point. The scout's sabre is a short curve inside its own outline; the lance
+ * leaves it.
+ */
+function drawKnight(g, col, dark, back, P) {
+  const { cx, ft } = UNIT_BOX.knight;
+  // A warm-grey dapple, NOT steel. The rider is in plate and the horse is
+  // armoured too, and when both were the same cool grey the pair fused into one
+  // slab with legs — you could not see where the animal stopped and the man
+  // began. Warming the hide by a few points of red separates them at a glance
+  // and still reads as a grey destrier rather than a bay.
+  const HIDE = 0x7d7268;
+  const HIDE_D = 0x585048;
+  const MANE = 0x2c2b31;
+  const bx = cx + P.bx;
+  const by = ft + P.by;
+
+  // Legs, fore and hind in opposition, exactly as the scout's. Barded: a steel
+  // plate over the shoulder of each leg, which is most of what makes them read
+  // as heavy rather than merely dark.
+  const legs = [
+    { x: bx - 14, a: P.la },
+    { x: bx - 9, a: P.lb * 0.8 },
+    { x: bx + 10, a: -P.lb },
+    { x: bx + 15, a: -P.la * 0.8 },
+  ];
+  const hipY = by - 15;
+  for (const l of legs) {
+    const fx = l.x + Math.sin(l.a) * 15;
+    const fy = hipY + Math.cos(l.a) * 15;
+    stick(g, l.x, hipY, fx, fy, 4.6, l.x > bx ? HIDE : HIDE_D);
+    g.fillStyle(OUT, 1);
+    g.fillEllipse(fx, fy + 1, 9, 5.2);
+    g.fillStyle(0x2c2019, 1);
+    g.fillEllipse(fx, fy + 0.6, 6.6, 3.4);
+  }
+
+  // Barrel and hindquarters — bigger than the scout's in every direction,
+  // because the two of them will stand side by side and "a bigger horse" has to
+  // be the first thing a player sees.
+  g.fillStyle(HIDE, 1);
+  g.fillRoundedRect(bx - 19, by - 30, 38, 17, 8);
+  g.fillStyle(HIDE_D, 1);
+  g.fillRoundedRect(bx - 19, by - 19, 38, 6, 3);
+  g.lineStyle(2.4, OUT, 1);
+  g.strokeRoundedRect(bx - 19, by - 30, 38, 17, 8);
+  g.fillStyle(lit(HIDE), 1);
+  g.fillRoundedRect(bx - 13, by - 29, 23, 4, 2);
+
+  // Tail, plaited short the way a warhorse's is.
+  for (let k = 0; k < 3; k++) {
+    stick(g, bx - 18, by - 27,
+      bx - 23 - k * 1.4 + P.la * 2, by - 17 + (k - 1) * 2.2, 2.4 - k * 0.4, MANE);
+  }
+
+  // The caparison. A SKIRT hanging off the barrel, not a blanket over it — the
+  // first attempt covered the whole animal and the knight came out as a blue
+  // slab on four boots, with no horse in it at all. Hung from the lower edge
+  // and scalloped at the hem, it does what a caparison actually does: adds mass
+  // low down, carries the team colour on the biggest cloth in the game, and
+  // leaves the horse's back and shoulder visible above it.
+  // The hem stops ABOVE the knee, and that is the whole tuning of this piece.
+  // Hung any lower it covers the tops of all four legs, and a galloping horse
+  // whose legs only show for seven pixels is a blue box that slides — the pose
+  // sheet made that obvious and nothing else would have.
+  const capTop = by - 26;
+  const hem = [];
+  for (let k = 0; k <= 7; k++) {
+    hem.push({ x: bx - 17 + k * 4.9, y: by - 14 + (k % 2 ? 2.2 : 0) });
+  }
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    { x: bx - 17, y: capTop }, { x: bx + 17, y: capTop },
+    ...hem.slice().reverse(),
+  ], true, true);
+  g.fillStyle(dark, 1);
+  g.fillPoints([
+    { x: bx - 17, y: by - 18 }, { x: bx + 17, y: by - 18 },
+    ...hem.slice().reverse(),
+  ], true, true);
+  g.lineStyle(1.3, shade(col, 0.32), 0.6);
+  g.beginPath();
+  g.moveTo(bx - 15, capTop + 4);
+  g.lineTo(bx + 15, capTop + 4);
+  g.strokePath();
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints([
+    { x: bx - 17, y: capTop }, { x: bx + 17, y: capTop },
+    ...hem.slice().reverse(),
+  ], true, true);
+
+  // Neck and head under a steel chanfron.
+  const neckX = bx + 14;
+  const neckY = by - 28;
+  const headX = neckX + 7;
+  const headY = neckY - 12;
+  stick(g, neckX, neckY, headX, headY, 8.5, HIDE);
+  g.fillStyle(STEEL_D, 1);
+  g.fillRoundedRect(headX - 5, headY - 6, 14, 9, 3);
+  g.lineStyle(2, OUT, 1);
+  g.strokeRoundedRect(headX - 5, headY - 6, 14, 9, 3);
+  g.fillStyle(STEEL, 1);
+  g.fillRect(headX - 3, headY - 5, 10, 2.4);
+  g.fillStyle(OUT, 1);
+  g.fillTriangle(headX - 4, headY - 6, headX - 2, headY - 12, headX + 0.5, headY - 6);
+  if (!back) {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(headX + 3, headY - 2.4, 1.2);
+  }
+  g.lineStyle(3.6, MANE, 1);
+  g.beginPath();
+  g.moveTo(neckX - 2, neckY - 3);
+  g.lineTo(headX - 3, headY - 4);
+  g.strokePath();
+
+  // The rider: plate over a surcoat, seated deep. Everything above is measured
+  // from `ry` so the whole man can be dropped a pixel without unpicking it —
+  // the crest is the tallest thing on the unit and the box has four pixels to
+  // spare over it, which is the sort of margin that only survives if it is
+  // controlled from one number.
+  const rx = bx - 2;
+  const ry = by - 28;
+  stick(g, rx + 3, ry - 3, rx + 5, ry + 8, 4, STEEL_D);
+  g.fillStyle(STEEL, 1);
+  g.fillRoundedRect(rx - 8, ry - 19, 16, 17, 5);
+  g.fillStyle(col, 1);
+  g.fillRoundedRect(rx - 8, ry - 19, 16, 10, 5);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillRoundedRect(rx + 2.5, ry - 10, 4.5, 7, 2);
+  g.lineStyle(2.2, OUT, 1);
+  g.strokeRoundedRect(rx - 8, ry - 19, 16, 17, 5);
+  // Pauldrons.
+  g.fillStyle(STEEL, 1);
+  g.fillEllipse(rx - 8, ry - 17, 8, 6.5);
+  g.fillEllipse(rx + 8, ry - 17, 8, 6.5);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeEllipse(rx - 8, ry - 17, 8, 6.5);
+  g.strokeEllipse(rx + 8, ry - 17, 8, 6.5);
+  rimLine(g, rx + 6, ry - 19, rx + 11, ry - 16, 1.6, 0.5);
+
+  // Great helm: a steel bucket with a slit, not a face. The scout has a visible
+  // face under a cap; "man" against "anonymous steel" is one more thing keeping
+  // the two riders apart at a glance.
+  const hy = ry - 25;
+  g.fillStyle(STEEL, 1);
+  g.fillRoundedRect(rx - 6.5, hy - 5, 13, 13, 4);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillRoundedRect(rx + 1.5, hy - 4, 4.5, 11, 2);
+  g.lineStyle(2, OUT, 1);
+  g.strokeRoundedRect(rx - 6.5, hy - 5, 13, 13, 4);
+  if (!back) {
+    g.fillStyle(OUT, 1);
+    g.fillRect(rx - 5, hy - 0.5, 10, 2.4);
+    g.fillRect(rx - 1, hy - 2.5, 2, 6);
+  }
+  // A horsehair crest lying back over the helm rather than a tall plume: the
+  // same amount of team colour, six pixels less height, and the box has no six
+  // pixels to give.
+  const crest = [
+    { x: rx + 4, y: hy - 6 },
+    { x: rx - 1, y: hy - 11 },
+    { x: rx - 9, y: hy - 9 },
+    { x: rx - 12, y: hy - 3 },
+    { x: rx - 6, y: hy - 5 },
+  ];
+  g.fillStyle(col, 1);
+  g.fillPoints(crest, true, true);
+  g.fillStyle(dark, 1);
+  g.fillPoints([crest[2], crest[3], crest[4]], true, true);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokePoints(crest, true, true);
+
+  // The lance, couched under the arm. It runs off the front of the body — a
+  // shape that leaves the silhouette is the one guaranteed to be visible in a
+  // press of bodies — but it stops inside the frame box, because a lance point
+  // clipped by the atlas is a lance point that is simply gone.
+  const gx = rx + 7;
+  const gy = ry - 11;
+  const R = pivot(gx, gy, P.swing * 0.45);
+  const butt = R(rx - 9, gy + 4);
+  const tip = R(rx + 27, gy - 10);
+  g.lineStyle(6.4, OUT, 1);
+  g.beginPath();
+  g.moveTo(butt.x, butt.y);
+  g.lineTo(tip.x, tip.y);
+  g.strokePath();
+  g.lineStyle(4, WOOD, 1);
+  g.beginPath();
+  g.moveTo(butt.x, butt.y);
+  g.lineTo(tip.x, tip.y);
+  g.strokePath();
+  // Spiral livery bands, so the lance is a knight's and not a fence rail.
+  g.lineStyle(3, col, 1);
+  for (const t of [0.34, 0.56, 0.78]) {
+    const px = butt.x + (tip.x - butt.x) * t;
+    const py = butt.y + (tip.y - butt.y) * t;
+    g.beginPath();
+    g.moveTo(px - 1.4, py - 1.4);
+    g.lineTo(px + 1.4, py + 1.4);
+    g.strokePath();
+  }
+  // Vamplate: the cone that guards the hand.
+  const vp = R(rx + 7, gy - 4);
+  g.fillStyle(STEEL_D, 1);
+  g.fillEllipse(vp.x, vp.y, 8, 9.5);
+  g.lineStyle(1.5, OUT, 1);
+  g.strokeEllipse(vp.x, vp.y, 8, 9.5);
+  g.fillStyle(lit(STEEL), 1);
+  g.fillEllipse(vp.x + 1.2, vp.y - 1.5, 3.2, 3.8);
+  // The point.
+  const ux = tip.x - butt.x;
+  const uy = tip.y - butt.y;
+  const ul = Math.hypot(ux, uy) || 1;
+  const nx = ux / ul;
+  const ny = uy / ul;
+  const pt = [
+    { x: tip.x + nx * 7, y: tip.y + ny * 7 },
+    { x: tip.x - ny * 2.8, y: tip.y + nx * 2.8 },
+    { x: tip.x + ny * 2.8, y: tip.y - nx * 2.8 },
+  ];
+  g.fillStyle(STEEL, 1);
+  g.fillPoints(pt, true, true);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokePoints(pt, true, true);
+}
+
+/**
+ * Mangonel — a stone-thrower, and the reason `splashRadius` exists.
+ *
+ * Same family as the ram: low, wide, wheeled, no head and no limbs, so a player
+ * knows immediately that it is a machine. What separates it from the ram is
+ * everything above the chassis. The ram has a shed roof and a swinging log; the
+ * mangonel is open, and carries one heavy arm raked back over its own axle with
+ * a bowl on the end and a padded crossbeam for it to slam into. That arm, and
+ * the boulder sitting in it, is the silhouette — a diagonal with a ball on the
+ * top, which nothing else in the game makes.
+ *
+ * `swing` winds the arm down against its ropes and then throws it: negative is
+ * loaded and low, positive is released and standing almost upright, which is
+ * where the boulder leaves.
+ */
+function drawMangonel(g, col, dark, back, P) {
+  const { cx, ft } = UNIT_BOX.mangonel;
+  const FRAME = 0x7a5630;
+  const FRAME_D = 0x54391e;
+  const bx = cx + P.bx;
+  const by = ft + P.by;
+
+  // Wheels, spinning with the walk pose — the only way a machine says it moves.
+  const spin = P.la * 1.6;
+  for (const [wx0, wy0, rr] of [[bx - 21, by - 7, 8], [bx + 19, by - 7, 8.5]]) {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(wx0, wy0, rr + 1.8);
+    g.fillStyle(FRAME_D, 1);
+    g.fillCircle(wx0, wy0, rr);
+    g.fillStyle(shade(FRAME, 0.12), 1);
+    g.fillCircle(wx0, wy0, rr * 0.38);
+    g.lineStyle(1.6, OUT, 0.85);
+    for (let k = 0; k < 4; k++) {
+      const a = spin + (Math.PI / 4) * k;
+      g.beginPath();
+      g.moveTo(wx0 - Math.cos(a) * rr, wy0 - Math.sin(a) * rr);
+      g.lineTo(wx0 + Math.cos(a) * rr, wy0 + Math.sin(a) * rr);
+      g.strokePath();
+    }
+  }
+
+  // Chassis: two rails and the cross members between them.
+  g.fillStyle(FRAME_D, 1);
+  g.fillRect(bx - 26, by - 16, 52, 7);
+  g.fillStyle(FRAME, 1);
+  g.fillRect(bx - 26, by - 16, 52, 2.6);
+  g.lineStyle(2.2, OUT, 1);
+  g.strokeRect(bx - 26, by - 16, 52, 7);
+
+  // The A-frame uprights that carry the arm's axle, and the axle itself.
+  const axX = bx + 2;
+  // The axle sits LOW, and that is a measurement rather than a taste. The arm
+  // rotates about it, so its height plus the arm's length plus the bowl on the
+  // end is exactly how far the sprite reaches, and the frame box has 58 pixels
+  // above the unit's feet. The first version put the axle at by-32 with a
+  // 40-pixel arm and the whole throwing gear was sliced off by the top of the
+  // box in every pose but the wound-up one — invisible in play, obvious the
+  // moment the pose sheet was printed, which is what the pose sheet is for.
+  const axY = by - 23;
+  for (const sgn of [-1, 1]) {
+    stick(g, axX + sgn * 11, by - 14, axX, axY, 4.4, sgn > 0 ? FRAME : FRAME_D);
+  }
+  g.fillStyle(OUT, 1);
+  g.fillCircle(axX, axY, 6);
+  g.fillStyle(STEEL_D, 1);
+  g.fillCircle(axX, axY, 4.2);
+
+  // The padded crossbeam the arm slams into, up at the front.
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(bx + 12, by - 36, 12, 22, 4);
+  g.fillStyle(FRAME, 1);
+  g.fillRoundedRect(bx + 13.5, by - 34.5, 9, 19, 3);
+  g.fillStyle(0x8a6a3c, 1);
+  g.fillRoundedRect(bx + 13, by - 37, 10, 6, 3);
+
+  // The twisted skein of rope that powers it: two coils either side of the axle.
+  for (const sgn of [-1, 1]) {
+    g.fillStyle(OUT, 1);
+    g.fillEllipse(axX + sgn * 9, axY + 2, 12, 10);
+    g.fillStyle(0xbca87c, 1);
+    g.fillEllipse(axX + sgn * 9, axY + 2, 9.5, 7.6);
+    g.lineStyle(1, shade(0xbca87c, -0.35), 0.85);
+    for (let k = -1; k <= 1; k++) {
+      g.beginPath();
+      g.moveTo(axX + sgn * 9 - 4, axY + 2 + k * 2.4);
+      g.lineTo(axX + sgn * 9 + 4, axY + 2 + k * 2.4 - 1);
+      g.strokePath();
+    }
+  }
+
+  // The arm. Loaded, it rakes back over the tail of the chassis; released, it
+  // stands up against the crossbeam. One rotation about the axle does both.
+  const rel = (P.swing + 1) * 0.5; // 0 = fully wound, 1 = fully thrown
+  // Raked back over its own tail when loaded, standing against the crossbeam
+  // when thrown. The span is wide on purpose: an arm that barely moves is an
+  // arm nobody sees move, and this is the only moving part on the machine.
+  // Rest is RAKED BACK over the tail, not upright: an engine standing about or
+  // rolling forward carries its arm down, and the difference between that and
+  // the arm snapped up against the crossbeam is what makes a shot visible from
+  // across the map. Mapped off `swing` directly rather than off `rel`, because
+  // what matters is where zero sits.
+  const armA = -2.55 + P.swing * 0.75;
+  const armLen = 31;
+  const tipX = axX + Math.cos(armA) * armLen;
+  const tipY = axY + Math.sin(armA) * armLen;
+  stick(g, axX, axY, tipX, tipY, 6, FRAME);
+  g.lineStyle(1.4, RIM, 0.35);
+  g.beginPath();
+  g.moveTo(axX + 2, axY - 2);
+  g.lineTo(tipX + 2, tipY - 2);
+  g.strokePath();
+
+  // The bowl on the end, and a stone in it while the arm is still loaded.
+  const bowl = [
+    { x: tipX - 8, y: tipY - 3 },
+    { x: tipX + 8, y: tipY - 3 },
+    { x: tipX + 5, y: tipY + 7 },
+    { x: tipX - 5, y: tipY + 7 },
+  ];
+  g.fillStyle(FRAME_D, 1);
+  g.fillPoints(bowl, true, true);
+  g.lineStyle(2, OUT, 1);
+  g.strokePoints(bowl, true, true);
+  if (rel < 0.75) {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(tipX, tipY - 4, 7.6);
+    g.fillStyle(0x7b8490, 1);
+    g.fillCircle(tipX, tipY - 4, 6.4);
+    g.fillStyle(0x9ca6b3, 1);
+    g.fillCircle(tipX + 1.6, tipY - 6, 3.4);
+  }
+
+  // A rack of spare shot on the chassis, and the team pennant. Ownership goes
+  // on a pennant for the same reason it does on the ram: a team-coloured
+  // machine looks like a man in a uniform.
+  for (const [ox, oy] of [[-19, -19], [-12, -19], [-15.5, -25]]) {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(bx + ox, by + oy, 5);
+    g.fillStyle(0x6f7883, 1);
+    g.fillCircle(bx + ox, by + oy, 4);
+    g.fillStyle(0x99a3af, 1);
+    g.fillCircle(bx + ox + 1, by + oy - 1.2, 2);
+  }
+  stick(g, bx + 24, by - 16, bx + 24, by - 46, 1.8, 0x6a5334);
+  g.fillStyle(col, 1);
+  g.fillTriangle(bx + 24, by - 46, bx + 36, by - 42.5, bx + 24, by - 39);
+  g.lineStyle(1.4, OUT, 1);
+  g.strokeTriangle(bx + 24, by - 46, bx + 36, by - 42.5, bx + 24, by - 39);
+  g.fillStyle(dark, 1);
+  g.fillTriangle(bx + 24, by - 44, bx + 30, by - 42.4, bx + 24, by - 41);
+}
+
+/**
+ * Scorpion — a bolt thrower.
+ *
+ * The third member of the engine family and the flattest: where the mangonel
+ * reaches up with a raking arm, this one reaches *sideways*. A horizontal bow
+ * across the front, wider than the chassis it sits on, with a bolt already in
+ * the groove pointing straight out. Low, wide and cruciform, against the
+ * mangonel's tall diagonal — that difference has to survive both of them
+ * sitting in the same siege line.
+ */
+function drawScorpion(g, col, dark, back, P) {
+  const { cx, ft } = UNIT_BOX.scorpion;
+  const FRAME = 0x7a5630;
+  const FRAME_D = 0x54391e;
+  const bx = cx + P.bx;
+  const by = ft + P.by;
+  // How far the string is drawn. Wound up = loaded and ready; released = the
+  // string has snapped forward and the bolt has gone.
+  const drawn = Math.max(0, Math.min(1, -P.swing));
+
+  // Two small wheels — a scorpion is a cart, not a siege tower.
+  const spin = P.la * 1.8;
+  for (const [wx0, wy0, rr] of [[bx - 16, by - 6, 6.5], [bx + 15, by - 6, 7]]) {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(wx0, wy0, rr + 1.6);
+    g.fillStyle(FRAME_D, 1);
+    g.fillCircle(wx0, wy0, rr);
+    g.lineStyle(1.5, OUT, 0.85);
+    for (let k = 0; k < 3; k++) {
+      const a = spin + (Math.PI / 3) * k;
+      g.beginPath();
+      g.moveTo(wx0 - Math.cos(a) * rr, wy0 - Math.sin(a) * rr);
+      g.lineTo(wx0 + Math.cos(a) * rr, wy0 + Math.sin(a) * rr);
+      g.strokePath();
+    }
+  }
+
+  // A splayed trestle carrying the stock.
+  for (const sgn of [-1, 1]) {
+    stick(g, bx + sgn * 13, by - 8, bx + sgn * 5, by - 24, 4, sgn > 0 ? FRAME : FRAME_D);
+  }
+  g.fillStyle(FRAME_D, 1);
+  g.fillRect(bx - 16, by - 14, 32, 5);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRect(bx - 16, by - 14, 32, 5);
+
+  // The stock: a squared beam running fore and aft, with the groove on top.
+  const stockY = by - 28;
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(bx - 21, stockY - 5, 46, 11, 3);
+  g.fillStyle(FRAME, 1);
+  g.fillRoundedRect(bx - 19.5, stockY - 3.5, 43, 8, 2.5);
+  g.fillStyle(shade(FRAME, 0.2), 1);
+  g.fillRect(bx - 18, stockY - 2.5, 40, 2.4);
+  g.fillStyle(FRAME_D, 1);
+  g.fillRect(bx - 18, stockY - 0.6, 40, 2.2);
+  // The windlass at the back, which is what a crew winds.
+  g.fillStyle(OUT, 1);
+  g.fillCircle(bx - 21, stockY, 6.4);
+  g.fillStyle(WOOD_D, 1);
+  g.fillCircle(bx - 21, stockY, 5);
+  g.lineStyle(1.8, STEEL_D, 1);
+  g.beginPath();
+  g.moveTo(bx - 21, stockY);
+  g.lineTo(bx - 27, stockY - 5);
+  g.strokePath();
+
+  // --- the bow: the whole read ---------------------------------------------
+  //
+  // Two limbs sweeping out from a central case, well past the width of the
+  // chassis. The limbs BULGE FORWARD and the string runs straight between their
+  // tips, which is what a strung bow looks like and — much more to the point —
+  // what stops this from being a vertical bar. The first version drew the limbs
+  // as straight segments; on screen a straight vertical line with a straight
+  // white line beside it is a flagpole, not a weapon, and no amount of detail
+  // on the chassis rescued it. A curve is the whole difference.
+  const bowX = bx + 11;
+  const bowY = stockY - 2;
+  const span = 24;
+  for (const sgn of [-1, 1]) {
+    const arcPts = [
+      { x: bowX + 1, y: bowY + sgn * 3 },
+      { x: bowX + 8, y: bowY + sgn * 11 },
+      { x: bowX + 9, y: bowY + sgn * 19 },
+      { x: bowX + 4, y: bowY + sgn * span },
+    ];
+    g.lineStyle(6.2, OUT, 1);
+    g.strokePoints(arcPts, false, false);
+    g.lineStyle(3.4, WOOD, 1);
+    g.strokePoints(arcPts, false, false);
+    g.lineStyle(1.2, shade(WOOD, 0.3), 0.75);
+    g.strokePoints(arcPts.map((p) => ({ x: p.x + 1.2, y: p.y })), false, false);
+    // Horn nock at the limb tip.
+    g.fillStyle(OUT, 1);
+    g.fillCircle(bowX + 4, bowY + sgn * span, 2.9);
+    g.fillStyle(STEEL_D, 1);
+    g.fillCircle(bowX + 4, bowY + sgn * span, 1.8);
+  }
+  // The case the limbs are socketed into. Small and wooden — a big steel block
+  // here reads as a hammer head sitting on the machine.
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(bowX - 2, bowY - 7, 9, 14, 3);
+  g.fillStyle(FRAME_D, 1);
+  g.fillRoundedRect(bowX - 0.8, bowY - 5.8, 6.6, 11.6, 2.4);
+  g.fillStyle(STEEL_D, 1);
+  g.fillRect(bowX - 0.5, bowY - 2, 6, 4);
+
+  // The string, and the bolt. A scorpion at rest is a scorpion that is loaded —
+  // it is only ever standing about because it has nothing to shoot at yet — so
+  // the bolt is drawn in every pose, and what `swing` moves is how far back the
+  // string has hauled it.
+  const nockX = bowX - 2 - drawn * 18;
+  g.lineStyle(2.4, OUT, 0.55);
+  g.beginPath();
+  g.moveTo(bowX + 4, bowY - span);
+  g.lineTo(nockX, bowY);
+  g.lineTo(bowX + 4, bowY + span);
+  g.strokePath();
+  g.lineStyle(1.3, 0xf4eedd, 0.95);
+  g.beginPath();
+  g.moveTo(bowX + 4, bowY - span);
+  g.lineTo(nockX, bowY);
+  g.lineTo(bowX + 4, bowY + span);
+  g.strokePath();
+  stick(g, nockX, bowY, bowX + 19, bowY, 2.2, 0xd8b070);
+  g.fillStyle(0xe6ebf0, 1);
+  g.fillTriangle(bowX + 17, bowY - 3.6, bowX + 27, bowY, bowX + 17, bowY + 3.6);
+  g.lineStyle(1.3, OUT, 1);
+  g.strokeTriangle(bowX + 17, bowY - 3.6, bowX + 27, bowY, bowX + 17, bowY + 3.6);
+  g.fillStyle(0xf2f2f2, 1);
+  g.fillTriangle(nockX, bowY - 3.4, nockX + 6, bowY, nockX, bowY + 3.4);
+
+  // Team pennant on the stock's tail.
+  stick(g, bx - 24, stockY - 4, bx - 24, stockY - 24, 1.7, 0x6a5334);
+  g.fillStyle(col, 1);
+  g.fillTriangle(bx - 24, stockY - 24, bx - 13, stockY - 21, bx - 24, stockY - 18);
+  g.lineStyle(1.3, OUT, 1);
+  g.strokeTriangle(bx - 24, stockY - 24, bx - 13, stockY - 21, bx - 24, stockY - 18);
+}
+
+/**
+ * Monk — the one unit in the game that cannot fight, and it has to look like it.
+ *
+ * Everything a soldier has is deliberately absent: no helmet, no shield, no
+ * weapon, nothing on the shoulders, no visible legs. What is there instead is a
+ * robe that reaches the ground — a single tapering trapezoid where every other
+ * humanoid on the map is a torso on two legs — a deep cowl, a knotted rope
+ * girdle, and both hands on a book. The outline is a bell with a hood on it, and
+ * a player who has never been told what a monk is will still not expect it to
+ * hit anything.
+ *
+ * Team colour goes on a stole down the front of the robe rather than on the robe
+ * itself: a monk in bright blue is a soldier in a dress, and the whole design
+ * depends on the cloth reading as undyed wool.
+ */
+function drawMonk(g, col, dark, back, P) {
+  const { cx, ft } = UNIT_BOX.monk;
+  const WOOL = 0xd9cfb4;
+  const WOOL_D = 0xa89c7c;
+  const bx = cx + P.bx;
+  const by = ft + P.by;
+  // The hem sways with the stride instead of legs swinging: the walk still
+  // reads, but nothing about the body says "infantry".
+  const sway = P.la * 3.4;
+
+  // Sandalled feet, only just showing under the hem — enough to tell which way
+  // the stride is going, not enough to make legs part of the silhouette.
+  for (const [side, ang] of [[-1, P.lb], [1, P.la]]) {
+    const fx = bx + side * 3 + Math.sin(ang) * 4.5;
+    g.fillStyle(OUT, 1);
+    g.fillEllipse(fx, ft - 1.5, 8.4, 4.6);
+    g.fillStyle(0x6b563a, 1);
+    g.fillEllipse(fx, ft - 2.2, 6.6, 3.2);
+  }
+
+  // The robe: one trapezoid from the shoulders to the floor.
+  const robe = [
+    { x: bx - 8, y: by - 34 },
+    { x: bx + 8, y: by - 34 },
+    { x: bx + 12 + sway * 0.5, y: ft - 3 },
+    { x: bx - 12 + sway * 0.5, y: ft - 3 },
+  ];
+  g.fillStyle(WOOL, 1);
+  g.fillPoints(robe, true, true);
+  // The shaded half, and a warm rim down the sunward edge: a big flat cloth
+  // shape is the easiest thing in this file to make look like paper, and two
+  // tones plus a rim is what stops it.
+  g.fillStyle(WOOL_D, 1);
+  g.fillPoints([
+    robe[0], { x: bx - 2, y: by - 34 },
+    { x: bx - 2 + sway * 0.5, y: ft - 3 }, robe[3],
+  ], true, true);
+  g.lineStyle(2, OUT, 1);
+  g.strokePoints(robe, true, true);
+  rimLine(g, bx + 7, by - 32, bx + 11 + sway * 0.5, ft - 5, 1.6, 0.5);
+  // Folds, hanging from the girdle.
+  g.lineStyle(1.1, WOOL_D, 0.75);
+  for (const t of [-0.45, 0, 0.45]) {
+    g.beginPath();
+    g.moveTo(bx + t * 9, by - 20);
+    g.lineTo(bx + t * 13 + sway * 0.5, ft - 5);
+    g.strokePath();
+  }
+
+  // Rope girdle with the three knots, which is a monk's whole uniform.
+  g.lineStyle(2.6, 0xbfa571, 1);
+  g.beginPath();
+  g.moveTo(bx - 8, by - 21);
+  g.lineTo(bx + 8, by - 21);
+  g.strokePath();
+  g.lineStyle(1.8, 0xbfa571, 1);
+  g.beginPath();
+  g.moveTo(bx + 5, by - 21);
+  g.lineTo(bx + 6.5, by - 9);
+  g.strokePath();
+  for (const ky of [-16, -12.5, -9]) {
+    g.fillStyle(0x9d8452, 1);
+    g.fillCircle(bx + 6, by + ky, 1.6);
+  }
+
+  // The stole. It hangs BELOW the girdle, not over the chest, because the book
+  // is held at the chest and covers everything there: the first version put two
+  // colour bands on the shoulders and the book turned them into a blue rectangle
+  // peeping out either side, which read as a satchel. Below the knot it is a
+  // single clean strip and it is the only saturated colour on the unit.
+  g.fillStyle(col, 1);
+  g.fillRect(bx - 2.4, by - 20, 4.8, 14);
+  g.fillStyle(dark, 1);
+  g.fillRect(bx - 2.4, by - 8, 4.8, 2.4);
+
+  head(g, bx, by - 38, 5, back);
+
+  // The cowl. A deep hood with a peak that overhangs the face, drawn as one
+  // shape so it reads at any size, plus a shoulder cape under it.
+  const cape = [
+    { x: bx - 11, y: by - 30 },
+    { x: bx - 9, y: by - 36 },
+    { x: bx + 9, y: by - 36 },
+    { x: bx + 11, y: by - 30 },
+  ];
+  g.fillStyle(WOOL_D, 1);
+  g.fillPoints(cape, true, true);
+  // A band of team colour along the lower edge of the mantle, which is the one
+  // place on the upper body the book never covers.
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    cape[0], { x: cape[3].x, y: cape[3].y },
+    { x: cape[3].x - 0.8, y: cape[3].y - 3 }, { x: cape[0].x + 0.8, y: cape[0].y - 3 },
+  ], true, true);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints(cape, true, true);
+  const hood = [
+    { x: bx - 8, y: by - 34 },
+    { x: bx - 8.5, y: by - 42 },
+    { x: bx - 2, y: by - 47.5 },
+    { x: bx + 6, y: by - 44 },
+    { x: bx + 8.5, y: by - 37 },
+    { x: bx + 7.5, y: by - 33 },
+  ];
+  g.fillStyle(WOOL, 1);
+  g.fillPoints(hood, true, true);
+  g.fillStyle(WOOL_D, 1);
+  g.fillPoints([
+    hood[0], hood[1], { x: bx - 2, y: by - 47.5 }, { x: bx - 2, y: by - 33 },
+  ], true, true);
+  g.lineStyle(2, OUT, 1);
+  g.strokePoints(hood, true, true);
+  rimLine(g, bx + 5, by - 44, bx + 8, by - 34, 1.5, 0.45);
+  if (!back) {
+    // Face in shadow under the peak — a monk's face is never lit, which is one
+    // more thing separating it from every other body on the field.
+    g.fillStyle(0x3f3628, 1);
+    g.fillEllipse(bx + 0.5, by - 38.5, 10, 8);
+    g.fillStyle(shade(SKIN, -0.32), 1);
+    g.fillEllipse(bx + 1, by - 38, 7.5, 6);
+    g.fillStyle(OUT, 1);
+    g.fillCircle(bx - 1, by - 38.6, 1);
+    g.fillCircle(bx + 3, by - 38.6, 1);
+  }
+
+  // The book, held in both hands and raised as the blessing is given. The
+  // `swing` phase carries it: wound back it is at the chest, following through
+  // it is up and out, which is the healing gesture.
+  const lift = P.swing;
+  const kx = bx + 3 + lift * 5;
+  const ky = by - 24 - lift * 7;
+  g.fillStyle(OUT, 1);
+  g.fillPoints([
+    { x: kx - 9, y: ky - 1 }, { x: kx, y: ky - 6 },
+    { x: kx + 9, y: ky - 1 }, { x: kx, y: ky + 5 },
+  ], true, true);
+  g.fillStyle(0x8a2f2a, 1);
+  g.fillPoints([
+    { x: kx - 7.5, y: ky - 1 }, { x: kx, y: ky - 4.6 },
+    { x: kx + 7.5, y: ky - 1 }, { x: kx, y: ky + 3.4 },
+  ], true, true);
+  g.fillStyle(0xf2ecd8, 1);
+  g.fillPoints([
+    { x: kx - 6.5, y: ky - 1.6 }, { x: kx - 0.6, y: ky - 4.4 },
+    { x: kx - 0.6, y: ky + 1.6 },
+  ], true, true);
+  g.fillStyle(0xe2dbc4, 1);
+  g.fillPoints([
+    { x: kx + 6.5, y: ky - 1.6 }, { x: kx + 0.6, y: ky - 4.4 },
+    { x: kx + 0.6, y: ky + 1.6 },
+  ], true, true);
+  g.fillStyle(SKIN, 1);
+  g.fillCircle(kx - 7, ky + 1.5, 2.4);
+  g.fillCircle(kx + 7, ky + 1.5, 2.4);
+  g.lineStyle(1.1, OUT, 1);
+  g.strokeCircle(kx - 7, ky + 1.5, 2.4);
+  g.strokeCircle(kx + 7, ky + 1.5, 2.4);
+}
+
 // ---------------------------------------------------------------------------
 // Buildings
 // ---------------------------------------------------------------------------
@@ -1541,8 +3191,46 @@ function drawRam(g, col, dark, back, P) {
 // shows up as a bar floating in mid-air.
 const BSPEC = {
   towncenter: { fw: 3, fh: 3, w: 200, h: 236 },
-  house: { fw: 2, fh: 2, w: 140, h: 106 },
-  barracks: { fw: 3, fh: 3, wallH: 38, roofH: 24, crenels: true, w: 200, h: 175 },
+  house: { fw: 2, fh: 2, w: 136, h: 100 },
+  barracks: { fw: 3, fh: 3, wallH: 38, roofH: 24, crenels: true, w: 200, h: 164 },
+
+  // --- the six that were falling through to the generic plaster box ----------
+  //
+  // Archery Range, Stable, Blacksmith, Siege Workshop, University and Monastery
+  // are all 3x3, all cost within a few tens of wood of each other, and are all
+  // built in the same part of a base — so of every readability problem in this
+  // file, telling these apart is the hardest and the one that matters most. Six
+  // buildings that share a silhouette are six buildings the player has to tap.
+  //
+  // The rule each of them is drawn to: ONE shape, above the roofline, that
+  // nothing else in the game makes. Not a decal on a wall, not a colour, not a
+  // different roof pitch — a shape in the outline, because at 0.7 zoom on a
+  // 390px phone, with half the building behind a tree and a fog edge across the
+  // rest, the outline is all there is.
+  //
+  //   Archery Range  a straw target butt: a disc on legs, standing on the
+  //                  ground clear of the hall. The only circle at ground level.
+  //   Stable         a black stall mouth with a horse's head coming out of it,
+  //                  under the widest roof of the six.
+  //   Blacksmith     one tall thin chimney with smoke on it, over a low hut.
+  //                  A vertical spike where the others are horizontal.
+  //   Siege Workshop an open timber gantry — an A-frame taller than the roof it
+  //                  straddles, with a block and tackle hanging in the gap, and
+  //                  a half-built engine's wheel under it.
+  //   University     a dome. There is no other dome; the Mill's cap is a cone,
+  //                  which is a different shape at any size.
+  //   Monastery      a bell tower: a tall square shaft with an open belfry and
+  //                  a cross, well above everything around it.
+  //
+  // fw/fh here MUST match BUILDING_STATS — nothing used to check, and a mismatch
+  // silently makes the placement ghost disagree with the finished sprite. See
+  // assertFootprints(), which now fails the bake if these drift.
+  archeryrange: { fw: 3, fh: 3, range: true, w: 200, h: 142 },
+  stable: { fw: 3, fh: 3, stable: true, w: 200, h: 150 },
+  blacksmith: { fw: 3, fh: 3, smith: true, w: 200, h: 196 },
+  siegeworkshop: { fw: 3, fh: 3, siege: true, w: 200, h: 161 },
+  university: { fw: 3, fh: 3, university: true, w: 200, h: 193 },
+  monastery: { fw: 3, fh: 3, monastery: true, w: 200, h: 189 },
   // --- the three drop-offs, and why they no longer share a body -------------
   //
   // They used to: one 2x2 plaster-and-timber box under one team-blue hip roof,
@@ -1570,21 +3258,21 @@ const BSPEC = {
   // three now have a shape to carry it instead; the team colour is on flags and
   // painted bands, which is where it stays legible without making every roof in
   // a base the same blue.
-  mill: { fw: 2, fh: 2, mill: true, w: 152, h: 182 },
-  farm: { fw: 2, fh: 2, w: 140, h: 100, stages: 3 },
-  lumbercamp: { fw: 2, fh: 2, lumber: true, w: 152, h: 116 },
-  miningcamp: { fw: 2, fh: 2, mine: true, w: 152, h: 150 },
+  mill: { fw: 2, fh: 2, mill: true, w: 136, h: 163 },
+  farm: { fw: 2, fh: 2, w: 136, h: 96, stages: 3 },
+  lumbercamp: { fw: 2, fh: 2, lumber: true, w: 136, h: 116 },
+  miningcamp: { fw: 2, fh: 2, mine: true, w: 136, h: 139 },
   // The Market. Two striped awnings over a trestle of goods, in front of a low
   // plaster hall. Stripes are the whole design: there is nothing else striped
   // anywhere on this map, so a Market is identifiable at any zoom, from any
   // angle, and with its lower half behind a tree — which is the same test the
   // three drop-offs above had to pass. Deliberately *low* as well, so it never
   // competes with the Mill's tower or the Town Center's mast for the eye.
-  market: { fw: 3, fh: 3, market: true, w: 200, h: 150 },
+  market: { fw: 3, fh: 3, market: true, w: 200, h: 146 },
   // The two stone buildings that shoot. Both are drawn tall on purpose: a
   // defensive building whose silhouette does not clear the houses around it is a
   // defensive building the player forgets they own.
-  watchtower: { fw: 1, fh: 1, tower: true, w: 80, h: 110 },
+  watchtower: { fw: 1, fh: 1, tower: true, w: 72, h: 110 },
   castle: { fw: 4, fh: 4, castle: true, w: 280, h: 250 },
 };
 
@@ -1599,7 +3287,38 @@ const TILE_ROOF_D = 0x8e4f20;
 const STONE = 0xa8a294;
 const STONE_D = 0x7c766a;
 
+/**
+ * Every BSPEC footprint must agree with the simulation's.
+ *
+ * Nothing else in the codebase cross-checks these. A BSPEC with the wrong fw/fh
+ * still bakes, still packs and still draws — it just draws a building whose
+ * platform is a different size from the tiles it occupies, so the placement
+ * ghost and the finished sprite disagree, and the player is told they cannot
+ * build somewhere that looks empty. That is a bug you find by squinting at a
+ * screenshot, which is to say one you find months late; so it is a hard failure
+ * at bake time instead, and the message names the pair.
+ *
+ * A missing BUILDING_STATS entry is fine and deliberately not an error: art may
+ * be baked for something the rules do not carry yet. The reverse — a building
+ * the rules know about with no art — is caught by drawBuilding's fallthrough.
+ */
+function assertFootprints() {
+  const bad = [];
+  for (const type of Object.keys(BSPEC)) {
+    const stats = BUILDING_STATS[type];
+    if (!stats) continue;
+    const s = BSPEC[type];
+    if (s.fw !== stats.fw || s.fh !== stats.fh) {
+      bad.push(`${type}: BSPEC ${s.fw}x${s.fh} vs BUILDING_STATS ${stats.fw}x${stats.fh}`);
+    }
+  }
+  if (bad.length) {
+    throw new Error(`[gfx] building footprint mismatch — ${bad.join('; ')}`);
+  }
+}
+
 function buildBuildings(put) {
+  assertFootprints();
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
@@ -1621,7 +3340,17 @@ function buildBuildings(put) {
   }
 }
 
-/** The ground the building stands on: an fw x fh block of packed stone. */
+/**
+ * The ground the building stands on: an fw x fh block of packed stone.
+ *
+ * Now with the thing every sprite in this file was missing — a soft shadow on
+ * the ground around it, thrown away from the sun. A building without one is a
+ * sticker laid on the map; the same building with one is standing on it, and it
+ * costs four ellipses at bake time and nothing at all per frame. The paving is
+ * also lit now rather than flat: the north-east half catches the key, the
+ * south-west half sits in the building's own ambient occlusion, and the stroke
+ * round the rim is heavy on the shaded side and warm-and-thin on the lit one.
+ */
 function platform(g, cx, cy, hw, hh, stepped) {
   const base = [
     { x: cx, y: cy - hh },
@@ -1629,12 +3358,23 @@ function platform(g, cx, cy, hw, hh, stepped) {
     { x: cx, y: cy + hh },
     { x: cx - hw, y: cy },
   ];
+  contactShadow(g, cx, cy + hh * 0.18, hw * 1.5, hh * 1.5, 1.15);
   g.fillStyle(0x5e5648, 1);
   g.fillPoints(base.map((p) => ({ x: p.x, y: p.y + 4 })), true, true);
   g.fillStyle(0x8d8271, 1);
   g.fillPoints(base, true, true);
+  // Lit half and shaded half of the paving, split along the grid's other axis.
+  g.fillStyle(lit(0x8d8271), 0.5);
+  g.fillPoints([
+    { x: cx, y: cy - hh }, { x: cx + hw, y: cy }, { x: cx, y: cy + hh },
+  ], true, true);
+  g.fillStyle(dim(0x8d8271), 0.45);
+  g.fillPoints([
+    { x: cx, y: cy - hh }, { x: cx - hw, y: cy }, { x: cx, y: cy + hh },
+  ], true, true);
   g.lineStyle(2.5, OUT, 1);
   g.strokePoints(base, true, true);
+  rimLine(g, cx, cy - hh + 1, cx + hw - 1, cy, 1.6, 0.35);
   if (stepped) {
     // A second, inset course. Reads as a raised dais and adds a little more
     // mass to the Town Center's base without widening its footprint.
@@ -1681,6 +3421,30 @@ function drawBuilding(g, type, s, cx, cy, col, colDark) {
   }
   if (s.market) {
     drawMarket(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.range) {
+    drawArcheryRange(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.stable) {
+    drawStable(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.smith) {
+    drawBlacksmith(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.siege) {
+    drawSiegeWorkshop(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.university) {
+    drawUniversity(g, s, cx, cy, col, colDark);
+    return;
+  }
+  if (s.monastery) {
+    drawMonastery(g, s, cx, cy, col, colDark);
     return;
   }
 
@@ -2375,6 +4139,947 @@ function drawMarket(g, s, cx, cy, col, colDark) {
 
   banner(g, cx + hw * 0.78, cy + hh * 0.1, col, colDark, 24);
 }
+// ---------------------------------------------------------------------------
+// The six military and research buildings
+// ---------------------------------------------------------------------------
+//
+// See the block in BSPEC for what each of these has to say in silhouette and
+// why. Everything below shares one skeleton — platform, body, roof, one big
+// identifying shape, a banner — and differs only in that identifying shape,
+// which is deliberate: a base wants to look like a base, so the family
+// resemblance is as much the job as the difference.
+
+/**
+ * A dome, in this projection: half an ellipsoid sitting on a drum.
+ *
+ * Built the same way isoCylinder is — a silhouette in the shaded tone, a lit
+ * lobe over it offset towards the sun, a bright specular near the top-right and
+ * a warm rim along the sunward limb — because Graphics has no radial gradient
+ * and a two-tone dome reads as a folded paper hat. The horizontal courses are
+ * what turn it from a circle into a curved surface; without them the eye has
+ * nothing to follow round it.
+ */
+function isoDome(g, cx, cyBase, r, h, base) {
+  const N = 15;
+  const arc = (k) => {
+    const pts = [];
+    for (let i = 0; i <= N; i++) {
+      const a = Math.PI + (Math.PI * i) / N;
+      pts.push({ x: cx + Math.cos(a) * r * k, y: cyBase + Math.sin(a) * h * k });
+    }
+    return pts;
+  };
+  const shell = arc(1);
+  g.fillStyle(dim(base), 1);
+  g.fillPoints(shell, true, true);
+  // The lit lobe: the same dome shrunk and pushed up-right, which is what the
+  // terminator on a sphere lit from that direction actually looks like.
+  g.fillStyle(base, 1);
+  g.fillPoints(arc(0.88).map((p) => ({ x: p.x + r * 0.11, y: p.y - h * 0.07 })), true, true);
+  g.fillStyle(lit(base), 1);
+  g.fillPoints(arc(0.6).map((p) => ({ x: p.x + r * 0.28, y: p.y - h * 0.16 })), true, true);
+  g.fillStyle(mix(lit(base), 0xffffff, 0.45), 0.7);
+  g.fillEllipse(cx + r * 0.34, cyBase - h * 0.62, r * 0.3, h * 0.26);
+  // Courses.
+  g.lineStyle(1, dim(base), 0.45);
+  for (let k = 1; k <= 3; k++) {
+    const t = k / 4;
+    g.beginPath();
+    const pts = arc(1 - t * 0.05);
+    for (let i = 0; i <= N; i++) {
+      const p = { x: pts[i].x, y: pts[i].y * (1 - 0) };
+      const yy = cyBase - (cyBase - p.y) * (1 - t * 0.9);
+      if (i === 0) g.moveTo(p.x * (1 - t * 0.3) + cx * t * 0.3, yy);
+      else g.lineTo(p.x * (1 - t * 0.3) + cx * t * 0.3, yy);
+    }
+    g.strokePath();
+  }
+  g.lineStyle(2.4, OUT, 1);
+  g.strokePoints(shell, false, false);
+  // Warm bounce along the sunward limb.
+  g.lineStyle(1.6, RIM, 0.4);
+  g.beginPath();
+  const s = arc(0.96);
+  for (let i = Math.floor(N * 0.5); i <= N; i++) {
+    if (i === Math.floor(N * 0.5)) g.moveTo(s[i].x, s[i].y);
+    else g.lineTo(s[i].x, s[i].y);
+  }
+  g.strokePath();
+}
+
+/** A curl of smoke leaving a chimney: three shrinking, drifting puffs. */
+function smokeCurl(g, x, y) {
+  for (let k = 0; k < 4; k++) {
+    const t = k / 3;
+    const px = x + Math.sin(k * 1.4) * 5 + t * 7;
+    const py = y - k * 8 - 3;
+    g.fillStyle(0xe8e2d6, 0.34 - t * 0.16);
+    g.fillEllipse(px, py, 13 - t * 3, 9 - t * 2);
+    g.fillStyle(0xffffff, 0.2 - t * 0.1);
+    g.fillEllipse(px + 1.5, py - 1.5, 7 - t * 2, 4.5 - t);
+  }
+}
+
+/**
+ * The Archery Range.
+ *
+ * A long shed open along its south-east side, a shooting line marked by a low
+ * rail, and — the whole read — a straw target butt standing free on the paving
+ * where nothing can hide it. Circles are rare in this game and there is nothing
+ * else circular at ground level, so the disc is findable before the building it
+ * belongs to is.
+ */
+function drawArcheryRange(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  platform(g, cx, cy, hw, hh, false);
+
+  // The shed, pushed back to the north so the shooting ground is clear in front.
+  const bx = cx - hw * 0.16;
+  const by = cy - hh * 0.34;
+  const iw = hw * 0.7;
+  const ih = hh * 0.7;
+  const wallH = 26;
+  isoBox(g, bx, by, iw, ih, wallH, PLASTER, PLASTER_D, shade(PLASTER, 0.1));
+  timbers(g, bx, by, iw, ih, wallH);
+
+  // The open bay: the south-east wall is a dark run of shadow with posts across
+  // it rather than a plastered face, which is what makes a range look like a
+  // place people shoot out of.
+  const S = { x: bx, y: by + ih };
+  const E = { x: bx + iw, y: by };
+  g.fillStyle(0x241d13, 1);
+  g.fillPoints([
+    S, E, { x: E.x, y: E.y - wallH + 4 }, { x: S.x, y: S.y - wallH + 4 },
+  ], true, true);
+  g.lineStyle(2, OUT, 1);
+  g.strokePoints([
+    S, E, { x: E.x, y: E.y - wallH + 4 }, { x: S.x, y: S.y - wallH + 4 },
+  ], true, true);
+  for (let k = 1; k <= 3; k++) {
+    const t = k / 4;
+    const px = S.x + (E.x - S.x) * t;
+    const py = S.y + (E.y - S.y) * t;
+    g.fillStyle(WOOD_D, 1);
+    g.fillRect(px - 2.4, py - wallH + 3, 4.8, wallH - 3);
+    g.lineStyle(1.5, OUT, 1);
+    g.strokeRect(px - 2.4, py - wallH + 3, 4.8, wallH - 3);
+    rimLine(g, px + 2, py - wallH + 4, px + 2, py - 2, 1.2, 0.35);
+  }
+  // Bows and quivers racked in the shadow, just legible.
+  g.lineStyle(2.2, WOOD, 0.9);
+  for (let k = 0; k < 3; k++) {
+    const px = S.x + (E.x - S.x) * (0.2 + k * 0.25);
+    const py = S.y + (E.y - S.y) * (0.2 + k * 0.25);
+    g.beginPath();
+    g.arc(px + 4, py - wallH * 0.55, 7, -1.1, 1.1, false);
+    g.strokePath();
+  }
+
+  gableRoof(g, bx, by - wallH, iw * 1.16, ih * 1.16, 20, col, colDark);
+
+  // The shooting line: a low rail across the front of the paving.
+  fenceRun(g,
+    { x: cx - hw * 0.72, y: cy + hh * 0.28 },
+    { x: cx + hw * 0.1, y: cy + hh * 0.72 }, false);
+
+  // The butt. A straw roundel on two splayed legs, tilted back a little, with
+  // painted rings and three arrows already in it.
+  const tx = cx + hw * 0.5;
+  const ty = cy + hh * 0.36;
+  contactShadow(g, tx, ty + 2, 30, 12, 1);
+  g.lineStyle(4.6, OUT, 1);
+  g.beginPath();
+  g.moveTo(tx - 8, ty);
+  g.lineTo(tx - 2, ty - 20);
+  g.moveTo(tx + 8, ty);
+  g.lineTo(tx + 2, ty - 20);
+  g.strokePath();
+  g.lineStyle(2.4, WOOD_D, 1);
+  g.beginPath();
+  g.moveTo(tx - 8, ty);
+  g.lineTo(tx - 2, ty - 20);
+  g.moveTo(tx + 8, ty);
+  g.lineTo(tx + 2, ty - 20);
+  g.strokePath();
+  const R = 19;
+  g.fillStyle(OUT, 1);
+  g.fillEllipse(tx, ty - 30, R * 2 + 5, R * 2 + 5);
+  g.fillStyle(0xcaa960, 1);
+  g.fillEllipse(tx, ty - 30, R * 2, R * 2);
+  g.fillStyle(lit(0xcaa960), 1);
+  g.fillEllipse(tx - 1.5, ty - 32, R * 1.6, R * 1.6);
+  // The rings. Red and white, the loudest pair in the palette, because this
+  // disc is doing all the identification work at thumbnail size.
+  g.fillStyle(0xf2ece0, 1);
+  g.fillCircle(tx, ty - 30, R * 0.68);
+  g.fillStyle(0xc03a34, 1);
+  g.fillCircle(tx, ty - 30, R * 0.44);
+  g.fillStyle(0xf2ece0, 1);
+  g.fillCircle(tx, ty - 30, R * 0.2);
+  g.lineStyle(2, OUT, 1);
+  g.strokeCircle(tx, ty - 30, R);
+  g.lineStyle(1.2, OUT, 0.55);
+  g.strokeCircle(tx, ty - 30, R * 0.68);
+  g.strokeCircle(tx, ty - 30, R * 0.44);
+  // Arrows in the butt, coming towards the camera.
+  for (const [ox, oy] of [[-7, -3], [4, -8], [1, 4]]) {
+    stick(g, tx + ox, ty - 30 + oy, tx + ox - 11, ty - 30 + oy - 4, 1.7, 0xd8b070);
+    g.fillStyle(0xf2f2f2, 1);
+    g.fillTriangle(
+      tx + ox - 11, ty - 30 + oy - 7,
+      tx + ox - 16, ty - 30 + oy - 3,
+      tx + ox - 10, ty - 30 + oy - 1,
+    );
+  }
+
+  banner(g, cx - hw * 0.78, cy + hh * 0.06, col, colDark, 26);
+}
+
+/**
+ * The Stable.
+ *
+ * The widest, lowest roof of the six over a body whose south-east face is one
+ * big black stall mouth, with a horse's head and neck coming out of it. A
+ * darkness that shape, at that size, is not something any other building has,
+ * and the head reads as a head even at twenty pixels. Hay, a water trough and a
+ * tie rail finish the yard.
+ */
+function drawStable(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  const HIDE = 0x7c5233;
+  platform(g, cx, cy, hw, hh, false);
+
+  const bx = cx - hw * 0.08;
+  const by = cy - hh * 0.22;
+  const iw = hw * 0.78;
+  const ih = hh * 0.78;
+  // Tall walls and a tight roof, deliberately, and this is the one measurement
+  // in the building that is not free: the horse's head is the whole read, and a
+  // generous eave overhang — which is what every other building in this file
+  // wears — puts the head behind the roof. Everything below is sized off the
+  // height of the eave above the south corner rather than off the wall.
+  const wallH = 38;
+  isoBox(g, bx, by, iw, ih, wallH, 0xb08c5c, 0xc09b68, shade(0xc09b68, 0.14));
+  // Board-and-batten siding rather than the plaster-and-timber the barracks
+  // family wears: a stable is a wooden building, and the vertical boarding is
+  // the second thing that separates it from its neighbours.
+  g.lineStyle(1.2, 0x7a5a33, 0.7);
+  for (let k = 1; k <= 6; k++) {
+    const t = k / 7;
+    const lx = bx - iw + iw * t;
+    const ly = by + ih * t;
+    g.beginPath();
+    g.moveTo(lx, ly);
+    g.lineTo(lx, ly - wallH);
+    g.strokePath();
+    const rx = bx + iw * t;
+    const ry = by + ih - ih * t;
+    g.beginPath();
+    g.moveTo(rx, ry);
+    g.lineTo(rx, ry - wallH);
+    g.strokePath();
+  }
+
+  // The stall mouth: a wide arch of pure shadow in the south-east face, and
+  // low enough that the roof cannot swallow what stands in it.
+  const mw = iw * 0.66;
+  const mx = bx + iw * 0.24;
+  const my = by + ih * 0.78;
+  const mH = 26;
+  g.fillStyle(0x1a140c, 1);
+  g.fillPoints([
+    { x: mx - mw * 0.5, y: my + mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 - mH },
+    { x: mx - mw * 0.5, y: my + mw * 0.25 - mH },
+  ], true, true);
+  g.lineStyle(2.4, OUT, 1);
+  g.strokePoints([
+    { x: mx - mw * 0.5, y: my + mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 - mH },
+    { x: mx - mw * 0.5, y: my + mw * 0.25 - mH },
+  ], true, true);
+  // The half-door across the bottom of it.
+  g.fillStyle(WOOD_D, 1);
+  g.fillPoints([
+    { x: mx - mw * 0.5, y: my + mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 - 11 },
+    { x: mx - mw * 0.5, y: my + mw * 0.25 - 11 },
+  ], true, true);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints([
+    { x: mx - mw * 0.5, y: my + mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 },
+    { x: mx + mw * 0.5, y: my - mw * 0.25 - 11 },
+    { x: mx - mw * 0.5, y: my + mw * 0.25 - 11 },
+  ], true, true);
+
+  // The horse, looking out over the half-door. Neck, head, ear, mane, eye —
+  // five marks, and a player reads "stable" from them instantly.
+  const hx = mx + 1;
+  const hy = my - 9;
+  stick(g, hx - 5, hy, hx + 4, hy - 13, 9, HIDE);
+  g.fillStyle(HIDE, 1);
+  g.fillRoundedRect(hx, hy - 21, 15, 9, 4);
+  g.lineStyle(2, OUT, 1);
+  g.strokeRoundedRect(hx, hy - 21, 15, 9, 4);
+  g.fillStyle(OUT, 1);
+  g.fillTriangle(hx + 2, hy - 21, hx + 4, hy - 27, hx + 6.5, hy - 21);
+  g.lineStyle(3.4, 0x35251a, 1);
+  g.beginPath();
+  g.moveTo(hx - 3, hy - 3);
+  g.lineTo(hx + 3, hy - 19);
+  g.strokePath();
+  g.fillStyle(OUT, 1);
+  g.fillCircle(hx + 9, hy - 17.5, 1.5);
+  g.fillStyle(shade(HIDE, 0.3), 1);
+  g.fillEllipse(hx + 13, hy - 15, 4, 3);
+  rimLine(g, hx + 4, hy - 21, hx + 14, hy - 18, 1.4, 0.4);
+
+  gableRoof(g, bx, by - wallH, iw * 1.04, ih * 1.04, 22, col, colDark);
+
+  // The yard: a tie rail with a rope over it, a hay bale and a trough.
+  fenceRun(g,
+    { x: cx - hw * 0.8, y: cy + hh * 0.1 },
+    { x: cx - hw * 0.12, y: cy + hh * 0.56 }, false);
+  const hax = cx + hw * 0.52;
+  const hay = cy + hh * 0.5;
+  contactShadow(g, hax, hay + 2, 22, 9, 1);
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(hax - 13, hay - 15, 26, 16, 3);
+  g.fillStyle(0xd6b464, 1);
+  g.fillRoundedRect(hax - 11.5, hay - 13.5, 23, 13, 2.5);
+  g.fillStyle(lit(0xd6b464), 1);
+  g.fillRect(hax - 10, hay - 12.5, 20, 4);
+  g.lineStyle(1.1, 0x9d803f, 0.8);
+  for (const t of [0.32, 0.68]) {
+    g.beginPath();
+    g.moveTo(hax - 11.5 + 23 * t, hay - 13.5);
+    g.lineTo(hax - 11.5 + 23 * t, hay - 0.5);
+    g.strokePath();
+  }
+
+  banner(g, cx + hw * 0.2, cy + hh * 0.76, col, colDark, 24);
+}
+
+/**
+ * The Blacksmith.
+ *
+ * One tall thin chimney with smoke coming off it, standing over a low stone
+ * hut: a vertical spike where every other building of this size is a horizontal
+ * mass. The forge mouth glows, which makes it the only building on the map that
+ * emits light, and the anvil on its stump outside says what the glow is for.
+ */
+function drawBlacksmith(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  const BRICK = 0x8d5a44;
+  platform(g, cx, cy, hw, hh, false);
+
+  const bx = cx - hw * 0.12;
+  const by = cy - hh * 0.18;
+  const iw = hw * 0.66;
+  const ih = hh * 0.66;
+  const wallH = 30;
+  isoBox(g, bx, by, iw, ih, wallH, STONE, shade(STONE, 0.08), shade(STONE, 0.18));
+  // Rubble coursing, not timber framing: the smithy is the one workshop that
+  // has to be fireproof, and stone says so without a caption.
+  g.lineStyle(1.1, STONE_D, 0.6);
+  for (let k = 1; k <= 4; k++) {
+    const y = by - (wallH * k) / 5;
+    g.beginPath();
+    g.moveTo(bx - iw, y);
+    g.lineTo(bx, y + ih);
+    g.lineTo(bx + iw, y);
+    g.strokePath();
+  }
+  gableRoof(g, bx, by - wallH, iw * 1.16, ih * 1.16, 17, col, colDark);
+
+  // The forge mouth, low in the south-east wall. Three colours out from the
+  // centre — white, orange, deep red — plus a wash of warm light thrown onto
+  // the paving in front, which is what makes it look lit rather than painted.
+  const fx = bx + iw * 0.34;
+  const fy = by + ih * 0.5;
+  g.fillStyle(0xff9a2e, 0.16);
+  g.fillEllipse(fx + 6, fy + 12, 54, 24);
+  g.fillStyle(0xffc054, 0.13);
+  g.fillEllipse(fx + 4, fy + 9, 36, 16);
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(fx - 10, fy - 20, 21, 20, 4);
+  g.fillStyle(0x5c1c0e, 1);
+  g.fillRoundedRect(fx - 8.5, fy - 18.5, 18, 17, 3);
+  g.fillStyle(0xd2431a, 1);
+  g.fillRoundedRect(fx - 6.5, fy - 15, 14, 12, 3);
+  g.fillStyle(0xff9a2e, 1);
+  g.fillEllipse(fx + 0.5, fy - 8.5, 11, 8);
+  g.fillStyle(0xffe6a0, 1);
+  g.fillEllipse(fx + 0.5, fy - 8.5, 6, 4.4);
+
+  // The chimney. Deliberately tall, deliberately thin, and deliberately set at
+  // the north corner where nothing overlaps it — this is the silhouette.
+  const chx = bx - iw * 0.42;
+  const chTop = by - ih * 0.4 - wallH - 62;
+  const chBase = by - ih * 0.4 - wallH + 8;
+  g.fillStyle(dim(BRICK), 1);
+  g.fillRect(chx - 10, chTop, 20, chBase - chTop);
+  g.fillStyle(BRICK, 1);
+  g.fillRect(chx - 2, chTop, 12, chBase - chTop);
+  g.fillStyle(lit(BRICK), 1);
+  g.fillRect(chx + 4, chTop, 5, chBase - chTop);
+  g.lineStyle(2.2, OUT, 1);
+  g.strokeRect(chx - 10, chTop, 20, chBase - chTop);
+  // Brick courses, alternating offsets so it reads as masonry.
+  g.lineStyle(1, shade(BRICK, -0.3), 0.55);
+  for (let k = 1; k * 7 < chBase - chTop; k++) {
+    g.beginPath();
+    g.moveTo(chx - 10, chTop + k * 7);
+    g.lineTo(chx + 10, chTop + k * 7);
+    g.strokePath();
+  }
+  // Corbelled cap.
+  g.fillStyle(shade(BRICK, -0.1), 1);
+  g.fillRect(chx - 13, chTop - 7, 26, 8);
+  g.lineStyle(2, OUT, 1);
+  g.strokeRect(chx - 13, chTop - 7, 26, 8);
+  g.fillStyle(0x120d08, 1);
+  g.fillRect(chx - 8, chTop - 6, 16, 3);
+  rimLine(g, chx + 9, chTop - 5, chx + 9, chBase - 2, 1.6, 0.4);
+  smokeCurl(g, chx + 2, chTop - 10);
+
+  // Anvil on a stump, out on the paving where it cannot be missed.
+  const ax = cx + hw * 0.5;
+  const ay = cy + hh * 0.42;
+  contactShadow(g, ax, ay + 1, 22, 9, 1);
+  g.fillStyle(0x6b4a28, 1);
+  g.fillRect(ax - 8, ay - 12, 16, 12);
+  g.fillStyle(0x8a663c, 1);
+  g.fillEllipse(ax, ay - 12, 16, 6);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRect(ax - 8, ay - 12, 16, 12);
+  g.strokeEllipse(ax, ay - 12, 16, 6);
+  // The anvil itself: horn, waist, base — the outline everybody knows.
+  const anv = [
+    { x: ax - 13, y: ay - 20 }, { x: ax + 9, y: ay - 20 },
+    { x: ax + 14, y: ay - 17.5 }, { x: ax + 8, y: ay - 16 },
+    { x: ax + 5, y: ay - 13 }, { x: ax + 7, y: ay - 11 },
+    { x: ax - 8, y: ay - 11 }, { x: ax - 6, y: ay - 13 },
+    { x: ax - 9, y: ay - 16 }, { x: ax - 13, y: ay - 17.5 },
+  ];
+  g.fillStyle(STEEL_D, 1);
+  g.fillPoints(anv, true, true);
+  g.lineStyle(2, OUT, 1);
+  g.strokePoints(anv, true, true);
+  g.fillStyle(STEEL, 1);
+  g.fillRect(ax - 12, ay - 19.5, 20, 2.4);
+  // A hammer left leaning against it.
+  stick(g, ax - 16, ay - 1, ax - 9, ay - 18, 2.2, WOOD);
+  g.fillStyle(STEEL_D, 1);
+  g.fillRoundedRect(ax - 13, ay - 24, 10, 5, 1.6);
+  g.lineStyle(1.4, OUT, 1);
+  g.strokeRoundedRect(ax - 13, ay - 24, 10, 5, 1.6);
+
+  banner(g, cx - hw * 0.74, cy + hh * 0.16, col, colDark, 26);
+}
+
+/**
+ * The Siege Workshop.
+ *
+ * An open timber gantry — two raking A-frames carrying a ridge beam, with a
+ * block and tackle swinging in the gap — straddling a half-built engine. No
+ * walls at all, like the Lumber Camp, but where that is a low flat slab this is
+ * a tall triangle with a rope hanging in it, and the finished half of the
+ * engine underneath is a wheel taller than a man.
+ */
+function drawSiegeWorkshop(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  const BEAM = 0x8a6134;
+  const BEAM_D = 0x5d3f1e;
+  platform(g, cx, cy, hw, hh, false);
+
+  // Two A-frames, one behind the engine and one in front of it, so the machine
+  // sits *inside* the gantry rather than beside it.
+  //
+  // Both feet of a frame stand at the same screen height, which is not what an
+  // isometric grid line does and is deliberate. Rake them along a grid axis and
+  // the two legs get different lengths and different angles; two of those, plus
+  // a ridge beam, plus a hanging tackle, and the result is a heap of sticks with
+  // no shape in it — which is exactly what the first attempt looked like. A
+  // symmetric A is a letter the eye already knows, it survives being twenty
+  // pixels tall, and nothing else on this map makes one.
+  const H = 76;
+  const frame = (fx, fy, spread, near) => {
+    const apex = { x: fx, y: fy - H };
+    const woodC = near ? BEAM : BEAM_D;
+    for (const sgn of [-1, 1]) {
+      const foot = { x: fx + sgn * spread, y: fy };
+      g.lineStyle(9.5, OUT, 1);
+      g.beginPath();
+      g.moveTo(foot.x, foot.y);
+      g.lineTo(apex.x, apex.y);
+      g.strokePath();
+      g.lineStyle(6, woodC, 1);
+      g.beginPath();
+      g.moveTo(foot.x, foot.y);
+      g.lineTo(apex.x, apex.y);
+      g.strokePath();
+      // A foot block, so the leg stands on something instead of ending in air.
+      g.fillStyle(OUT, 1);
+      g.fillEllipse(foot.x, foot.y, 15, 7);
+      g.fillStyle(shade(woodC, -0.2), 1);
+      g.fillEllipse(foot.x, foot.y - 1, 12, 5);
+      if (sgn > 0) rimLine(g, foot.x + 2, foot.y - 3, apex.x + 2, apex.y + 4, 1.8, 0.42);
+    }
+    // Collar tie, level, a third of the way down: the crossbar of the A.
+    const tieY = fy - H * 0.46;
+    const tieX = spread * 0.46;
+    g.lineStyle(7.5, OUT, 1);
+    g.beginPath();
+    g.moveTo(fx - tieX, tieY);
+    g.lineTo(fx + tieX, tieY);
+    g.strokePath();
+    g.lineStyle(4.4, woodC, 1);
+    g.beginPath();
+    g.moveTo(fx - tieX, tieY);
+    g.lineTo(fx + tieX, tieY);
+    g.strokePath();
+    return apex;
+  };
+
+  const backApex = frame(cx - hw * 0.26, cy - hh * 0.5, hw * 0.5, false);
+
+  // The ridge beam between the two apexes, and the tackle hanging off it.
+  const frontApexX = cx + hw * 0.26;
+  const frontApexY = cy + hh * 0.5 - H;
+  g.lineStyle(9, OUT, 1);
+  g.beginPath();
+  g.moveTo(backApex.x, backApex.y);
+  g.lineTo(frontApexX, frontApexY);
+  g.strokePath();
+  g.lineStyle(5.5, BEAM, 1);
+  g.beginPath();
+  g.moveTo(backApex.x, backApex.y);
+  g.lineTo(frontApexX, frontApexY);
+  g.strokePath();
+
+  // Block and tackle: a pulley on the beam, two falls of rope, a hook.
+  const px = (backApex.x + frontApexX) / 2;
+  const py = (backApex.y + frontApexY) / 2 + 3;
+  g.fillStyle(OUT, 1);
+  g.fillCircle(px, py, 6);
+  g.fillStyle(WOOD, 1);
+  g.fillCircle(px, py, 4.4);
+  g.fillStyle(STEEL_D, 1);
+  g.fillCircle(px, py, 1.6);
+  g.lineStyle(2.4, OUT, 0.85);
+  g.beginPath();
+  g.moveTo(px - 3, py + 4);
+  g.lineTo(px - 3, py + 30);
+  g.moveTo(px + 3, py + 4);
+  g.lineTo(px + 3, py + 30);
+  g.strokePath();
+  g.lineStyle(1.2, 0xcbb98c, 1);
+  g.beginPath();
+  g.moveTo(px - 3, py + 4);
+  g.lineTo(px - 3, py + 30);
+  g.moveTo(px + 3, py + 4);
+  g.lineTo(px + 3, py + 30);
+  g.strokePath();
+  g.lineStyle(2.6, STEEL_D, 1);
+  g.beginPath();
+  g.arc(px, py + 34, 5, -0.4, 3.4, false);
+  g.strokePath();
+
+  // The engine under construction: one big spoked wheel, a throwing arm half
+  // pinned, and a stack of squared timber waiting to become the other half.
+  const wx = cx + hw * 0.2;
+  const wy = cy + hh * 0.42;
+  const R = 20;
+  contactShadow(g, wx, wy + 2, 46, 18, 1);
+  g.fillStyle(OUT, 1);
+  g.fillCircle(wx, wy - R * 0.55, R + 2.4);
+  g.fillStyle(0x5d3f1e, 1);
+  g.fillCircle(wx, wy - R * 0.55, R);
+  g.fillStyle(shade(0x8a6134, 0.06), 1);
+  g.fillCircle(wx, wy - R * 0.55, R - 5);
+  g.fillStyle(0x3d2a13, 1);
+  g.fillCircle(wx, wy - R * 0.55, R - 8.5);
+  g.lineStyle(3, 0x5d3f1e, 1);
+  for (let k = 0; k < 6; k++) {
+    const a = (Math.PI / 6) * k + 0.3;
+    g.beginPath();
+    g.moveTo(wx - Math.cos(a) * (R - 2), wy - R * 0.55 - Math.sin(a) * (R - 2));
+    g.lineTo(wx + Math.cos(a) * (R - 2), wy - R * 0.55 + Math.sin(a) * (R - 2));
+    g.strokePath();
+  }
+  g.fillStyle(STEEL_D, 1);
+  g.fillCircle(wx, wy - R * 0.55, 4);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeCircle(wx, wy - R * 0.55, 4);
+  g.lineStyle(2, RIM, 0.32);
+  g.beginPath();
+  g.arc(wx, wy - R * 0.55, R - 1.5, -1.9, -0.3, false);
+  g.strokePath();
+
+  // The chassis the wheel is pinned to: a short squared beam with the axle
+  // through it and a second wheel started on the far side. Kept low and short
+  // on purpose — an earlier version had a full throwing arm raking right across
+  // the gantry, and one more long diagonal in a picture already made of long
+  // diagonals is what turned this building into a woodpile.
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(wx - 30, wy - R * 0.55 - 6, 46, 13, 4);
+  g.fillStyle(BEAM_D, 1);
+  g.fillRoundedRect(wx - 28.5, wy - R * 0.55 - 4.5, 43, 10, 3);
+  g.fillStyle(BEAM, 1);
+  g.fillRect(wx - 27, wy - R * 0.55 - 3.5, 40, 3.4);
+
+  // Timber stack and a stone shot, so the yard reads as a place work happens.
+  const sx = cx - hw * 0.6;
+  const sy = cy + hh * 0.5;
+  for (let r = 0; r < 2; r++) {
+    for (let k = 0; k < 3 - r; k++) {
+      const lx = sx + k * 11 + r * 5.5;
+      const ly = sy - r * 9;
+      g.fillStyle(OUT, 1);
+      g.fillCircle(lx, ly, 6.2);
+      g.fillStyle(WOOD_D, 1);
+      g.fillCircle(lx, ly, 5);
+      g.fillStyle(0xc59a5f, 1);
+      g.fillCircle(lx + 1, ly - 1, 3);
+    }
+  }
+  const bx = cx + hw * 0.62;
+  const by = cy + hh * 0.5;
+  contactShadow(g, bx, by + 1, 20, 8, 1);
+  g.fillStyle(OUT, 1);
+  g.fillCircle(bx, by - 8, 10);
+  g.fillStyle(0x7b8490, 1);
+  g.fillCircle(bx, by - 8, 8.6);
+  g.fillStyle(0x9ca6b3, 1);
+  g.fillCircle(bx + 1.6, by - 10, 5);
+
+  frame(frontApexX, cy + hh * 0.5, hw * 0.5, true);
+
+  banner(g, cx - hw * 0.5, cy + hh * 0.62, col, colDark, 28);
+}
+
+/**
+ * The University.
+ *
+ * A dome, and there is no other dome in the game — the Mill's cap is a cone,
+ * which stays a different shape however small it gets. Under it a drum on an
+ * arcaded base, with a lantern and a weathervane on top so the profile is
+ * dome-plus-pinnacle rather than dome-alone, and a shelf of books and an
+ * armillary sphere on the paving to say what goes on inside.
+ */
+function drawUniversity(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  const ASHLAR = 0xd8d0bd;
+  platform(g, cx, cy, hw, hh, true);
+
+  // The arcaded base: a low block with a run of round-headed arches on the two
+  // faces the camera can see. Arches are the second cue — nothing else in the
+  // game has a repeated curve at wall height.
+  const iw = hw * 0.74;
+  const ih = hh * 0.74;
+  const wallH = 34;
+  isoBox(g, cx, cy, iw, ih, wallH, ASHLAR, shade(ASHLAR, 0.06), shade(ASHLAR, 0.16));
+  const arches = (from, to, n, shadow) => {
+    for (let k = 0; k < n; k++) {
+      const t = (k + 0.5) / n;
+      const px = from.x + (to.x - from.x) * t;
+      const py = from.y + (to.y - from.y) * t;
+      g.fillStyle(shadow, 1);
+      g.fillRoundedRect(px - 5, py - wallH + 7, 10, wallH - 9, 5);
+      g.lineStyle(1.5, OUT, 0.9);
+      g.strokeRoundedRect(px - 5, py - wallH + 7, 10, wallH - 9, 5);
+    }
+  };
+  arches({ x: cx - iw, y: cy }, { x: cx, y: cy + ih }, 3, 0x352f24);
+  arches({ x: cx, y: cy + ih }, { x: cx + iw, y: cy }, 3, 0x433c2e);
+
+  // A cornice, then the drum.
+  const topY = cy - wallH;
+  g.fillStyle(shade(ASHLAR, 0.2), 1);
+  g.fillPoints([
+    { x: cx, y: topY - ih * 1.05 }, { x: cx + iw * 1.05, y: topY },
+    { x: cx, y: topY + ih * 1.05 }, { x: cx - iw * 1.05, y: topY },
+  ], true, true);
+  g.lineStyle(2.2, OUT, 1);
+  g.strokePoints([
+    { x: cx, y: topY - ih * 1.05 }, { x: cx + iw * 1.05, y: topY },
+    { x: cx, y: topY + ih * 1.05 }, { x: cx - iw * 1.05, y: topY },
+  ], true, true);
+
+  const drumR = iw * 0.6;
+  const { yT } = isoCylinder(g, cx, topY + 4, drumR, drumR * 0.96, 26,
+    ASHLAR, shade(ASHLAR, 0.14));
+  // Round-headed windows round the drum.
+  for (let k = -1; k <= 1; k++) {
+    const wxp = cx + k * drumR * 0.52;
+    g.fillStyle(0x2e3a4a, 1);
+    g.fillRoundedRect(wxp - 3.6, yT + 5, 7.2, 14, 3.6);
+    g.lineStyle(1.4, OUT, 1);
+    g.strokeRoundedRect(wxp - 3.6, yT + 5, 7.2, 14, 3.6);
+  }
+  // A band of team colour where the drum meets the dome — the University's roof
+  // is stone and stays stone, so ownership lives on a painted string course.
+  g.fillStyle(colDark, 1);
+  g.fillRect(cx - drumR * 0.98, yT - 4, drumR * 1.96, 6);
+  g.fillStyle(col, 1);
+  g.fillRect(cx - drumR * 0.98, yT - 4, drumR * 1.96, 3);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeRect(cx - drumR * 0.98, yT - 4, drumR * 1.96, 6);
+
+  isoDome(g, cx, yT - 3, drumR * 0.99, 40, 0xbfc7cf);
+
+  // Lantern and finial on the crown.
+  const lanY = yT - 43;
+  g.fillStyle(shade(ASHLAR, 0.1), 1);
+  g.fillRect(cx - 7, lanY - 13, 14, 14);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRect(cx - 7, lanY - 13, 14, 14);
+  g.fillStyle(0x2e3a4a, 1);
+  g.fillRect(cx - 4, lanY - 10, 8, 9);
+  g.fillStyle(shade(ASHLAR, 0.24), 1);
+  g.fillPoints([
+    { x: cx - 9, y: lanY - 13 }, { x: cx, y: lanY - 22 }, { x: cx + 9, y: lanY - 13 },
+  ], true, true);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints([
+    { x: cx - 9, y: lanY - 13 }, { x: cx, y: lanY - 22 }, { x: cx + 9, y: lanY - 13 },
+  ], true, true);
+  stick(g, cx, lanY - 21, cx, lanY - 31, 1.8, 0xd8b23c);
+  g.fillStyle(0xf0c94a, 1);
+  g.fillCircle(cx, lanY - 33, 3.4);
+  g.lineStyle(1.3, OUT, 1);
+  g.strokeCircle(cx, lanY - 33, 3.4);
+
+  // An armillary sphere on a stand out on the paving: three rings and an axis,
+  // which is a shape nothing else in the game makes and reads even tiny.
+  const ax = cx + hw * 0.56;
+  const ay = cy + hh * 0.44;
+  contactShadow(g, ax, ay + 1, 20, 8, 1);
+  stick(g, ax, ay, ax, ay - 14, 3, WOOD_D);
+  g.lineStyle(3.2, OUT, 1);
+  g.strokeCircle(ax, ay - 24, 10);
+  g.lineStyle(1.7, 0xd8b23c, 1);
+  g.strokeCircle(ax, ay - 24, 10);
+  g.lineStyle(2.6, OUT, 1);
+  g.strokeEllipse(ax, ay - 24, 20, 8);
+  g.strokeEllipse(ax, ay - 24, 8, 20);
+  g.lineStyle(1.4, 0xd8b23c, 1);
+  g.strokeEllipse(ax, ay - 24, 20, 8);
+  g.strokeEllipse(ax, ay - 24, 8, 20);
+
+  // A lectern with an open book, at the foot of the steps.
+  const bx = cx - hw * 0.56;
+  const by = cy + hh * 0.4;
+  contactShadow(g, bx, by + 1, 20, 8, 1);
+  stick(g, bx, by, bx, by - 12, 3.4, WOOD_D);
+  g.fillStyle(OUT, 1);
+  g.fillPoints([
+    { x: bx - 13, y: by - 14 }, { x: bx, y: by - 19 },
+    { x: bx + 13, y: by - 14 }, { x: bx, y: by - 10 },
+  ], true, true);
+  g.fillStyle(0xf2ecd8, 1);
+  g.fillPoints([
+    { x: bx - 11, y: by - 14.4 }, { x: bx - 0.8, y: by - 18 },
+    { x: bx - 0.8, y: by - 11.6 },
+  ], true, true);
+  g.fillStyle(0xe2dbc4, 1);
+  g.fillPoints([
+    { x: bx + 11, y: by - 14.4 }, { x: bx + 0.8, y: by - 18 },
+    { x: bx + 0.8, y: by - 11.6 },
+  ], true, true);
+
+  banner(g, cx - hw * 0.82, cy + hh * 0.06, col, colDark, 26);
+}
+
+/**
+ * The Monastery.
+ *
+ * A bell tower — a tall square shaft with an open belfry, a pyramid cap and a
+ * cross — standing beside a low chapel. It is the tallest thing in a base after
+ * the Town Center and the only building with a cross on it, and the belfry
+ * opening is a hole in the silhouette near the top, which nothing else has.
+ */
+function drawMonastery(g, s, cx, cy, col, colDark) {
+  const hw = (s.fw + s.fh) * (HALF_W / 2);
+  const hh = (s.fw + s.fh) * (HALF_H / 2);
+  const LIME = 0xeae0cc;
+  const SLATE = 0x5a6472;
+  platform(g, cx, cy, hw, hh, false);
+
+  // The chapel: a low limewashed nave, pushed to the south-east so the tower
+  // has clear sky above it.
+  const nx = cx + hw * 0.22;
+  const ny = cy + hh * 0.16;
+  const iw = hw * 0.52;
+  const ih = hh * 0.52;
+  const wallH = 26;
+  isoBox(g, nx, ny, iw, ih, wallH, LIME, shade(LIME, 0.05), shade(LIME, 0.14));
+  // Round-headed windows down the nave wall.
+  for (let k = 0; k < 3; k++) {
+    const t = (k + 0.5) / 3;
+    const px = nx + iw * t;
+    const py = ny + ih - ih * t;
+    g.fillStyle(0x2b3547, 1);
+    g.fillRoundedRect(px - 3, py - wallH + 6, 6, 13, 3);
+    g.lineStyle(1.3, OUT, 0.9);
+    g.strokeRoundedRect(px - 3, py - wallH + 6, 6, 13, 3);
+  }
+  gableRoof(g, nx, ny - wallH, iw * 1.18, ih * 1.18, 18, col, colDark);
+
+  // The tower. Four courses of ashlar, then the belfry, then the cap.
+  const tx = cx - hw * 0.42;
+  const ty = cy + hh * 0.06;
+  const tw = 26;
+  const td = 13;
+  const TH = 92;
+  const top = ty - TH;
+  // Left face, right face, top — by hand rather than through isoBox, because
+  // the tower is a square shaft on a diamond footprint and wants its own
+  // proportions.
+  const shaft = (yTop, yBot) => {
+    g.fillStyle(dim(LIME), 1);
+    g.fillPoints([
+      { x: tx - tw, y: yBot - td }, { x: tx, y: yBot },
+      { x: tx, y: yTop }, { x: tx - tw, y: yTop - td },
+    ], true, true);
+    g.fillStyle(lit(LIME), 1);
+    g.fillPoints([
+      { x: tx + tw, y: yBot - td }, { x: tx, y: yBot },
+      { x: tx, y: yTop }, { x: tx + tw, y: yTop - td },
+    ], true, true);
+    g.lineStyle(2.4, OUT, 1);
+    g.strokePoints([
+      { x: tx - tw, y: yBot - td }, { x: tx, y: yBot },
+      { x: tx + tw, y: yBot - td }, { x: tx + tw, y: yTop - td },
+      { x: tx, y: yTop }, { x: tx - tw, y: yTop - td },
+    ], true, true);
+    g.lineStyle(2, OUT, 1);
+    g.beginPath();
+    g.moveTo(tx, yBot);
+    g.lineTo(tx, yTop);
+    g.strokePath();
+    rimLine(g, tx + tw - 1, yTop - td + 1, tx + tw - 1, yBot - td - 1, 1.8, 0.42);
+  };
+  shaft(top + 34, ty);
+  // String courses, so the shaft has scale.
+  g.lineStyle(1.4, shade(LIME, -0.22), 0.6);
+  for (const f of [0.34, 0.62]) {
+    const y = ty - (ty - (top + 34)) * f;
+    g.beginPath();
+    g.moveTo(tx - tw, y - td);
+    g.lineTo(tx, y);
+    g.lineTo(tx + tw, y - td);
+    g.strokePath();
+  }
+  // A tall lancet in the shaft.
+  g.fillStyle(0x2b3547, 1);
+  g.fillRoundedRect(tx - 5, ty - 44, 10, 20, 5);
+  g.lineStyle(1.5, OUT, 1);
+  g.strokeRoundedRect(tx - 5, ty - 44, 10, 20, 5);
+
+  // The belfry: an open stage, so there is a hole in the silhouette. This is
+  // the single detail that separates the tower from a chimney or a mast.
+  const bTop = top + 8;
+  const bBot = top + 34;
+  g.fillStyle(0x171208, 1);
+  g.fillPoints([
+    { x: tx - tw, y: bBot - td }, { x: tx, y: bBot },
+    { x: tx + tw, y: bBot - td }, { x: tx + tw, y: bTop - td },
+    { x: tx, y: bTop }, { x: tx - tw, y: bTop - td },
+  ], true, true);
+  // The bell hanging in it, and its headstock.
+  g.lineStyle(2.4, OUT, 1);
+  g.beginPath();
+  g.moveTo(tx - 12, bTop + 4);
+  g.lineTo(tx + 12, bTop + 4);
+  g.strokePath();
+  const bell = [
+    { x: tx - 8, y: bBot - 6 }, { x: tx - 6, y: bTop + 12 },
+    { x: tx - 2.5, y: bTop + 7 }, { x: tx + 2.5, y: bTop + 7 },
+    { x: tx + 6, y: bTop + 12 }, { x: tx + 8, y: bBot - 6 },
+  ];
+  g.fillStyle(0x8a6a2c, 1);
+  g.fillPoints(bell, true, true);
+  g.fillStyle(0xc9a54a, 1);
+  g.fillPoints(bell.map((p) => ({ x: p.x + 2, y: p.y - 1 })), true, true);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints(bell, true, true);
+  g.fillStyle(0x6b5220, 1);
+  g.fillEllipse(tx, bBot - 6, 17, 5);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeEllipse(tx, bBot - 6, 17, 5);
+  // Corner posts of the stage, drawn last so the bell sits behind them.
+  for (const sgn of [-1, 1]) {
+    g.fillStyle(LIME, 1);
+    g.fillRect(tx + sgn * tw - (sgn > 0 ? 5 : 0), bTop - td, 5, bBot - bTop);
+    g.lineStyle(1.8, OUT, 1);
+    g.strokeRect(tx + sgn * tw - (sgn > 0 ? 5 : 0), bTop - td, 5, bBot - bTop);
+  }
+
+  // Pyramid cap in slate, then the cross.
+  const apex = bTop - 34;
+  g.fillStyle(dim(SLATE), 1);
+  g.fillPoints([
+    { x: tx - tw - 3, y: bTop - td }, { x: tx, y: bTop + 2 }, { x: tx, y: apex },
+  ], true, true);
+  g.fillStyle(lit(SLATE), 1);
+  g.fillPoints([
+    { x: tx + tw + 3, y: bTop - td }, { x: tx, y: bTop + 2 }, { x: tx, y: apex },
+  ], true, true);
+  g.fillStyle(shade(SLATE, 0.1), 1);
+  g.fillPoints([
+    { x: tx - tw - 3, y: bTop - td }, { x: tx, y: bTop - td * 2 },
+    { x: tx + tw + 3, y: bTop - td }, { x: tx, y: apex },
+  ], true, true);
+  g.lineStyle(2.4, OUT, 1);
+  g.strokePoints([
+    { x: tx - tw - 3, y: bTop - td }, { x: tx, y: bTop + 2 },
+    { x: tx + tw + 3, y: bTop - td }, { x: tx, y: apex },
+  ], true, true);
+  rimLine(g, tx + tw + 2, bTop - td, tx, apex, 1.6, 0.4);
+
+  stick(g, tx, apex + 2, tx, apex - 16, 2.4, 0xd8b23c);
+  g.lineStyle(4.6, OUT, 1);
+  g.beginPath();
+  g.moveTo(tx - 6, apex - 11);
+  g.lineTo(tx + 6, apex - 11);
+  g.strokePath();
+  g.lineStyle(2.4, 0xf0c94a, 1);
+  g.beginPath();
+  g.moveTo(tx - 6, apex - 11);
+  g.lineTo(tx + 6, apex - 11);
+  g.strokePath();
+
+  // A cloister well and a herb bed on the paving, so the yard is a monastery's
+  // yard and not a parade ground.
+  const wx = cx + hw * 0.02;
+  const wy = cy + hh * 0.66;
+  contactShadow(g, wx, wy + 1, 26, 11, 1);
+  g.fillStyle(STONE_D, 1);
+  g.fillEllipse(wx, wy - 6, 26, 12);
+  g.fillStyle(STONE, 1);
+  g.fillEllipse(wx, wy - 8, 26, 12);
+  g.fillStyle(0x120d08, 1);
+  g.fillEllipse(wx, wy - 8.5, 18, 8);
+  g.lineStyle(1.9, OUT, 1);
+  g.strokeEllipse(wx, wy - 8, 26, 12);
+  stick(g, wx - 10, wy - 12, wx - 10, wy - 28, 2.2, WOOD_D);
+  stick(g, wx + 10, wy - 12, wx + 10, wy - 28, 2.2, WOOD_D);
+  stick(g, wx - 11, wy - 28, wx + 11, wy - 28, 2.6, WOOD);
+
+  banner(g, cx + hw * 0.66, cy + hh * 0.3, col, colDark, 24);
+}
+
 
 // ---------------------------------------------------------------------------
 // Town Center — must survive being ringed by houses at radius 2
@@ -2552,12 +5257,28 @@ function gableRoof(g, cx, cy, hw, hh, h, col, colDark) {
     { x: E.x, y: E.y + 3 }, { x: S.x, y: S.y + 3 }, { x: W.x, y: W.y + 3 },
   ], true, true);
 
-  // south-east slope
+  // south-east slope — the one plane on this roof that faces the sun.
   const slope = [S, E, R1, R2];
-  g.fillStyle(shade(col, 0.06), 1);
+  g.fillStyle(lit(col), 1);
   g.fillPoints(slope, true, true);
-  g.lineStyle(2.2, OUT, 1);
+  // Graded down the pitch: the eave sees less sky than the ridge does.
+  for (let k = 0; k < 3; k++) {
+    const t0 = k / 3;
+    const t1 = (k + 1) / 3;
+    const lerp = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+    g.fillStyle(0x1a1a24, 0.07 * (1 - k / 3));
+    g.fillPoints([
+      lerp(S, R2, t0), lerp(E, R1, t0), lerp(E, R1, t1), lerp(S, R2, t1),
+    ], true, true);
+  }
+  outline(g, true, 2.2);
   g.strokePoints(slope, true, true);
+  outline(g, false, 2.2);
+  g.beginPath();
+  g.moveTo(S.x, S.y);
+  g.lineTo(E.x, E.y);
+  g.strokePath();
+  rimLine(g, R2.x, R2.y + 1, R1.x, R1.y + 1, 2, 0.45);
   g.lineStyle(1.1, shade(col, -0.4), 0.42);
   for (let i = 1; i <= 3; i++) {
     const t = i / 4;
@@ -2781,7 +5502,31 @@ function fenceRun(g, a, b, weathered) {
   }
 }
 
-/** An isometric box: two visible wall faces plus the flat top. */
+/**
+ * An isometric box: two visible wall faces plus the flat top.
+ *
+ * THREE values, never two, and they are not arbitrary. The sun in this world is
+ * up and to the right (see THE LIGHT at the top of the file), so the south-east
+ * face takes the key, the south-west face is turned away from it and takes both
+ * a drop in value and a shift towards the blue of skylight, and the roof plane
+ * — pointing straight up at the sky — is the brightest of the three. Two values
+ * make a box look like a folded sheet of paper; the third is what gives it mass.
+ *
+ * Three more things happen here that did not before, and between them they are
+ * most of the difference between "vector art" and "a building":
+ *
+ *   AMBIENT OCCLUSION. Light does not reach into the corner where two walls
+ *   meet, nor into the last few pixels where a wall meets the ground. Two very
+ *   soft dark bands, one down the vertical corner and one along each footing.
+ *
+ *   A GRADED WALL. Real walls are darker at the bottom, where less of the sky
+ *   is visible to them. Four low-alpha bands up each face, since Graphics has no
+ *   gradient fill.
+ *
+ *   A VARIED OUTLINE. Heavy black on the shaded silhouette, thin and warm on the
+ *   lit one. A single black keyline of one weight around everything is the
+ *   classic flat-vector tell, and it was around everything in this file.
+ */
 function isoBox(g, cx, cy, hw, hh, h, faceL, faceR, top) {
   const bW = { x: cx - hw, y: cy };
   const bS = { x: cx, y: cy + hh };
@@ -2797,17 +5542,58 @@ function isoBox(g, cx, cy, hw, hh, h, faceL, faceR, top) {
     { x: bW.x, y: bW.y - h },
   ];
 
-  g.fillStyle(shade(faceL, -0.16), 1);
+  g.fillStyle(dim(faceL), 1);
   g.fillPoints(left, true, true);
-  g.fillStyle(faceR, 1);
+  g.fillStyle(lit(faceR), 1);
   g.fillPoints(right, true, true);
-  g.fillStyle(top, 1);
+  g.fillStyle(mix(top, SKY, 0.1), 1);
   g.fillPoints(topFace, true, true);
 
-  g.lineStyle(2.2, OUT, 1);
+  // Value grading up each wall: darkest at the footing, lightest under the eave.
+  for (let k = 0; k < 4; k++) {
+    const t0 = (k / 4) * h;
+    const t1 = ((k + 1) / 4) * h;
+    const a = 0.09 * (1 - k / 4);
+    g.fillStyle(0x1a1a24, a);
+    g.fillPoints([
+      { x: bW.x, y: bW.y - t0 }, { x: bS.x, y: bS.y - t0 },
+      { x: bS.x, y: bS.y - t1 }, { x: bW.x, y: bW.y - t1 },
+    ], true, true);
+    g.fillPoints([
+      { x: bS.x, y: bS.y - t0 }, { x: bE.x, y: bE.y - t0 },
+      { x: bE.x, y: bE.y - t1 }, { x: bS.x, y: bS.y - t1 },
+    ], true, true);
+  }
+  // Occlusion in the inside corner where the two walls meet.
+  g.lineStyle(6, 0x171a22, 0.14);
+  g.beginPath();
+  g.moveTo(bS.x, bS.y);
+  g.lineTo(bS.x, bS.y - h);
+  g.strokePath();
+  g.lineStyle(3, 0x171a22, 0.16);
+  g.beginPath();
+  g.moveTo(bS.x, bS.y);
+  g.lineTo(bS.x, bS.y - h);
+  g.strokePath();
+
+  outline(g, false, 2.2);
   g.strokePoints(left, true, true);
-  g.strokePoints(right, true, true);
   g.strokePoints(topFace, true, true);
+  outline(g, true, 2.2);
+  g.strokePoints(right, true, true);
+  outline(g, false, 2.2);
+  // The two edges that must stay heavy whatever else happens: the footing, and
+  // the vertical corner nearest the camera. Those are the shape.
+  g.beginPath();
+  g.moveTo(bW.x, bW.y);
+  g.lineTo(bS.x, bS.y);
+  g.lineTo(bE.x, bE.y);
+  g.moveTo(bS.x, bS.y);
+  g.lineTo(bS.x, bS.y - h);
+  g.strokePath();
+  // Warm bounce along the sunward eave and the sunward corner.
+  rimLine(g, bE.x - 1, bE.y - h + 1, bS.x, bS.y - h + 1, 1.8, 0.4);
+  rimLine(g, bE.x - 1, bE.y - h + 2, bE.x - 1, bE.y - 2, 1.6, 0.32);
 }
 
 function timbers(g, cx, cy, hw, hh, h) {
@@ -2873,13 +5659,25 @@ function isoRoof(g, cx, cy, hw, hh, h, col, colDark, fasciaCol, fasciaDark, fasc
 
   const left = [W, S, apex];
   const right = [S, E, apex];
-  g.fillStyle(shade(col, -0.2), 1);
+  g.fillStyle(dim(col), 1);
   g.fillPoints(left, true, true);
-  g.fillStyle(shade(col, 0.08), 1);
+  g.fillStyle(lit(col), 1);
   g.fillPoints(right, true, true);
-  g.lineStyle(2.4, OUT, 1);
+  // The hip between the two slopes catches the light along its whole length —
+  // it is the one edge on a pyramid roof that faces the sun square on, and one
+  // warm line down it does more for the read than any amount of shingle detail.
+  outline(g, false, 2.4);
   g.strokePoints(left, true, true);
+  outline(g, true, 2.4);
   g.strokePoints(right, true, true);
+  outline(g, false, 2.4);
+  g.beginPath();
+  g.moveTo(W.x, W.y);
+  g.lineTo(S.x, S.y);
+  g.lineTo(E.x, E.y);
+  g.strokePath();
+  rimLine(g, S.x, S.y - 1, apex.x, apex.y + 1, 2, 0.45);
+  rimLine(g, E.x - 1, E.y, apex.x, apex.y + 1, 1.6, 0.3);
 
   // shingle lines, faint
   g.lineStyle(1.1, shade(col, -0.4), 0.4);
@@ -2971,8 +5769,19 @@ const WALL_DIR = [
 // Wall texture boxes. `ay` is the pixel the tile centre sits on; it has to leave
 // room above for the tallest thing drawn (a gate tower and its finial), or the
 // health bar the renderer hangs off the sprite's top edge floats in the sky.
-const WALL_TEX = { w: 80, h: 76, ay: 54 };
-const GATE_TEX = { w: 80, h: 92, ay: 70 };
+//
+// These were 80x76 and 80x92 and both were far too generous — a wall segment
+// reaches half a tile in each grid direction, which is 16 screen pixels each
+// way, so the widest case (the cross) is under fifty pixels across and the
+// remaining thirty were empty. Sixty-four wall frames and sixteen gate frames
+// paid for that emptiness twice over, once per team: measured against the packed
+// sheet the two boxes were throwing away 204k pixels, which is five per cent of
+// the whole atlas and about four 3x3 buildings' worth of art. They are cut to
+// the measured content plus a four-pixel margin for the rim light and the
+// contact shadow, and the margin is deliberately named here so the next person
+// to add a finial knows how much room they have before something clips.
+const WALL_TEX = { w: 52, h: 65, ax: 26, ay: 51 };
+const GATE_TEX = { w: 74, h: 81, ax: 34, ay: 63 };
 
 const PAL_WOOD = { left: 0x7c5326, right: 0x9a6b38, top: 0xb2854c };
 const PAL_STONE = { left: 0x7c766a, right: 0x9c9689, top: 0xbcb6a6 };
@@ -2985,7 +5794,7 @@ const PAL_STONE = { left: 0x7c766a, right: 0x9c9689, top: 0xbcb6a6 };
  * exact — no face can partly occlude another — and it costs a four-element sort
  * that runs once at bake time and never again.
  */
-function prism(g, cx, cy, vx, vy, px, py, H, pal, outline = 1.6) {
+function prism(g, cx, cy, vx, vy, px, py, H, pal, ow = 1.6) {
   const base = [
     { x: cx + px, y: cy + py },
     { x: cx + vx + px, y: cy + vy + py },
@@ -3004,14 +5813,35 @@ function prism(g, cx, cy, vx, vy, px, py, H, pal, outline = 1.6) {
   }
   faces.sort((a, b) => a.my - b.my);
   for (const f of faces) {
-    g.fillStyle(f.mx >= cx + vx / 2 ? pal.right : pal.left, 1);
+    // Which way this face is turned decides its value, its outline and whether
+    // it gets a warm bounce down its sunward edge — see THE LIGHT at the top of
+    // the file. Sixty-four wall frames and sixteen gate frames come through
+    // here, so this one branch is most of the lighting on a walled base.
+    const sunward = f.mx >= cx + vx / 2;
+    g.fillStyle(sunward ? lit(pal.right) : dim(pal.left), 1);
     g.fillPoints(f.quad, true, true);
-    g.lineStyle(outline, OUT, 1);
+    // Darker at the footing, in three bands. Masonry is never one flat value
+    // from the ground to the parapet, and a wall that is reads as cardboard.
+    for (let k = 0; k < 3; k++) {
+      const t0 = (k / 3) * H;
+      const t1 = ((k + 1) / 3) * H;
+      g.fillStyle(0x171a22, 0.075 * (1 - k / 3));
+      g.fillPoints([
+        { x: f.quad[0].x, y: f.quad[0].y - t0 }, { x: f.quad[1].x, y: f.quad[1].y - t0 },
+        { x: f.quad[1].x, y: f.quad[1].y - t1 }, { x: f.quad[0].x, y: f.quad[0].y - t1 },
+      ], true, true);
+    }
+    outline(g, sunward, ow);
     g.strokePoints(f.quad, true, true);
+    if (sunward) {
+      rimLine(g, f.quad[3].x, f.quad[3].y + 1, f.quad[2].x, f.quad[2].y + 1, 1.4, 0.34);
+    }
   }
-  g.fillStyle(pal.top, 1);
+  // The top plane looks straight up at the sky, so it is the coolest and the
+  // brightest thing on the prism.
+  g.fillStyle(mix(pal.top, SKY, 0.12), 1);
   g.fillPoints(top, true, true);
-  g.lineStyle(outline + 0.2, OUT, 1);
+  outline(g, false, ow + 0.2);
   g.strokePoints(top, true, true);
   return { base, top };
 }
@@ -3246,8 +6076,8 @@ function buildWalls(put) {
     for (const type of Object.keys(WALL_SPEC)) {
       const spec = WALL_SPEC[type];
       for (let mask = 0; mask < 16; mask++) {
-        put(wallFrame(type, p, mask), WALL_TEX.w, WALL_TEX.h, WALL_TEX.w / 2, WALL_TEX.ay,
-          (g) => drawWallSegment(g, WALL_TEX.w / 2, WALL_TEX.ay, mask, spec, col, dark));
+        put(wallFrame(type, p, mask), WALL_TEX.w, WALL_TEX.h, WALL_TEX.ax, WALL_TEX.ay,
+          (g) => drawWallSegment(g, WALL_TEX.ax, WALL_TEX.ay, mask, spec, col, dark));
       }
     }
     // Each gate borrows the wall family it belongs to, so a stone gate in a
@@ -3257,8 +6087,8 @@ function buildWalls(put) {
       for (let axis = 0; axis < 2; axis++) {
         for (const open of [false, true]) {
           put(gateFrame(gateType, p, axis, open), GATE_TEX.w, GATE_TEX.h,
-            GATE_TEX.w / 2, GATE_TEX.ay,
-            (g) => drawGate(g, GATE_TEX.w / 2, GATE_TEX.ay, axis, open, spec, col, dark));
+            GATE_TEX.ax, GATE_TEX.ay,
+            (g) => drawGate(g, GATE_TEX.ax, GATE_TEX.ay, axis, open, spec, col, dark));
         }
       }
     }
@@ -3405,7 +6235,7 @@ function buildFoundations(put) {
       const hw = fw * HALF_W;
       const hh = fw * HALF_H;
       const w = hw * 2 + 12;
-      const h = hh * 2 + 30;
+      const h = hh * 2 + 22;
       const ax = w / 2;
       const ay = h - 6 - hh;
       put(foundationFrame(fw, p), w, h, ax, ay, (g) =>
@@ -3567,11 +6397,14 @@ function buildResources(put, rng) {
   });
 }
 
+/**
+ * The shadow a resource node throws. Now the same soft, sun-aware wash every
+ * other object in the file uses rather than two hard ellipses — a shadow with a
+ * visible edge is a second silhouette, and a tree with one reads as a sticker
+ * of a tree on a mat.
+ */
 function groundShadow(g, x, y, w, h) {
-  g.fillStyle(0x000000, 0.13);
-  g.fillEllipse(x, y + 1, w * 1.12, h * 1.12);
-  g.fillStyle(0x000000, 0.2);
-  g.fillEllipse(x, y, w, h);
+  contactShadow(g, x, y, w, h, 1.25);
 }
 
 function drawTree(g, t, v, rng) {
@@ -3597,10 +6430,16 @@ function drawTree(g, t, v, rng) {
   for (const b of blobs) g.fillCircle(b.x, b.y, b.r + 1.8);
   g.fillStyle(0x2f6130, 1);
   for (const b of blobs) g.fillCircle(b.x, b.y, b.r);
+  // Lit from the upper RIGHT, like every other solid in the game. These three
+  // circles used to be offset up and to the LEFT — the file's resources and its
+  // architecture disagreed about where the sun was, which is the sort of thing
+  // nobody can name but everybody can feel. See THE LIGHT at the top.
   g.fillStyle(0x3f7a3a, 1);
-  for (const b of blobs) g.fillCircle(b.x - b.r * 0.16, b.y - b.r * 0.2, b.r * 0.74);
+  for (const b of blobs) g.fillCircle(b.x + b.r * 0.16, b.y - b.r * 0.2, b.r * 0.74);
   g.fillStyle(0x559347, 0.85);
-  g.fillCircle(blobs[2].x - 4 * scale, blobs[2].y - 5 * scale, 5.5 * scale);
+  g.fillCircle(blobs[2].x + 4 * scale, blobs[2].y - 5 * scale, 5.5 * scale);
+  g.fillStyle(mix(0x7ab060, RIM, 0.35), 0.7);
+  g.fillCircle(blobs[2].x + 7 * scale, blobs[2].y - 7 * scale, 2.8 * scale);
 }
 
 function drawBerry(g, b, v, rng) {
@@ -3614,7 +6453,7 @@ function drawBerry(g, b, v, rng) {
   g.fillStyle(0x3d7a3c, 1);
   for (const m of mounds) g.fillCircle(m.x, m.y, m.r);
   g.fillStyle(0x4f9448, 1);
-  for (const m of mounds) g.fillCircle(m.x - m.r * 0.2, m.y - m.r * 0.25, m.r * 0.68);
+  for (const m of mounds) g.fillCircle(m.x + m.r * 0.2, m.y - m.r * 0.25, m.r * 0.68);
   // berries
   const spots = [[-9, -10], [-3, -16], [4, -13], [10, -9], [-1, -6], [7, -18], [-8, -3]];
   for (const [dx, dy] of spots) {
@@ -3646,7 +6485,9 @@ function drawGold(g, go, v, rng) {
     g.fillStyle(0x8b8b93, 1);
     g.fillPoints(pts, true, true);
     g.fillStyle(0xa9a9b2, 1);
-    g.fillPoints(pts.map((p) => ({ x: p.x - 1, y: p.y - 1.5 })), true, true);
+    g.fillPoints(pts.map((p) => ({ x: p.x + 1, y: p.y - 1.5 })), true, true);
+    g.fillStyle(mix(0xc4c4cd, RIM, 0.3), 0.75);
+    g.fillPoints(pts.map((p) => ({ x: p.x + 2.4, y: p.y - 3 })), true, true);
     g.lineStyle(2, OUT, 1);
     g.strokePoints(pts, true, true);
   }
@@ -3774,6 +6615,8 @@ function buildDetails(put, rng) {
       g.fillEllipse(cx + dx, cy + dy, rw * 2, rh * 2);
       g.fillStyle(0x9a9387, 1);
       g.fillEllipse(cx + dx + rw * 0.35, cy + dy - rh * 0.4, rw, rh);
+      g.fillStyle(mix(0xb8b1a3, RIM, 0.3), 0.7);
+      g.fillEllipse(cx + dx + rw * 0.6, cy + dy - rh * 0.7, rw * 0.45, rh * 0.4);
     }
   });
 
@@ -3890,9 +6733,14 @@ function buildCliffs(put, rng) {
   const hw = HALF_W + 1.2;
   const hh = HALF_H + 0.6;
   const w = TILE_W + 8;
-  const h = TILE_H + CLIFF_H + 18;
+  // Measured, not guessed: the tallest cliff frame reaches CLIFF_H above the
+  // tile's north corner and the deepest reaches the south corner, so the box is
+  // that plus four pixels of margin. It used to carry eighteen, which across
+  // forty-eight frames was 48k pixels — a whole unit type's animation, spent on
+  // air.
+  const h = TILE_H + CLIFF_H + 8;
   const ax = w / 2;
-  const ay = h - 10 - hh;
+  const ay = h - 5 - hh;
   for (let v = 0; v < CLIFF_VARIANTS; v++) {
     for (let mask = 0; mask < 16; mask++) {
       put(cliffFrame(v, mask), w, h, ax, ay, (g) =>
@@ -4070,10 +6918,15 @@ function buildScaffolds(put) {
     const hw = fw * HALF_W;
     const hh = fw * HALF_H;
     const H = 34 + fw * 13;
-    const w = hw * 2 + 24;
-    const h = hh * 2 + H + 24;
+    // The cage reaches exactly hw either side of the tile centre and exactly H
+    // above it, so the box is that plus a four-pixel margin. It used to carry
+    // twelve pixels of air on every side, which on the 4x4 frame alone is eight
+    // thousand wasted pixels — see the note on WALL_TEX about what that costs
+    // once a frame is baked per footprint and per team.
+    const w = hw * 2 + 8;
+    const h = hh * 2 + H + 8;
     const ax = w / 2;
-    const ay = h - 12 - hh;
+    const ay = h - 4 - hh;
     put(scaffoldFrame(fw), w, h, ax, ay, (g) => drawScaffold(g, ax, ay, hw, hh, H));
   }
 }
@@ -4177,9 +7030,17 @@ function buildMarkers(put) {
   for (let p = 0; p < PLAYER_COLORS.length; p++) {
     const col = PLAYER_COLORS[p];
     const dark = PLAYER_COLORS_DARK[p];
-    put(markerFrame(p), 36, 22, 18, 11, (g) => {
-      g.fillStyle(0x000000, 0.22);
-      g.fillEllipse(18, 12.5, 31, 15);
+    put(markerFrame(p), 40, 26, 20, 13, (g) => {
+      // The unit's contact shadow lives here rather than on the body sprite,
+      // and it has to, because the body is drawn ON TOP of this disc: a shadow
+      // baked into the body would sit over the team colour and muddy the one
+      // element that makes a 30-pixel unit findable on a phone. Down here it is
+      // under everything, it is soft, and it is offset away from the sun like
+      // every other shadow in the file — which is what stops a unit looking
+      // like a sticker laid on the map.
+      contactShadow(g, 20, 15, 30, 15, 1.2);
+      g.fillStyle(0x000000, 0.18);
+      g.fillEllipse(20, 14.5, 31, 15);
       g.fillStyle(OUT, 0.9);
       g.fillEllipse(18, 11, 28, 14);
       g.fillStyle(dark, 1);
@@ -4281,6 +7142,21 @@ function buildGlyphs(putCanvas, measure) {
   });
 }
 
+/**
+ * The FX sheet.
+ *
+ * Everything that flies used to be `fx_arrow`, which meant a mangonel's boulder
+ * and a monk's blessing were both a fletched shaft — the two loudest events in
+ * a battle, drawn as the quietest one. The frames below are the missing
+ * vocabulary, and they are cheap: the whole set is under thirty thousand pixels,
+ * a hundredth of the sheet.
+ *
+ * Anything meant to be tinted at runtime is drawn white or near-white, because
+ * tint is a multiply and nothing can be made brighter than what is baked. The
+ * boulder and the bolt are the exceptions — they are objects with their own
+ * material, not washes of light, and they should look the same whoever fired
+ * them.
+ */
 function buildFx(put) {
   put('fx_spark', 20, 20, 10, 10, (g) => {
     g.fillStyle(0xffffff, 1);
@@ -4359,5 +7235,112 @@ function buildFx(put) {
     g.fillCircle(7, 7.6, 5.6);
     g.fillStyle(0xffffff, 1);
     g.fillCircle(7, 7, 5);
+  });
+
+  // --- the new projectiles ---------------------------------------------------
+
+  // The mangonel's boulder. Round, heavy, lit from the upper right like every
+  // other solid in the game, with a couple of chipped facets so it tumbles
+  // legibly when the renderer spins it. Anchored dead centre for that reason.
+  put('fx_boulder', 22, 22, 11, 11, (g) => {
+    g.fillStyle(OUT, 1);
+    g.fillCircle(11, 11, 10);
+    g.fillStyle(0x6b7480, 1);
+    g.fillCircle(11, 11, 8.6);
+    g.fillStyle(0x848d9a, 1);
+    g.fillCircle(12, 9.6, 6.4);
+    g.fillStyle(0xa3adba, 1);
+    g.fillCircle(13, 8.4, 3.4);
+    g.fillStyle(0x525a66, 1);
+    g.fillTriangle(5, 14, 10, 16, 6, 10);
+    g.fillTriangle(14, 17, 18, 13, 17, 17);
+  });
+
+  // The scorpion's bolt: a heavier, shorter, iron-headed shaft than the arrow,
+  // with a flat pair of vanes rather than a feather. It has to be different from
+  // fx_arrow in flight or the two engines' fire reads as one.
+  put('fx_bolt', 30, 10, 15, 5, (g) => {
+    g.lineStyle(5, OUT, 1);
+    g.beginPath();
+    g.moveTo(4, 5);
+    g.lineTo(23, 5);
+    g.strokePath();
+    g.lineStyle(3, 0xb08a52, 1);
+    g.beginPath();
+    g.moveTo(4, 5);
+    g.lineTo(23, 5);
+    g.strokePath();
+    g.fillStyle(0x5a626e, 1);
+    g.fillTriangle(20, 0.5, 29.5, 5, 20, 9.5);
+    g.lineStyle(1.3, OUT, 1);
+    g.strokeTriangle(20, 0.5, 29.5, 5, 20, 9.5);
+    g.fillStyle(0x9aa4b0, 1);
+    g.fillTriangle(21, 3, 26.5, 5, 21, 6);
+    // Flat vanes.
+    g.fillStyle(0xd8d2c2, 1);
+    g.fillPoints([{ x: 0.5, y: 1 }, { x: 7, y: 4 }, { x: 7, y: 6 }, { x: 0.5, y: 9 }],
+      true, true);
+    g.lineStyle(1.1, OUT, 1);
+    g.strokePoints([{ x: 0.5, y: 1 }, { x: 7, y: 4 }, { x: 7, y: 6 }, { x: 0.5, y: 9 }],
+      true, true);
+  });
+
+  // --- the new washes --------------------------------------------------------
+
+  // Smoke. Bigger, lumpier and much softer than fx_puff, which is a hit spark's
+  // worth of dust; this is what comes off a burning building or the wheels of a
+  // siege engine, and it wants to be scaled up and faded out over a second or
+  // two. Four overlapping lobes rather than concentric circles, so a stack of
+  // them at different rotations never shows a ring.
+  put('fx_smoke', 40, 40, 20, 20, (g) => {
+    const lobes = [[20, 21, 15], [13, 17, 11], [27, 18, 10], [21, 13, 9]];
+    for (const [x, y, r] of lobes) {
+      g.fillStyle(0xffffff, 0.16);
+      g.fillCircle(x, y, r);
+    }
+    for (const [x, y, r] of lobes) {
+      g.fillStyle(0xffffff, 0.2);
+      g.fillCircle(x - 1, y - 1.5, r * 0.66);
+    }
+    g.fillStyle(0xffffff, 0.28);
+    g.fillCircle(19, 17, 6);
+  });
+
+  // Flame. Drawn as a teardrop with a hot core, in three layers from a deep
+  // ember through orange to a near-white heart — NOT white-to-be-tinted, because
+  // a fire that takes a tint is a fire somebody will accidentally make blue, and
+  // the one thing a flame has to be is the same colour every time. Anchored at
+  // its base so it can be planted on a roof rather than floating over one.
+  put('fx_flame', 22, 32, 11, 30, (g) => {
+    const tongue = (w, h, col, a) => {
+      g.fillStyle(col, a);
+      g.fillPoints([
+        { x: 11, y: 30 },
+        { x: 11 - w, y: 30 - h * 0.42 },
+        { x: 11 - w * 0.5, y: 30 - h * 0.82 },
+        { x: 11, y: 30 - h },
+        { x: 11 + w * 0.5, y: 30 - h * 0.82 },
+        { x: 11 + w, y: 30 - h * 0.42 },
+      ], true, true);
+    };
+    tongue(10, 29, 0xc23a12, 0.85);
+    tongue(7.4, 23, 0xf07c1e, 0.95);
+    tongue(4.6, 15, 0xffd86a, 1);
+  });
+
+  // The monk's heal: a warm ring of light with a cross inside it, which is the
+  // one symbol on the map that means "this is help, not harm". White so the
+  // renderer can tint it — a gold for a heal that landed, a paler wash for a
+  // heal in progress.
+  put('fx_heal', 30, 30, 15, 15, (g) => {
+    g.lineStyle(4.5, 0xffffff, 0.22);
+    g.strokeCircle(15, 15, 12);
+    g.lineStyle(2, 0xffffff, 0.55);
+    g.strokeCircle(15, 15, 12);
+    g.fillStyle(0xffffff, 0.18);
+    g.fillCircle(15, 15, 10);
+    g.fillStyle(0xffffff, 1);
+    g.fillRoundedRect(12.4, 6, 5.2, 18, 1.6);
+    g.fillRoundedRect(6, 12.4, 18, 5.2, 1.6);
   });
 }

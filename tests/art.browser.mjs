@@ -126,34 +126,81 @@ const run = async () => {
       const names = Object.keys(tex.frames).filter((n) => n !== '__BASE');
       let used = 0;
       let maxY = 0;
+      let empty = 0;
       const byKind = {};
+      const img = tex.getSourceImage();
+      // Read the packed sheet back and count frames that came out blank. A frame
+      // that did not fit used to be registered anyway and rendered as nothing at
+      // all; buildTextures now throws instead, but the symptom is cheap to test
+      // for directly and this is the one place that can see it.
+      const probe = document.createElement('canvas');
+      probe.width = img.width;
+      probe.height = img.height;
+      const pc = probe.getContext('2d', { willReadFrequently: true });
+      pc.drawImage(img, 0, 0);
+      const blank = [];
       for (const n of names) {
         const f = tex.frames[n];
         used += f.width * f.height;
         maxY = Math.max(maxY, f.cutY + f.height);
         const kind = n.split('_')[0];
         byKind[kind] = (byKind[kind] || 0) + 1;
+        if (f.cutY + f.height > img.height || f.cutX + f.width > img.width) {
+          empty++;
+          blank.push(n);
+          continue;
+        }
+        const d = pc.getImageData(f.cutX, f.cutY, f.width, f.height).data;
+        let hit = 0;
+        for (let i = 3; i < d.length; i += 4 * 7) if (d[i] > 8) { hit = 1; break; }
+        if (!hit) { empty++; if (blank.length < 8) blank.push(n); }
       }
-      const img = tex.getSourceImage();
-      return { count: names.length, used, maxY, w: img.width, h: img.height, byKind };
+      return {
+        count: names.length, used, maxY, empty, blank,
+        w: img.width, h: img.height, byKind,
+      };
     });
+    const budget = atlas.w * atlas.h;
+    const occupied = atlas.maxY * atlas.w;
     console.log('\n  atlas', `${atlas.w}x${atlas.h}`, `${atlas.count} frames`,
-      `${(atlas.used / 1e6).toFixed(2)}M px used`,
-      `packed to y=${atlas.maxY} (${((atlas.maxY / atlas.h) * 100).toFixed(0)}% of the sheet)`);
+      `${(atlas.used / 1e6).toFixed(3)}M px drawn`,
+      `(${((atlas.used / budget) * 100).toFixed(1)}% of ${(budget / 1e6).toFixed(2)}M)`,
+      `packed to y=${atlas.maxY} (${((occupied / budget) * 100).toFixed(1)}% occupied,`,
+      `${((atlas.used / occupied) * 100).toFixed(1)}% packing efficiency)`);
+    console.log(`  headroom: ${((budget - occupied) / 1e6).toFixed(2)}M px `
+      + `(${(((budget - occupied) / budget) * 100).toFixed(1)}%), `
+      + `${atlas.h - atlas.maxY} unused scanlines`);
     console.log('  by kind:', JSON.stringify(atlas.byKind));
     check('the atlas has not overflowed', atlas.maxY <= atlas.h,
       `packed to ${atlas.maxY} of ${atlas.h}`);
+    // Headroom, not just fit. The sheet filling up is a thing to find out about
+    // one art pass early, not on the boot that throws.
+    check('the atlas has room for the next pass', occupied <= budget * 0.97,
+      `${((occupied / budget) * 100).toFixed(1)}% occupied`);
+    check('no frame packed out blank', atlas.empty === 0,
+      `${atlas.empty} blank: ${atlas.blank.join(', ')}`);
     check('the atlas is one texture', atlas.w === atlas.h && atlas.w <= 2048, `${atlas.w}px`);
 
     // --- 2. unit pose sheets -------------------------------------------------
     if (want('poses')) {
+      // Must track UNIT_POSES in textures.js. The walk is six drawings for
+      // anything with legs, four for a rider and three for a wheeled engine;
+      // see the note on pose budget in the units section there.
+      const W6 = ['w0', 'w1', 'w2', 'w3', 'w4', 'w5'];
+      const G4 = ['c0', 'c1', 'c2', 'c3'];
+      const E3 = ['w0', 'w2', 'w4'];
       const sets = {
-        villager: ['i', 'w0', 'w1', 'w2', 'g0', 'g1', 'b0', 'b1', 'd0', 'd1'],
-        militia: ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'],
-        spearman: ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'],
-        archer: ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'],
-        scout: ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'],
-        ram: ['i', 'w0', 'w1', 'w2', 'a0', 'a1', 'd0', 'd1'],
+        villager: ['i', ...W6, 'g0', 'g1', 'b0', 'b1', 'd0', 'd1'],
+        militia: ['i', ...W6, 'a0', 'a1', 'd0', 'd1'],
+        spearman: ['i', ...W6, 'a0', 'a1', 'd0', 'd1'],
+        archer: ['i', ...W6, 'a0', 'a1', 'd0', 'd1'],
+        skirmisher: ['i', ...W6, 'a0', 'a1', 'd0', 'd1'],
+        monk: ['i', ...W6, 'h0', 'h1', 'd0', 'd1'],
+        scout: ['i', ...G4, 'a0', 'a1', 'd0', 'd1'],
+        knight: ['i', ...G4, 'a0', 'a1', 'd0', 'd1'],
+        ram: ['i', ...E3, 'a0', 'a1', 'd0', 'd1'],
+        mangonel: ['i', ...E3, 'a0', 'a1', 'd0', 'd1'],
+        scorpion: ['i', ...E3, 'a0', 'a1', 'd0', 'd1'],
       };
       for (const [type, poses] of Object.entries(sets)) {
         const frames = [];
@@ -168,7 +215,7 @@ const run = async () => {
         });
       }
       await page.evaluate(CLEAR_SHEET);
-      console.log('  wrote pose sheets for 6 unit types');
+      console.log(`  wrote pose sheets for ${Object.keys(sets).length} unit types`);
     }
 
     // --- 3. every unit on the ground, at the zoom the game actually uses -----
@@ -301,6 +348,73 @@ const run = async () => {
       await page.evaluate(() => window.__game.renderer.camera.setZoom(1.3));
       await page.waitForTimeout(300);
       await shot(page, 'art-market-130');
+      await page.evaluate(() => window.__game.renderer.camera.setZoom(0.7));
+    }
+
+    // --- 4c. the six that have to be told apart ------------------------------
+    //
+    // Archery Range, Stable, Blacksmith, Siege Workshop, University and
+    // Monastery: all 3x3, all built in the same corner of the same base, all
+    // within a few tens of wood of each other. Before this pass they all fell
+    // through to the same generic plaster box, which made a military quarter
+    // six identical buildings and a memory test. This is the picture that says
+    // whether the six silhouettes are still distinguishable — at 0.7, which is
+    // the zoom the game is actually played at, on the screen it is played on.
+    if (want('military')) {
+      await page.evaluate(() => {
+        const g = window.__game;
+        const w = g.world;
+        const W = window.__world;
+        const tc = [...w.players[0].owned].map((id) => w.entities.get(id))
+          .find((e) => e && e.type === 'towncenter');
+        const gx = Math.round(tc.x) + 12;
+        const gy = Math.round(tc.y) + 12;
+        for (const e of [...w.resources, ...w.buildings, ...w.units]) {
+          if (Math.abs(e.x - gx) < 22 && Math.abs(e.y - gy) < 22) W.removeEntity(w, e);
+        }
+        // Flat, unblocked ground: this is a silhouette comparison and a pond or
+        // a cliff behind one of the six is a distraction, not a control.
+        for (let ty = gy - 16; ty <= gy + 16; ty++) {
+          for (let tx = gx - 16; tx <= gx + 16; tx++) {
+            if (tx < 0 || ty < 0 || tx >= w.width || ty >= w.height) continue;
+            const i = ty * w.width + tx;
+            w.terrain[i] = 0;
+            w.blocked[i] = 0;
+            if (w.cliff) w.cliff[i] = 0;
+          }
+        }
+        // Two rows of three along the screen-horizontal (equal gx+gy), so no
+        // building can hide behind another and all six sit at the same depth
+        // within their row.
+        const rows = [
+          ['archeryrange', 'stable', 'blacksmith'],
+          ['siegeworkshop', 'university', 'monastery'],
+        ];
+        rows.forEach((row, r) => {
+          row.forEach((t, i) => {
+            // tx+ty is constant along a row, which is what puts three buildings
+            // on one screen-horizontal line; the row offset walks straight down.
+            W.spawnBuilding(w, t, 0, gx - 4 + i * 4 + r * 3, gy + 4 - i * 4 + r * 3);
+          });
+        });
+        w.vision.update();
+        w.over = true;
+        const st = w.vision.state(0);
+        st.visible.fill(1);
+        st.explored.fill(1);
+        st.revision++;
+        // The six span 512 screen pixels either side of tx-ty = 0; centre on that
+        // or the far one falls off a 390px phone even at 0.55.
+        g.renderer.centerOn(gx + 1.5, gy + 1.5);
+        g.renderer.camera.scrollY += 130;
+      });
+      await page.waitForTimeout(500);
+      await page.evaluate(() => window.__game.renderer.camera.setZoom(0.55));
+      await page.waitForTimeout(300);
+      await shot(page, 'art-military-055');
+      await page.evaluate(() => window.__game.renderer.camera.setZoom(0.75));
+      await page.waitForTimeout(300);
+      await shot(page, 'art-military-075');
       await page.evaluate(() => window.__game.renderer.camera.setZoom(0.7));
     }
 

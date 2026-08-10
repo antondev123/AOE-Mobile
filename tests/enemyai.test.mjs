@@ -258,6 +258,16 @@ function runMatch({
   m.endArmy = ownedBy(world, ENEMY, 'unit').filter((u) => u.type !== 'villager').length;
   m.militia = ownedBy(world, ENEMY, 'unit', 'militia').length;
   m.archers = ownedBy(world, ENEMY, 'unit', 'archer').length;
+  // The whole army by type. Two counters used to be enough because there were
+  // two units; the roster is nine wide now, and "militia and archers" is no
+  // longer a description of anything — a report that only names those two
+  // cannot show whether the AI ever built the Archery Range or the Stable the
+  // Barracks stopped standing in for.
+  m.armyMix = {};
+  for (const u of ownedBy(world, ENEMY, 'unit')) {
+    if (u.type === 'villager') continue;
+    m.armyMix[u.type] = (m.armyMix[u.type] || 0) + 1;
+  }
   m.buildings = ownedBy(world, ENEMY, 'building').map((b) => b.type);
   m.endFood = world.players[ENEMY].resources.food;
   m.endWood = world.players[ENEMY].resources.wood;
@@ -387,11 +397,15 @@ check('is deterministic for a given seed (fresh process each time)', () => {
 const pressure = runMatch({ seed: 12345, propUp: true });
 const waveLog = pressure.stats.waveLog;
 const gaps = waveLog.slice(1).map((wv, i) => wv.t - waveLog[i].t);
+const asMix = (mix) =>
+  Object.entries(mix || {}).map(([t, n]) => `${n} ${t}`).join(' + ') || 'nothing';
 console.log(
   `  wave schedule (player propped up): ` +
-  waveLog.map((wv) => `${wv.t}s x${wv.size} (${wv.militia}M/${wv.archers}A)`).join(', ') +
+  waveLog.map((wv) => `${wv.t}s x${wv.size} (${asMix(wv.mix)})`).join(', ') +
   `\n  gaps between waves: ${gaps.join('s, ')}s` +
-  `\n  army mix at 10:00: ${pressure.militia} militia / ${pressure.archers} archers\n`,
+  `\n  army at 10:00: ${asMix(pressure.armyMix)}` +
+  `\n  buildings started: ${JSON.stringify(pressure.stats.started)}` +
+  `\n  ages reached: ${JSON.stringify(pressure.stats.ageUps)}\n`,
 );
 
 check('keeps launching waves, not just the first', () => {
@@ -411,6 +425,33 @@ check('waves escalate in size', () => {
   assert.ok(
     waveLog[waveLog.length - 1].size > waveLog[0].size,
     `first ${waveLog[0].size}, last ${waveLog[waveLog.length - 1].size}`,
+  );
+});
+// The regression this whole pass exists to prevent. The Barracks trains militia
+// and spearmen and nothing else now: the archer moved to the Archery Range and
+// the scout to the Stable, and both of those units are Feudal Age besides. So an
+// AI that ages up and does not follow it with one of those two buildings fields
+// an infantry-only army for the entire match — no ranged unit, no cavalry, and
+// no answer to a player who masses either.
+//
+// A word on the margin, because this check is tighter than it looks. Seed 12345
+// is one of the slower food starts the AI has been measured on: it commits to
+// the Feudal Age at about 8:05, stands in it a minute later, and the Archery
+// Range follows within the minute after that — inside the last ninety seconds of
+// the match. That is close to the worst case; over six seeds of a twelve-minute
+// run the age lands at 6:20-9:20, the Range is always up, five seeds add a
+// Blacksmith and four add a Stable. If this check starts failing, look first at
+// what has delayed the age-up (see the age-up push in enemyAI.js) rather than at
+// the build order behind it.
+check('follows the Feudal Age with the arm the Barracks no longer trains', () => {
+  const feudal = s.ageUps.find((a) => a.age === 1);
+  assert.ok(feudal, `never reached the Feudal Age: ${JSON.stringify(s.ageUps)}`);
+  const started = s.started || {};
+  const arms = (started.archeryrange || 0) + (started.stable || 0);
+  assert.ok(
+    arms >= 1,
+    `Feudal Age at ${feudal.t}s but no Archery Range or Stable — started ` +
+    `${JSON.stringify(started)}`,
   );
 });
 check('first wave is beatable but real (4-8 units)', () => {

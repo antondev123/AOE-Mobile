@@ -58,6 +58,18 @@ const ALERT_GLOW_MS = 5000;
 // its own so a forgotten arm cannot be spent by a tap thirty seconds later.
 const DEMOLISH_ARM_MS = 4000;
 
+// How fast a resource counter catches up with the stockpile behind it, as the
+// time constant of an exponential approach. 0.10s means a ten-food drop-off
+// rolls over in about a fifth of a second and a 275-wood Town Center counts
+// down in a little over half of one — long enough to read as *spending*, short
+// enough that the digits are never still moving by the time a thumb has
+// travelled to the next button. See updateResources.
+const RES_TAU = 0.10;
+// Under half a unit from home, stop easing and land. An exponential never
+// actually arrives, and a bar that reads 249 for the rest of the match because
+// it is asymptotically approaching 250 is worse than no animation at all.
+const RES_SNAP = 0.5;
+
 // A rally point this close to something workable *is* an order to work it.
 // Must match unitAI's RALLY_SNAP: the HUD's job below is to say out loud what
 // the unit AI has already decided, and a HUD that disagrees with the sim is
@@ -74,11 +86,38 @@ const RALLY_SNAP = 1.5;
 // worse than a chip with three letters in it. The near-collisions the review
 // found (MIL militia against MLL mill against MIN mining camp) no longer matter
 // on a screen where every one of them is a picture.
+//
+// THE ONE RULE THIS TABLE HAS. The fallback for a type that is not listed is
+// `type.slice(0, 3).toUpperCase()`, and that default is not merely ugly, it can
+// be *wrong*: 'archeryrange' auto-abbreviates to ARC, which is already the
+// archer's code — so a Feudal player selecting a Range and looking at the unit
+// training in it would read ARC twice and be told nothing by either. A silent
+// duplicate is the failure mode to design against, because both chips still
+// look fine on their own. So every type whose first three letters collide with
+// another entry is named here explicitly, and the codes below are the words
+// players already use out loud: a Range is RNG, a Siege Workshop is SGE.
+//
+// The eleven types added with the military buildings are all listed even where
+// the default would have been harmless (UNI, KNT), because a table that only
+// carries the awkward cases is a table the next person has to re-derive.
 const ABBR = {
   villager: 'VIL', militia: 'MIL', archer: 'ARC',
   spearman: 'SPR', scout: 'CAV', ram: 'RAM',
+  // The Feudal and Castle roster. SKR/SCP rather than SKI/SCO: the scout is
+  // already CAV, but 'skirmisher' and 'scorpion' would otherwise both sit one
+  // letter from 'scout' in a 10px font, which is not a distinction a thumb-speed
+  // glance can make.
+  skirmisher: 'SKR', knight: 'KNT', mangonel: 'MNG', scorpion: 'SCP',
+  monk: 'MNK',
   towncenter: 'TC', house: 'HSE', barracks: 'BRK', mill: 'MLL',
   lumbercamp: 'LMB', miningcamp: 'MIN', market: 'MKT',
+  // The six military and research buildings. RNG resolves the archer collision
+  // described above; SMT and SGE keep the Blacksmith away from BRK (barracks)
+  // and the Siege Workshop away from anything beginning SI. MON against the
+  // monk's MNK differs in two of three letters, which is the margin every other
+  // pair in this table keeps.
+  archeryrange: 'RNG', stable: 'STB', blacksmith: 'SMT',
+  siegeworkshop: 'SGE', university: 'UNI', monastery: 'MON',
   berry: 'BSH', tree: 'TRE', gold: 'GLD', stone: 'STN',
 };
 // The build menu lists the whole tech tree, locked entries included, and on a
@@ -102,6 +141,26 @@ const NODE_NAME = {
 // attack-move, counted in the stance panel — the moment it declares itself one.
 const MILITARY = new Set(MILITARY_TYPES);
 export function isMilitary(u) { return u.kind === 'unit' && MILITARY.has(u.type); }
+
+/**
+ * The order units are listed in when several buildings are selected at once.
+ *
+ * UNIT_STATS' own key order, which is not an arbitrary choice: constants.js
+ * writes the roster out in the order a player meets it — villager, the two
+ * Dark Age infantry, the archer, the scout, then siege, then the Castle Age
+ * additions and the monk last — and every building's `trains` array is already
+ * written in that same order. So sorting a merged list by this map reproduces
+ * each building's own ordering exactly when only one is selected, and produces
+ * the one obvious interleaving when several are: a Barracks plus an Archery
+ * Range reads Militia, Spearman, Archer, Skirmisher, not whichever building the
+ * box-select happened to touch first.
+ *
+ * That last point is the whole reason this is not "concatenate in selection
+ * order". Selection order comes out of a Set and shifts with how the player
+ * dragged the box; a panel whose buttons move between two identical selections
+ * is a panel you cannot build muscle memory on.
+ */
+const UNIT_RANK = new Map(Object.keys(UNIT_STATS).map((t, i) => [t, i]));
 
 function statsOf(e) {
   return e.kind === 'building' ? BUILDING_STATS[e.type] : UNIT_STATS[e.type];
@@ -325,6 +384,10 @@ export function createHud(scene, world, audio = null) {
     selSig: '',
     cmdSig: '',
     resSig: '',
+    // What the resource bar is currently *reading*, which trails the stockpile
+    // by up to half a second while it rolls. Never read by anything that
+    // decides whether the player can afford something — see updateResources.
+    resShown: { food: NaN, wood: NaN, gold: NaN, stone: NaN },
     idleSig: '',
     minimapAcc: 0,
     hudH: 108,               // measured height of the bottom bar
@@ -343,6 +406,7 @@ export function createHud(scene, world, audio = null) {
     liveQueue: null,         // { building, bar, label }
     liveAlloc: null,         // { rows, tally, toggle } — the allocation sheet
     liveResearch: null,      // { building, fill, label, slots } — research bar
+    liveRack: null,          // the train rack, which scrolls and so needs a fade
     liveBars: [],            // { kind, list, bar, fill, text } — hp and stock rows
     destroyed: false,
   };
@@ -505,6 +569,23 @@ export function createHud(scene, world, audio = null) {
     // is a convenience with a full-screen alternative (pan and pinch), while
     // the dock is the only way to reach Jobs, the menu and the idle villagers.
     root.classList.toggle('is-tight', band < TIGHT_BAND);
+  }
+
+  /**
+   * Has the player asked for less movement?
+   *
+   * The stylesheet already honours this wholesale — the last rule in hud.css
+   * turns off every animation and transition inside the HUD — so anything done
+   * in CSS is covered for free. This is for the one piece of motion that is not
+   * CSS and cannot be: the rolling resource counters are computed in JS and a
+   * stylesheet has no way to reach them. Queried live rather than cached
+   * because the setting can be changed while the game is running, and a player
+   * who turns it on mid-match means it now.
+   */
+  const motionQuery = typeof win.matchMedia === 'function'
+    ? win.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  function reducedMotion() {
+    return !!(motionQuery && motionQuery.matches);
   }
 
   /** env(safe-area-inset-top) as a number, via the value the stylesheet resolved. */
@@ -879,15 +960,58 @@ export function createHud(scene, world, audio = null) {
     if (span && span.textContent !== value) span.textContent = value;
   }
 
-  function updateResources() {
+  /**
+   * The stockpiles, rolled rather than jumped.
+   *
+   * A villager banking ten wood used to replace 250 with 260 between one frame
+   * and the next, and the eye reads that as the number having always said 260 —
+   * so the single most continuous thing in the game, the income the whole match
+   * is about, was invisible unless you happened to be staring at the bar. A
+   * counter that *travels* the ten is the difference: motion in the corner of
+   * the eye is what tells a player the economy is alive without asking them to
+   * look away from the map.
+   *
+   * The roll is presentation only. Every affordability check in this file reads
+   * `p.resources` directly, so a button un-greys the instant the wood actually
+   * lands and never waits for the digits to catch up — the HUD may take half a
+   * second to finish saying something, but it must never be half a second wrong
+   * about what you can buy.
+   */
+  function updateResources(dt) {
     const p = world.players[PLAYER];
     const age = tech.currentAge(world, PLAYER);
+
+    // exp(-dt/TAU), not a fixed fraction per frame: the roll has to take the
+    // same length of time on a 60Hz phone and a 120Hz one.
+    const instant = !Number.isFinite(dt) || dt <= 0 || reducedMotion();
+    const k = instant ? 0 : Math.exp(-dt / RES_TAU);
+    const shown = state.resShown;
+    let rising = '';
+    for (const key of RES_ORDER) {
+      const target = Math.max(0, Math.floor(p.resources[key] || 0));
+      let v = shown[key];
+      if (!Number.isFinite(v)) {
+        v = target;                       // first paint: start where we are
+      } else if (Math.abs(target - v) < RES_SNAP) {
+        v = target;                       // close enough — land, do not creep
+      } else {
+        if (target > v) rising += key[0]; // income arriving, worth saying so
+        v = target + (v - target) * k;
+      }
+      shown[key] = v;
+    }
+
     let sig = '';
-    for (const k of RES_ORDER) sig += `${p.resources[k] | 0}/`;
-    sig += `${p.pop}/${p.popCap}/${age}`;
+    for (const key of RES_ORDER) sig += `${Math.floor(shown[key])}/`;
+    // `rising` is in the signature because the glow has to be taken off again
+    // at the end of a roll that did not happen to change the last digit.
+    sig += `${p.pop}/${p.popCap}/${age}/${rising}`;
     if (sig === state.resSig) return;
     state.resSig = sig;
-    for (const k of RES_ORDER) setRes(dom[k], String(Math.floor(p.resources[k] || 0)));
+    for (const key of RES_ORDER) {
+      setRes(dom[key], String(Math.floor(shown[key])));
+      if (dom[key]) dom[key].classList.toggle('rising', rising.includes(key[0]));
+    }
     setRes(dom.pop, `${p.pop}/${p.popCap}`);
     if (dom.pop) dom.pop.classList.toggle('low', p.pop >= p.popCap);
     if (dom.age) {
@@ -1133,16 +1257,29 @@ export function createHud(scene, world, audio = null) {
 
   // --- Command panel --------------------------------------------------------
 
-  function cmdButton(label, { cls = '', cost = null, onTap, disabled = false, sub = null, aria = null } = {}) {
+  /**
+   * One command button.
+   *
+   * `icon` takes a node (a portrait, or the three-letter fallback) and puts it
+   * ahead of the label; `subCls` lets a caller word its sub-line as something
+   * other than a price, which is what the locked entries need — see trainCard.
+   * Both exist so that the train cards go through this door rather than growing
+   * a second, subtly different button factory beside it.
+   */
+  function cmdButton(label, {
+    cls = '', cost = null, onTap, disabled = false,
+    sub = null, subCls = 'cost', icon = null, aria = null,
+  } = {}) {
     const b = el('button', `cbtn ${cls}`);
     if (aria) b.setAttribute('aria-label', aria);
+    if (icon) b.appendChild(icon);
     b.appendChild(el('span', 'label', label));
     if (cost) {
       const c = costNode(cost);
       b.appendChild(c);
       state.liveCosts.push({ el: b, cost });
     } else if (sub) {
-      b.appendChild(el('span', 'cost', sub));
+      b.appendChild(el('span', subCls, sub));
     }
     if (disabled) b.disabled = true;
     if (onTap) {
@@ -1158,6 +1295,7 @@ export function createHud(scene, world, audio = null) {
     state.liveCosts = [];
     state.liveQueue = null;
     state.liveResearch = null;
+    state.liveRack = null;
 
     const sel = selectedEntities(world);
     const own = sel.filter((e) => e.player === PLAYER);
@@ -1203,18 +1341,12 @@ export function createHud(scene, world, audio = null) {
     }
 
     // Production buildings: train.
-    const trainer = buildings.find((b) => b.trains && b.trains.length);
-    if (trainer) {
-      for (const t of trainer.trains) {
-        const s = UNIT_STATS[t];
-        if (!s) continue;
-        panel.appendChild(cmdButton(s.name, {
-          cost: s.cost,
-          onTap: () => train(trainer, t),
-        }));
-      }
-      renderQueue(panel, trainer);
-      renderRallyNote(panel, trainer);
+    const trainers = buildings.filter((b) => b.trains && b.trains.length);
+    const focus = focusedTrainer(trainers);
+    if (trainers.length) {
+      renderTrainRack(panel, trainers);
+      renderQueue(panel, focus, trainers);
+      renderRallyNote(panel, trainers, focus);
     }
 
     // The Market. A sheet rather than six buttons in this panel: a trade is two
@@ -1233,9 +1365,12 @@ export function createHud(scene, world, audio = null) {
     // Research. Preferring the building that also trains keeps the Town
     // Center's age-up and the Barracks' blacksmith line on the same panel as
     // the units they are for; a Mill or a Lumber Camp trains nothing and is
-    // picked up by the fallback.
+    // picked up by the fallback. With several trainers in hand it is the
+    // focused one that gets asked first, so the research list and the queue
+    // block above it are always talking about the same building.
     const researcher =
-      (trainer && tech.techsAt(trainer.type).length ? trainer : null) ||
+      (focus && tech.techsAt(focus.type).length ? focus : null) ||
+      trainers.find((b) => tech.techsAt(b.type).length > 0) ||
       buildings.find((b) => tech.techsAt(b.type).length > 0);
     if (researcher) renderResearch(panel, researcher);
 
@@ -1341,6 +1476,179 @@ export function createHud(scene, world, audio = null) {
     if (buildings.length) renderDemolish(panel, buildings);
 
     refreshAffordability();
+  }
+
+  // --- Training ---------------------------------------------------------------
+  //
+  // WHAT A SELECTION CAN TRAIN, NOT WHAT ITS FIRST BUILDING CAN.
+  //
+  // This used to be `buildings.find((b) => b.trains && b.trains.length)` — one
+  // building, whichever the selection happened to yield first, and everything
+  // else in hand silently offering nothing. With a Barracks and a Town Center
+  // that was a rare annoyance. With six military buildings it is the normal
+  // case: box-select your base to queue an army and the panel shows you two
+  // infantry and pretends the Archery Range, the Stable, the Siege Workshop and
+  // the Monastery you also caught do not exist. Worse, it is *silent* about it
+  // — nothing on screen says a building was dropped, so the player concludes
+  // the Stable does not work.
+  //
+  // So the roster is merged across every trainer in hand, de-duplicated (two
+  // Barracks offer one Militia button, not two) and sorted into the canonical
+  // roster order (see UNIT_RANK). One tap trains at the least-busy building
+  // that can make the thing, which is what the player means by selecting three
+  // Barracks and tapping Militia three times.
+
+  /**
+   * Every unit the selection could train: one entry per type, in roster order,
+   * each carrying the buildings that could make it.
+   */
+  function trainingRoster(trainers) {
+    const byType = new Map();
+    for (const b of trainers) {
+      for (const t of b.trains || []) {
+        // A `trains` entry with no stats block is a roster name that has not
+        // landed yet — the same forward-declaration BUILDABLE relies on. Skip
+        // it rather than drawing a button that cannot be costed.
+        if (!UNIT_STATS[t]) continue;
+        let rec = byType.get(t);
+        if (!rec) byType.set(t, (rec = { type: t, from: [] }));
+        rec.from.push(b);
+      }
+    }
+    const rank = (t) => (UNIT_RANK.has(t) ? UNIT_RANK.get(t) : UNIT_RANK.size);
+    return [...byType.values()].sort((a, b) => rank(a.type) - rank(b.type));
+  }
+
+  /**
+   * Which of these buildings should take the order.
+   *
+   * The shortest queue, ties broken by id so the answer never depends on how
+   * the selection was made. Three Barracks and three taps on Militia puts one
+   * in each rather than three in the first — a building that is already two
+   * deep would deliver the third militia a minute late, and the player picked
+   * up three Barracks precisely so that it would not.
+   */
+  function pickTrainer(list) {
+    let best = null;
+    for (const b of list) {
+      if (!b || b.dead || !b.complete) continue;
+      const n = (b.queue || []).length;
+      if (!best || n < best.n || (n === best.n && b.id < best.b.id)) best = { b, n };
+    }
+    return best ? best.b : null;
+  }
+
+  /**
+   * The building the queue block, the rally line and the research list are
+   * about when several are in hand.
+   *
+   * The one that will finish something soonest, because "what is coming out
+   * next" is the question a queue readout exists to answer. It hands over
+   * naturally: the building it names is the one that pops, and the moment it
+   * does the next-soonest takes the block. With nothing training anywhere it
+   * falls back to the lowest id, which is stable across re-renders.
+   */
+  function focusedTrainer(trainers) {
+    let best = null;
+    for (const b of trainers) {
+      const head = (b.queue || [])[0];
+      if (!head) continue;
+      const left = Number.isFinite(head.remaining) ? head.remaining : Infinity;
+      if (!best || left < best.left || (left === best.left && b.id < best.b.id)) {
+        best = { b, left };
+      }
+    }
+    if (best) return best.b;
+    let idle = null;
+    for (const b of trainers) if (!idle || b.id < idle.id) idle = b;
+    return idle;
+  }
+
+  /**
+   * One train card: the picture, the name, and either the price or the age it
+   * is waiting for.
+   *
+   * THE LOCKED HALF IS THE POINT. A Feudal Stable can train a scout and cannot
+   * yet train a Knight (AGE_UNITS in tech.js), and the obvious implementation —
+   * list only what is trainable — teaches the player that the Stable they just
+   * paid 175 wood for makes one cheap horseman and nothing else. The build menu
+   * settled this argument for buildings a while ago and the reasoning carries
+   * over word for word: the reason to spend 600 food and 200 gold on the Castle
+   * Age is the things it buys, and a panel that only reveals them afterwards
+   * asks for that decision blind. So a locked unit is shown, greyed, with the
+   * age where its cost would be, and tapping it says why out loud — the same
+   * dashed cool wash and the same sentence the build menu uses, because they
+   * are the same fact about the same tech tree.
+   */
+  function trainCard(entry) {
+    const type = entry.type;
+    const s = UNIT_STATS[type];
+    const reason = tech.unitLockReason(world, PLAYER, type);
+    if (reason) {
+      const need = tech.ageForUnit(type);
+      return cmdButton(s.name, {
+        cls: 'train locked',
+        icon: typeIcon('unit', type, PLAYER, 'ab'),
+        // The age replaces the price, exactly as in the build menu: what a
+        // Knight costs is not the question you have while you cannot make one.
+        sub: tech.AGE_SHORT[need] ? `${tech.AGE_SHORT[need]} Age` : 'later',
+        subCls: 'cost need',
+        aria: `${s.name}. Locked — ${reason}.`,
+        onTap: () => {
+          toast(`${s.name} — ${reason.toLowerCase()}`, 'warn');
+          flashAge();
+        },
+      });
+    }
+    const where = entry.from.length > 1
+      ? ` Trains at whichever of your ${entry.from.length} buildings is free.`
+      : '';
+    return cmdButton(s.name, {
+      cls: 'train',
+      cost: s.cost,
+      icon: typeIcon('unit', type, PLAYER, 'ab'),
+      aria: `Train a ${s.name}.${where}`,
+      // Resolved at tap time, not at render time: the queues move between the
+      // two and the whole value of "least busy" is that it is current.
+      onTap: () => {
+        const b = pickTrainer(entry.from);
+        if (b) train(b, type);
+      },
+    });
+  }
+
+  /**
+   * The rack the cards live in — a bounded, scrolling box rather than more
+   * panel.
+   *
+   * THIS IS THE SCREEN BUDGET SPEAKING. A Barracks, an Archery Range and a
+   * Stable is six cards; add a Siege Workshop and a Monastery and it is ten,
+   * and at two per row that is five rows — 250px, more than the entire command
+   * panel is allowed (min(30dvh, 240px)). Left to grow, the fix for the .find()
+   * bug would have handed back the screen the HUD pass fought to reclaim, and
+   * the queue, the rally line and the research buttons would all have gone
+   * below a fold nobody scrolls to.
+   *
+   * Three rows is the ceiling: six cards, which is the realistic worst case
+   * (all three Feudal military buildings at once) shown whole, and anything
+   * beyond it scrolls inside the rack with the fade the rest of the HUD uses to
+   * say so. The panel underneath keeps its shape whatever is selected, which is
+   * worth more than seeing card seven without a swipe.
+   */
+  function renderTrainRack(panel, trainers) {
+    const roster = trainingRoster(trainers);
+    if (!roster.length) return;
+    const rack = el('div', 'train-rack');
+    rack.setAttribute('role', 'group');
+    rack.setAttribute('aria-label', trainers.length > 1
+      ? `Train — ${roster.length} units across ${trainers.length} buildings`
+      : 'Train');
+    for (const entry of roster) rack.appendChild(trainCard(entry));
+    rack.addEventListener('scroll', () => markCut(rack), { passive: true });
+    panel.appendChild(rack);
+    // Measured once the panel is complete (see markAllCut), never per frame:
+    // scrollHeight forces layout.
+    state.liveRack = rack;
   }
 
   // --- Stance and formation --------------------------------------------------
@@ -1509,17 +1817,36 @@ export function createHud(scene, world, audio = null) {
    *
    * This is the discoverability half of rally-to-resource: the behaviour is
    * worth nothing if the player never learns the tap exists.
+   *
+   * @param {Element}  panel
+   * @param {object[]} list  every production building in hand
+   * @param {object}   b     the focused one, whose rally the line describes
+   *
+   * One line for the whole group, not one per building: a rally tap sets the
+   * point on every producer selected (see setRally in ui/input.js), so in the
+   * ordinary case they all agree and repeating that three times would be three
+   * rows of a panel that has none to spare. They can only disagree when the
+   * points were set under two different selections, and that case gets said out
+   * loud rather than papered over — a HUD showing one flag for three buildings
+   * that are aimed at three places is lying about where the army will muster.
    */
-  function renderRallyNote(panel, b) {
+  function renderRallyNote(panel, list, b) {
     const note = el('div', 'cmd-note rally-note');
-    if (b.rally) {
-      const r = rallyText(world, [b], b.rally);
+    note.appendChild(el('i', 'flag', '⚑'));
+    const key = (p) => (p ? `${p.x.toFixed(2)},${p.y.toFixed(2)}` : '-');
+    const agreed = list.every((x) => key(x.rally) === key(b.rally));
+    if (!agreed) {
+      note.classList.add('is-mixed');
+      note.appendChild(doc.createTextNode(
+        `Rally points differ across ${list.length} buildings — tap the map to set them all`));
+    } else if (b.rally) {
+      // Worded against the whole group, so a Town Center picked up alongside a
+      // Barracks still says "Villagers will gather food here".
+      const r = rallyText(world, list, b.rally);
       note.classList.add(`is-${r.kind}`);
-      note.appendChild(el('i', 'flag', '⚑'));
       note.appendChild(doc.createTextNode(r.text));
     } else {
       note.classList.add('is-hint');
-      note.appendChild(el('i', 'flag', '⚑'));
       note.appendChild(doc.createTextNode('Tap a resource to rally onto it'));
     }
     panel.appendChild(note);
@@ -1545,7 +1872,22 @@ export function createHud(scene, world, audio = null) {
   // back before the toast has faded, and the alternative, an arm-then-confirm on
   // a button pressed mostly by accident-correction, is two taps to undo one.
 
-  function renderQueue(panel, b) {
+  /**
+   * @param {Element}  panel
+   * @param {object}   b     the building this block is about (see focusedTrainer)
+   * @param {object[]} list  every trainer in hand, for the "elsewhere" line
+   *
+   * ONE BLOCK, EVEN WITH SIX BUILDINGS IN HAND. A queue readout per selected
+   * building would be five rows of ninety pixels for a selection whose whole
+   * point was to fill them all, and the questions it answers — what is coming
+   * out next, how long, what can I cancel — are singular questions with one
+   * answer. So the block follows the building that will finish soonest, names
+   * it when the answer could be ambiguous, and adds one line accounting for
+   * everything queued at the others, which is the only thing the player would
+   * otherwise have no way to see.
+   */
+  function renderQueue(panel, b, list = [b]) {
+    if (!b) return;
     const row = el('div', 'queue');
     const head = el('div', 'qhead');
     const what = el('span', 'what');
@@ -1556,6 +1898,13 @@ export function createHud(scene, world, audio = null) {
     head.appendChild(eta);
     row.appendChild(head);
 
+    // Which building is being talked about. Only when there is more than one
+    // trainer in hand: on a lone Barracks it is a label saying "Barracks" over
+    // a panel whose header already says Barracks.
+    // It needs no refresh: the focus can only change when a queue changes
+    // length, and that is in commandSignature, so the whole panel is rebuilt.
+    if (list.length > 1) row.appendChild(el('div', 'qwho', displayName(b)));
+
     const prog = el('div', 'qprog');
     const fill = el('i');
     prog.appendChild(fill);
@@ -1564,7 +1913,18 @@ export function createHud(scene, world, audio = null) {
     const slots = el('div', 'qslots');
     row.appendChild(slots);
     panel.appendChild(row);
-    state.liveQueue = { building: b, fill, slots, what, behind, eta, drawn: -1, drawnType: '' };
+    state.liveQueue = {
+      building: b, others: list.filter((x) => x !== b),
+      fill, slots, what, behind, eta, drawn: -1, drawnType: '',
+    };
+
+    // What is queued at the buildings this block is not about. Without it the
+    // three taps a player just spent on a second Barracks vanish from the HUD
+    // entirely, which reads exactly like three taps that did nothing.
+    if (state.liveQueue.others.length) {
+      state.liveQueue.elsewhere = el('div', 'cmd-note queue-elsewhere');
+      panel.appendChild(state.liveQueue.elsewhere);
+    }
     refreshQueue();
   }
 
@@ -1585,6 +1945,22 @@ export function createHud(scene, world, audio = null) {
     if (q.behind.textContent !== behindText) q.behind.textContent = behindText;
     const etaText = head ? `${Math.max(0, Math.ceil(head.remaining))}s` : '';
     if (q.eta.textContent !== etaText) q.eta.textContent = etaText;
+
+    if (q.elsewhere) {
+      let n = 0;
+      let busy = 0;
+      for (const o of q.others) {
+        if (o.dead) continue;
+        const len = (o.queue || []).length;
+        n += len;
+        if (len) busy++;
+      }
+      const text = n
+        ? `+${n} more queued at ${busy} other building${busy === 1 ? '' : 's'}`
+        : `${q.others.length} other building${q.others.length === 1 ? '' : 's'} idle`;
+      if (q.elsewhere.textContent !== text) q.elsewhere.textContent = text;
+      q.elsewhere.classList.toggle('is-quiet', n === 0);
+    }
 
     // Rebuild the chips only when the queue actually changes shape — this runs
     // every frame, and the head's type matters as well as the length (cancel the
@@ -2986,7 +3362,7 @@ export function createHud(scene, world, audio = null) {
     const now = performance.now();
     const _tDom = perfBegin('hud.dom');
 
-    updateResources();
+    updateResources(dt);
     updateIdle();
     tickToasts(now);
     tickCoach();
@@ -3092,6 +3468,11 @@ export function createHud(scene, world, audio = null) {
 
   function markAllCut() {
     for (const n of SCROLLERS) markCut(n);
+    // The train rack is rebuilt with the command panel, so it cannot join
+    // SCROLLERS — that list is permanent and would grow by one node per
+    // re-render for the life of the match. It carries its own scroll listener
+    // (see renderTrainRack) and is measured here, with everything else.
+    if (state.liveRack) markCut(state.liveRack);
   }
 
   watchScroller(dom.cmdPanel);
