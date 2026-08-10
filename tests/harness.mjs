@@ -134,9 +134,48 @@ export async function snapshot(page) {
   });
 }
 
-/** Synthesise a touch tap at screen coordinates. */
+/**
+ * Wait for the HUD to have drawn whatever the last input did.
+ *
+ * The HUD is frame-driven on purpose: ui/hud.js computes a selection signature
+ * once per update() and only touches the DOM when it changed, which is what
+ * keeps a 3000-line panel off the critical path at 60fps. So a synthetic tap
+ * mutates world.selection *synchronously* and the DOM catches up on the next
+ * frame, and a test that reads the panel in the same breath as the tap is
+ * racing a design decision rather than observing one.
+ *
+ * That race was real and latent for as long as these tests have existed: the
+ * assertions won it by accident, on the timing of whatever the sim happened to
+ * be doing. Making the simulation bit-identical across engines shifted the
+ * per-frame work enough to lose it, and four bush-panel checks started failing
+ * with world.selection holding the bush and the panel still reading "Nothing
+ * selected" — a diagnosis that costs an afternoon if you go looking for it in
+ * the HUD, where there is nothing wrong.
+ *
+ * Two frames, not one: the first is the one the tap's own handler may already
+ * be inside, the second is the one that draws its consequences.
+ */
+export async function settle(page, frames = 2) {
+  await page.evaluate(
+    (n) => new Promise((resolve) => {
+      let left = n;
+      const tick = () => (--left <= 0 ? resolve() : requestAnimationFrame(tick));
+      requestAnimationFrame(tick);
+    }),
+    frames,
+  );
+}
+
+/**
+ * Synthesise a touch tap at screen coordinates, and let the UI answer it.
+ *
+ * The settle() is part of the gesture as far as a test is concerned: "the
+ * player tapped" and "the screen has responded" are one event to anyone reading
+ * an assertion, and separating them only invites the race described above.
+ */
 export async function tap(page, x, y) {
   await page.touchscreen.tap(x, y);
+  await settle(page);
 }
 
 /** Synthesise a touch drag (for box-select and panning). */

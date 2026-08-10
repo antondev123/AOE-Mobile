@@ -121,8 +121,17 @@ function fail(label, detail) {
 }
 function check(cond, label, detail) { cond ? ok(label) : fail(label, detail); }
 
-/** A page joined to `matchId`, booted far enough to have a world and a seat. */
-async function joinPage(browser, base, matchId, tag) {
+/**
+ * A page connected to `matchId` and sitting in the lobby with a seat.
+ *
+ * This deliberately stops at the lobby. A room does not start until every seat
+ * is filled AND every player has said they are ready, so a page that waited
+ * here for `window.__game` would wait forever: the second player has not
+ * arrived yet, and the scene is not built until the server sends the start
+ * signal with the snapshot everyone builds from. What exists at this point is
+ * the socket and nothing else.
+ */
+async function connectPage(browser, base, matchId, tag) {
   const context = await browser.newContext(PHONE);
   const page = await context.newPage();
   const errors = [];
@@ -130,14 +139,30 @@ async function joinPage(browser, base, matchId, tag) {
   page.on('pageerror', (e) => errors.push(`pageerror: ${e.message}`));
 
   await page.goto(`${base}/?m=${matchId}`, { waitUntil: 'load' });
-  // The scene does not exist until the server's welcome has arrived with a
-  // snapshot to build from, so this waits on the game, not on the page.
+  // The net client is published the moment the socket is created; the seat
+  // arrives with the server's welcome a round trip later.
   await page.waitForFunction(
-    () => window.__game && window.__game.world && window.__game.net,
+    () => window.__net && window.__net.state.playerId !== null,
     null,
     { timeout: 30000 },
   );
   return { tag, page, context, errors };
+}
+
+/**
+ * Say ready, and wait for the match the lobby then starts.
+ *
+ * Called for every page only once they have all connected — readying the first
+ * player before the second has taken their seat is exactly the state the lobby
+ * exists to hold, and it would sit in it.
+ */
+async function readyUp(pages) {
+  await Promise.all(pages.map((p) => p.page.evaluate(() => window.__net.setReady(true))));
+  await Promise.all(pages.map((p) => p.page.waitForFunction(
+    () => window.__game && window.__game.world && window.__game.net,
+    null,
+    { timeout: 30000 },
+  )));
 }
 
 const state = (p) => p.page.evaluate(() => ({
@@ -236,8 +261,10 @@ async function main() {
   let a = null;
   let b = null;
   try {
-    a = await joinPage(browser, browserBase, matchId, 'A');
-    b = await joinPage(browser, browserBase, matchId, 'B');
+    a = await connectPage(browser, browserBase, matchId, 'A');
+    b = await connectPage(browser, browserBase, matchId, 'B');
+    // Both are in the room before either says go: see readyUp().
+    await readyUp([a, b]);
 
     // --- 1. two seats, not one -----------------------------------------------
     const [sa, sb] = await Promise.all([state(a), state(b)]);

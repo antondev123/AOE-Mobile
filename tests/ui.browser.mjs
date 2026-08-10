@@ -20,7 +20,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { boot, step } from './harness.mjs';
+import { boot, step, settle } from './harness.mjs';
 
 const args = process.argv.slice(2);
 const arg = (name, fallback) => {
@@ -98,6 +98,10 @@ const watchToasts = (page) => page.evaluate(() => {
 async function tapSlow(page, x, y) {
   await page.waitForTimeout(DOUBLE_TAP_MS + 60);
   await page.touchscreen.tap(x, y);
+  // The wait above separates this tap from the previous one; this one lets the
+  // HUD answer it. See settle() in harness.mjs for why reading the panel
+  // without it is a race the assertions used to win by luck.
+  await settle(page);
 }
 const DOUBLE_TAP_MS = 400; // must match ui/input.js
 
