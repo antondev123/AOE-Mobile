@@ -19,7 +19,7 @@
 import {
   MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
   ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT, PLAYER,
-  BUILDING_STATS, isWallType, isGateType,
+  BUILDING_STATS, isWallType, isGateType, TERRAIN,
 } from '../core/constants.js';
 import { WALL_E, WALL_W } from '../core/world.js';
 import { depthFor } from '../core/iso.js';
@@ -2117,12 +2117,36 @@ function buildTerrainOps(world) {
   }
 
   // --- 3. transition washes -------------------------------------------------
+  //
   // Edge index order matches textures.js: 0 = -y, 1 = +x, 2 = +y, 3 = -x.
+  //
+  // WHY THIS IS NOT JUST ONE WASH PER EDGE ANY MORE. It was, at a flat alpha of
+  // 0.85, and the result is the single loudest thing wrong with a screenshot of
+  // this map: a tile either received the neighbour's colour or it did not, so
+  // every grass/dirt boundary was a clean one-tile-wide staircase of 45-degree
+  // diamonds. The wash softened the *colour* across that boundary and did
+  // nothing at all about its *shape*, and shape is what the eye reads first.
+  // Ground in the world does not change over exactly one tile and it does not
+  // change by the same amount all along a border.
+  //
+  // So the boundary now varies in two ways, both driven by the tile hash, so
+  // both are stable across re-bakes and identical on every machine:
+  //
+  //   * strength varies per tile, 0.5 to 1.0, so the edge fades in and out
+  //     along its length instead of reading as one drawn line;
+  //   * on about a third of tiles the neighbouring terrain bleeds a SECOND tile
+  //     inland, faintly. That is the part that actually kills the staircase —
+  //     it makes the boundary two tiles wide in patches and one tile wide in
+  //     others, which is a ragged edge rather than a stepped one.
+  //
+  // Both are free: they change the alpha and the count of quads already being
+  // pushed into a batched bake that happens once per chunk.
   const NEIGH = [[0, -1], [1, 0], [0, 1], [-1, 0]];
   for (let ty = 0; ty < H; ty++) {
     for (let tx = 0; tx < W; tx++) {
       const id = world.terrain[ty * W + tx];
       const mine = TERRAIN_PRIORITY[id];
+      const h = tileHash(tx, ty);
       let placed = false;
       for (let e = 0; e < 4; e++) {
         const nId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
@@ -2132,20 +2156,54 @@ function buildTerrainOps(world) {
           tilePos(tx, ty, p);
           placed = true;
         }
-        push(edgeBlendFrame(e), 0.85, TERRAIN_BASE[nId]);
+        // (h >>> shift) & 7 gives each edge its own three bits, so the four
+        // edges of one tile do not all get the same strength.
+        const bits = (h >>> (e * 3)) & 7;
+        push(edgeBlendFrame(e), 0.5 + bits * (0.5 / 7), TERRAIN_BASE[nId]);
+      }
+
+      // The second rank: this tile is not adjacent to the other terrain, but
+      // the tile beyond its neighbour is. A faint wash here on a hashed
+      // minority of tiles is what makes the border wander.
+      if (!placed) {
+        for (let e = 0; e < 4; e++) {
+          const midId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
+          if (midId !== id) continue;              // only bleed through our own kind
+          const farId = terrainAt(tx + NEIGH[e][0] * 2, ty + NEIGH[e][1] * 2);
+          if (farId < 0 || farId === id) continue;
+          if (TERRAIN_PRIORITY[farId] <= mine) continue;
+          if (((h >>> (12 + e * 2)) & 3) !== 0) continue;   // one tile in four
+          tilePos(tx, ty, p);
+          push(edgeBlendFrame(e), 0.3, TERRAIN_BASE[farId]);
+          break;
+        }
       }
     }
   }
 
-  // --- 4. surf along the coast ---------------------------------------------
+  // --- 4. surf along every coast, not just the map's own --------------------
+  //
+  // This used to run only on the four border rows (`tx !== 0 && ty !== 0 &&
+  // ...`), which meant the out-of-bounds ocean got a surf line and every pond
+  // on the map got none: a lake was a flat blue diamond butted straight against
+  // sand with a hard edge, which is exactly the frame that gives a tilemap
+  // away. Every land tile that touches water now gets the line on the side that
+  // faces it, and the map edge is the same rule with "off the map" counting as
+  // water — which is what it is.
   for (let ty = 0; ty < H; ty++) {
     for (let tx = 0; tx < W; tx++) {
-      if (tx !== 0 && ty !== 0 && tx !== W - 1 && ty !== H - 1) continue;
-      tilePos(tx, ty, p);
-      if (ty === 0) push(shoreFrame(0), 0.75, 0xdff1ff);
-      if (tx === W - 1) push(shoreFrame(1), 0.75, 0xdff1ff);
-      if (ty === H - 1) push(shoreFrame(2), 0.75, 0xdff1ff);
-      if (tx === 0) push(shoreFrame(3), 0.75, 0xdff1ff);
+      if (world.terrain[ty * W + tx] === TERRAIN.WATER) continue;
+      let placed = false;
+      for (let e = 0; e < 4; e++) {
+        const nId = terrainAt(tx + NEIGH[e][0], ty + NEIGH[e][1]);
+        // Out of bounds (-1) is the sea the map sits in.
+        if (nId >= 0 && nId !== TERRAIN.WATER) continue;
+        if (!placed) {
+          tilePos(tx, ty, p);
+          placed = true;
+        }
+        push(shoreFrame(e), 0.75, 0xdff1ff);
+      }
     }
   }
 
@@ -2192,6 +2250,40 @@ function buildTerrainOps(world) {
       p.y = (jx + jy + 1) * HALF_H - 50;
       const warm = (h & 1) === 0;
       push(BLOB_FRAME, warm ? 0.16 : 0.13, warm ? 0x6b5a3a : 0x9fd07a);
+    }
+  }
+
+  // --- 6. the ground shadow the rock casts ----------------------------------
+  //
+  // Cliffs are drawn as sprites so they can depth-sort against units (see
+  // drawCliffs), which means they sit *on* the terrain with nothing underneath
+  // them: a thirty-pixel-tall block of stone that casts no shadow at all, and
+  // the eye reads it as a sticker rather than as a thing standing on ground.
+  // One dark wash on the tiles the rock would shade fixes it, and it belongs in
+  // the bake rather than in the sprite pass because it is a property of the
+  // ground, not of the cliff — it must be under the units that walk across it.
+  //
+  // The light in this game comes from the upper left, stated everywhere in
+  // textures.js and honoured in every hand-shaded face. Upper left in this
+  // projection means the shadow falls toward +x and +y, so those are the two
+  // neighbours that darken, and the tile diagonally beyond both — the corner
+  // the two shadows overlap in — darkens most.
+  if (world.cliff) {
+    const cliffAt = (tx, ty) =>
+      (tx < 0 || ty < 0 || tx >= W || ty >= H ? 0 : world.cliff[ty * W + tx]);
+    for (let ty = 0; ty < H; ty++) {
+      for (let tx = 0; tx < W; tx++) {
+        if (cliffAt(tx, ty)) continue;          // the rock shades itself
+        const ex = cliffAt(tx - 1, ty) ? 1 : 0; // rock uphill on the -x side
+        const ey = cliffAt(tx, ty - 1) ? 1 : 0;
+        const diag = cliffAt(tx - 1, ty - 1) ? 1 : 0;
+        if (!ex && !ey && !diag) continue;
+        // Two faces of shade is darker than one; the diagonal alone is the
+        // faint corner where a real shadow would only just reach.
+        const a = ex && ey ? 0.34 : (ex || ey) ? 0.24 : 0.11;
+        tilePos(tx, ty, p);
+        push(terrainFrame(TERRAIN.GRASS, 0), a, 0x1a1710);
+      }
     }
   }
 
