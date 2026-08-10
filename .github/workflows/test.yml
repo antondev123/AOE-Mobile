@@ -13,9 +13,12 @@
 # should have to remember to run.
 name: Tests
 
+# Once per change, not twice. `push: ['**']` plus `pull_request` fires both
+# triggers for every commit on an open PR, which doubles the runner time and
+# reports the same failure twice under the same check name.
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -32,8 +35,9 @@ jobs:
       - run: npm ci
       # The unit suite is Phaser-free by design — src/core and src/systems import
       # nothing from the engine — so it runs under bare node with no browser.
+      # `npm run smoke` looks like it belongs here and does not: it boots the
+      # real page in Chromium, so it lives in the browser job below.
       - run: npm test
-      - run: npm run smoke
 
   browser:
     name: Browser and multiplayer tests
@@ -45,10 +49,18 @@ jobs:
           node-version: '22'
           cache: npm
       - run: npm ci
-      # playwright-core ships no browser of its own; `install --with-deps` is the
-      # supported way to get one plus the system libraries Chromium needs on a
-      # bare runner. tests/harness.mjs then finds it through PLAYWRIGHT_BROWSERS_PATH.
-      - run: npx --yes playwright@1.49.0 install --with-deps chromium
+      # playwright-core ships no browser of its own, and the browser it looks for
+      # is version-locked: the build id comes from the playwright-core in
+      # node_modules, so a browser fetched by any *other* playwright version
+      # lands in a directory this one will not look in. Installing through this
+      # package's own CLI is what keeps the two in step — `npx playwright@1.49.0`
+      # downloaded 100MB of Chromium that the resolver then ignored, because
+      # package.json's `^1.49.0` had resolved to 1.62.
+      - run: node node_modules/playwright-core/cli.js install --with-deps chromium
+      # Drives the real page for ten simulated minutes and asserts the match is
+      # actually being played — an economy that grows, an AI that trains an army,
+      # units that are not standing idle.
+      - run: npm run smoke
       - run: npm run test:browser
       # Not in the test:browser script, and that is exactly how it went stale.
       # It is also the only end-to-end proof of the netcode: two real browsers,

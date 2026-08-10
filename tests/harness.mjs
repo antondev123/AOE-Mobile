@@ -55,11 +55,22 @@ export function serve(port = 0) {
  *
  *   1. CHROMIUM_PATH, for anyone who knows better than this file
  *   2. the preinstalled sandbox browser, when it is actually there
- *   3. playwright's own resolution, which is what `playwright install` populates
+ *   3. undefined — hand the question back to playwright-core
  *
- * Falling through to (3) rather than throwing matters: an unresolvable path
- * fails at launch with a message about the browser, which is the truth, instead
- * of failing here with a message about this constant, which is not.
+ * (3) is the important one and it is deliberately *not* a path. Returning a
+ * guess that does not exist produces "Failed to launch chromium because
+ * executable doesn't exist at /opt/pw-browsers/..." on a machine that never had
+ * that directory, which sends the reader looking for a browser instead of at the
+ * real problem. Leaving `executablePath` unset makes playwright resolve its own
+ * registry and, when that is empty, print its own message naming the install
+ * command — which is the actionable one.
+ *
+ * Note the registry is version-locked: the browser build id is tied to the
+ * playwright-core in node_modules, so browsers installed by a *different*
+ * playwright version resolve to a directory that is not there. Install with this
+ * package's own CLI (see .github/workflows/test.yml) rather than with an npx
+ * version pin, or this returns undefined on a machine that just downloaded 100MB
+ * of Chromium.
  */
 function findChromium() {
   const fromEnv = process.env.CHROMIUM_PATH;
@@ -70,9 +81,9 @@ function findChromium() {
     const own = chromium.executablePath();
     if (own && fs.existsSync(own)) return own;
   } catch {
-    // playwright-core with no browsers registered. Fall through.
+    // playwright-core with no browsers registered.
   }
-  return sandbox;
+  return undefined;
 }
 
 export const CHROMIUM = findChromium();
