@@ -1,44 +1,121 @@
-// Skirmish map generation: terrain, resource nodes, and two mirrored bases.
+// Skirmish map generation: terrain, resource nodes, and one base per player.
 //
 // The layout follows AoE2's opening: a Town Center, a few villagers, berries
 // and wood close by, gold a short walk away and stone a longer one — so the
 // first two minutes are about assigning villagers rather than exploring, and
 // the minutes after that are about deciding when to leave the base.
+//
+// TWO BASES BECAME N, AND THE MIRROR BECAME A ROTATION. Every base used to be
+// laid out with `dir = player === PLAYER ? 1 : -1`, a sign flip applied to five
+// local offsets — which is a 180-degree rotation written the only way two
+// players ever need it written, and which silently hands player 0's layout to
+// every player after the second. The offsets are unchanged; what they are
+// measured from is a per-base heading now. See baseSites() and rotateOffset().
 
-import { MAP_W, MAP_H, TERRAIN, PLAYER, ENEMY } from './constants.js';
+import { TERRAIN } from './constants.js';
 import { dirVec, DIR_COUNT } from './iso.js';
 import { spawnBuilding, spawnResource, spawnUnit, isBlocked, inBounds, recomputePop } from './world.js';
 import { commandUnits } from '../systems/unitAI.js';
 
-// Distance of each Town Center from its map corner.
+// How close a Town Center sits to the map edge, as a fraction of the side.
 //
-// 18 on a 96x96 map puts the two bases 60 tiles apart on each axis — about 85
+// 18 on a 96x96 map put the two bases 60 tiles apart on each axis — about 85
 // tiles of walking — so a militia at 1.1 tiles/second needs a little over a
 // minute to cross, and the first raid is something you hear about from the
-// minimap rather than something that is already happening. It is the old figure
-// (9 on 48x48) scaled with the map, deliberately: the *local* layout around a
-// base is tuned and did not want moving, only the gap between the two.
-const BASE_OFFSET = 18;
+// minimap rather than something already happening. That was the old 48x48 figure
+// (9) scaled with the map, and this is the same figure expressed as the ratio it
+// always was, so it keeps scaling on its own.
+const BASE_INSET_FRACTION = 18 / 96;
 
-// Everything scattered across open ground scales with the map's area, so a map
-// four times the size is not four times emptier. The counts below are the old
-// 48x48 figures multiplied by this and rounded to something that reads well.
-const AREA_SCALE = (MAP_W * MAP_H) / (48 * 48);
+// The heading player 0 has always faced: index 40 of 64 is (-0.707, -0.707),
+// which on a 96x96 map is the tile (18, 18). Bases are placed starting from
+// here, so a two-player match lands on exactly the two corners it always has.
+const FIRST_BASE_DIR = 40;
 
-export function generateMap(world) {
-  carveTerrain(world);
+/**
+ * Where each player's Town Center goes, and which way it faces.
+ *
+ * Bases sit at even angular intervals, pushed out until each is `inset` tiles
+ * from the nearest map edge — a square ring rather than a circle. That detail is
+ * load-bearing rather than fussy: a circle inscribed in a square wastes the
+ * corners, and at two players the corners are precisely where the bases have
+ * always been. Pushing to the square reproduces (18, 18) and (78, 78) exactly
+ * while still spreading eight bases evenly, and keeps every base the same
+ * distance from the edge behind it whichever way it happens to face.
+ *
+ * `rot` is what replaces the old sign flip: the base's heading measured from
+ * player 0's, so player 0 gets rot 0 (every local offset exactly as tuned) and,
+ * in a 1v1, player 1 gets rot 32 — half of DIR_COUNT, which is the 180-degree
+ * turn that `dir = -1` always was.
+ */
+export function baseSites(world, count) {
+  const W = world.width;
+  const H = world.height;
+  const cx = W / 2;
+  const cy = H / 2;
+  const inset = Math.round(Math.min(W, H) * BASE_INSET_FRACTION);
+  const half = Math.min(W, H) / 2 - inset;
 
-  const bases = [
-    { player: PLAYER, x: BASE_OFFSET, y: BASE_OFFSET },
-    { player: ENEMY, x: MAP_W - BASE_OFFSET, y: MAP_H - BASE_OFFSET },
-  ];
+  const sites = [];
+  for (let i = 0; i < count; i++) {
+    // Integer index arithmetic into the direction table, never trigonometry:
+    // an angle computed with Math.cos would be free to differ in the last bit
+    // between two JavaScript engines, and a base one ulp out is a whole town in
+    // a different place. See the header of core/iso.js.
+    const rot = Math.round((DIR_COUNT * i) / count);
+    const idx = FIRST_BASE_DIR + rot;
+    const d = dirVec(idx);
+    // Push along this heading until the nearer axis hits the inset square.
+    const m = Math.max(Math.abs(d[0]), Math.abs(d[1]));
+    sites.push({
+      player: i,
+      x: cx + (d[0] / m) * half,
+      y: cy + (d[1] / m) * half,
+      rot,
+    });
+  }
+  return sites;
+}
+
+/**
+ * A base-local offset, turned to face the way this base faces.
+ *
+ * The offsets themselves are the tuned ones and are not touched — berries three
+ * tiles in front, gold seven out and four across, stone fourteen behind. All
+ * that changes is which way "in front" points.
+ */
+function rotateOffset(ox, oy, rot) {
+  const [c, s] = dirVec(rot);
+  return { x: ox * c - oy * s, y: ox * s + oy * c };
+}
+
+/** A point `ox, oy` from a base, in that base's own frame. */
+function atBase(base, ox, oy) {
+  const o = rotateOffset(ox, oy, base.rot);
+  return { x: base.x + o.x, y: base.y + o.y };
+}
+
+export function generateMap(world, opts = {}) {
+  const baseCount = Math.max(1, Math.min(world.players.length, opts.baseCount || world.players.length));
+
+  // Everything scattered across open ground scales with the map's area, so a map
+  // four times the size is not four times emptier. The counts below are the old
+  // 48x48 figures multiplied by this and rounded to something that reads well.
+  // Derived per world rather than per module, because the map is as big as the
+  // roster needs now.
+  const areaScale = (world.width * world.height) / (48 * 48);
+  const scaled = (n) => Math.max(n, Math.round(n * areaScale));
+
+  carveTerrain(world, scaled);
+
+  const bases = baseSites(world, baseCount);
 
   // Scatter neutral forest across the middle before bases claim their ground,
   // then clear anything that would sit on top of a base.
-  scatterForests(world, bases);
-  scatterGold(world, bases);
-  scatterStone(world, bases);
-  scatterBerries(world, bases);
+  scatterForests(world, bases, scaled);
+  scatterGold(world, bases, scaled);
+  scatterStone(world, bases, scaled);
+  scatterBerries(world, bases, scaled);
 
   for (const b of bases) {
     const built = buildBase(world, b);
@@ -108,13 +185,11 @@ function nearestNode(world, x, y, type) {
   return best;
 }
 
-/** Counts that should grow with the map, never below the original figure. */
-function scaled(n) {
-  return Math.max(n, Math.round(n * AREA_SCALE));
-}
-
-function carveTerrain(world) {
+function carveTerrain(world, scaled) {
   const { rng } = world;
+  const MAP_W = world.width;
+  const MAP_H = world.height;
+  const inset = Math.round(Math.min(MAP_W, MAP_H) * BASE_INSET_FRACTION);
   // Gentle patches of dirt and sand so the ground is not a flat green sheet.
   for (let i = 0; i < scaled(70); i++) {
     const cx = rng.int(0, MAP_W - 1);
@@ -126,8 +201,8 @@ function carveTerrain(world) {
   // Ponds, away from the base corners. Kept small and few: water is impassable,
   // and a lake across the middle of a 96-tile map is a wall, not scenery.
   for (let i = 0; i < scaled(2); i++) {
-    const cx = rng.int(BASE_OFFSET + 6, MAP_W - BASE_OFFSET - 6);
-    const cy = rng.int(BASE_OFFSET + 6, MAP_H - BASE_OFFSET - 6);
+    const cx = rng.int(inset + 6, MAP_W - inset - 6);
+    const cy = rng.int(inset + 6, MAP_H - inset - 6);
     const r = rng.range(2.5, 4.5);
     stamp(world, cx, cy, r, TERRAIN.WATER);
   }
@@ -141,6 +216,7 @@ function carveTerrain(world) {
 }
 
 function stamp(world, cx, cy, r, kind) {
+  const MAP_W = world.width;
   const r2 = r * r;
   for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
     for (let x = Math.floor(cx - r); x <= Math.ceil(cx + r); x++) {
@@ -159,7 +235,7 @@ function stamp(world, cx, cy, r, kind) {
 function freeSpot(world, x, y, bases, minBaseDist) {
   if (!inBounds(world, x, y)) return false;
   if (isBlocked(world, x, y)) return false;
-  if (world.terrain[y * MAP_W + x] === TERRAIN.WATER) return false;
+  if (world.terrain[y * world.width + x] === TERRAIN.WATER) return false;
   for (const b of bases) {
     const dx = x - b.x;
     const dy = y - b.y;
@@ -168,8 +244,10 @@ function freeSpot(world, x, y, bases, minBaseDist) {
   return true;
 }
 
-function scatterForests(world, bases) {
+function scatterForests(world, bases, scaled) {
   const { rng } = world;
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   // Big neutral woods in the middle of the map...
   for (let i = 0; i < scaled(22); i++) {
     const cx = rng.int(3, MAP_W - 4);
@@ -179,14 +257,15 @@ function scatterForests(world, bases) {
   // ...plus a guaranteed woodline for each player, close enough to be the
   // obvious first wood assignment.
   for (const b of bases) {
-    // A fixed heading per base, taken from the literal direction table. Index 9
-    // of 64 is ~0.88 radians, which is where the old `0.9` put it; the opposite
-    // base gets the antipode. Trigonometry is not used here because sin and cos
-    // differ in the last bit between JavaScript engines, and a single flipped
-    // Math.round relocates a whole woodline — which changes blocked[], which
-    // changes every path near it, on one machine and not the other.
-    const ang = b.player === PLAYER ? 9 : 9 + DIR_COUNT / 2;
-    const d = dirVec(ang);
+    // A fixed heading relative to the base's own, taken from the literal
+    // direction table. Index 9 of 64 is ~0.88 radians, which is where the old
+    // `0.9` put player 0's woodline; every other base gets the same angle turned
+    // by its own rotation, so in a 1v1 player 1 still gets the antipode exactly.
+    // Trigonometry is not used here because sin and cos differ in the last bit
+    // between JavaScript engines, and a single flipped Math.round relocates a
+    // whole woodline — which changes blocked[], which changes every path near
+    // it, on one machine and not the other.
+    const d = dirVec(9 + b.rot);
     const cx = Math.round(b.x + d[0] * 7);
     const cy = Math.round(b.y + d[1] * 7);
     growForest(world, cx, cy, 30, bases, 4.5);
@@ -227,8 +306,10 @@ function growForest(world, cx, cy, count, bases, minBaseDist) {
 // assigning villagers, not about exploring.
 const NEUTRAL_MIN_BASE_DIST = 22;
 
-function scatterGold(world, bases) {
+function scatterGold(world, bases, scaled) {
   const { rng } = world;
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   // Neutral gold in the contested middle — worth fighting over.
   for (let i = 0; i < scaled(7); i++) {
     const cx = rng.int(8, MAP_W - 9);
@@ -241,8 +322,8 @@ function scatterGold(world, bases) {
   // you never have to defend — enough to reach the end of a skirmish without
   // contesting the middle even once. Three leaves you needing the map.
   for (const b of bases) {
-    const dir = b.player === PLAYER ? 1 : -1;
-    placeCluster(world, b.x + 7 * dir, b.y - 4 * dir, 'gold', 3, bases, 4.5);
+    const p = atBase(b, 7, -4);
+    placeCluster(world, p.x, p.y, 'gold', 3, bases, 4.5);
   }
 }
 
@@ -262,8 +343,10 @@ function scatterGold(world, bases) {
  * of the trees, which is the intended scarcity ordering: wood is everywhere,
  * gold is worth a fight, stone is worth a walk and a fight.
  */
-function scatterStone(world, bases) {
+function scatterStone(world, bases, scaled) {
   const { rng } = world;
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   for (let i = 0; i < scaled(6); i++) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
@@ -273,14 +356,16 @@ function scatterStone(world, bases) {
   // resource you go and get once the first raid has told you that you need
   // walls, so the starting mine should be a decision with a walk attached.
   for (const b of bases) {
-    const dir = b.player === PLAYER ? 1 : -1;
-    placeCluster(world, b.x - 5 * dir, b.y + 14 * dir, 'stone', 3, bases, 6.5);
+    const p = atBase(b, -5, 14);
+    placeCluster(world, p.x, p.y, 'stone', 3, bases, 6.5);
   }
 }
 
 /** Neutral berry patches, so a long game has food worth walking out for. */
-function scatterBerries(world, bases) {
+function scatterBerries(world, bases, scaled) {
   const { rng } = world;
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   for (let i = 0; i < scaled(6); i++) {
     const cx = rng.int(10, MAP_W - 11);
     const cy = rng.int(10, MAP_H - 11);
@@ -319,9 +404,10 @@ function buildBase(world, base) {
   // the Farm — the renewable food source the wood economy is supposed to feed
   // into — something you never had to build. Seven is enough to open on and
   // run out with, which is the point at which farms become a decision.
-  const dir = player === PLAYER ? 1 : -1;
-  placeCluster(world, x - 5 * dir, y + 3 * dir, 'berry', 4, [], 0);
-  placeCluster(world, x + 4 * dir, y + 7 * dir, 'berry', 3, [], 0);
+  const near = atBase(base, -5, 3);
+  const far = atBase(base, 4, 7);
+  placeCluster(world, near.x, near.y, 'berry', 4, [], 0);
+  placeCluster(world, far.x, far.y, 'berry', 3, [], 0);
 
   // Three starting villagers, fanned out in front of the Town Center.
   const spawned = [];
@@ -331,9 +417,10 @@ function buildBase(world, base) {
     // Math.cos they would differ in the last bit between engines, which means
     // two peers in a lockstep match would start the game with their villagers
     // at measurably different places, before a single order is given. A literal
-    // table removes the whole class of problem: index 6 of 64 is ~0.59 rad
-    // (the old 0.6) and the enemy's 3.7 rad is 21 sixty-fourths further round.
-    const d = dirVec((player === PLAYER ? 6 : 38) + Math.round((DIR_COUNT * i) / 3));
+    // table removes the whole class of problem: index 6 of 64 is ~0.59 rad (the
+    // old 0.6), turned by the base's own heading — so in a 1v1 the second base
+    // still fans from index 38, which is the 3.7 rad it always used.
+    const d = dirVec(6 + base.rot + Math.round((DIR_COUNT * i) / 3));
     const ux = x + d[0] * 2.6;
     const uy = y + d[1] * 2.6;
     spawned.push(spawnUnit(world, 'villager', player, ux, uy));
@@ -343,6 +430,7 @@ function buildBase(world, base) {
 }
 
 function clearArea(world, cx, cy, r) {
+  const MAP_W = world.width;
   const r2 = r * r;
   // Remove resource nodes overlapping the area so the base is not walled in.
   for (const e of world.resources.slice()) {

@@ -51,7 +51,7 @@
 
 import {
   TAP_SLOP, DRAG_BOX_THRESHOLD, TAP_PICK_RADIUS, ORDER_PICK_RADIUS,
-  ZOOM_MIN, ZOOM_MAX, MAP_W, MAP_H, HALF_W, HALF_H,
+  ZOOM_MIN, ZOOM_MAX, HALF_W, HALF_H,
   BUILDING_STATS, isWallType, isGateType, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
@@ -148,7 +148,10 @@ export function createInput(scene, world, renderer, hud) {
   // console) working exactly as it did before there was a bus at all.
   const bus = scene.bus || createLocalBus(world, PLAYER);
 
-  // World-pixel bounds of the playable diamond (see core/iso.js).
+  // World-pixel bounds of the playable diamond (see core/iso.js). Read off the
+  // world rather than off a constant: the map is as big as the roster needs.
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const BOUNDS = {
     minX: -MAP_H * HALF_W,
     maxX: MAP_W * HALF_W,

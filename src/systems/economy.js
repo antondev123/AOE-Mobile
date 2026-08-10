@@ -14,6 +14,7 @@ import {
   isWallType, isGateType, wallFamily,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
+import { sameTeam } from '../core/teams.js';
 import {
   spawnUnit, spawnBuilding, removeEntity, canPlace, placeBlockedBy, isBlocked, inBounds,
   applyPopBonus, recomputePop, edgeDist2, footprintTiles, ownedBy, forEachNear,
@@ -795,9 +796,12 @@ export function updateGates(world) {
     let hostile = false;
     forEachNear(world, b.x, b.y, GATE_ENEMY_RADIUS, (e) => {
       if (e.kind !== 'unit' || e.dead) return;
-      if (e.player === b.player) {
+      // An ally counts as a friend here. Without it the gate you built to keep
+      // the enemy out shuts in your team-mate's face, which reads as the wall
+      // being broken rather than as diplomacy.
+      if (sameTeam(world, e.player, b.player)) {
         if (edgeDist2(b, e.x, e.y) <= GATE_FRIEND_RADIUS * GATE_FRIEND_RADIUS) friend = true;
-      } else if (isHostile(b, e)) {
+      } else if (isHostile(world, b, e)) {
         hostile = true;
       }
     });

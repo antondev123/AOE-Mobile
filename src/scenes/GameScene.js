@@ -13,10 +13,12 @@
 import { createWorld, ownedBy, recomputePop } from '../core/world.js';
 import { generateMap } from '../core/mapgen.js';
 import {
-  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY, BUILDING_STATS, MILITARY_TYPES,
+  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
+import { checkVictory } from '../core/victory.js';
+import { sameTeam } from '../core/teams.js';
 
 import { createRenderer } from '../gfx/render.js';
 import { createLocalBus, createNetBus } from '../net/bus.js';
@@ -102,8 +104,7 @@ export class GameScene extends Phaser.Scene {
     if (!world) {
       world = createWorld(this.seed);
       generateMap(world);
-      recomputePop(world, PLAYER);
-      recomputePop(world, ENEMY);
+      for (const p of world.players) recomputePop(world, p.id);
     }
     this.world = world;
     this.resumeFrom = null;
@@ -420,54 +421,16 @@ export class GameScene extends Phaser.Scene {
   }
 
   /**
-   * You lose when you can no longer produce anything.
+   * End the match when one side is left standing.
    *
-   * The old rule was "no buildings and no villagers", which is the last
-   * possible moment rather than the decisive one, and it made winning worse
-   * than losing: a player who had razed the enemy's Town Center, Barracks and
-   * Castle still had to hunt the last enemy villager across a map that is 93%
-   * fog, and there is no tool in this game for finding one villager on 9216
-   * tiles. Meanwhile the loser sat in a game that was decided ten minutes ago
-   * with no resign button and nothing to do but close the tab.
-   *
-   * A player who owns nothing that trains a unit cannot replace a villager,
-   * cannot replace a soldier and cannot rebuild — a lone villager can lay a
-   * Town Center foundation, so a foundation counts, which is why this asks
-   * "does anything you own train units" rather than "is anything finished".
-   * That is the point at which the match is over, and it is the point the
-   * match now ends at.
-   *
-   * Written as a scan rather than as list comprehensions, because it runs every
-   * sim step for every player: the readable version allocated four arrays of up
-   * to two hundred entities twenty times a second, all of it to answer a yes/no
-   * question that stops the moment it finds its first hit.
+   * The rule itself lives in core/victory.js, called by both this scene and
+   * server/match.js. It used to be written out in both places with two
+   * *different* elimination conditions, which is invisible in a skirmish and
+   * means the server ends a game the clients are still playing in a networked
+   * one.
    */
   checkVictory() {
-    const world = this.world;
-    if (world.over) return;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      let canRecover = false;
-      for (const id of p.owned) {
-        const e = world.entities.get(id);
-        if (!e || e.dead || e.kind !== 'building') continue;
-        const s = BUILDING_STATS[e.type];
-        if (s && s.trains && s.trains.length) { canRecover = true; break; }
-      }
-      if (!canRecover && world.time > 3) p.defeated = true;
-    }
-    let alive = null;
-    let aliveCount = 0;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      aliveCount++;
-      alive = p;
-    }
-    if (aliveCount === 1) {
-      world.over = true;
-      world.winner = alive.id;
-      world.events.emit(EV.GAME_OVER, { winner: alive.id });
-    }
+    checkVictory(this.world);
   }
 
   /** Biggest army the player ever fielded. Called once a simulated second. */
@@ -491,7 +454,9 @@ export class GameScene extends Phaser.Scene {
   resign() {
     const world = this.world;
     if (!world || world.over) return false;
-    world.players[PLAYER].defeated = true;
+    // This seat, not seat zero. In a networked match the local player is
+    // whichever chair the server gave them, and resigning must give up that one.
+    world.players[this.seat].defeated = true;
     this.resigned = true;
     this.checkVictory();
     return true;
@@ -508,16 +473,30 @@ export class GameScene extends Phaser.Scene {
     const title = document.getElementById('end-title');
     const sub = document.getElementById('end-sub');
     if (!card) return;
-    const won = winner === this.seat;
-    title.textContent = won ? 'Victory' : 'Defeat';
-    title.className = won ? 'win' : 'lose';
+    // Won as a *side*, not as a seat. A team-mate still standing when your own
+    // town has fallen has won the match, and so have you. A draw — every
+    // remaining side eliminated on one step — is neither.
+    const draw = winner === null || winner === undefined;
+    const won = !draw && sameTeam(this.world, winner, this.seat);
+    title.textContent = draw ? 'Draw' : won ? 'Victory' : 'Defeat';
+    title.className = draw ? '' : won ? 'win' : 'lose';
     const mins = Math.floor(this.world.time / 60);
     const secs = Math.floor(this.world.time % 60);
+    // "The enemy" was a fair thing to call the other player when there was
+    // exactly one of them. With a roster it is a side, and the sentence has to
+    // survive both a 1v1 and a four-way free-for-all.
+    const mine = this.world.players[this.seat];
+    const wonAlone = won && mine && !mine.defeated
+      && this.world.players.every((p) => p.defeated || p.id === this.seat);
     sub.textContent = this.resigned
       ? `You resigned after ${mins}m ${secs}s.`
-      : won
-        ? `The enemy can train nothing more. ${mins}m ${secs}s.`
-        : `You can train nothing more. ${mins}m ${secs}s.`;
+      : draw
+        ? `Nobody was left standing. ${mins}m ${secs}s.`
+        : wonAlone
+          ? `Nobody else can train anything more. ${mins}m ${secs}s.`
+          : won
+            ? `Your side is the last one standing. ${mins}m ${secs}s.`
+            : `You can train nothing more. ${mins}m ${secs}s.`;
 
     const stats = document.getElementById('end-stats');
     if (stats) {

@@ -17,7 +17,7 @@
 // quad — see makeFog — darkens the ground. Nothing per-tile happens per frame.
 
 import {
-  MAP_W, MAP_H, HALF_W, HALF_H, TILE_W, TILE_H,
+  HALF_W, HALF_H, TILE_W, TILE_H,
   ZOOM_MIN, ZOOM_MAX, ZOOM_DEFAULT,
   BUILDING_STATS, isWallType, isGateType,
 } from '../core/constants.js';
@@ -212,12 +212,19 @@ const FOG_DEPTH = 700000;
 let fogTextureSerial = 0;
 
 export function createRenderer(scene, world) {
-  const tex = buildTextures(scene);
+  // Only this match's seats get a colour variant baked. See buildTextures.
+  const tex = buildTextures(scene, { seats: world.players.length });
   const origins = tex.origins;
 
   const camera = scene.cameras.main;
 
   // --- camera --------------------------------------------------------------
+  // Read off the world, not off a constant: the map is as big as the roster
+  // needs it to be. Everything below that indexes, culls or bakes by tile has to
+  // agree with core/world.js's arrays or it silently addresses the wrong ones.
+  const MAP_W = world.width;
+  const MAP_H = world.height;
+
   // The playable diamond spans x in [-MAP_H*HALF_W, MAP_W*HALF_W] and
   // y in [0, (MAP_W+MAP_H)*HALF_H] (see the header of iso.js). Its bounding
   // box therefore has four empty corners, which used to show as raw canvas
@@ -1595,6 +1602,8 @@ function setFrame(s, frame, origins) {
 const INDEX_CELL = 8;
 
 function makeStaticIndex(world) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const cols = Math.ceil(MAP_W / INDEX_CELL);
   const rows = Math.ceil(MAP_H / INDEX_CELL);
   const cells = new Array(cols * rows);
@@ -1824,6 +1833,8 @@ function strokeDiamond(g, cx, cy, hw, hh) {
  * the world.
  */
 function makeFog(scene, world, rect) {
+  const MAP_W = world.width;
+  const MAP_H = world.height;
   const vision = world.vision;
   if (!vision) return null;
 

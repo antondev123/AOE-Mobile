@@ -49,7 +49,7 @@
 // visionStats for the measured numbers.
 
 import {
-  MAP_W, MAP_H, UNIT_STATS, BUILDING_STATS,
+  UNIT_STATS, BUILDING_STATS,
   DEFAULT_UNIT_LOS, DEFAULT_BUILDING_LOS,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
@@ -227,8 +227,8 @@ function makeState(n) {
  * or enforces who is allowed to know what; it only answers the question.
  */
 export function createVision(world) {
-  const W = world.width || MAP_W;
-  const H = world.height || MAP_H;
+  const W = world.width;
+  const H = world.height;
   const N = W * H;
 
   const states = world.players.map(() => makeState(N));
@@ -682,7 +682,7 @@ export function createVision(world) {
 
   /**
    * Write the fog alpha field for a player into the alpha bytes of an RGBA
-   * buffer sized MAP_W x MAP_H — one texel per tile, ready to be uploaded and
+   * buffer sized W x H — one texel per tile, ready to be uploaded and
    * stretched over the map.
    *
    * This lives here, in the sim file, rather than in the renderer for one

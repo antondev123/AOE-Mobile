@@ -147,7 +147,7 @@ export function inRange(attacker, target) {
 }
 
 /** May `attacker` attack `target` at all (alive, hostile, attackable)? Pure. */
-export function canAttack(attacker, target) {
+export function canAttack(world, attacker, target) {
   if (!attacker || !target || attacker === target) return false;
   if (attacker.dead || target.dead) return false;
   if (attacker.kind !== 'unit') return false;       // buildings do not fight back
@@ -155,7 +155,7 @@ export function canAttack(attacker, target) {
   if (!(attacker.hp > 0)) return false;
   if (target.kind !== 'unit' && target.kind !== 'building') return false;
   if (!(target.hp > 0)) return false;
-  return isHostile(attacker, target);
+  return isHostile(world, attacker, target);
 }
 
 // --- Damage -----------------------------------------------------------------
@@ -366,7 +366,7 @@ function raiseAlert(world, attacker, target) {
   const player = target.player;
   if (player === null || player === undefined) return false;
   // Only an enemy attacking you is an alarm.
-  if (attacker && !isHostile(attacker, target)) return false;
+  if (attacker && !isHostile(world, attacker, target)) return false;
 
   const st = alertState(world, player);
   const now = world.time;
@@ -402,7 +402,7 @@ function raiseAlert(world, attacker, target) {
 function callForHelp(world, attacker, victim) {
   if (!attacker || attacker.dead) return;
   if (victim.player === null || victim.player === undefined) return;
-  if (!isHostile(attacker, victim)) return;
+  if (!isHostile(world, attacker, victim)) return;
   if (world.time - (victim._helpAt ?? -Infinity) < HELP_INTERVAL) return;
   victim._helpAt = world.time;
 
@@ -412,7 +412,7 @@ function callForHelp(world, attacker, victim) {
     if (isVillager(e) || e.fleeing) return;
     if (e.target) return;                        // already in a fight
     if (e.task && e.state !== 'idle') return;    // under orders — do not hijack
-    if (!canAttack(e, attacker)) return;
+    if (!canAttack(world, e, attacker)) return;
     // Answering a cry for help is still auto-acquisition: the same two gates
     // apply. A Stand Ground unit holds its spot however loudly its neighbour
     // shouts, a No Attack unit never joins, and nobody charges something their
@@ -442,7 +442,7 @@ function kill(world, e, killer) {
 /** Being hit makes soldiers angry and villagers scared. */
 function reactToDamage(world, attacker, target) {
   if (target.kind !== 'unit') return;
-  if (!attacker || attacker.dead || !isHostile(attacker, target)) return;
+  if (!attacker || attacker.dead || !isHostile(world, attacker, target)) return;
 
   if (isVillager(target)) {
     // Villagers do not trade with soldiers. If the player explicitly ordered
@@ -456,7 +456,7 @@ function reactToDamage(world, attacker, target) {
   // takes it rather than abandoning its post, and nothing charges an attacker
   // hidden in the dark — which is precisely the tower or the archer you have
   // not scouted yet.
-  if (!target.target && !target.task && canAttack(target, attacker)) {
+  if (!target.target && !target.task && canAttack(world, target, attacker)) {
     const stance = stanceOf(target);
     if (stance === STANCE.NO_ATTACK) return;
     if (stance === STANCE.STAND_GROUND && !inRange(target, attacker)) return;
@@ -571,7 +571,7 @@ export function updateCombat(world, dt) {
       u._autoFor = null;
     }
 
-    if (u.target && !canAttack(u, u.target)) dropTarget(u, false);
+    if (u.target && !canAttack(world, u, u.target)) dropTarget(u, false);
     // Whether a snapped leash walks the unit home is the difference between
     // Aggressive and Defensive: an aggressive unit holds the ground it took, a
     // defensive one goes back to the post it was covering. See returnsToPost.
@@ -817,7 +817,7 @@ function acquire(world, u, dt) {
   let best = null;
   let bestScore = Infinity;
   forEachNear(world, u.x, u.y, range, (e) => {
-    if (!canAttack(u, e)) return;
+    if (!canAttack(world, u, e)) return;
     // The fog gate. Never auto-acquire what your side cannot see.
     if (!canSee(world, u, e)) return;
     // Stand Ground fights only what has walked into its reach — it may not take
@@ -1091,7 +1091,7 @@ function updateBuildings(world, dt) {
     const seen = [];
     forEachNear(world, b.x, b.y, w.range + Math.max(b.fw, b.fh) / 2, (e) => {
       if (e.kind !== 'unit' || e.dead || !(e.hp > 0)) return;
-      if (!isHostile(b, e)) return;
+      if (!isHostile(world, b, e)) return;
       if (edgeDist2(e, b.x, b.y) > w.range * w.range) return;
       // The same fog rule the units obey: a building does not shoot what its
       // owner cannot see.

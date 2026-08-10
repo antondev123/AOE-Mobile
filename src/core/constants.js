@@ -9,16 +9,54 @@ export const HALF_W = TILE_W / 2;
 export const HALF_H = TILE_H / 2;
 
 // --- Map --------------------------------------------------------------------
-// AoE2's smallest two-player map is 120x120. 96 is the largest square that
-// still keeps this honest on a phone: the A* grid is 9216 tiles (four times the
-// old 48x48, still well inside the search budget in pathfinding.js), the baked
-// terrain is 6272x3168 world pixels, and the two bases end up ~85 tiles apart —
-// about 75 seconds of marching for a militia, which is the point. At 48 the
-// enemy's first wave was on top of you before you had finished walling your
+//
+// AoE2's smallest two-player map is 120x120. 96 is the largest square that still
+// keeps a *two-player* match honest on a phone: the A* grid is 9216 tiles (four
+// times the old 48x48, still well inside the search budget in pathfinding.js),
+// the baked terrain is 6272x3168 world pixels, and the two bases end up ~85 tiles
+// apart — about 75 seconds of marching for a militia, which is the point. At 48
+// the enemy's first wave was on top of you before you had finished walling your
 // wood line, and there was nowhere to expand to because the whole map was your
 // two starting corners touching in the middle.
-export const MAP_W = 96;
-export const MAP_H = 96;
+//
+// THESE ARE DEFAULTS, NOT THE MAP. They were `MAP_W`/`MAP_H` and were imported
+// directly by a dozen files, which is why a match had exactly one possible size.
+// The world carries its own `width`/`height` now and everything that draws,
+// paths, bins or indexes must read those. The rename is the enforcement: a site
+// that still wants the constant has to say `DEFAULT_` out loud, and a site that
+// forgot to be updated throws a ReferenceError at import rather than quietly
+// laying out a 192-tile map on a 96-tile grid — which does not crash, it just
+// makes half the world invisible to the spatial index.
+export const DEFAULT_MAP_W = 96;
+export const DEFAULT_MAP_H = 96;
+
+/** Most seats a match can have. Eight is AoE2's, and the atlas budget's. */
+export const MAX_PLAYERS = 8;
+
+/**
+ * How big a map should be for a given number of players.
+ *
+ * Area per player is held at what two players get on 96x96, because that is the
+ * figure everything else in this file was tuned against: the walk to the middle,
+ * how long a militia takes to cross, how much wood is inside a base's pocket,
+ * and how far apart `BASE_OFFSET` puts two town centers. Scaling area linearly
+ * with the roster keeps all of that true at any seat count — eight players get
+ * four times the tiles of two, and each of them still opens on the same amount
+ * of ground.
+ *
+ * Rounded to a multiple of 8 so both bucket grids in core/world.js divide evenly
+ * (4 tiles a cell for the mixed index, 2 for the units-only one), and capped at
+ * 192: past that the terrain bake and the per-player fog masks start costing
+ * more than a phone has, and the far corners are further away than a ten-minute
+ * match can reach anyway.
+ *
+ *   2 -> 96   3 -> 120   4 -> 136   5 -> 152   6 -> 168   7 -> 176   8 -> 192
+ */
+export function mapSizeFor(playerCount) {
+  const n = Math.max(2, Math.min(MAX_PLAYERS, playerCount | 0));
+  const side = DEFAULT_MAP_W * Math.sqrt(n / 2);
+  return Math.max(DEFAULT_MAP_W, Math.min(192, Math.round(side / 8) * 8));
+}
 
 export const TERRAIN = {
   GRASS: 0,
@@ -28,11 +66,48 @@ export const TERRAIN = {
 };
 
 // --- Players ----------------------------------------------------------------
+//
+// PLAYER and ENEMY are seat *numbers*, and they survive only as the default
+// two-seat roster's names — for mapgen's fallback, for tests that want to say
+// "the other one", and for the single-player skirmish. Nothing that draws or
+// decides should use them to mean "me": the local seat is ME in
+// core/viewpoint.js, and with eight seats "the enemy" is a question about teams
+// rather than a constant. See core/teams.js.
 export const PLAYER = 0;
 export const ENEMY = 1;
 
-export const PLAYER_COLORS = [0x3d8bfd, 0xe03131];
-export const PLAYER_COLORS_DARK = [0x1f5fbf, 0x9c1c1c];
+// Eight colours, and every one of them has to survive three hostile conditions:
+// a 160x160 minimap where a player is three pixels, the fog's dimming, and a
+// phone screen outdoors. So they are picked around the hue circle at high
+// chroma, avoiding the two hues the map itself already owns — the grass greens
+// and the sand/dirt tans — which is why there is no green and no brown here.
+//
+// The first two are unchanged. A 1v1 must look exactly as it always has, and
+// blue-against-red is the one pairing every RTS player already reads without
+// being told.
+export const PLAYER_COLORS = [
+  0x3d8bfd, // 1 blue
+  0xe03131, // 2 red
+  0xf4b400, // 3 gold
+  0xa64dd6, // 4 purple
+  0x18b3a8, // 5 teal
+  0xff7a1a, // 6 orange
+  0xf06fb0, // 7 pink
+  0xd8dee9, // 8 grey
+];
+// The shaded half of every sprite, and the minimap's incomplete-building fill.
+// Each is its colour taken down in value and slightly in chroma, rather than
+// blended toward black, so a unit reads as one material lit from one side.
+export const PLAYER_COLORS_DARK = [
+  0x1f5fbf, // 1
+  0x9c1c1c, // 2
+  0xa87a06, // 3
+  0x6f2f95, // 4
+  0x0d7a72, // 5
+  0xb04f07, // 6
+  0xa8447a, // 7
+  0x8d94a1, // 8
+];
 
 // --- Resources --------------------------------------------------------------
 export const RES = { FOOD: 'food', WOOD: 'wood', GOLD: 'gold', STONE: 'stone' };

@@ -218,6 +218,10 @@ export function serializeGame(world, extra = {}) {
       resources: { ...p.resources },
       popCap: p.popCap,
       defeated: !!p.defeated,
+      // Which side they play for. A save from before there were teams has none,
+      // and restoreGame falls back to the seat number — a free-for-all, which is
+      // exactly what a two-player save was.
+      team: p.team,
       // Insertion order matters: ownedBy() walks this set and several passes
       // stop at their first hit.
       owned: Array.from(p.owned),
@@ -275,10 +279,27 @@ export function restoreGame(data) {
   }
   if (!Array.isArray(data.entities)) throw new Error('Save has no entities');
 
-  const world = createWorld(data.seed);
+  // Built to the save's shape rather than checked against the build's.
+  //
+  // This used to be createWorld(seed) followed by "is this the size I always
+  // am", which was the only thing it could be when there was one possible map.
+  // The map is a lobby decision now, so the save carries its own dimensions and
+  // its own roster and the world is made to fit them.
+  const savedPlayers = Array.isArray(data.players) ? data.players : [];
+  const world = createWorld(data.seed, {
+    playerCount: savedPlayers.length || 2,
+    width: data.width,
+    height: data.height,
+    teams: savedPlayers.map((p, i) => (p && p.team !== undefined && p.team !== null ? p.team : i)),
+  });
   if (world.width !== data.width || world.height !== data.height) {
     throw new Error(
-      `Save is a ${data.width}x${data.height} map, this build plays ${world.width}x${world.height}`,
+      `Save is a ${data.width}x${data.height} map, which this build cannot build`,
+    );
+  }
+  if (world.players.length !== savedPlayers.length) {
+    throw new Error(
+      `Save has ${savedPlayers.length} players, which is outside what this build supports`,
     );
   }
 

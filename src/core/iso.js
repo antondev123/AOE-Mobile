@@ -4,8 +4,8 @@
 // World space: pixel coordinates inside the Phaser world (camera scrolls this).
 //
 // The map's north corner (0,0) projects to worldX = 0, worldY = 0, so the
-// playable diamond spans x in [-MAP_H*HALF_W, MAP_W*HALF_W] and y in
-// [0, (MAP_W+MAP_H)*HALF_H].
+// playable diamond spans x in [-H*HALF_W, W*HALF_W] and y in
+// [0, (W+H)*HALF_H], for a world's own width and height.
 
 import { HALF_W, HALF_H } from './constants.js';
 

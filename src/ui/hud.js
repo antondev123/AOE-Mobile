@@ -11,7 +11,7 @@
 // systems, and it reads world state. Selection changes go through ui/selection.js.
 
 import {
-  BUILDABLE, UNIT_STATS, BUILDING_STATS, MAP_W, MAP_H, HALF_W, HALF_H,
+  BUILDABLE, UNIT_STATS, BUILDING_STATS, HALF_W, HALF_H,
   MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
   FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
   isWallType, isGateType,
@@ -34,7 +34,7 @@ import {
 } from '../systems/combat.js';
 
 import { createLocalBus } from '../net/bus.js';
-import { createMinimap, miniToGrid } from './minimap.js';
+import { createMinimap } from './minimap.js';
 import { createPortraits } from './portraits.js';
 import {
   selectedEntities, setSelection, clearSelection, selectionSignature,
@@ -2932,10 +2932,10 @@ export function createHud(scene, world, audio = null) {
     const r = dom.minimap.getBoundingClientRect();
     const px = ((ev.clientX - r.left) / r.width) * minimap.size;
     const py = ((ev.clientY - r.top) / r.height) * minimap.size;
-    const g = miniToGrid(px, py, minimap.size);
+    const g = minimap.toGrid(px, py);
     centerOnGrid(
-      Math.max(0, Math.min(MAP_W, g.x)),
-      Math.max(0, Math.min(MAP_H, g.y)),
+      Math.max(0, Math.min(world.width, g.x)),
+      Math.max(0, Math.min(world.height, g.y)),
     );
   }
 

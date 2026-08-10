@@ -16,12 +16,24 @@
 // costs 9216 byte writes — a rounding error next to the ~2000 node pips this
 // map already paints.
 
-import { MAP_W, MAP_H, HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
+import { HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
 // The local player's seat, as a live binding — see src/core/viewpoint.js for
 // why this is imported under the old name instead of threading a parameter.
 import { ME as PLAYER } from '../core/viewpoint.js';
 
-const SPAN = MAP_W + MAP_H;
+/**
+ * The minimap's projection, for one world.
+ *
+ * These three numbers were module constants, which is what made the minimap a
+ * 96x96 minimap rather than a minimap. `span` is the diagonal of the isometric
+ * diamond in tiles: the whole projection is (gx - gy) across and (gx + gy) down,
+ * and both fit in w + h.
+ */
+function miniDims(world) {
+  const w = world.width;
+  const h = world.height;
+  return { w, h, span: w + h };
+}
 
 const TERRAIN_COLOR = {
   [TERRAIN.GRASS]: '#3d6430',
@@ -115,31 +127,36 @@ function now() {
 }
 
 /** Grid -> minimap pixels (0..size). */
-export function gridToMini(gx, gy, size) {
+function gridToMini(gx, gy, size, d) {
   return {
-    x: ((gx - gy + MAP_H) / SPAN) * size,
-    y: ((gx + gy) / SPAN) * size,
+    x: ((gx - gy + d.h) / d.span) * size,
+    y: ((gx + gy) / d.span) * size,
   };
 }
 
 /** World pixels -> minimap pixels. */
-function worldToMini(wx, wy, size) {
+function worldToMini(wx, wy, size, d) {
   return {
-    x: ((wx + MAP_H * HALF_W) / (SPAN * HALF_W)) * size,
-    y: (wy / (SPAN * HALF_H)) * size,
+    x: ((wx + d.h * HALF_W) / (d.span * HALF_W)) * size,
+    y: (wy / (d.span * HALF_H)) * size,
   };
 }
 
 /** Minimap pixels -> grid coordinates. */
-export function miniToGrid(px, py, size) {
-  const a = (px / size) * SPAN - MAP_H; // gx - gy
-  const b = (py / size) * SPAN;         // gx + gy
+function miniToGrid(px, py, size, d) {
+  const a = (px / size) * d.span - d.h; // gx - gy
+  const b = (py / size) * d.span;       // gx + gy
   return { x: (a + b) / 2, y: (b - a) / 2 };
 }
 
 export function createMinimap(canvas, world) {
   const size = canvas.width || 160;
   const ctx = canvas.getContext('2d');
+  // The world's own dimensions, not the old module constants. Everything below
+  // that projects, bins or walks the terrain reads these.
+  const d = miniDims(world);
+  const MAP_W = d.w;
+  const MAP_H = d.h;
 
   // --- Bake terrain -------------------------------------------------------
   const bg = document.createElement('canvas');
@@ -186,7 +203,7 @@ export function createMinimap(canvas, world) {
     // grid -> minimap is x = k(gx - gy) + MAP_H*k, y = k(gx + gy). Handing that
     // straight to the canvas transform means the fog pixels land on the tile
     // diamonds rather than on a screen-aligned grid rotated across them.
-    const k = size / SPAN;
+    const k = size / d.span;
     const smooth = ctx.imageSmoothingEnabled;
     ctx.imageSmoothingEnabled = true;
     ctx.setTransform(k, k, -k, k, MAP_H * k, 0);
@@ -275,7 +292,7 @@ export function createMinimap(canvas, world) {
       for (let p = 0; p < 2; p++) {
         const n = binN[p][i];
         if (!n) continue;
-        const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size);
+        const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size, d);
         // sqrt, so the pip grows quickly from one unit to a squad and then
         // levels off: the difference between 1 and 8 units matters far more
         // than the difference between 40 and 60.
@@ -336,7 +353,7 @@ export function createMinimap(canvas, world) {
       const age = t - p.at;
       const fade = 1 - age / PING_LIFE;          // whole marker dies away
       const phase = (age % PING_PERIOD) / PING_PERIOD;
-      const c = gridToMini(p.gx, p.gy, size);
+      const c = gridToMini(p.gx, p.gy, size, d);
       // The two colours swap every half pulse. Whichever way round they are,
       // white and alarm-red are both on screen at once, so the marker separates
       // itself from the enemy's red pips *and* from pale sand in every frame.
@@ -367,7 +384,7 @@ export function createMinimap(canvas, world) {
 
   /** One resource pip. Shared by the live pass and the memory pass. */
   function node(type, gx, gy) {
-    const p = gridToMini(gx, gy, size);
+    const p = gridToMini(gx, gy, size, d);
     const s = NODE_SIZE[type] || NODE_SIZE_DEFAULT;
     ctx.fillStyle = RES_COLOR[type] || '#888';
     ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
@@ -375,8 +392,8 @@ export function createMinimap(canvas, world) {
 
   /** One building block. Shared by the live pass and the memory pass. */
   function building(type, player, fw, complete, gx, gy) {
-    const p = gridToMini(gx, gy, size);
-    const s = Math.max(3, Math.round((fw / SPAN) * size * 2));
+    const p = gridToMini(gx, gy, size, d);
+    const s = Math.max(3, Math.round((fw / d.span) * size * 2));
     ctx.fillStyle = complete ? TEAM[player] : TEAM_DARK[player];
     ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
     ctx.strokeStyle = 'rgba(0,0,0,0.7)';
@@ -432,7 +449,7 @@ export function createMinimap(canvas, world) {
         const e = world.entities.get(id);
         if (!e || e.dead) continue;
         if (e.kind === 'building' ? !litBuilding(e) : !lit(e.x, e.y)) continue;
-        const p = gridToMini(e.x, e.y, size);
+        const p = gridToMini(e.x, e.y, size, d);
         ctx.fillRect(p.x - 1, p.y - 1, 2, 2);
       }
     }
@@ -440,8 +457,8 @@ export function createMinimap(canvas, world) {
     // Camera viewport.
     if (camera && camera.worldView) {
       const v = camera.worldView;
-      const a = worldToMini(v.x, v.y, size);
-      const b = worldToMini(v.x + v.width, v.y + v.height, size);
+      const a = worldToMini(v.x, v.y, size, d);
+      const b = worldToMini(v.x + v.width, v.y + v.height, size, d);
       ctx.strokeStyle = 'rgba(255,255,255,0.92)';
       ctx.lineWidth = 1.5;
       ctx.strokeRect(
@@ -456,10 +473,18 @@ export function createMinimap(canvas, world) {
     drawPings();
   }
 
-  return { draw, size, ping, pings };
+  // toGrid rather than an exported miniToGrid: the projection depends on this
+  // world's dimensions, so it belongs to a minimap built for that world and not
+  // to the module. The HUD's tap-to-jump is the only caller.
+  const toGrid = (px, py) => miniToGrid(px, py, size, d);
+
+  return { draw, size, ping, pings, toGrid };
 }
 
 function bake(g, world, size) {
+  const d = miniDims(world);
+  const MAP_W = d.w;
+  const MAP_H = d.h;
   // Everything outside the playable diamond is open sea you can never set foot
   // on, so under fog of war it is permanently unexplored and it is painted in
   // the fog's own black rather than in water. The main view does exactly the
@@ -472,10 +497,10 @@ function bake(g, world, size) {
   // The playable area is a diamond; fill it with grass, then paint the tiles
   // that differ. That is a few hundred fills instead of MAP_W*MAP_H.
   const corners = [
-    gridToMini(0, 0, size),
-    gridToMini(MAP_W, 0, size),
-    gridToMini(MAP_W, MAP_H, size),
-    gridToMini(0, MAP_H, size),
+    gridToMini(0, 0, size, d),
+    gridToMini(MAP_W, 0, size, d),
+    gridToMini(MAP_W, MAP_H, size, d),
+    gridToMini(0, MAP_H, size, d),
   ];
   g.beginPath();
   g.moveTo(corners[0].x, corners[0].y);
@@ -489,7 +514,7 @@ function bake(g, world, size) {
       const t = world.terrain[ty * MAP_W + tx];
       if (t === TERRAIN.GRASS) continue;
       g.fillStyle = TERRAIN_COLOR[t] || '#444';
-      tileDiamond(g, tx, ty, size);
+      tileDiamond(g, tx, ty, size, d);
       g.fill();
     }
   }
@@ -505,11 +530,11 @@ function bake(g, world, size) {
 }
 
 
-function tileDiamond(g, tx, ty, size) {
+function tileDiamond(g, tx, ty, size, d) {
   // Grown by a hair so neighbouring tiles do not leave hairline seams.
-  const c = gridToMini(tx + 0.5, ty + 0.5, size);
-  const hw = (1 / SPAN) * size + 0.35;
-  const hh = (1 / SPAN) * size + 0.35;
+  const c = gridToMini(tx + 0.5, ty + 0.5, size, d);
+  const hw = (1 / d.span) * size + 0.35;
+  const hh = (1 / d.span) * size + 0.35;
   g.beginPath();
   g.moveTo(c.x, c.y - hh);
   g.lineTo(c.x + hw, c.y);

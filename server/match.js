@@ -38,7 +38,7 @@
 
 import { createWorld, recomputePop, reindex } from '../src/core/world.js';
 import { generateMap } from '../src/core/mapgen.js';
-import { SIM_DT, PLAYER, ENEMY } from '../src/core/constants.js';
+import { SIM_DT, mapSizeFor } from '../src/core/constants.js';
 import { updateAllocation } from '../src/systems/allocation.js';
 import { updateUnits } from '../src/systems/unitAI.js';
 import { updateCombat } from '../src/systems/combat.js';
@@ -47,6 +47,7 @@ import { createEnemyAI } from '../src/systems/enemyAI.js';
 import { serializeGame } from '../src/core/save.js';
 import { applyCommand } from '../src/core/command.js';
 import { checksum } from '../src/core/checksum.js';
+import { checkVictory } from '../src/core/victory.js';
 import { EV } from '../src/core/events.js';
 
 /** Ticks between a command arriving and taking effect. 4 ticks = 200ms at 20Hz. */
@@ -63,22 +64,40 @@ export { checksum };
 /**
  * @param {object} opts
  * @param {number} opts.seed
- * @param {Array<{kind: 'human'|'ai', clientId?: string}>} opts.seats
- *   Index is the playerId. Exactly world.players.length entries.
+ * @param {Array<{kind: 'human'|'ai'|'open'|'closed', team?: number}>} opts.seats
+ *   Index is the playerId. The roster decides how many players there are.
+ * @param {number} [opts.width]   map size; derived from the roster when absent
+ * @param {number} [opts.height]
  */
-export function createMatch({ seed = 1, seats = null } = {}) {
-  const world = createWorld(seed);
-  generateMap(world);
-  recomputePop(world, PLAYER);
-  recomputePop(world, ENEMY);
-  world.vision.update();
-
-  // Default: the classic single-player shape, so this file can host the
-  // existing game unchanged as well as a 1v1.
+export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = {}) {
+  // Default: the classic single-player shape, so this file can host the existing
+  // game unchanged as well as a 1v1.
+  //
+  // THE ROSTER COMES FIRST NOW. It used to be checked against a world that had
+  // already been built, because the world was always two players on a 96x96
+  // map and the check could only ever fail. The roster is the input: it says how
+  // many seats there are, which says how big the map is.
   const roster = seats || [{ kind: 'human' }, { kind: 'ai' }];
-  if (roster.length !== world.players.length) {
-    throw new Error(`need ${world.players.length} seats, got ${roster.length}`);
+  const side = width && height ? 0 : mapSizeFor(roster.length);
+
+  const world = createWorld(seed, {
+    playerCount: roster.length,
+    width: width || side,
+    height: height || side,
+    teams: roster.map((s, i) => (s && s.team !== undefined && s.team !== null ? s.team : i)),
+  });
+  generateMap(world);
+  for (const p of world.players) recomputePop(world, p.id);
+
+  // A closed slot is a seat nobody will ever sit in: it is defeated from tick
+  // zero and owns nothing, which keeps slot index equal to player id everywhere
+  // without leaving a live player standing on a base they cannot command. See
+  // the note on compaction in server/room.js.
+  for (let i = 0; i < roster.length; i++) {
+    if (roster[i] && roster[i].kind === 'closed') world.players[i].defeated = true;
   }
+
+  world.vision.update();
 
   // Listeners for the schedule, so a transport can tell clients about a command
   // *when it is stamped* rather than when it fires. That lead time is the only
@@ -166,40 +185,9 @@ export function createMatch({ seed = 1, seats = null } = {}) {
     world.time += SIM_DT;
     world.tick++;
 
-    checkVictory();
+    checkVictory(world);
 
     return { tick: world.tick, at, applied };
-  }
-
-  // Ported from GameScene.checkVictory() so a headless match ends the same way
-  // a played one does.
-  function checkVictory() {
-    if (world.over) return;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      let canRecover = false;
-      for (const id of p.owned) {
-        const e = world.entities.get(id);
-        if (!e || e.dead) continue;
-        if (e.kind === 'building' || (e.kind === 'unit' && e.type === 'villager')) {
-          canRecover = true;
-          break;
-        }
-      }
-      if (!canRecover && world.time > 3) p.defeated = true;
-    }
-    let alive = null;
-    let aliveCount = 0;
-    for (const p of world.players) {
-      if (p.defeated) continue;
-      aliveCount++;
-      alive = p;
-    }
-    if (aliveCount === 1) {
-      world.over = true;
-      world.winner = alive.id;
-      world.events.emit(EV.GAME_OVER, { winner: alive.id });
-    }
   }
 
   return {

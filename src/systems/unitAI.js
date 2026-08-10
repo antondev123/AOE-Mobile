@@ -998,7 +998,7 @@ function adoptFollowUpWork(world, u, ctx) {
   // Auto-acquisition belongs to combat.js: it stamps `target` on idle soldiers
   // (villagers never), and we walk them in. Note the task is flagged `auto` so
   // we do not clear combat's leash bookkeeping when the fight ends.
-  if (u.target && canAttack(u, u.target)) {
+  if (u.target && canAttack(world, u, u.target)) {
     u.task = { type: 'attack', target: u.target, auto: true };
     return;
   }
@@ -1121,7 +1121,7 @@ function tickMove(world, u, dt, ctx) {
   // the whole reason a deliberate attack-move looked broken.
   if (t.attackMove) {
     const target = u.target;
-    if (target && canAttack(u, target)) {
+    if (target && canAttack(world, u, target)) {
       if (inRange(u, target)) {
         clearMovement(u);
         u.state = 'attack';
@@ -1481,7 +1481,7 @@ function tickAttack(world, u, dt, ctx) {
   if (t.auto) t.target = u.target;
   const target = t.target;
 
-  if (!target || !canAttack(u, target)) {
+  if (!target || !canAttack(world, u, target)) {
     if (!t.auto) u.target = null;
     u.task = null;
     clearMovement(u);

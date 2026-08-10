@@ -39,7 +39,18 @@
 // time with a partial path rather than stalling the frame. unitAI.js bounds the
 // other side of it: SEARCHES_PER_STEP caps how many of these can happen in one
 // sim step, so a hundred units all re-planning at once still cannot spike.
-const DEFAULT_BUDGET = 12000;
+import { sameTeam } from '../core/teams.js';
+
+// It is 1.3x the tile count, not a number: 12000 was that figure for a 96x96
+// map (9216 tiles, "with a third in hand" as the paragraph above puts it), and
+// written out it silently became a third of the grid on a 192x192 eight-player
+// map — which turns this from a backstop into a partial-path generator, and
+// every long walk into the re-planning stutter the whole comment exists to
+// prevent.
+const BUDGET_PER_TILE = 1.3;
+function budgetFor(world) {
+  return Math.round(world.width * world.height * BUDGET_PER_TILE);
+}
 const SQRT2 = Math.SQRT2;
 // Slight tie-breaker toward the goal: keeps A* from fanning out over the huge
 // open areas of an AoE2 map when a straight walk would do. Bounded so paths
@@ -206,7 +217,16 @@ export function isWalkable(world, tx, ty, player) {
   if (b === 0) return true;
   if (b !== 3) return false;                       // 3 === BLOCK_GATE
   const key = gateKeyFor(player);
-  return key !== 0 && world.gateOwner[i] === key;
+  if (key === 0) return false;
+  const owner = world.gateOwner[i];
+  if (owner === key) return true;
+  // An ALLY'S gate opens too, and the team test sits behind the equality above
+  // rather than replacing it. This is the hottest predicate in the game — five
+  // calls per line-of-sight sample — so the overwhelmingly common answers (free
+  // tile, solid tile, my own gate) each stay a single compare. Only a closed
+  // gate belonging to somebody else gets as far as asking whose side they are
+  // on, and a map holds a handful of those.
+  return owner !== 0 && sameTeam(world, player, owner - 1);
 }
 
 /**
@@ -628,7 +648,7 @@ function octile(dx, dy) {
 export function findPath(world, sx, sy, tx, ty, opts = {}) {
   const W = world.width;
   const H = world.height;
-  const budget = opts.budget || DEFAULT_BUDGET;
+  const budget = opts.budget || budgetFor(world);
   const smooth = opts.smooth !== false;
   const allowPartial = opts.allowPartial !== false;
   const player = opts.player;
