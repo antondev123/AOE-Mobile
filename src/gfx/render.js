@@ -30,7 +30,7 @@ import {
   oceanFrame, edgeBlendFrame, shoreFrame, cliffFrame, BLOB_FRAME, waterFrame,
   TERRAIN_VARIANTS, RESOURCE_VARIANTS, DETAIL_VARIANTS, DETAIL_BOX, detailFrame,
   TERRAIN_BORDER, OCEAN_LEVELS, OCEAN_DEEP, TERRAIN_BASE, TERRAIN_PRIORITY,
-  CLIFF_H, CLIFF_VARIANTS,
+  CLIFF_H, CLIFF_VARIANTS, BUILDING_VARIANTS, smokeFrame, SMOKE_FPS, CHIMNEY,
 } from './textures.js';
 import { createFx } from './fx.js';
 import { EV } from '../core/events.js';
@@ -371,6 +371,7 @@ export function createRenderer(scene, world) {
   // difference between a budget and a hope.
   const waterTiles = buildWaterList(world);
   let waterPhase = 0;
+  let smokePhase = 0;
 
   // --- pools ---------------------------------------------------------------
   const waterPool = makePool(() => mkImage(scene, waterFrame(0), -999000));
@@ -378,6 +379,7 @@ export function createRenderer(scene, world) {
   const markerPool = makePool(() => mkImage(scene, markerFrame(0), -1));
   const unitPool = makePool(() => mkImage(scene, unitFrame('villager', 0, false), -1));
   const bldPool = makePool(() => mkImage(scene, buildingFrame('house', 0), -1));
+  const smokePool = makePool(() => mkImage(scene, smokeFrame(0), -1));
   const resPool = makePool(() => mkImage(scene, resourceFrame('tree', 0), -1));
   const selPool = makePool(() => mkImage(scene, 'mk_sel', -1));
   const ghostPool = makePool(() => mkImage(scene, 'tile_hi', -1));
@@ -563,11 +565,43 @@ export function createRenderer(scene, world) {
   }
   const unitFrameFor = (type, player, back, pose = 'i') =>
     unitPoseFor(type, player, back, pose).f;
+  /**
+   * Which drawing of a building to use, when the atlas holds more than one.
+   *
+   * The variant is the entity id and nothing cleverer. It is stable for the
+   * life of the building, it survives a save, and two houses raised next to
+   * each other get different numbers because they were raised at different
+   * times — which is exactly the case this exists for. Deriving it from
+   * position instead would make the two bases mirror each other, and deriving
+   * it from a render-side counter would reshuffle every roof on the map the
+   * moment one house burned down.
+   *
+   * The fallback is two-stage on purpose. A type the atlas has never heard of
+   * has to become *something*, and a house is the least alarming something. But
+   * a type that exists and merely lacks the variant asked for must fall back to
+   * its own variant 0, or a Barracks with an unlucky id silently turns into a
+   * cottage — a failure that looks like a gameplay bug rather than a missing
+   * frame, which is the worst way for a renderer to break.
+   */
   function buildingFrameFor(type, player, b) {
     if (type === 'farm') return farmFrame(player, farmStage(b));
     if (isWallType(type)) return wallPieceFrame(type, player, b);
-    const f = buildingFrame(type, player);
-    return has(f) ? f : buildingFrame('house', player);
+    const f = buildingFrame(type, player, (b && b.id) | 0);
+    if (has(f)) return f;
+    const base = buildingFrame(type, player, 0);
+    return has(base) ? base : buildingFrame('house', player);
+  }
+
+  /**
+   * The variant index buildingFrameFor landed on — same arithmetic, no string.
+   * Only the smoke needs this, because where a chimney is depends on which
+   * house got drawn.
+   */
+  function buildingVariant(type, b) {
+    const n = BUILDING_VARIANTS[type] || 1;
+    if (n <= 1) return 0;
+    const v = ((b && b.id) | 0) % n;
+    return (v + n) % n;
   }
 
   /**
@@ -590,10 +624,42 @@ export function createRenderer(scene, world) {
     const f = wallFrame(type, player, mask);
     return has(f) ? f : wallFrame('palisade', player, mask);
   }
-  function resourceFrameFor(type, variant) {
+  /**
+   * Which drawing of a resource node to use.
+   *
+   * The simulation rolls a three-way flavour for every node it spawns
+   * (core/world.js), and that number is three because it always has been, not
+   * because the art has three of anything: there are six trees, three golds,
+   * three stones and two berry bushes. Taking `variant % n` straight — which is
+   * what this used to do — leaves trees 3, 4 and 5 baked into the atlas and
+   * unreachable, and hands berry bush 1 twice the ground of bush 0.
+   *
+   * So the renderer re-rolls, mixing the node's id into the sim's flavour. This
+   * is the right side of the wall for it: how many drawings exist is an atlas
+   * fact, and core/ has to run headless under node with no Phaser in the room,
+   * so it cannot import the table that knows. Widening the constant in world.js
+   * instead would put an art number inside the simulation, where the next art
+   * change silently desyncs it — and would change the world hash for a decision
+   * no peer needs to agree about.
+   *
+   * The mix is a hash rather than `id % n` because nodes are spawned in
+   * spatial runs — a forest is a blob laid down in one pass — and consecutive
+   * ids down a row of trees would march 0,1,2,3,4,5,0,1,2 in a line you can see
+   * from the minimap.
+   */
+  function resourceFrameFor(type, variant, id) {
     const n = RESOURCE_VARIANTS[type];
-    const f = resourceFrame(type, n ? variant % n : 0);
+    const f = resourceFrame(type, n ? mixVariant(variant, id, n) : 0);
     return has(f) ? f : resourceFrame('tree', 0);
+  }
+
+  /** Stable, well-spread pick in [0, n) from two integers. */
+  function mixVariant(variant, id, n) {
+    let h = Math.imul(((variant | 0) + 1), 0x27d4eb2d) ^ Math.imul(id | 0, 0x165667b1);
+    h ^= h >>> 15;
+    h = Math.imul(h, 0x2545f491);
+    h ^= h >>> 13;
+    return (h >>> 0) % n;
   }
 
   // Cached screen<->world affine terms, refreshed whenever the camera moves.
@@ -750,6 +816,7 @@ export function createRenderer(scene, world) {
     markerPool.reset();
     unitPool.reset();
     bldPool.reset();
+    smokePool.reset();
     resPool.reset();
     selPool.reset();
     ghostPool.reset();
@@ -778,6 +845,10 @@ export function createRenderer(scene, world) {
     perfEnd('render.resources', _tRes);
     const _tBld = perfBegin('render.buildings');
     drawBuildings(invZ);
+    // Inside the buildings span rather than beside it: the smoke is one sprite
+    // per smoking building and it is spent on making buildings look alive, so
+    // it belongs against the buildings budget where it will be noticed.
+    drawSmoke(dt);
     perfEnd('render.buildings', _tBld);
     const _tUnits = perfBegin('render.units');
     drawUnits(alpha, invZ);
@@ -798,6 +869,7 @@ export function createRenderer(scene, world) {
     markerPool.trim();
     unitPool.trim();
     bldPool.trim();
+    smokePool.trim();
     resPool.trim();
     selPool.trim();
     ghostPool.trim();
@@ -918,7 +990,7 @@ export function createRenderer(scene, world) {
     const wx = (e.x - e.y) * HALF_W;
     const wy = (e.x + e.y) * HALF_H;
     if (!visible(wx, wy)) return;
-    const frame = resourceFrameFor(e.type, e.variant || 0);
+    const frame = resourceFrameFor(e.type, e.variant || 0, e.id);
     const s = resPool.get();
     setFrame(s, frame, origins);
     s.setPosition(wx, wy);
@@ -1025,6 +1097,53 @@ export function createRenderer(scene, world) {
       if (selected && b.rally && typeof b.rally.x === 'number') {
         rallyLine(b, wx, wy, invZ);
       }
+    }
+  }
+
+  /**
+   * Chimney plumes — the one thing on the map that moves without being told to.
+   *
+   * A second walk of the building list rather than four lines inside
+   * drawBuildings. The list is a few dozen entries against the hundreds of
+   * sprites that pass drives, so the walk is free, and keeping it separate
+   * means the smoke can be moved, muted or depth-ruled differently without
+   * touching the pass that has to get buildings right.
+   *
+   * The plume is an overlay on an unchanged building frame, which is why it is
+   * affordable: the Blacksmith's own drawing keeps the first two puffs at the
+   * flue and this continues upward from where they stop, so the building is
+   * correct with the overlay on and correct with it off. Only two of the four
+   * house drawings have a chimney in CHIMNEY, which is not an oversight — a
+   * street where every roof smokes in step is worse than one where two do.
+   *
+   * Driven by the render clock like the water, and for the same reason: a
+   * paused game with frozen smoke reads as a crash, and no peer has ever had
+   * to agree about a puff of smoke.
+   */
+  function drawSmoke(dt) {
+    smokePhase += dt * SMOKE_FPS;
+    const frame = smokeFrame(smokePhase | 0);
+    const list = world.buildings;
+    for (let i = 0; i < list.length; i++) {
+      const b = list[i];
+      // A half-built forge has no fire in it, and a remembered one is a
+      // snapshot — drawMemory paints the past, and the past holds still.
+      if (b.dead || !b.complete) continue;
+      const v = buildingVariant(b.type, b);
+      const c = CHIMNEY[v ? `${b.type}_v${v}` : b.type];
+      if (!c) continue;
+      if (!litBuilding(b)) continue;
+      const wx = (b.x - b.y) * HALF_W;
+      const wy = (b.x + b.y) * HALF_H;
+      if (!visible(wx, wy)) continue;
+      const s = smokePool.get();
+      setFrame(s, frame, origins);
+      s.setPosition(wx + c.dx, wy + c.dy);
+      // Above its own building and below anything standing a tile in front:
+      // depthFor gives whole tiles sixteen units apart, so a fractional bias
+      // orders the pair without reaching the neighbour.
+      s.setDepth(depthFor(b.x, b.y, 1) + 0.5);
+      s.setScale(c.scale);
     }
   }
 
@@ -1347,7 +1466,7 @@ export function createRenderer(scene, world) {
 
       if (m.kind === 'resource') {
         const s = resPool.get();
-        setFrame(s, resourceFrameFor(m.type, m.variant || 0), origins);
+        setFrame(s, resourceFrameFor(m.type, m.variant || 0, m.id), origins);
         s.setPosition(wx, wy);
         s.setDepth(depthFor(m.x, m.y, 2));
         const left = m.maxAmount ? m.amount / m.maxAmount : 1;

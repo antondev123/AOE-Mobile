@@ -305,9 +305,46 @@ export function terrainFrame(terrainId, variant) {
 export function unitFrame(type, player, back, pose = 'i') {
   return `u_${type}_${player}_${back ? 'b' : 'f'}_${pose}`;
 }
-export function buildingFrame(type, player) {
-  return `b_${type}_${player}`;
+/**
+ * A building's sprite, optionally one of several drawings of the same building.
+ *
+ * THE PROBLEM THIS SOLVES is the one the review put hardest: "eight
+ * pixel-identical red-roofed houses in one frame — same roof, same wall, same
+ * flag in the same corner. This is the frame a player stares at for twenty
+ * minutes." A base is mostly housing, so the house sprite is not one sprite
+ * among forty; it is the *texture of the screen*, and one drawing repeated eight
+ * times reads as wallpaper rather than as a town.
+ *
+ * `variant` is an optional trailing argument and defaults to 0, which returns
+ * exactly the frame name this function has always returned and exactly the
+ * drawing it has always named — so every existing call site keeps working
+ * untouched, and the extra drawings only appear once the renderer starts
+ * passing something. What it should pass is a STABLE PER-ENTITY value, not a
+ * random one: a house that redraws itself as a different house when it leaves
+ * and re-enters the camera is worse than eight identical houses. The building's
+ * id is exactly such a value and it survives a save (`b.id % 4`).
+ *
+ * Types with no variants ignore the argument entirely, so the renderer can pass
+ * a hash unconditionally for every building without a table of its own.
+ */
+export function buildingFrame(type, player, variant = 0) {
+  const n = BUILDING_VARIANTS[type] || 1;
+  const v = n > 1 ? ((variant % n) + n) % n : 0;
+  return v ? `b_${type}_${player}_v${v}` : `b_${type}_${player}`;
 }
+/**
+ * How many drawings exist of each building. Anything absent has exactly one.
+ *
+ * Only the house is here, and that is a budget decision rather than a
+ * preference. A house is a 136x100 frame and there are two players, so each
+ * extra house drawing costs 27k atlas pixels; the atlas is a 2048 sheet with
+ * about 300k pixels of headroom, and three extra houses spend a quarter of what
+ * is left. There is exactly one building the player sees eight of at once, and
+ * this is the one — the Town Center, the Mill and the military halls are
+ * singletons or near enough, and a second drawing of a building you own one of
+ * buys nothing at all.
+ */
+export const BUILDING_VARIANTS = { house: 4 };
 /**
  * A wall segment, keyed by the four-bit neighbour mask from core/world.js
  * (1 = north, 2 = east, 4 = south, 8 = west). Sixteen frames per wall type per
@@ -410,6 +447,50 @@ export function waterFrame(i) {
   return `wa_${i % WATER_ANIM_FRAMES}`;
 }
 export const WATER_ANIM_FRAMES = 4;
+/**
+ * One frame of a chimney plume: smoke rising, spreading and thinning, drawn on
+ * transparency so the renderer can stack it over a building that never moves.
+ *
+ * WHY THIS IS AN OVERLAY AND NOT A SECOND BUILDING FRAME. "Nothing on the map
+ * moves" was a review finding, and the honest fix for a windmill is four bakes
+ * of the whole windmill; for a chimney it is not, because smoke is ADDITIVE.
+ * The Blacksmith's own frame keeps the first two puffs leaving the flue, and
+ * this plume continues upward from where those stop — so the building looks
+ * exactly as it does today with the overlay switched off, and looks alive with
+ * it switched on. That property is what makes it affordable: four frames of
+ * 52x64 is 13k of atlas against the 44k a sail-less second Mill body would
+ * cost, and it needs no fallback path in the renderer at all.
+ *
+ * HOW TO DRIVE IT. One sprite per smoking building, positioned at the entity's
+ * world position plus the offset in CHIMNEY for its type, depth just above the
+ * building, frame `smokeFrame((t * SMOKE_FPS) | 0)`. The four frames are one
+ * full cycle of the plume — puff five is puff one reborn at the flue — so it
+ * loops seamlessly at any speed. SMOKE_FPS is deliberately slow: smoke that
+ * cycles faster than about five frames a second stops reading as drift and
+ * starts reading as a flicker, which is worse than a static plume.
+ */
+export function smokeFrame(i) {
+  return `fx_smoke_${((i % SMOKE_FRAMES) + SMOKE_FRAMES) % SMOKE_FRAMES}`;
+}
+export const SMOKE_FRAMES = 4;
+export const SMOKE_FPS = 4.5;
+/**
+ * Where a plume leaves each building, in pixels from the entity's own world
+ * position — which is the point the renderer already puts the sprite on, so
+ * these are the numbers to add and nothing has to be derived from the frame
+ * box. `scale` is what the plume should be drawn at: a forge flue throws a
+ * column, a cottage hearth throws a wisp, and one frame set at two scales is
+ * cheaper and more consistent than two frame sets.
+ *
+ * Only the Blacksmith is worth turning on by itself; the houses are listed
+ * because a base with two or three of them smoking gently is the difference
+ * between a settlement and a diorama, and they cost nothing extra to add.
+ */
+export const CHIMNEY = {
+  blacksmith: { dx: 4, dy: -134, scale: 1 },
+  house: { dx: 11, dy: -62, scale: 0.5 },      // variant 0
+  house_v2: { dx: -20, dy: -68, scale: 0.45 }, // the two-storey town house
+};
 /** Big soft ellipse used to break up large flat regions at bake time. */
 export const BLOB_FRAME = 'tr_blob';
 
@@ -426,7 +507,32 @@ export const BLOB_FRAME = 'tr_blob';
 // below), so a sheet of grass reads as ground that undulates rather than as one
 // flat sheet with blades stamped on it.
 export const TERRAIN_VARIANTS = [11, 9, 4, 6];
-export const RESOURCE_VARIANTS = { tree: 3, berry: 2, gold: 3, stone: 3 };
+/**
+ * How many drawings there are of each resource node.
+ *
+ * TREES WENT 3 -> 6, and of everything in this file that is the change with the
+ * largest number of instances behind it: a map carries a couple of thousand
+ * trees, they cover more of the screen than every building put together, and
+ * the review's line was "roughly forty trees and about two silhouettes — same
+ * broccoli canopy, same trunk, same hue, same black outline". Three variants
+ * that differed only by a scale factor and a lean were, correctly, two
+ * silhouettes.
+ *
+ * The six are now six *species* rather than six jitters: a round oak, a
+ * conifer, a birch, a low spreading oak, a dead snag and a poplar. Each has its
+ * own frame box, its own trunk, its own green and — the part that actually does
+ * the work — its own outline. A tree costs about 3.5k atlas pixels, a
+ * fortieth of one house, so this is the cheapest variety in the file by a long
+ * way and there was no reason to have been buying so little of it.
+ *
+ * THE ORDER IS LOAD-BEARING. core/world.js currently rolls `variant` as
+ * `floor(rng() * 3)` — a hardcoded 3 — and render.js takes it modulo this
+ * count, so until that is widened only slots 0, 1 and 2 are ever placed on a
+ * map. The three most different silhouettes are therefore in those slots (round
+ * / conifer / birch), so the map gets most of the benefit with no change
+ * outside this file at all, and slots 3-5 come alive the moment the roll does.
+ */
+export const RESOURCE_VARIANTS = { tree: 6, berry: 2, gold: 3, stone: 3 };
 
 /**
  * Scattered ground decals. These are *not* per-tile texture: they are placed
@@ -1490,10 +1596,10 @@ const UNIT_BOX = {
   // contact sheet showed seven columns and six rows of empty pixels on every
   // one of its frames; at forty-four frames per team that emptiness was 23k
   // pixels of atlas, which is most of a monk.)
-  archer: { w: 45, h: 57, cx: 24, ft: 52 },
+  archer: { w: 44, h: 56, cx: 24, ft: 52 },
   // The only unit on the map wider than it is tall. That, not the rider, is what
   // makes cavalry findable in a crowd at 0.7 zoom without reading a label.
-  scout: { w: 61, h: 67, cx: 30, ft: 58 },
+  scout: { w: 60, h: 66, cx: 29, ft: 58 },
   // A machine, not a man: no head, no limbs, no tunic. A player has to know at a
   // glance that the thing crawling at their Town Center cannot be answered by
   // trading blows with it.
@@ -1514,7 +1620,7 @@ const UNIT_BOX = {
   // the scout is a pony with a man in a cap, this is a wall of steel with a
   // lance over it, and the difference has to survive the two of them standing
   // next to each other.
-  knight: { w: 64, h: 74, cx: 32, ft: 62 },
+  knight: { w: 63, h: 71, cx: 31, ft: 62 },
   // Both engines are wider than they are tall and both sit low, like the ram —
   // that is the family they belong to, and the family is the first read. What
   // separates them from each other is the throwing gear on top: the mangonel's
@@ -1538,8 +1644,8 @@ const UNIT_BOX = {
   //
   // The three tops now sit at roughly 40, 52 and 66 pixels above the ground,
   // which is a spread you can see in a thumbnail.
-  mangonel: { w: 70, h: 78, cx: 35, ft: 70 },
-  scorpion: { w: 64, h: 50, cx: 32, ft: 41 },
+  mangonel: { w: 70, h: 77, cx: 35, ft: 69 },
+  scorpion: { w: 64, h: 54, cx: 32, ft: 43 },
   // The narrowest body in the game, and deliberately the plainest: a robe to
   // the ground, a cowl, and both hands on a book. No weapon, no helmet, no
   // shield, nothing on the shoulders — a monk has to read as a non-combatant
@@ -3126,9 +3232,42 @@ function drawMangonel(g, col, dark, back, P) {
   const bx = cx + P.bx;
   const by = ft + P.by;
 
+  // --- WHICH WAY THE MACHINE IS POINTING ------------------------------------
+  //
+  // The review's sharpest line about the siege engines was "the front-row and
+  // back-row contact sheets are identical — an army moving right has its
+  // catapults pointing left", and it was correct: the `back` flag moved a
+  // winch drum and changed a crossbeam's width, which is a detail, not a
+  // facing. A machine is a long rigid object and the ONE thing that says which
+  // way it is going is the direction its long axis lies in.
+  //
+  // In this projection that direction is known exactly. render.js draws the
+  // front sprite for the three facings that come towards the camera and the
+  // back sprite for the three that go away (FACE_BACK/FACE_FLIP there), and
+  // the canonical member of each of those sets is down-right and up-right
+  // respectively — which are the two tile diagonals, one screen pixel of drop
+  // for every two of run. So the chassis rakes DOWN to the right when the
+  // engine is coming at you and UP to the right when it is driving away, and
+  // everything bolted to the chassis rakes with it.
+  //
+  // RAKE is 0.3 rather than the true 0.515 of the tile diagonal, and that is a
+  // frame-box decision rather than a fudge: the full slope drops the tail
+  // wheel thirteen pixels below the foot line, the box has seven, and buying
+  // those six pixels back costs 14k of atlas on thirty-two frames. At 0.3 the
+  // difference between the two drawings is sixteen pixels of attitude across
+  // the machine, which is more than enough to read at play size — the test is
+  // whether the two contact-sheet rows look like the same object, and they no
+  // longer do.
+  const rake = back ? -0.3 : 0.3;
+  /** The y of a point `dx` along the machine from its centre. */
+  const RY = (dx) => by + rake * dx;
+
   // Wheels, spinning with the walk pose — the only way a machine says it moves.
+  // The near wheel sits lower than the far one now, which is the first thing
+  // that says the axle is not parallel to the screen.
   const spin = P.la * 1.6;
-  for (const [wx0, wy0, rr] of [[bx - 21, by - 7, 8], [bx + 19, by - 7, 8.5]]) {
+  for (const [wx0, wy0, rr] of [
+    [bx - 21, RY(-21) - 7, back ? 8.5 : 8], [bx + 19, RY(19) - 7, back ? 8 : 8.5]]) {
     g.fillStyle(OUT, 1);
     g.fillCircle(wx0, wy0, rr + 1.8);
     g.fillStyle(FRAME_D, 1);
@@ -3152,16 +3291,25 @@ function drawMangonel(g, col, dark, back, P) {
   // else. A player has to be able to answer "whose mangonel is that" from the
   // far side of a siege line, and a flag on a mast is exactly the thing that
   // disappears behind the building being knocked down.
+  //
+  // Drawn as a raked parallelogram rather than as a rectangle, because a
+  // rectangle is exactly what made the two facings the same picture.
+  const rail = (x0, x1, top, h) => [
+    { x: bx + x0, y: RY(x0) + top },
+    { x: bx + x1, y: RY(x1) + top },
+    { x: bx + x1, y: RY(x1) + top + h },
+    { x: bx + x0, y: RY(x0) + top + h },
+  ];
   g.fillStyle(FRAME_D, 1);
-  g.fillRect(bx - 26, by - 16, 52, 7);
+  g.fillPoints(rail(-26, 26, -16, 7), true, true);
   g.fillStyle(FRAME, 1);
-  g.fillRect(bx - 26, by - 16, 52, 2.6);
+  g.fillPoints(rail(-26, 26, -16, 2.6), true, true);
   g.lineStyle(2.2, OUT, 1);
-  g.strokeRect(bx - 26, by - 16, 52, 7);
+  g.strokePoints(rail(-26, 26, -16, 7), true, true);
   g.fillStyle(col, 1);
-  g.fillRect(bx - 24, by - 14.6, 48, 4.4);
+  g.fillPoints(rail(-24, 24, -14.6, 4.4), true, true);
   g.fillStyle(dark, 1);
-  g.fillRect(bx - 24, by - 11.4, 48, 1.4);
+  g.fillPoints(rail(-24, 24, -11.4, 1.4), true, true);
 
   // The A-frame uprights that carry the arm's axle, and the axle itself.
   const axX = bx + 2;
@@ -3172,9 +3320,10 @@ function drawMangonel(g, col, dark, back, P) {
   // 40-pixel arm and the whole throwing gear was sliced off by the top of the
   // box in every pose but the wound-up one — invisible in play, obvious the
   // moment the pose sheet was printed, which is what the pose sheet is for.
-  const axY = by - 23;
+  const axY = RY(2) - 23;
   for (const sgn of [-1, 1]) {
-    stick(g, axX + sgn * 11, by - 14, axX, axY, 4.4, sgn > 0 ? FRAME : FRAME_D);
+    stick(g, axX + sgn * 11, RY(2 + sgn * 11) - 14, axX, axY, 4.4,
+      sgn > 0 ? FRAME : FRAME_D);
   }
   g.fillStyle(OUT, 1);
   g.fillCircle(axX, axY, 6);
@@ -3186,17 +3335,19 @@ function drawMangonel(g, col, dark, back, P) {
   // higher — the cheapest honest way to say "further away" in a projection
   // that has no perspective.
   if (back) {
+    const bt = RY(18) - 30;
     g.fillStyle(OUT, 1);
-    g.fillRoundedRect(bx + 14, by - 36, 9, 20, 3);
+    g.fillRoundedRect(bx + 14, bt, 9, 20, 3);
     g.fillStyle(FRAME_D, 1);
-    g.fillRoundedRect(bx + 15.2, by - 34.8, 6.6, 17.6, 2.4);
+    g.fillRoundedRect(bx + 15.2, bt + 1.2, 6.6, 17.6, 2.4);
   } else {
+    const bt = RY(18) - 36;
     g.fillStyle(OUT, 1);
-    g.fillRoundedRect(bx + 12, by - 36, 12, 22, 4);
+    g.fillRoundedRect(bx + 12, bt, 12, 22, 4);
     g.fillStyle(FRAME, 1);
-    g.fillRoundedRect(bx + 13.5, by - 34.5, 9, 19, 3);
+    g.fillRoundedRect(bx + 13.5, bt + 1.5, 9, 19, 3);
     g.fillStyle(0x8a6a3c, 1);
-    g.fillRoundedRect(bx + 13, by - 37, 10, 6, 3);
+    g.fillRoundedRect(bx + 13, bt - 1, 10, 6, 3);
   }
 
   // The twisted skein of rope that powers it: two coils either side of the axle.
@@ -3265,7 +3416,7 @@ function drawMangonel(g, col, dark, back, P) {
     // engine is pointing away: the windlass the crew hauls the arm down with,
     // its rope running up to the arm, and the ratchet pawl on the drum.
     const wx0 = bx - 20;
-    const wy0 = by - 21;
+    const wy0 = RY(-20) - 21;
     g.lineStyle(2.6, OUT, 0.75);
     g.beginPath();
     g.moveTo(wx0, wy0);
@@ -3277,36 +3428,53 @@ function drawMangonel(g, col, dark, back, P) {
     g.lineTo(axX + Math.cos(armA) * 14, axY + Math.sin(armA) * 14);
     g.strokePath();
     g.fillStyle(OUT, 1);
-    g.fillCircle(wx0, wy0, 8.4);
+    g.fillCircle(wx0, wy0, 7.2);
     g.fillStyle(WOOD_D, 1);
-    g.fillCircle(wx0, wy0, 6.8);
+    g.fillCircle(wx0, wy0, 5.8);
     g.fillStyle(shade(WOOD, 0.1), 1);
-    g.fillCircle(wx0 + 1.4, wy0 - 1.6, 3);
-    g.lineStyle(2, STEEL_D, 1);
+    g.fillCircle(wx0 + 1.2, wy0 - 1.4, 2.6);
+    // Three bars across the drum and a crank handle off the side. Without them
+    // this is a brown circle at wheel height and the machine appears to have
+    // grown a third wheel — which is exactly what the first version looked like.
+    g.lineStyle(1.4, OUT, 0.8);
+    for (let k = 0; k < 3; k++) {
+      const a = 0.4 + (Math.PI / 3) * k;
+      g.beginPath();
+      g.moveTo(wx0 - Math.cos(a) * 5.6, wy0 - Math.sin(a) * 5.6);
+      g.lineTo(wx0 + Math.cos(a) * 5.6, wy0 + Math.sin(a) * 5.6);
+      g.strokePath();
+    }
+    g.lineStyle(3.4, OUT, 1);
     g.beginPath();
     g.moveTo(wx0, wy0);
-    g.lineTo(wx0 - 8, wy0 - 7);
+    g.lineTo(wx0 - 9, wy0 - 8);
+    g.strokePath();
+    g.lineStyle(1.8, STEEL_D, 1);
+    g.beginPath();
+    g.moveTo(wx0, wy0);
+    g.lineTo(wx0 - 9, wy0 - 8);
     g.strokePath();
   } else {
     // A rack of spare shot on the chassis, on the near flank.
     for (const [ox, oy] of [[-19, -19], [-12, -19], [-15.5, -25]]) {
       g.fillStyle(OUT, 1);
-      g.fillCircle(bx + ox, by + oy, 5);
+      g.fillCircle(bx + ox, RY(ox) + oy, 5);
       g.fillStyle(0x6f7883, 1);
-      g.fillCircle(bx + ox, by + oy, 4);
+      g.fillCircle(bx + ox, RY(ox) + oy, 4);
       g.fillStyle(0x99a3af, 1);
-      g.fillCircle(bx + ox + 1, by + oy - 1.2, 2);
+      g.fillCircle(bx + ox + 1, RY(ox) + oy - 1.2, 2);
     }
   }
 
   // The masthead pennant, on a staff at the front rail.
-  stick(g, bx + 24, by - 16, bx + 24, by - 44, 1.8, 0x6a5334);
+  const py0 = RY(24);
+  stick(g, bx + 24, py0 - 16, bx + 24, py0 - 44, 1.8, 0x6a5334);
   g.fillStyle(col, 1);
-  g.fillTriangle(bx + 24, by - 44, bx + 35, by - 40.5, bx + 24, by - 37);
+  g.fillTriangle(bx + 24, py0 - 44, bx + 35, py0 - 40.5, bx + 24, py0 - 37);
   g.lineStyle(1.4, OUT, 1);
-  g.strokeTriangle(bx + 24, by - 44, bx + 35, by - 40.5, bx + 24, by - 37);
+  g.strokeTriangle(bx + 24, py0 - 44, bx + 35, py0 - 40.5, bx + 24, py0 - 37);
   g.fillStyle(dark, 1);
-  g.fillTriangle(bx + 24, by - 42, bx + 30, by - 40.4, bx + 24, by - 39);
+  g.fillTriangle(bx + 24, py0 - 42, bx + 30, py0 - 40.4, bx + 24, py0 - 39);
 }
 
 /**
@@ -3333,10 +3501,25 @@ function drawScorpion(g, col, dark, back, P) {
   // mantlet is drawn large. Nothing else about the engine changes — it is the
   // same object from the other side, not a different one.
   const far = back ? 0.72 : 1;
+  // ...and it rakes the other way. See the long note in drawMangonel: the
+  // direction a machine's long axis lies in IS its facing, and both engines
+  // used to lie flat along the screen in both drawings, which is why the two
+  // contact-sheet rows were the same picture. Down-right coming towards you,
+  // up-right driving away.
+  //
+  // The pivot is eight pixels forward of centre rather than at the middle, and
+  // that is arithmetic on the frame box rather than taste: raked about its
+  // centre this engine's tail wheel drops below the bottom of its box in one
+  // drawing and its bow limb rises out of the top in the other. Pivoting where
+  // the mass is keeps both inside a box that only grew by two pixels.
+  const rake = back ? -0.26 : 0.26;
+  const RY = (dx) => by + rake * (dx - 8);
 
   // Two small wheels — a scorpion is a cart, not a siege tower.
   const spin = P.la * 1.8;
-  for (const [wx0, wy0, rr] of [[bx - 16, by - 5.5, 6], [bx + 15, by - 5.5, 6.5]]) { // scorpion
+  for (const [wx0, wy0, rr] of [
+    [bx - 16, RY(-16) - 5.5, back ? 6.5 : 6],
+    [bx + 15, RY(15) - 5.5, back ? 6 : 6.5]]) {
     g.fillStyle(OUT, 1);
     g.fillCircle(wx0, wy0, rr + 1.6);
     g.fillStyle(FRAME_D, 1);
@@ -3356,33 +3539,43 @@ function drawScorpion(g, col, dark, back, P) {
   // the ram's fifty and the mangonel's sixty-five, and that spread is what
   // stops the three of them reading as one cart drawn three times.
   for (const sgn of [-1, 1]) {
-    stick(g, bx + sgn * 13, by - 7, bx + sgn * 5, by - 16, 4, sgn > 0 ? FRAME : FRAME_D);
+    stick(g, bx + sgn * 13, RY(sgn * 13) - 7, bx + sgn * 5, RY(sgn * 5) - 16, 4,
+      sgn > 0 ? FRAME : FRAME_D);
   }
+  // Every long member of this machine is a raked parallelogram now, not a
+  // rectangle: `beam` is the one place that conversion lives.
+  const beam = (x0, x1, top, h) => [
+    { x: bx + x0, y: RY(x0) + top },
+    { x: bx + x1, y: RY(x1) + top },
+    { x: bx + x1, y: RY(x1) + top + h },
+    { x: bx + x0, y: RY(x0) + top + h },
+  ];
   g.fillStyle(FRAME_D, 1);
-  g.fillRect(bx - 16, by - 11, 32, 5);
+  g.fillPoints(beam(-16, 16, -11, 5), true, true);
   g.lineStyle(1.8, OUT, 1);
-  g.strokeRect(bx - 16, by - 11, 32, 5);
+  g.strokePoints(beam(-16, 16, -11, 5), true, true);
 
   // The stock: a squared beam running fore and aft, with the groove on top.
-  const stockY = by - 20;
+  /** The stock's own y at `dx` along it. */
+  const SY = (dx) => RY(dx) - 20;
   g.fillStyle(OUT, 1);
-  g.fillRoundedRect(bx - 21, stockY - 5, 46, 11, 3);
+  g.fillPoints(beam(-21, 25, -25, 11), true, true);
   g.fillStyle(FRAME, 1);
-  g.fillRoundedRect(bx - 19.5, stockY - 3.5, 43, 8, 2.5);
+  g.fillPoints(beam(-19.5, 23.5, -23.5, 8), true, true);
   g.fillStyle(shade(FRAME, 0.2), 1);
-  g.fillRect(bx - 18, stockY - 2.5, 40, 2.4);
+  g.fillPoints(beam(-18, 22, -22.5, 2.4), true, true);
   g.fillStyle(FRAME_D, 1);
-  g.fillRect(bx - 18, stockY - 0.6, 40, 2.2);
+  g.fillPoints(beam(-18, 22, -20.6, 2.2), true, true);
   // The windlass at the back, which is what a crew winds. From behind it is
   // the nearest thing on the machine, so it gets its crank and its rope.
   g.fillStyle(OUT, 1);
-  g.fillCircle(bx - 21, stockY, back ? 7.6 : 6.4);
+  g.fillCircle(bx - 21, SY(-21), back ? 7.6 : 6.4);
   g.fillStyle(WOOD_D, 1);
-  g.fillCircle(bx - 21, stockY, back ? 6.2 : 5);
+  g.fillCircle(bx - 21, SY(-21), back ? 6.2 : 5);
   g.lineStyle(1.8, STEEL_D, 1);
   g.beginPath();
-  g.moveTo(bx - 21, stockY);
-  g.lineTo(bx - 27, stockY - 5);
+  g.moveTo(bx - 21, SY(-21));
+  g.lineTo(bx - 27, SY(-27) - 5);
   g.strokePath();
 
   // --- the bow: the whole read ---------------------------------------------
@@ -3395,7 +3588,7 @@ function drawScorpion(g, col, dark, back, P) {
   // white line beside it is a flagpole, not a weapon, and no amount of detail
   // on the chassis rescued it. A curve is the whole difference.
   const bowX = bx + 11;
-  const bowY = stockY - 2;
+  const bowY = SY(11) - 2;
   const span = 16 * far;
   for (const sgn of [-1, 1]) {
     // A gentle sweep, not a curl. The bulge used to reach eight pixels forward
@@ -3469,7 +3662,7 @@ function drawScorpion(g, col, dark, back, P) {
   // reason.
   const mw = back ? 10.5 : 7;
   const mx = bx - 22;
-  const mTop = stockY - 11;
+  const mTop = SY(-22) - 11;
   const mH = 20;
   // A pavise, not a placard: the top is arched, the bottom is a plain plank
   // rail and there are two iron straps across the face. Those three marks are
@@ -3711,7 +3904,20 @@ function drawMonk(g, col, dark, back, P) {
 // shows up as a bar floating in mid-air.
 const BSPEC = {
   towncenter: { fw: 3, fh: 3, w: 200, h: 236 },
-  house: { fw: 2, fh: 2, w: 136, h: 100 },
+  // Four houses, and each one gets its own frame box because each one is a
+  // different shape — see BUILDING_VARIANTS and drawHouse. `w`/`h` here is
+  // variant 0's box and stays exactly what it always was, so the default
+  // drawing is byte-for-byte the one that shipped.
+  house: {
+    fw: 2,
+    fh: 2,
+    w: 136,
+    h: 100,
+    // Every box is at least 136 wide whatever the building on it does, because
+    // the paved platform under it is the full 2x2 footprint and a narrower box
+    // clips the paving, not the house. Height is the free dimension.
+    vbox: [null, { w: 136, h: 94 }, { w: 136, h: 120 }, { w: 140, h: 102 }],
+  },
   barracks: { fw: 3, fh: 3, wallH: 38, roofH: 24, crenels: true, w: 200, h: 164 },
 
   // --- the six that were falling through to the generic plaster box ----------
@@ -3746,7 +3952,7 @@ const BSPEC = {
   // silently makes the placement ghost disagree with the finished sprite. See
   // assertFootprints(), which now fails the bake if these drift.
   archeryrange: { fw: 3, fh: 3, range: true, w: 200, h: 142 },
-  stable: { fw: 3, fh: 3, stable: true, w: 200, h: 150 },
+  stable: { fw: 3, fh: 3, stable: true, w: 200, h: 142 },
   blacksmith: { fw: 3, fh: 3, smith: true, w: 200, h: 196 },
   siegeworkshop: { fw: 3, fh: 3, siege: true, w: 200, h: 161 },
   university: { fw: 3, fh: 3, university: true, w: 200, h: 193 },
@@ -3853,8 +4059,18 @@ function buildBuildings(put) {
             drawFarm(g, s, ax, ay, col, dark, stage));
         }
       } else {
-        put(buildingFrame(type, p), s.w, s.h, ax, ay, (g) =>
-          drawBuilding(g, type, s, ax, ay, col, dark));
+        // Every variant of a building gets its own box. Sharing one would mean
+        // sizing it for the tallest drawing and then wasting that headroom on
+        // every other — which on the house, the most-repeated frame in the
+        // atlas, is exactly the pixels the variants are being paid for with.
+        const nv = BUILDING_VARIANTS[type] || 1;
+        for (let v = 0; v < nv; v++) {
+          const box = (s.vbox && s.vbox[v]) || s;
+          const vax = box.w / 2;
+          const vay = box.h - 6 - baseHH;
+          put(buildingFrame(type, p, v), box.w, box.h, vax, vay, (g) =>
+            drawBuilding(g, type, s, vax, vay, col, dark, v));
+        }
       }
     }
   }
@@ -3910,13 +4126,13 @@ function platform(g, cx, cy, hw, hh, stepped) {
   return base;
 }
 
-function drawBuilding(g, type, s, cx, cy, col, colDark) {
+function drawBuilding(g, type, s, cx, cy, col, colDark, variant = 0) {
   if (type === 'towncenter') {
     drawTownCenter(g, s, cx, cy, col, colDark);
     return;
   }
   if (type === 'house') {
-    drawHouse(g, s, cx, cy, col, colDark);
+    drawHouse(g, s, cx, cy, col, colDark, variant);
     return;
   }
   if (s.tower) {
@@ -4727,9 +4943,16 @@ function isoDome(g, cx, cyBase, r, h, base) {
   g.strokePath();
 }
 
-/** A curl of smoke leaving a chimney: three shrinking, drifting puffs. */
-function smokeCurl(g, x, y) {
-  for (let k = 0; k < 4; k++) {
+/**
+ * A curl of smoke leaving a chimney: `n` shrinking, drifting puffs.
+ *
+ * `n` defaults to four, which is what every existing caller wants. The
+ * Blacksmith asks for two, because its plume continues into the animated
+ * overlay frames and a tall static curl underneath them would read as two
+ * separate columns of smoke rather than one.
+ */
+function smokeCurl(g, x, y, n = 4) {
+  for (let k = 0; k < n; k++) {
     const t = k / 3;
     const px = x + Math.sin(k * 1.4) * 5 + t * 7;
     const py = y - k * 8 - 3;
@@ -4740,73 +4963,120 @@ function smokeCurl(g, x, y) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// THE THREE MILITARY HALLS, AND WHY THEY ARE NOW THREE SHAPES
+// ---------------------------------------------------------------------------
+//
+// The review was blunt and it was right: "The Archery Range and the Stable are
+// the same building. Same footprint, same roof pitch, same cream wall, same
+// fence run, same grey pad, same banner position. The difference is a ~20px
+// target decal versus a ~20px shape in the doorway. These are the two buildings
+// a player most needs to tell apart. Blacksmith is a third instance of the same
+// shed."
+//
+// Every word of that was true, and the reason is structural rather than lazy:
+// all three were a centred diamond of the same proportions under the same
+// gableRoof, because a centred diamond was the only plan isoBox could make.
+// They could differ in size and in what was glued to them, and that is exactly
+// the class of difference that dies at 0.7 zoom behind a tree.
+//
+// So the three now occupy their 3x3 pad in three incompatible ways. This is the
+// design, and it is deliberately statable in one word each:
+//
+//   ARCHERY RANGE   A BAR. One long narrow hall pushed hard against the far
+//                   edge, two and a half tiles by less than one, with its whole
+//                   front open. Two thirds of the pad is empty ground with a
+//                   shooting line across it and a target butt at the end.
+//                   Long, low, and mostly not there.
+//   STABLE          AN L. Two low ranges meeting at the far corner, with two
+//                   ridges running at right angles to each other — the only
+//                   building in the game whose plan is not convex — wrapped
+//                   round a railed paddock with a horse standing in it.
+//   BLACKSMITH      A POINT. A small square block barely a fifth of the pad,
+//                   with the tallest, thinnest chimney on the map over it and a
+//                   charcoal lean-to beside it. Almost all of its silhouette is
+//                   vertical, and none of it is roof.
+//
+// A bar, an L and a point. Those read as different buildings at thumbnail size,
+// through fog, with half of each behind a tree — which is the test, and which
+// no decal has ever passed.
+//
+// The identifying props all stay (the butt, the horse, the anvil and the forge
+// glow) because they are what confirms the guess the silhouette already made.
+// They are no longer being asked to make it.
+
 /**
- * The Archery Range.
+ * The Archery Range: a bar.
  *
- * A long shed open along its south-east side, a shooting line marked by a low
- * rail, and — the whole read — a straw target butt standing free on the paving
- * where nothing can hide it. Circles are rare in this game and there is nothing
- * else circular at ground level, so the disc is findable before the building it
- * belongs to is.
+ * The hall is a strip along the far edge with no front wall at all — a run of
+ * posts over a band of pure shadow, with bows racked in it. What that buys is
+ * not detail, it is a HOLE: the only other building on the map you can see
+ * daylight through is the Lumber Camp, which is 2x2 and half this length. In
+ * front of it the pad is deliberately, conspicuously empty except for the
+ * shooting line and the butt, because emptiness is a silhouette too, and no
+ * other 3x3 building leaves two thirds of its own paving bare.
  */
 function drawArcheryRange(g, s, cx, cy, col, colDark) {
   const hw = (s.fw + s.fh) * (HALF_W / 2);
   const hh = (s.fw + s.fh) * (HALF_H / 2);
   platform(g, cx, cy, hw, hh, false);
 
-  // The shed, pushed back to the north so the shooting ground is clear in front.
-  const bx = cx - hw * 0.16;
-  const by = cy - hh * 0.34;
-  const iw = hw * 0.7;
-  const ih = hh * 0.7;
-  const wallH = 26;
-  isoBox(g, bx, by, iw, ih, wallH, PLASTER, PLASTER_D, shade(PLASTER, 0.1));
-  timbers(g, bx, by, iw, ih, wallH);
+  // The strip. 2.65 tiles along u, 0.85 across it — the most extreme aspect
+  // ratio of any building in the game, and the whole point of the drawing.
+  const u0 = -1.35;
+  const u1 = 1.3;
+  const v0 = -1.35;
+  const v1 = -0.5;
+  const wallH = 24;
 
-  // The open bay: the south-east wall is a dark run of shadow with posts across
-  // it rather than a plastered face, which is what makes a range look like a
-  // place people shoot out of.
-  const S = { x: bx, y: by + ih };
-  const E = { x: bx + iw, y: by };
+  isoBlock(g, cx, cy, u0, v0, u1, v1, wallH, PLASTER, PLASTER_D, shade(PLASTER, 0.1));
+
+  // The open front: the entire +v face replaced by shadow, with posts standing
+  // in it. Drawn over the block's own wall rather than instead of it, so the
+  // footing line and the outline stay exactly where isoBlock put them.
+  const fW = gpt(cx, cy, u0, v1);
+  const fS = gpt(cx, cy, u1, v1);
+  const bay = [
+    fW, fS, { x: fS.x, y: fS.y - wallH + 4 }, { x: fW.x, y: fW.y - wallH + 4 },
+  ];
   g.fillStyle(0x241d13, 1);
-  g.fillPoints([
-    S, E, { x: E.x, y: E.y - wallH + 4 }, { x: S.x, y: S.y - wallH + 4 },
-  ], true, true);
+  g.fillPoints(bay, true, true);
   g.lineStyle(2, OUT, 1);
-  g.strokePoints([
-    S, E, { x: E.x, y: E.y - wallH + 4 }, { x: S.x, y: S.y - wallH + 4 },
-  ], true, true);
-  for (let k = 1; k <= 3; k++) {
-    const t = k / 4;
-    const px = S.x + (E.x - S.x) * t;
-    const py = S.y + (E.y - S.y) * t;
+  g.strokePoints(bay, true, true);
+  for (let k = 0; k <= 5; k++) {
+    const t = k / 5;
+    const px = fW.x + (fS.x - fW.x) * t;
+    const py = fW.y + (fS.y - fW.y) * t;
     g.fillStyle(WOOD_D, 1);
     g.fillRect(px - 2.4, py - wallH + 3, 4.8, wallH - 3);
     g.lineStyle(1.5, OUT, 1);
     g.strokeRect(px - 2.4, py - wallH + 3, 4.8, wallH - 3);
     rimLine(g, px + 2, py - wallH + 4, px + 2, py - 2, 1.2, 0.35);
   }
-  // Bows and quivers racked in the shadow, just legible.
+  // Bows on the rack, just legible in the shadow between the posts.
   g.lineStyle(2.2, WOOD, 0.9);
-  for (let k = 0; k < 3; k++) {
-    const px = S.x + (E.x - S.x) * (0.2 + k * 0.25);
-    const py = S.y + (E.y - S.y) * (0.2 + k * 0.25);
+  for (let k = 0; k < 4; k++) {
+    const t = 0.13 + k * 0.24;
+    const px = fW.x + (fS.x - fW.x) * t;
+    const py = fW.y + (fS.y - fW.y) * t;
     g.beginPath();
-    g.arc(px + 4, py - wallH * 0.55, 7, -1.1, 1.1, false);
+    g.arc(px + 5, py - wallH * 0.55, 7, -1.1, 1.1, false);
     g.strokePath();
   }
 
-  gableRoof(g, bx, by - wallH, iw * 1.16, ih * 1.16, 20, col, colDark);
+  // A long shallow ridge running the length of the strip. Shallow because a
+  // steep roof on a 2.6-tile building is a barn, and this has to stay low
+  // enough that the Blacksmith's chimney beside it is unmistakably taller.
+  blockRoof(g, cx, cy - wallH, u0, v0, u1, v1, 16, col, colDark, 'u', 0.12);
 
-  // The shooting line: a low rail across the front of the paving.
-  fenceRun(g,
-    { x: cx - hw * 0.72, y: cy + hh * 0.28 },
-    { x: cx + hw * 0.1, y: cy + hh * 0.72 }, false);
+  // The shooting line, straight across the empty ground.
+  fenceRun(g, gpt(cx, cy, -1.25, 0.2), gpt(cx, cy, 0.95, 0.2), false);
 
-  // The butt. A straw roundel on two splayed legs, tilted back a little, with
-  // painted rings and three arrows already in it.
-  const tx = cx + hw * 0.5;
-  const ty = cy + hh * 0.36;
+  // The butt. Still the only circle at ground level in the game, still doing
+  // the confirming — but no longer doing the identifying on its own.
+  const bt = gpt(cx, cy, 0.75, 1.15);
+  const tx = bt.x;
+  const ty = bt.y;
   contactShadow(g, tx, ty + 2, 30, 12, 1);
   g.lineStyle(4.6, OUT, 1);
   g.beginPath();
@@ -4822,152 +5092,222 @@ function drawArcheryRange(g, s, cx, cy, col, colDark) {
   g.moveTo(tx + 8, ty);
   g.lineTo(tx + 2, ty - 20);
   g.strokePath();
-  const R = 19;
+  const R = 18;
   g.fillStyle(OUT, 1);
-  g.fillEllipse(tx, ty - 30, R * 2 + 5, R * 2 + 5);
+  g.fillEllipse(tx, ty - 29, R * 2 + 5, R * 2 + 5);
   g.fillStyle(0xcaa960, 1);
-  g.fillEllipse(tx, ty - 30, R * 2, R * 2);
+  g.fillEllipse(tx, ty - 29, R * 2, R * 2);
   g.fillStyle(lit(0xcaa960), 1);
-  g.fillEllipse(tx - 1.5, ty - 32, R * 1.6, R * 1.6);
-  // The rings. Red and white, the loudest pair in the palette, because this
-  // disc is doing all the identification work at thumbnail size.
+  g.fillEllipse(tx - 1.5, ty - 31, R * 1.6, R * 1.6);
   g.fillStyle(0xf2ece0, 1);
-  g.fillCircle(tx, ty - 30, R * 0.68);
+  g.fillCircle(tx, ty - 29, R * 0.68);
   g.fillStyle(0xc03a34, 1);
-  g.fillCircle(tx, ty - 30, R * 0.44);
+  g.fillCircle(tx, ty - 29, R * 0.44);
   g.fillStyle(0xf2ece0, 1);
-  g.fillCircle(tx, ty - 30, R * 0.2);
+  g.fillCircle(tx, ty - 29, R * 0.2);
   g.lineStyle(2, OUT, 1);
-  g.strokeCircle(tx, ty - 30, R);
+  g.strokeCircle(tx, ty - 29, R);
   g.lineStyle(1.2, OUT, 0.55);
-  g.strokeCircle(tx, ty - 30, R * 0.68);
-  g.strokeCircle(tx, ty - 30, R * 0.44);
-  // Arrows in the butt, coming towards the camera.
+  g.strokeCircle(tx, ty - 29, R * 0.68);
+  g.strokeCircle(tx, ty - 29, R * 0.44);
   for (const [ox, oy] of [[-7, -3], [4, -8], [1, 4]]) {
-    stick(g, tx + ox, ty - 30 + oy, tx + ox - 11, ty - 30 + oy - 4, 1.7, 0xd8b070);
+    stick(g, tx + ox, ty - 29 + oy, tx + ox - 11, ty - 29 + oy - 4, 1.7, 0xd8b070);
     g.fillStyle(0xf2f2f2, 1);
     g.fillTriangle(
-      tx + ox - 11, ty - 30 + oy - 7,
-      tx + ox - 16, ty - 30 + oy - 3,
-      tx + ox - 10, ty - 30 + oy - 1,
+      tx + ox - 11, ty - 29 + oy - 7,
+      tx + ox - 16, ty - 29 + oy - 3,
+      tx + ox - 10, ty - 29 + oy - 1,
     );
   }
+  // A barrel of spare shafts on the shooting line. A loose fan of sticks was
+  // tried first and read as a broom leaning on nothing — anything standing on
+  // open paving needs a base the eye can put on the ground.
+  const bl = gpt(cx, cy, -0.55, 0.45);
+  contactShadow(g, bl.x, bl.y + 1, 18, 8, 0.9);
+  for (let k = -2; k <= 2; k++) {
+    stick(g, bl.x + k * 2, bl.y - 12, bl.x + k * 3.4, bl.y - 30, 1.6, 0xc9a86a);
+    g.fillStyle(0xf2f2f2, 0.9);
+    g.fillTriangle(
+      bl.x + k * 3.4 - 2.5, bl.y - 30,
+      bl.x + k * 3.4 + 2.5, bl.y - 30,
+      bl.x + k * 3.4, bl.y - 35,
+    );
+  }
+  g.fillStyle(OUT, 1);
+  g.fillRect(bl.x - 9, bl.y - 15, 18, 15);
+  g.fillStyle(0x6d4c29, 1);
+  g.fillRect(bl.x - 8, bl.y - 14, 16, 14);
+  g.fillStyle(0x8a6337, 1);
+  g.fillRect(bl.x - 8, bl.y - 14, 6, 14);
+  g.lineStyle(1.6, shade(STEEL_D, -0.2), 0.9);
+  g.beginPath();
+  g.moveTo(bl.x - 8, bl.y - 10);
+  g.lineTo(bl.x + 8, bl.y - 10);
+  g.moveTo(bl.x - 8, bl.y - 4);
+  g.lineTo(bl.x + 8, bl.y - 4);
+  g.strokePath();
 
-  banner(g, cx - hw * 0.78, cy + hh * 0.06, col, colDark, 26);
+  banner(g, cx - hw * 0.8, cy + hh * 0.12, col, colDark, 26);
 }
 
 /**
- * The Stable.
+ * The Stable: an L round a paddock.
  *
- * The widest, lowest roof of the six over a body whose south-east face is one
- * big black stall mouth, with a horse's head and neck coming out of it. A
- * darkness that shape, at that size, is not something any other building has,
- * and the head reads as a head even at twenty pixels. Hay, a water trough and a
- * tie rail finish the yard.
+ * Two low ranges meeting at the north corner, so there are two ridges on this
+ * building and they run at RIGHT ANGLES to each other. That is a thing no other
+ * roof in the game does, it survives to any size, and it is visible from every
+ * direction — unlike a horse's head in a doorway, which is visible from one and
+ * disappears the moment a unit walks in front of the door.
+ *
+ * The rest of the pad is a railed paddock with a horse standing loose in it.
+ * A horse OUTSIDE the building rather than framed in a hole in it is worth far
+ * more: it is on open paving with grass behind it, it is the full animal rather
+ * than a head, and nothing occludes it.
  */
 function drawStable(g, s, cx, cy, col, colDark) {
   const hw = (s.fw + s.fh) * (HALF_W / 2);
   const hh = (s.fw + s.fh) * (HALF_H / 2);
   const HIDE = 0x7c5233;
+  const BOARD = 0xb08c5c; // board-and-batten: a stable is a wooden building
   platform(g, cx, cy, hw, hh, false);
 
-  const bx = cx - hw * 0.08;
-  const by = cy - hh * 0.22;
-  const iw = hw * 0.78;
-  const ih = hh * 0.78;
-  // Tall walls and a tight roof, deliberately, and this is the one measurement
-  // in the building that is not free: the horse's head is the whole read, and a
-  // generous eave overhang — which is what every other building in this file
-  // wears — puts the head behind the roof. Everything below is sized off the
-  // height of the eave above the south corner rather than off the wall.
-  const wallH = 38;
-  isoBox(g, bx, by, iw, ih, wallH, 0xb08c5c, 0xc09b68, shade(0xc09b68, 0.14));
-  // Board-and-batten siding rather than the plaster-and-timber the barracks
-  // family wears: a stable is a wooden building, and the vertical boarding is
-  // the second thing that separates it from its neighbours.
-  g.lineStyle(1.2, 0x7a5a33, 0.7);
-  for (let k = 1; k <= 6; k++) {
-    const t = k / 7;
-    const lx = bx - iw + iw * t;
-    const ly = by + ih * t;
+  const wallH = 25;
+  // Range A, along the far edge; range B comes forward down the shaded side.
+  // Drawn in that order because depth in this projection is u + v and B's
+  // centre is nearer the camera — the same rule every overlapping pair in this
+  // file obeys.
+  const A = { u0: -1.35, v0: -1.35, u1: 0.15, v1: -0.45 };
+  const B = { u0: -1.35, v0: -0.45, u1: -0.45, v1: 1.2 };
+
+  const battens = (r) => {
+    g.lineStyle(1.2, 0x7a5a33, 0.7);
+    for (let k = 1; k <= 7; k++) {
+      const t = k / 8;
+      const p = gpt(cx, cy, r.u0 + (r.u1 - r.u0) * t, r.v1);
+      const q = gpt(cx, cy, r.u1, r.v0 + (r.v1 - r.v0) * t);
+      for (const z of [p, q]) {
+        g.beginPath();
+        g.moveTo(z.x, z.y);
+        g.lineTo(z.x, z.y - wallH);
+        g.strokePath();
+      }
+    }
+  };
+
+  isoBlock(g, cx, cy, A.u0, A.v0, A.u1, A.v1, wallH, BOARD, shade(BOARD, 0.08),
+    shade(BOARD, 0.16));
+  battens(A);
+  // Stall doors along range A's open front: two dark mouths with half-doors.
+  for (const t of [0.24, 0.62]) {
+    const p = gpt(cx, cy, A.u0 + (A.u1 - A.u0) * t, A.v1);
+    g.fillStyle(0x1a140c, 1);
+    g.fillRect(p.x - 9, p.y - wallH + 3, 18, wallH - 3);
+    g.lineStyle(2, OUT, 1);
+    g.strokeRect(p.x - 9, p.y - wallH + 3, 18, wallH - 3);
+    g.fillStyle(WOOD_D, 1);
+    g.fillRect(p.x - 9, p.y - 10, 18, 10);
+    g.lineStyle(1.6, OUT, 1);
+    g.strokeRect(p.x - 9, p.y - 10, 18, 10);
+    rimLine(g, p.x + 8, p.y - 10, p.x + 8, p.y - 1, 1.2, 0.3);
+  }
+  blockRoof(g, cx, cy - wallH, A.u0, A.v0, A.u1, A.v1, 15, col, colDark, 'u', 0.12);
+
+  isoBlock(g, cx, cy, B.u0, B.v0, B.u1, B.v1, wallH, BOARD, shade(BOARD, 0.08),
+    shade(BOARD, 0.16));
+  battens(B);
+  // The tack room door on the wing, facing down-right.
+  const bd = gpt(cx, cy, B.u1, B.v0 + (B.v1 - B.v0) * 0.55);
+  g.fillStyle(0x1a140c, 1);
+  g.fillRect(bd.x - 7, bd.y - wallH + 4, 14, wallH - 4);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRect(bd.x - 7, bd.y - wallH + 4, 14, wallH - 4);
+  blockRoof(g, cx, cy - wallH, B.u0, B.v0, B.u1, B.v1, 15, col, colDark, 'v', 0.12);
+
+  // The paddock: rails along the two pad edges that face the camera.
+  fenceRun(g, gpt(cx, cy, 1.32, -0.4), gpt(cx, cy, 1.32, 1.32), false);
+  fenceRun(g, gpt(cx, cy, 1.32, 1.32), gpt(cx, cy, -0.35, 1.32), false);
+
+  // The horse. Side-on, standing, about thirty pixels nose to tail — big enough
+  // that the animal itself is the read at play zoom, which the old head in a
+  // doorway never was.
+  const h = gpt(cx, cy, 0.75, 0.35);
+  const hx = h.x;
+  const hy = h.y;
+  contactShadow(g, hx, hy, 34, 12, 1);
+  // Legs first, behind the body. Four of them, paired near and far, with the
+  // far pair a shade darker so the animal has depth rather than four sticks in
+  // a row.
+  const legs = [[-9.5, 0], [-6, 1], [6.5, 0], [10, 1]];
+  g.lineStyle(4.6, OUT, 1);
+  g.beginPath();
+  for (const [dx] of legs) {
+    g.moveTo(hx + dx, hy - 17);
+    g.lineTo(hx + dx * 1.1, hy);
+  }
+  g.strokePath();
+  for (const [dx, far] of legs) {
+    g.lineStyle(2.8, far ? shade(HIDE, -0.32) : shade(HIDE, -0.12), 1);
     g.beginPath();
-    g.moveTo(lx, ly);
-    g.lineTo(lx, ly - wallH);
-    g.strokePath();
-    const rx = bx + iw * t;
-    const ry = by + ih - ih * t;
-    g.beginPath();
-    g.moveTo(rx, ry);
-    g.lineTo(rx, ry - wallH);
+    g.moveTo(hx + dx, hy - 17);
+    g.lineTo(hx + dx * 1.1, hy);
     g.strokePath();
   }
-
-  // The stall mouth: a wide arch of pure shadow in the south-east face, and
-  // low enough that the roof cannot swallow what stands in it.
-  const mw = iw * 0.66;
-  const mx = bx + iw * 0.24;
-  const my = by + ih * 0.78;
-  const mH = 26;
-  g.fillStyle(0x1a140c, 1);
-  g.fillPoints([
-    { x: mx - mw * 0.5, y: my + mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 - mH },
-    { x: mx - mw * 0.5, y: my + mw * 0.25 - mH },
-  ], true, true);
-  g.lineStyle(2.4, OUT, 1);
-  g.strokePoints([
-    { x: mx - mw * 0.5, y: my + mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 - mH },
-    { x: mx - mw * 0.5, y: my + mw * 0.25 - mH },
-  ], true, true);
-  // The half-door across the bottom of it.
-  g.fillStyle(WOOD_D, 1);
-  g.fillPoints([
-    { x: mx - mw * 0.5, y: my + mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 - 11 },
-    { x: mx - mw * 0.5, y: my + mw * 0.25 - 11 },
-  ], true, true);
-  g.lineStyle(1.8, OUT, 1);
-  g.strokePoints([
-    { x: mx - mw * 0.5, y: my + mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 },
-    { x: mx + mw * 0.5, y: my - mw * 0.25 - 11 },
-    { x: mx - mw * 0.5, y: my + mw * 0.25 - 11 },
-  ], true, true);
-
-  // The horse, looking out over the half-door. Neck, head, ear, mane, eye —
-  // five marks, and a player reads "stable" from them instantly.
-  const hx = mx + 1;
-  const hy = my - 9;
-  stick(g, hx - 5, hy, hx + 4, hy - 13, 9, HIDE);
-  g.fillStyle(HIDE, 1);
-  g.fillRoundedRect(hx, hy - 21, 15, 9, 4);
-  g.lineStyle(2, OUT, 1);
-  g.strokeRoundedRect(hx, hy - 21, 15, 9, 4);
+  // Barrel, haunch and shoulder as one silhouette. Three overlapping masses
+  // rather than one capsule: a horse drawn as a rounded rectangle on four
+  // sticks is a llama, which is what the first attempt at this looked like, and
+  // the difference is entirely in the round haunch at the back and the
+  // shoulder mass under a neck that comes forward rather than straight up.
+  const body = () => {
+    g.fillRoundedRect(hx - 13, hy - 25, 26, 12, 5);
+    g.fillCircle(hx - 10, hy - 20, 7.5);
+    g.fillCircle(hx + 9, hy - 20.5, 6.8);
+  };
   g.fillStyle(OUT, 1);
-  g.fillTriangle(hx + 2, hy - 21, hx + 4, hy - 27, hx + 6.5, hy - 21);
+  g.lineStyle(3.6, OUT, 1);
+  body();
+  g.fillStyle(HIDE, 1);
+  g.fillRoundedRect(hx - 12.4, hy - 24.4, 24.8, 10.8, 4.4);
+  g.fillCircle(hx - 10, hy - 20, 6.9);
+  g.fillCircle(hx + 9, hy - 20.5, 6.2);
+  g.fillStyle(shade(HIDE, 0.16), 1);
+  g.fillRoundedRect(hx - 10, hy - 24, 20, 4.5, 2.4);
+
+  // Neck forward and up at about forty degrees, and a long head on the end of
+  // it. The angle is the whole animal: vertical reads as a camelid, horizontal
+  // reads as grazing, and forty degrees reads as a horse standing at ease.
+  stick(g, hx + 8, hy - 23, hx + 19, hy - 33, 9, HIDE);
+  g.fillStyle(OUT, 1);
+  g.fillRoundedRect(hx + 16, hy - 39, 17, 9, 4);
+  g.fillStyle(HIDE, 1);
+  g.fillRoundedRect(hx + 17, hy - 38, 15.4, 7.2, 3.2);
+  g.fillStyle(shade(HIDE, -0.25), 1);
+  g.fillRoundedRect(hx + 27, hy - 36.5, 6, 5, 2.4);
+  g.fillStyle(OUT, 1);
+  g.fillTriangle(hx + 17, hy - 38, hx + 18.5, hy - 44, hx + 21.5, hy - 38);
+  // Mane, along the crest of the neck.
   g.lineStyle(3.4, 0x35251a, 1);
   g.beginPath();
-  g.moveTo(hx - 3, hy - 3);
-  g.lineTo(hx + 3, hy - 19);
+  g.moveTo(hx + 8, hy - 26);
+  g.lineTo(hx + 18, hy - 37);
   g.strokePath();
   g.fillStyle(OUT, 1);
-  g.fillCircle(hx + 9, hy - 17.5, 1.5);
-  g.fillStyle(shade(HIDE, 0.3), 1);
-  g.fillEllipse(hx + 13, hy - 15, 4, 3);
-  rimLine(g, hx + 4, hy - 21, hx + 14, hy - 18, 1.4, 0.4);
+  g.fillCircle(hx + 23, hy - 35.5, 1.5);
+  rimLine(g, hx + 19, hy - 38, hx + 31, hy - 35, 1.4, 0.4);
+  // Tail, falling off the haunch.
+  g.lineStyle(5, OUT, 1);
+  g.beginPath();
+  g.moveTo(hx - 14, hy - 24);
+  g.lineTo(hx - 19, hy - 10);
+  g.strokePath();
+  g.lineStyle(3.2, 0x35251a, 1);
+  g.beginPath();
+  g.moveTo(hx - 14, hy - 24);
+  g.lineTo(hx - 19, hy - 10);
+  g.strokePath();
 
-  gableRoof(g, bx, by - wallH, iw * 1.04, ih * 1.04, 22, col, colDark);
-
-  // The yard: a tie rail with a rope over it, a hay bale and a trough.
-  fenceRun(g,
-    { x: cx - hw * 0.8, y: cy + hh * 0.1 },
-    { x: cx - hw * 0.12, y: cy + hh * 0.56 }, false);
-  const hax = cx + hw * 0.52;
-  const hay = cy + hh * 0.5;
+  // Hay and a trough against the wing.
+  const hax = cx - hw * 0.3;
+  const hay = cy + hh * 0.72;
   contactShadow(g, hax, hay + 2, 22, 9, 1);
   g.fillStyle(OUT, 1);
   g.fillRoundedRect(hax - 13, hay - 15, 26, 16, 3);
@@ -4983,16 +5323,21 @@ function drawStable(g, s, cx, cy, col, colDark) {
     g.strokePath();
   }
 
-  banner(g, cx + hw * 0.2, cy + hh * 0.76, col, colDark, 24);
+  banner(g, cx + hw * 0.2, cy - hh * 0.62, col, colDark, 24);
 }
 
 /**
- * The Blacksmith.
+ * The Blacksmith: a point.
  *
- * One tall thin chimney with smoke coming off it, standing over a low stone
- * hut: a vertical spike where every other building of this size is a horizontal
- * mass. The forge mouth glows, which makes it the only building on the map that
- * emits light, and the anvil on its stump outside says what the glow is for.
+ * A small square block — barely a fifth of the paving it stands on — carrying
+ * the tallest, thinnest chimney in the game, with a charcoal lean-to against
+ * its sunward side. Where the Range is horizontal and the Stable is bent, this
+ * is a spike: nearly all of what the eye gets is a vertical line with smoke
+ * coming off it, and there is more empty pad around it than there is building.
+ *
+ * The forge mouth still glows and still throws warm light onto the paving,
+ * which makes this the only building on the map that emits light, and the anvil
+ * on its stump still says what the glow is for.
  */
 function drawBlacksmith(g, s, cx, cy, col, colDark) {
   const hw = (s.fw + s.fh) * (HALF_W / 2);
@@ -5000,50 +5345,84 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
   const BRICK = 0x8d5a44;
   platform(g, cx, cy, hw, hh, false);
 
-  const bx = cx - hw * 0.12;
-  const by = cy - hh * 0.18;
-  const iw = hw * 0.66;
-  const ih = hh * 0.66;
-  const wallH = 30;
-  isoBox(g, bx, by, iw, ih, wallH, STONE, shade(STONE, 0.08), shade(STONE, 0.18));
+  // The charcoal store, first because it stands further from the camera than
+  // the forge block. Four posts and a timber lean-to with a heap of charcoal
+  // under it — open-sided, so it is a dark hole rather than a second mass, and
+  // small enough that it never competes with the chimney. The first version of
+  // this was a stone-roofed shed the size of the forge itself and it read as a
+  // sheet of paper leaning against the building.
+  const cu0 = 0.5;
+  const cu1 = 1.2;
+  const cv0 = -1.15;
+  const cv1 = -0.45;
+  const heap = gpt(cx, cy, (cu0 + cu1) / 2, (cv0 + cv1) / 2 + 0.15);
+  g.fillStyle(0x1c1a19, 1);
+  g.fillEllipse(heap.x, heap.y - 4, 30, 12);
+  g.fillStyle(0x33302d, 1);
+  g.fillEllipse(heap.x + 2, heap.y - 8, 22, 9);
+  g.fillStyle(0x46413a, 0.85);
+  g.fillEllipse(heap.x + 4, heap.y - 11, 10, 4);
+  for (const [pu, pv] of [[cu0, cv0], [cu1, cv0], [cu0, cv1], [cu1, cv1]]) {
+    const p = gpt(cx, cy, pu, pv);
+    g.fillStyle(OUT, 1);
+    g.fillRect(p.x - 3, p.y - 24, 6, 24);
+    g.fillStyle(WOOD_D, 1);
+    g.fillRect(p.x - 2, p.y - 23, 4, 23);
+  }
+  shedRoof(g, cx, cy, cu0, cv0, cu1, cv1, 30, 22, WOOD, WOOD_D, 0.16);
+
+  // The forge block. 1.3 tiles square on a 3-tile pad: the smallest body of any
+  // 3x3 building in the game, and that is the measurement doing the work.
+  const u0 = -0.9;
+  const u1 = 0.4;
+  const v0 = -0.9;
+  const v1 = 0.4;
+  const wallH = 32;
+  isoBlock(g, cx, cy, u0, v0, u1, v1, wallH, STONE, shade(STONE, 0.08),
+    shade(STONE, 0.18));
   // Rubble coursing, not timber framing: the smithy is the one workshop that
   // has to be fireproof, and stone says so without a caption.
+  const cW = gpt(cx, cy, u0, v1);
+  const cS = gpt(cx, cy, u1, v1);
+  const cE = gpt(cx, cy, u1, v0);
   g.lineStyle(1.1, STONE_D, 0.6);
   for (let k = 1; k <= 4; k++) {
-    const y = by - (wallH * k) / 5;
+    const y = (wallH * k) / 5;
     g.beginPath();
-    g.moveTo(bx - iw, y);
-    g.lineTo(bx, y + ih);
-    g.lineTo(bx + iw, y);
+    g.moveTo(cW.x, cW.y - y);
+    g.lineTo(cS.x, cS.y - y);
+    g.lineTo(cE.x, cE.y - y);
     g.strokePath();
   }
-  gableRoof(g, bx, by - wallH, iw * 1.16, ih * 1.16, 17, col, colDark);
+  blockRoof(g, cx, cy - wallH, u0, v0, u1, v1, 13, col, colDark, 'v', 0.1);
 
-  // The forge mouth, low in the south-east wall. Three colours out from the
-  // centre — white, orange, deep red — plus a wash of warm light thrown onto
-  // the paving in front, which is what makes it look lit rather than painted.
-  const fx = bx + iw * 0.34;
-  const fy = by + ih * 0.5;
+  // The forge mouth, low in the shaded wall, with its light on the paving.
+  const fp = gpt(cx, cy, u0 + (u1 - u0) * 0.62, v1);
+  const fx = fp.x;
+  const fy = fp.y;
   g.fillStyle(0xff9a2e, 0.16);
-  g.fillEllipse(fx + 6, fy + 12, 54, 24);
+  g.fillEllipse(fx + 4, fy + 12, 54, 24);
   g.fillStyle(0xffc054, 0.13);
-  g.fillEllipse(fx + 4, fy + 9, 36, 16);
+  g.fillEllipse(fx + 3, fy + 9, 36, 16);
   g.fillStyle(OUT, 1);
-  g.fillRoundedRect(fx - 10, fy - 20, 21, 20, 4);
+  g.fillRoundedRect(fx - 10, fy - 23, 21, 22, 4);
   g.fillStyle(0x5c1c0e, 1);
-  g.fillRoundedRect(fx - 8.5, fy - 18.5, 18, 17, 3);
+  g.fillRoundedRect(fx - 8.5, fy - 21.5, 18, 19, 3);
   g.fillStyle(0xd2431a, 1);
-  g.fillRoundedRect(fx - 6.5, fy - 15, 14, 12, 3);
+  g.fillRoundedRect(fx - 6.5, fy - 17, 14, 13, 3);
   g.fillStyle(0xff9a2e, 1);
-  g.fillEllipse(fx + 0.5, fy - 8.5, 11, 8);
+  g.fillEllipse(fx + 0.5, fy - 10, 11, 8);
   g.fillStyle(0xffe6a0, 1);
-  g.fillEllipse(fx + 0.5, fy - 8.5, 6, 4.4);
+  g.fillEllipse(fx + 0.5, fy - 10, 6, 4.4);
 
-  // The chimney. Deliberately tall, deliberately thin, and deliberately set at
-  // the north corner where nothing overlaps it — this is the silhouette.
-  const chx = bx - iw * 0.42;
-  const chTop = by - ih * 0.4 - wallH - 62;
-  const chBase = by - ih * 0.4 - wallH + 8;
+  // THE CHIMNEY. Set at the shaded corner where nothing overlaps it, and drawn
+  // deliberately narrow: at play zoom this is roughly four pixels wide and
+  // seventy tall, and a four-pixel vertical that clears every roof around it is
+  // findable across a whole base in a way that no wide mass ever is.
+  const cn = gpt(cx, cy, u0 + 0.12, v0 + 0.12);
+  const chx = cn.x;
+  const chBase = cn.y - wallH + 6;
+  const chTop = chBase - 62;
   g.fillStyle(dim(BRICK), 1);
   g.fillRect(chx - 10, chTop, 20, chBase - chTop);
   g.fillStyle(BRICK, 1);
@@ -5052,7 +5431,6 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
   g.fillRect(chx + 4, chTop, 5, chBase - chTop);
   g.lineStyle(2.2, OUT, 1);
   g.strokeRect(chx - 10, chTop, 20, chBase - chTop);
-  // Brick courses, alternating offsets so it reads as masonry.
   g.lineStyle(1, shade(BRICK, -0.3), 0.55);
   for (let k = 1; k * 7 < chBase - chTop; k++) {
     g.beginPath();
@@ -5060,7 +5438,6 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
     g.lineTo(chx + 10, chTop + k * 7);
     g.strokePath();
   }
-  // Corbelled cap.
   g.fillStyle(shade(BRICK, -0.1), 1);
   g.fillRect(chx - 13, chTop - 7, 26, 8);
   g.lineStyle(2, OUT, 1);
@@ -5068,11 +5445,15 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
   g.fillStyle(0x120d08, 1);
   g.fillRect(chx - 8, chTop - 6, 16, 3);
   rimLine(g, chx + 9, chTop - 5, chx + 9, chBase - 2, 1.6, 0.4);
-  smokeCurl(g, chx + 2, chTop - 10);
+  // The first few feet of smoke are baked in, so the building is never a
+  // chimney with nothing coming out of it. Everything above this is the
+  // animated plume — see FX_SMOKE_FRAMES.
+  smokeCurl(g, chx + 2, chTop - 8, 2);
 
   // Anvil on a stump, out on the paving where it cannot be missed.
-  const ax = cx + hw * 0.5;
-  const ay = cy + hh * 0.42;
+  const av = gpt(cx, cy, 1.3, 0.4);
+  const ax = av.x;
+  const ay = av.y;
   contactShadow(g, ax, ay + 1, 22, 9, 1);
   g.fillStyle(0x6b4a28, 1);
   g.fillRect(ax - 8, ay - 12, 16, 12);
@@ -5081,7 +5462,6 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
   g.lineStyle(1.8, OUT, 1);
   g.strokeRect(ax - 8, ay - 12, 16, 12);
   g.strokeEllipse(ax, ay - 12, 16, 6);
-  // The anvil itself: horn, waist, base — the outline everybody knows.
   const anv = [
     { x: ax - 13, y: ay - 20 }, { x: ax + 9, y: ay - 20 },
     { x: ax + 14, y: ay - 17.5 }, { x: ax + 8, y: ay - 16 },
@@ -5095,14 +5475,27 @@ function drawBlacksmith(g, s, cx, cy, col, colDark) {
   g.strokePoints(anv, true, true);
   g.fillStyle(STEEL, 1);
   g.fillRect(ax - 12, ay - 19.5, 20, 2.4);
-  // A hammer left leaning against it.
   stick(g, ax - 16, ay - 1, ax - 9, ay - 18, 2.2, WOOD);
   g.fillStyle(STEEL_D, 1);
   g.fillRoundedRect(ax - 13, ay - 24, 10, 5, 1.6);
   g.lineStyle(1.4, OUT, 1);
   g.strokeRoundedRect(ax - 13, ay - 24, 10, 5, 1.6);
 
-  banner(g, cx - hw * 0.74, cy + hh * 0.16, col, colDark, 26);
+  // The slack tub, standing well clear of the anvil.
+  const st = gpt(cx, cy, -0.5, 1.2);
+  contactShadow(g, st.x, st.y + 1, 16, 7, 0.9);
+  g.fillStyle(OUT, 1);
+  g.fillRect(st.x - 8, st.y - 13, 16, 13);
+  g.fillStyle(0x5f4426, 1);
+  g.fillRect(st.x - 7, st.y - 12, 14, 12);
+  g.fillStyle(0x7c5a30, 1);
+  g.fillRect(st.x - 7, st.y - 12, 5, 12);
+  g.fillStyle(0x3f5a63, 1);
+  g.fillEllipse(st.x, st.y - 12.5, 14, 5.5);
+  g.lineStyle(1.5, OUT, 1);
+  g.strokeEllipse(st.x, st.y - 12.5, 14, 5.5);
+
+  banner(g, cx - hw * 0.78, cy + hh * 0.1, col, colDark, 26);
 }
 
 /**
@@ -5736,11 +6129,65 @@ function mast(g, x, y, col, colDark, h) {
 // breaks the "one continuous mass of identical roofs" the reviewer hit, and
 // the whole thing is 25px shorter than it was.
 
-function drawHouse(g, s, cx, cy, col, colDark) {
+// ---------------------------------------------------------------------------
+// THE FOUR HOUSES
+// ---------------------------------------------------------------------------
+//
+// "Eight pixel-identical red-roofed houses in one frame — same roof, same wall,
+// same flag in the same corner. This is the frame a player stares at for twenty
+// minutes." That is the whole brief, and it is worth being precise about why
+// one house drawing is a worse problem than one Blacksmith drawing: a base has
+// one Blacksmith and eight houses, so the house sprite is not an object on the
+// screen, it is the screen's TEXTURE. Repetition at that density stops reading
+// as "several of the same building" and starts reading as a tiled background,
+// which is the exact impression the review reported.
+//
+// FOUR THINGS VARY, and they are listed in the order the eye notices them.
+// Anything further down this list, on its own, is invisible at 0.7 zoom:
+//
+//   1. THE ROOFLINE. Which way the ridge runs, and whether there is a ridge at
+//      all. v0's ridge runs down-left to up-right; v1's runs the other way, so
+//      the two are mirror images in the one line that dominates a small
+//      building's silhouette. v2 is two storeys and v3 has two roofs at
+//      different heights. Nothing else changes an outline this much.
+//   2. THE HEIGHT AND FOOTPRINT. 60px, 48px, 80px and 57px of building above
+//      the ground line, over a square, a long strip, a narrow tower and an L.
+//      A row of these has a skyline; a row of v0 has a comb.
+//   3. THE ROOF MATERIAL, and this is where team colour gets rebudgeted. Two of
+//      the four keep a fully team-coloured roof, so ownership is still instant
+//      at a glance; the other two wear thatch and terracotta and carry their
+//      team colour on a gable board, a door, shutters and a banner instead. A
+//      base of eight then reads as a settlement with a couple of painted roofs
+//      in it, rather than as one continuous sheet of blue.
+//   4. THE CLUTTER, and where the flag is. A woodpile, a water butt, a hand
+//      cart, a garden fence — and the banner in a different corner on each,
+//      because "same flag in the same corner" was called out by name.
+//
+// WHAT DOES NOT VARY: the plaster, the timber, the light, the outline weights
+// and the paving. Four houses that share materials read as one village. Four
+// houses that share nothing read as four games.
+
+/** Straw. Warm, desaturated, and deliberately not near any team colour. */
+const THATCH = 0xc9a961;
+const THATCH_D = 0x8f7338;
+/** Fired clay. The Town Center's roof tile, reused so the palette stays small. */
+const CLAY = 0xb9683a;
+const CLAY_D = 0x81421f;
+
+function drawHouse(g, s, cx, cy, col, colDark, variant = 0) {
   const hw = (s.fw + s.fh) * (HALF_W / 2);
   const hh = (s.fw + s.fh) * (HALF_H / 2);
   platform(g, cx, cy, hw, hh, false);
 
+  if (variant === 1) { drawHouseLong(g, cx, cy, hw, hh, col, colDark); return; }
+  if (variant === 2) { drawHouseTall(g, cx, cy, hw, hh, col, colDark); return; }
+  if (variant === 3) { drawHouseFarm(g, cx, cy, hw, hh, col, colDark); return; }
+
+  // --- variant 0: the timber-framed cottage --------------------------------
+  //
+  // Unchanged, on purpose. It is the house every screenshot of this game has in
+  // it and the one the other three are read against, so it is the one that must
+  // not move; the variety is bought by adding, not by rewriting.
   const iw = hw * 0.76;
   const ih = hh * 0.76;
   const wallH = 22;
@@ -5755,6 +6202,309 @@ function drawHouse(g, s, cx, cy, col, colDark) {
 
   gableRoof(g, cx, cy - wallH, iw * 1.14, ih * 1.14, 20, col, colDark);
   banner(g, cx + iw * 0.85, cy + 3, col, colDark, 18);
+}
+
+/**
+ * Variant 1: the thatched longhouse.
+ *
+ * A strip rather than a square — two and a bit tiles along the grid's u axis
+ * and barely one across it — under a shallow thatch roof whose ridge therefore
+ * runs the OTHER WAY from variant 0's. That is the single most valuable thing
+ * in this drawing: on a 40-pixel building the ridge is the longest straight
+ * line in the silhouette, and two buildings whose longest line goes in opposite
+ * directions can never be confused, however similar everything else is.
+ *
+ * It is also the lowest of the four by fifteen pixels, and it wears no team
+ * colour on the roof at all. Ownership is carried by the painted gable board
+ * across the sunward end — a strip of colour up in the roofline where nothing
+ * occludes it — plus the door and a banner at the low end.
+ */
+function drawHouseLong(g, cx, cy, hw, hh, col, colDark) {
+  const u0 = -0.98;
+  const u1 = 0.9;
+  const v0 = -0.46;
+  const v1 = 0.4;
+  const wallH = 18;
+  const DAUB = 0xdccaa4; // mud daub: yellower and dirtier than town plaster
+
+  isoBlock(g, cx, cy, u0, v0, u1, v1, wallH, DAUB, shade(DAUB, 0.04), shade(DAUB, 0.1));
+  // Cruck framing: heavy curved timbers at intervals down the long wall, which
+  // is what a building of this age and shape actually looks like and, more
+  // usefully, what stops a long blank wall from reading as a shipping crate.
+  for (let k = 0; k <= 3; k++) {
+    const u = u0 + ((u1 - u0) * k) / 3;
+    const a = gpt(cx, cy, u, v1);
+    g.lineStyle(3, WOOD_D, 0.85);
+    g.beginPath();
+    g.moveTo(a.x, a.y);
+    g.lineTo(a.x, a.y - wallH);
+    g.strokePath();
+  }
+  // The door: a black opening with a painted lintel over it. A team-coloured
+  // door *panel* was tried first and at play size it read as a flag someone had
+  // dropped against the wall — a saturated rectangle in the middle of a pale
+  // wall is a shape, not a door. A dark hole with a coloured beam above it is
+  // both, and it costs the same eight pixels of colour.
+  const d = gpt(cx, cy, (u0 + u1) * 0.5 + 0.1, v1);
+  g.fillStyle(0x1d160e, 1);
+  g.fillRect(d.x - 5, d.y - wallH + 3, 10, wallH - 3);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeRect(d.x - 5, d.y - wallH + 3, 10, wallH - 3);
+  g.fillStyle(colDark, 1);
+  g.fillRect(d.x - 7, d.y - wallH + 0.5, 14, 4);
+  g.fillStyle(col, 1);
+  g.fillRect(d.x - 7, d.y - wallH + 0.5, 14, 2.4);
+  g.lineStyle(1.4, OUT, 1);
+  g.strokeRect(d.x - 7, d.y - wallH + 0.5, 14, 4);
+
+  const R = blockRoof(g, cx, cy - wallH, u0, v0, u1, v1, 16,
+    THATCH, THATCH_D, 'u', 0.09);
+  // Thatch is not tiles: it wants a thick soft ridge rather than a capped one,
+  // and a couple of tufts breaking the line. Drawn over blockRoof's ridge cap.
+  g.lineStyle(7, OUT, 0.9);
+  g.beginPath();
+  g.moveTo(R.R0.x, R.R0.y + 1);
+  g.lineTo(R.R1.x, R.R1.y + 1);
+  g.strokePath();
+  g.lineStyle(4.6, THATCH_D, 1);
+  g.beginPath();
+  g.moveTo(R.R0.x, R.R0.y + 1);
+  g.lineTo(R.R1.x, R.R1.y + 1);
+  g.strokePath();
+  g.lineStyle(2, mix(THATCH, RIM, 0.3), 0.8);
+  g.beginPath();
+  g.moveTo(R.R0.x + 1, R.R0.y);
+  g.lineTo(R.R1.x - 1, R.R1.y);
+  g.strokePath();
+  // Moss along the eave of the shaded slope, where rain sits. One green stain
+  // on a straw roof does more for "somebody lives here" than any amount of
+  // extra thatch texture, but it has to be at the edge — in the middle of the
+  // plane it reads as a hole in the drawing, which is what the first try was.
+  g.fillStyle(0x5f7340, 0.4);
+  g.fillEllipse(cx - 26, cy - wallH - 3, 26, 6);
+
+  // The painted bargeboards on the sunward gable: this house's whole allowance
+  // of team colour, carried as two strokes down the rake of the roof rather
+  // than as a field. Up in the roofline, where in a packed base nothing stands
+  // in front of it — and the reason this variant can afford to wear thatch.
+  const gE = gpt(cx, cy - wallH, u1 + 0.09, v0 - 0.09);
+  const gS = gpt(cx, cy - wallH, u1 + 0.09, v1 + 0.09);
+  const apex = { x: (gE.x + gS.x) / 2, y: (gE.y + gS.y) / 2 - 16 };
+  g.lineStyle(5, OUT, 1);
+  g.beginPath();
+  g.moveTo(gE.x, gE.y);
+  g.lineTo(apex.x, apex.y);
+  g.lineTo(gS.x, gS.y);
+  g.strokePath();
+  g.lineStyle(3, col, 1);
+  g.beginPath();
+  g.moveTo(gE.x, gE.y);
+  g.lineTo(apex.x, apex.y);
+  g.lineTo(gS.x, gS.y);
+  g.strokePath();
+  g.lineStyle(1.2, shade(col, 0.35), 0.7);
+  g.beginPath();
+  g.moveTo(gE.x - 1, gE.y - 1);
+  g.lineTo(apex.x, apex.y - 2);
+  g.strokePath();
+
+  // A woodpile against the shaded end, and the flag at the far corner — a
+  // different corner from every other variant.
+  const wx = cx - hw * 0.66;
+  const wy = cy + hh * 0.3;
+  contactShadow(g, wx, wy + 1, 22, 9, 0.9);
+  for (let r = 0; r < 3; r++) {
+    for (let k = 0; k < 4 - r; k++) {
+      const px = wx - 8 + k * 5.4 + r * 2.7;
+      const py = wy - 4 - r * 5;
+      g.fillStyle(OUT, 1);
+      g.fillCircle(px, py, 3.2);
+      g.fillStyle(0x7d5a30, 1);
+      g.fillCircle(px, py, 2.4);
+      g.fillStyle(0xc2a06a, 1);
+      g.fillCircle(px + 0.5, py - 0.6, 1.2);
+    }
+  }
+  banner(g, cx - 6, cy + hh * 0.86, col, colDark, 20);
+}
+
+/**
+ * Variant 2: the two-storey town house.
+ *
+ * The tall one. A narrow plan — barely one tile square — carrying two storeys
+ * with the upper one JETTIED out over the lower, which puts a step in the
+ * silhouette halfway up that nothing else in the game has. Roofed in fired
+ * clay, steeply, so the outline is a narrow spike rather than a wide tent.
+ *
+ * This is the variant that gives a row of houses a skyline. Eight copies of
+ * variant 0 are eight identical bumps; two or three of these among them and the
+ * base has a shape. Its team colour is on the shutters, the door and a banner
+ * carried high on the jetty, where in a packed base it clears the roofs of its
+ * neighbours — which is more visible ownership than variant 0's roof gets once
+ * something is built in front of it.
+ */
+function drawHouseTall(g, cx, cy, hw, hh, col, colDark) {
+  const a = 0.5;   // ground floor
+  const b = 0.63;  // the jetty overhangs it
+  const h1 = 21;
+  const h2 = 20;
+
+  isoBlock(g, cx, cy, -a, -a, a, a, h1, PLASTER_D, PLASTER, shade(PLASTER, 0.08));
+  // Ground floor in exposed stone: a town house has a rubble base and a timber
+  // top, and the two materials stacked are half of why it reads as two storeys
+  // rather than as one tall box.
+  g.lineStyle(1, STONE_D, 0.5);
+  for (let k = 1; k <= 3; k++) {
+    const y = cy - (h1 * k) / 4;
+    g.beginPath();
+    g.moveTo(cx - a * 2 * HALF_W, y);
+    g.lineTo(cx, y + a * 2 * HALF_H);
+    g.lineTo(cx + a * 2 * HALF_W, y);
+    g.strokePath();
+  }
+  // The door, deep in the shadow of the jetty above it.
+  const dS = gpt(cx, cy, a, a);
+  g.fillStyle(0x241d13, 1);
+  g.fillRoundedRect(dS.x - 6, dS.y - h1 + 1, 12, h1 - 1, 2.5);
+  g.fillStyle(WOOD_D, 1);
+  g.fillRoundedRect(dS.x - 5, dS.y - h1 + 2, 10, h1 - 2, 2);
+  g.fillStyle(col, 1);
+  g.fillRect(dS.x - 3.6, dS.y - h1 + 3.2, 7.2, h1 - 5);
+
+  // The jetty. Drawn as a block whose ground plane is the top of the first
+  // storey, then the joist ends that carry it picked out underneath — those
+  // five dark ticks are what say "this floor is hanging in the air".
+  const upper = isoBlock(g, cx, cy - h1, -b, -b, b, b, h2,
+    PLASTER, shade(PLASTER, 0.06), shade(PLASTER, 0.12));
+  timbers(g, cx, cy - h1, b * 2 * HALF_W, b * 2 * HALF_H, h2);
+  g.fillStyle(shade(WOOD_D, -0.2), 1);
+  for (let k = 1; k <= 4; k++) {
+    const t = k / 5;
+    const p = { x: upper.W.x + (upper.S.x - upper.W.x) * t, y: upper.W.y + (upper.S.y - upper.W.y) * t };
+    const q = { x: upper.S.x + (upper.E.x - upper.S.x) * t, y: upper.S.y + (upper.E.y - upper.S.y) * t };
+    g.fillRect(p.x - 2, p.y - 1, 4, 4);
+    g.fillRect(q.x - 2, q.y - 1, 4, 4);
+  }
+
+  // Shuttered windows on the jetty, in team colour. Small, high, and repeated —
+  // three of them together carry more ownership than one big painted panel and
+  // cost a fraction of the sprite.
+  for (const t of [0.3, 0.7]) {
+    const p = gpt(cx, cy - h1, -b + b * 2 * t, b);
+    g.fillStyle(OUT, 1);
+    g.fillRect(p.x - 6, p.y - h2 + 4, 12, 9);
+    g.fillStyle(0x2b2116, 1);
+    g.fillRect(p.x - 4.8, p.y - h2 + 5, 9.6, 7);
+    g.fillStyle(col, 1);
+    g.fillRect(p.x - 6, p.y - h2 + 4, 2.6, 9);
+    g.fillRect(p.x + 3.4, p.y - h2 + 4, 2.6, 9);
+    g.lineStyle(1.4, OUT, 1);
+    g.strokeRect(p.x - 6, p.y - h2 + 4, 12, 9);
+  }
+
+  blockRoof(g, cx, cy - h1 - h2, -b, -b, b, b, 22, CLAY, CLAY_D, 'v', 0.1);
+  // Chimney against the shaded slope, tall and thin.
+  g.fillStyle(0x8a6a55, 1);
+  g.fillRect(cx - 24, cy - h1 - h2 - 24, 7, 18);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokeRect(cx - 24, cy - h1 - h2 - 24, 7, 18);
+  g.fillStyle(0x5f483a, 1);
+  g.fillRect(cx - 25.4, cy - h1 - h2 - 27, 9.8, 3);
+
+  banner(g, cx + b * 2 * HALF_W - 2, cy - h1 + 4, col, colDark, 22);
+}
+
+/**
+ * Variant 3: the farmstead.
+ *
+ * An L: a gabled house along one grid axis with a lower lean-to byre along the
+ * other, wrapping a yard. This is the only house in the set whose FOOTPRINT is
+ * not convex, and a plan with a notch in it is unmistakable from above at any
+ * size — it is also the one that makes a cluster of houses look like a village
+ * that grew rather than a row that was placed.
+ *
+ * It keeps a fully team-coloured roof on the main range, so that between this
+ * and variant 0 half of any group of houses still shouts whose they are.
+ */
+function drawHouseFarm(g, cx, cy, hw, hh, col, colDark) {
+  // The main range, across the back.
+  const mu0 = -0.98;
+  const mu1 = 0.2;
+  const mv0 = -0.95;
+  const mv1 = -0.05;
+  const wallH = 17;
+  // The byre wing, coming forward down the shaded side. Drawn after the main
+  // range because it is nearer the camera: in this projection depth is u+v, and
+  // every pair of overlapping pieces in this file is ordered by it.
+  const bu0 = -0.98;
+  const bu1 = -0.24;
+  const bv0 = -0.05;
+  const bv1 = 0.82;
+
+  isoBlock(g, cx, cy, mu0, mv0, mu1, mv1, wallH, PLASTER, PLASTER_D, shade(PLASTER, 0.1));
+  const mS = gpt(cx, cy, mu1, mv1);
+  const mW = gpt(cx, cy, mu0, mv1);
+  g.lineStyle(2.4, WOOD_D, 0.85);
+  for (let k = 1; k <= 3; k++) {
+    const t = k / 4;
+    const p = { x: mW.x + (mS.x - mW.x) * t, y: mW.y + (mS.y - mW.y) * t };
+    g.beginPath();
+    g.moveTo(p.x, p.y);
+    g.lineTo(p.x, p.y - wallH);
+    g.strokePath();
+  }
+  const md = gpt(cx, cy, mu1 - 0.3, mv1);
+  g.fillStyle(WOOD_D, 1);
+  g.fillRoundedRect(md.x - 5, md.y - wallH + 2, 10, wallH - 3, 2);
+  g.lineStyle(1.7, OUT, 1);
+  g.strokeRoundedRect(md.x - 5, md.y - wallH + 2, 10, wallH - 3, 2);
+  blockRoof(g, cx, cy - wallH, mu0, mv0, mu1, mv1, 12, col, colDark, 'u', 0.13);
+
+  // The byre: lower walls, a mono-pitch roof in thatch, and open at the front
+  // so there is a dark bay in the middle of the house. That hole is worth as
+  // much to the silhouette as the L is.
+  const byreH = 13;
+  isoBlock(g, cx, cy, bu0, bv0, bu1, bv1, byreH,
+    shade(PLASTER, -0.06), PLASTER_D, shade(PLASTER, 0.06));
+  const oS = gpt(cx, cy, bu1, bv1);
+  const oE = gpt(cx, cy, bu1, bv0);
+  g.fillStyle(0x241d13, 1);
+  g.fillPoints([
+    oS, oE, { x: oE.x, y: oE.y - byreH + 2 }, { x: oS.x, y: oS.y - byreH + 2 },
+  ], true, true);
+  g.lineStyle(1.8, OUT, 1);
+  g.strokePoints([
+    oS, oE, { x: oE.x, y: oE.y - byreH + 2 }, { x: oS.x, y: oS.y - byreH + 2 },
+  ], true, true);
+  shedRoof(g, cx, cy, bu0, bv0, bu1, bv1, byreH + 12, byreH + 1,
+    THATCH, THATCH_D, 0.14);
+
+  // The yard: a water butt under the eaves and a hand cart tipped on its shafts.
+  const bx = cx + hw * 0.3;
+  const by = cy + hh * 0.42;
+  contactShadow(g, bx, by + 1, 16, 7, 0.9);
+  g.fillStyle(OUT, 1);
+  g.fillRect(bx - 7, by - 14, 14, 14);
+  g.fillStyle(0x6d4c29, 1);
+  g.fillRect(bx - 6, by - 13, 12, 13);
+  g.fillStyle(0x8a6337, 1);
+  g.fillRect(bx - 6, by - 13, 5, 13);
+  g.fillStyle(0x4c6d7a, 1);
+  g.fillEllipse(bx, by - 13.5, 12, 5);
+  g.lineStyle(1.6, OUT, 1);
+  g.strokeEllipse(bx, by - 13.5, 12, 5);
+  g.lineStyle(1.4, STEEL_D, 0.9);
+  g.beginPath();
+  g.moveTo(bx - 6, by - 9);
+  g.lineTo(bx + 6, by - 9);
+  g.moveTo(bx - 6, by - 3);
+  g.lineTo(bx + 6, by - 3);
+  g.strokePath();
+
+  fenceRun(g,
+    { x: cx + hw * 0.06, y: cy + hh * 0.72 },
+    { x: cx + hw * 0.74, y: cy + hh * 0.26 }, true);
+  banner(g, cx - hw * 0.5, cy + hh * 0.56, col, colDark, 22);
 }
 
 /**
@@ -6135,6 +6885,261 @@ function timbers(g, cx, cy, hw, hh, h) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// RECTANGULAR MASS: buildings that are not square
+// ---------------------------------------------------------------------------
+//
+// Every drawn building in this file up to now has been a diamond: isoBox takes
+// a half-width and a half-height and produces a plan that is always SQUARE in
+// grid terms, because the only thing that can vary is how big the diamond is.
+// That single limitation is most of why the Archery Range, the Stable and the
+// Blacksmith were "the same shed three times" — they could differ in how much
+// of the pad they filled and in what was stuck on top, but never in their
+// PROPORTION, and proportion is the first thing the eye reads and the last
+// thing that survives being shrunk.
+//
+// The review was precise about it: "the difference is a ~20px target decal
+// versus a ~20px shape in the doorway. These are the two buildings a player
+// most needs to tell apart." A decal cannot fix that, and neither can a colour.
+// What fixes it is a long low hall being a genuinely different SHAPE from an
+// L-shaped yard, which is a genuinely different shape from a small block with a
+// tall stack on it — and all three of those need a plan that is a rectangle of
+// arbitrary aspect, placed anywhere on the pad, rather than a centred diamond.
+//
+// So: footprint-local coordinates. (u, v) are tiles along the grid's two axes,
+// measured from the building's centre, so a 3x3 pad spans u and v in
+// [-1.5, +1.5] and a piece of building is a rectangle in that space. `gpt`
+// converts one to screen pixels, and everything below is written in terms of it.
+//
+// WHICH FACES ARE VISIBLE, once and for all, so nothing has to work it out
+// again: the camera is south of the map, so the two faces of any block that
+// can be seen are the one pointing along +u (down-RIGHT on screen, and toward
+// the sun, so it takes the key) and the one pointing along +v (down-LEFT, away
+// from the sun, so it takes the drop and the sky-blue shift). That is exactly
+// the split isoBox already uses; these helpers keep it.
+
+/** A footprint-local grid point (u, v in tiles from the centre) in pixels. */
+function gpt(cx, cy, u, v) {
+  return { x: cx + (u - v) * HALF_W, y: cy + (u + v) * HALF_H };
+}
+
+/**
+ * A rectangular block standing on the footprint, from grid corner (u0, v0) to
+ * (u1, v1), `h` pixels tall.
+ *
+ * The isoBox that already exists is this function with u0 = v0 = -a and
+ * u1 = v1 = a; it is kept as it is because a dozen buildings call it and its
+ * shading has been tuned against real screenshots, and this is the same shading
+ * with the square constraint lifted.
+ */
+function isoBlock(g, cx, cy, u0, v0, u1, v1, h, faceL, faceR, top) {
+  const N = gpt(cx, cy, u0, v0);
+  const E = gpt(cx, cy, u1, v0);
+  const S = gpt(cx, cy, u1, v1);
+  const W = gpt(cx, cy, u0, v1);
+  const up = (p) => ({ x: p.x, y: p.y - h });
+
+  const left = [W, S, up(S), up(W)];     // faces +v: away from the sun
+  const right = [S, E, up(E), up(S)];    // faces +u: into the sun
+  const roof = [up(N), up(E), up(S), up(W)];
+
+  g.fillStyle(dim(faceL), 1);
+  g.fillPoints(left, true, true);
+  g.fillStyle(lit(faceR), 1);
+  g.fillPoints(right, true, true);
+  g.fillStyle(mix(top, SKY, 0.1), 1);
+  g.fillPoints(roof, true, true);
+
+  // Value grading up both walls — darkest at the footing, where least sky
+  // reaches them. Four bands, because Graphics has no gradient fill.
+  for (let k = 0; k < 4; k++) {
+    const t0 = (k / 4) * h;
+    const t1 = ((k + 1) / 4) * h;
+    g.fillStyle(0x1a1a24, 0.09 * (1 - k / 4));
+    const band = (a, b) => g.fillPoints([
+      { x: a.x, y: a.y - t0 }, { x: b.x, y: b.y - t0 },
+      { x: b.x, y: b.y - t1 }, { x: a.x, y: a.y - t1 },
+    ], true, true);
+    band(W, S);
+    band(S, E);
+  }
+  // Occlusion down the inside corner where the two visible walls meet.
+  g.lineStyle(6, 0x171a22, 0.14);
+  g.beginPath();
+  g.moveTo(S.x, S.y);
+  g.lineTo(S.x, S.y - h);
+  g.strokePath();
+
+  outline(g, false, 2.2);
+  g.strokePoints(left, true, true);
+  g.strokePoints(roof, true, true);
+  outline(g, true, 2.2);
+  g.strokePoints(right, true, true);
+  outline(g, false, 2.2);
+  g.beginPath();
+  g.moveTo(W.x, W.y);
+  g.lineTo(S.x, S.y);
+  g.lineTo(E.x, E.y);
+  g.moveTo(S.x, S.y);
+  g.lineTo(S.x, S.y - h);
+  g.strokePath();
+  rimLine(g, E.x - 1, E.y - h + 1, S.x, S.y - h + 1, 1.8, 0.4);
+  rimLine(g, E.x - 1, E.y - h + 2, E.x - 1, E.y - 2, 1.6, 0.32);
+  return { N, E, S, W, up };
+}
+
+/**
+ * A ridge roof over a rectangular block, with the ridge running along whichever
+ * grid axis is given.
+ *
+ * `axis` is 'u' or 'v', and the choice is a design decision rather than a
+ * detail: a roof whose ridge runs along u presents its shaded slope and its
+ * SUNWARD gable end to the camera, and one running along v presents its lit
+ * slope and its shaded gable. Two buildings with the same plan and different
+ * ridge axes therefore look nothing alike, which is a whole extra axis of
+ * difference for no extra pixels. `over` extends the eaves past the walls in
+ * tiles — a deep overhang says thatch and a farmyard, a tight one says a town.
+ *
+ * Returns the two ridge ends, because callers want to hang things off them.
+ */
+function blockRoof(g, cx, cy, u0, v0, u1, v1, h, col, colDark, axis, over = 0.12) {
+  const a0 = u0 - over;
+  const a1 = u1 + over;
+  const b0 = v0 - over;
+  const b1 = v1 + over;
+  const P = (u, v) => gpt(cx, cy, u, v);
+  let slope;
+  let gable;
+  let R0;
+  let R1;
+  let lit0;
+  if (axis === 'u') {
+    const vm = (b0 + b1) / 2;
+    R0 = { ...P(a0, vm), y: P(a0, vm).y - h };
+    R1 = { ...P(a1, vm), y: P(a1, vm).y - h };
+    slope = [P(a0, b1), P(a1, b1), R1, R0]; // the +v plane: shaded
+    gable = [P(a1, b0), P(a1, b1), R1];     // the +u end: sunward
+    lit0 = false;
+  } else {
+    const um = (a0 + a1) / 2;
+    R0 = { ...P(um, b0), y: P(um, b0).y - h };
+    R1 = { ...P(um, b1), y: P(um, b1).y - h };
+    slope = [P(a1, b0), P(a1, b1), R1, R0]; // the +u plane: sunward
+    gable = [P(a0, b1), P(a1, b1), R1];     // the +v end: shaded
+    lit0 = true;
+  }
+
+  // Eave lip: a few pixels of shadowed thickness under the roof edge, which is
+  // what stops a roof reading as a sheet of coloured paper laid on the walls.
+  g.fillStyle(shade(colDark, -0.3), 1);
+  g.fillPoints([...slope.slice(0, 2).map((p) => ({ x: p.x, y: p.y + 3 })),
+    slope[1], slope[0]], true, true);
+
+  g.fillStyle(lit0 ? lit(col) : dim(col), 1);
+  g.fillPoints(slope, true, true);
+  // Graded down the pitch: an eave sees less sky than a ridge does.
+  const lerp = (p, q, t) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+  for (let k = 0; k < 3; k++) {
+    g.fillStyle(0x1a1a24, 0.07 * (1 - k / 3));
+    g.fillPoints([
+      lerp(slope[0], slope[3], k / 3), lerp(slope[1], slope[2], k / 3),
+      lerp(slope[1], slope[2], (k + 1) / 3), lerp(slope[0], slope[3], (k + 1) / 3),
+    ], true, true);
+  }
+  g.lineStyle(1.1, shade(col, -0.4), 0.42);
+  for (let i = 1; i <= 3; i++) {
+    const t = i / 4;
+    g.beginPath();
+    const p = lerp(slope[0], slope[3], t);
+    const q = lerp(slope[1], slope[2], t);
+    g.moveTo(p.x, p.y);
+    g.lineTo(q.x, q.y);
+    g.strokePath();
+  }
+  outline(g, lit0, 2.2);
+  g.strokePoints(slope, true, true);
+
+  // The gable end, in plaster with a brace across it.
+  g.fillStyle(lit0 ? PLASTER_D : PLASTER, 1);
+  g.fillPoints(gable, true, true);
+  g.lineStyle(2.2, WOOD_D, 0.85);
+  g.beginPath();
+  g.moveTo(gable[0].x + 2, gable[0].y - 1);
+  g.lineTo(gable[2].x, gable[2].y + 4);
+  g.moveTo(gable[1].x - 2, gable[1].y - 1);
+  g.lineTo(gable[2].x, gable[2].y + 4);
+  g.strokePath();
+  g.lineStyle(2.2, OUT, 1);
+  g.strokePoints(gable, true, true);
+
+  // A capped ridge, and a warm bounce along it. The ridge is the top edge of
+  // the silhouette, so it is where the light has to land.
+  g.lineStyle(5, OUT, 1);
+  g.beginPath();
+  g.moveTo(R0.x, R0.y);
+  g.lineTo(R1.x, R1.y);
+  g.strokePath();
+  g.lineStyle(2.8, shade(colDark, -0.15), 1);
+  g.beginPath();
+  g.moveTo(R0.x, R0.y);
+  g.lineTo(R1.x, R1.y);
+  g.strokePath();
+  rimLine(g, R0.x, R0.y + 1, R1.x, R1.y + 1, 2, 0.45);
+  return { R0, R1 };
+}
+
+/**
+ * A mono-pitch (lean-to) roof over a rectangle: high along the v0 edge, falling
+ * towards the camera to v1.
+ *
+ * One plane and two triangular ends, and that is the whole point of it — a shed
+ * roof has no ridge, so its silhouette is a wedge rather than a tent, and a
+ * building wearing one cannot be mistaken for a building wearing a gable even
+ * when both are the same size in the same place.
+ */
+function shedRoof(g, cx, cy, u0, v0, u1, v1, hi, lo, col, colDark, over = 0.14) {
+  const a0 = u0 - over;
+  const a1 = u1 + over;
+  const b0 = v0 - over;
+  const b1 = v1 + over;
+  const P = (u, v) => gpt(cx, cy, u, v);
+  const HW = { ...P(a0, b0) };
+  const HE = { ...P(a1, b0) };
+  const LW = { ...P(a0, b1) };
+  const LE = { ...P(a1, b1) };
+  HW.y -= hi; HE.y -= hi; LW.y -= lo; LE.y -= lo;
+  const plane = [LW, LE, HE, HW];
+
+  g.fillStyle(shade(colDark, -0.3), 1);
+  g.fillPoints([LW, LE, { x: LE.x, y: LE.y + 3.5 }, { x: LW.x, y: LW.y + 3.5 }], true, true);
+  g.fillStyle(mix(col, SKY, 0.08), 1);
+  g.fillPoints(plane, true, true);
+  const lerp = (p, q, t) => ({ x: p.x + (q.x - p.x) * t, y: p.y + (q.y - p.y) * t });
+  for (let k = 0; k < 3; k++) {
+    g.fillStyle(0x1a1a24, 0.06 * (1 - k / 3));
+    g.fillPoints([
+      lerp(LW, HW, k / 3), lerp(LE, HE, k / 3),
+      lerp(LE, HE, (k + 1) / 3), lerp(LW, HW, (k + 1) / 3),
+    ], true, true);
+  }
+  g.lineStyle(1.1, shade(col, -0.4), 0.4);
+  for (let i = 1; i <= 3; i++) {
+    const p = lerp(LW, HW, i / 4);
+    const q = lerp(LE, HE, i / 4);
+    g.beginPath();
+    g.moveTo(p.x, p.y);
+    g.lineTo(q.x, q.y);
+    g.strokePath();
+  }
+  // The sunward end of the wedge, which is the piece that gives it thickness.
+  g.fillStyle(dim(colDark), 1);
+  g.fillPoints([LE, HE, { x: HE.x, y: HE.y + 4 }, { x: LE.x, y: LE.y + 4 }], true, true);
+  outline(g, false, 2.2);
+  g.strokePoints(plane, true, true);
+  rimLine(g, HW.x, HW.y + 1, HE.x, HE.y + 1, 2, 0.4);
+  return { HW, HE, LW, LE };
+}
+
 /**
  * Hip roof as a pyramid; the two south faces are all the camera can see.
  * `fasciaCol` hangs a band of team colour under the eaves — that is how the
@@ -6300,7 +7305,14 @@ const WALL_DIR = [
 // the measured content plus a four-pixel margin for the rim light and the
 // contact shadow, and the margin is deliberately named here so the next person
 // to add a finial knows how much room they have before something clips.
+// Two boxes, not one. A stone wall is taller and thicker than a palisade and
+// fills nearly every pixel of the shared 52x65 box; a palisade rattles around
+// inside it with three empty columns each side and six empty scanlines on top.
+// At sixteen masks per type per player that emptiness was 17k of atlas — most
+// of a tree set — bought for nothing. Origins carry the anchor, so a per-type
+// box costs the renderer nothing at all.
 const WALL_TEX = { w: 52, h: 65, ax: 26, ay: 51 };
+const WALL_TEX_PALISADE = { w: 48, h: 59, ax: 24, ay: 46 };
 const GATE_TEX = { w: 74, h: 81, ax: 34, ay: 63 };
 
 const PAL_WOOD = { left: 0x7c5326, right: 0x9a6b38, top: 0xb2854c };
@@ -6595,9 +7607,10 @@ function buildWalls(put) {
     const dark = PLAYER_COLORS_DARK[p];
     for (const type of Object.keys(WALL_SPEC)) {
       const spec = WALL_SPEC[type];
+      const T = type === 'palisade' ? WALL_TEX_PALISADE : WALL_TEX;
       for (let mask = 0; mask < 16; mask++) {
-        put(wallFrame(type, p, mask), WALL_TEX.w, WALL_TEX.h, WALL_TEX.ax, WALL_TEX.ay,
-          (g) => drawWallSegment(g, WALL_TEX.ax, WALL_TEX.ay, mask, spec, col, dark));
+        put(wallFrame(type, p, mask), T.w, T.h, T.ax, T.ay,
+          (g) => drawWallSegment(g, T.ax, T.ay, mask, spec, col, dark));
       }
     }
     // Each gate borrows the wall family it belongs to, so a stone gate in a
@@ -6874,8 +7887,30 @@ function drawFoundation(g, cx, cy, hw, hh, col, colDark) {
 // Resource nodes
 // ---------------------------------------------------------------------------
 
+/**
+ * The frame box each tree variant is drawn in.
+ *
+ * One shared box for all six was the first thing tried and it is what keeps a
+ * set of trees looking like one tree: a box big enough for a poplar forces the
+ * spreading oak to be drawn small in the middle of it, and a box wide enough
+ * for the oak wastes a third of every conifer's frame. Sizing each variant to
+ * its own drawing is both cheaper in atlas pixels AND the thing that lets the
+ * silhouettes actually differ in proportion — a 38x88 column and a 66x56 dome
+ * cannot be mistaken for each other at any zoom, and two 52x66 boxes almost
+ * always can.
+ *
+ * `ft` is the foot: the pixel that sits on the tile the tree occupies.
+ */
+const TREE_TEX = [
+  { w: 54, h: 68, cx: 27, ft: 62 }, // 0 round oak
+  { w: 46, h: 86, cx: 23, ft: 80 }, // 1 conifer
+  { w: 48, h: 84, cx: 24, ft: 78 }, // 2 birch
+  { w: 68, h: 58, cx: 34, ft: 52 }, // 3 spreading oak
+  { w: 54, h: 72, cx: 27, ft: 66 }, // 4 dead snag
+  { w: 38, h: 88, cx: 19, ft: 82 }, // 5 poplar
+];
+
 const RES_TEX = {
-  tree: { w: 52, h: 66, cx: 26, ft: 60 },
   berry: { w: 46, h: 40, cx: 23, ft: 34 },
   gold: { w: 48, h: 42, cx: 24, ft: 36 },
   // Taller and wider than the gold vein on purpose. At 0.7 zoom on a 390px
@@ -6886,8 +7921,8 @@ const RES_TEX = {
 };
 
 function buildResources(put, rng) {
-  const t = RES_TEX.tree;
   for (let v = 0; v < RESOURCE_VARIANTS.tree; v++) {
+    const t = TREE_TEX[v];
     put(resourceFrame('tree', v), t.w, t.h, t.cx, t.ft, (g) => drawTree(g, t, v, rng));
   }
   const b = RES_TEX.berry;
@@ -6927,39 +7962,292 @@ function groundShadow(g, x, y, w, h) {
   contactShadow(g, x, y, w, h, 1.25);
 }
 
-function drawTree(g, t, v, rng) {
-  const { cx, ft } = t;
-  const scale = [1, 0.86, 1.08][v];
-  const lean = [0, -1.6, 1.4][v];
-  groundShadow(g, cx, ft - 1, 26 * scale, 10 * scale);
+// ---------------------------------------------------------------------------
+// TREES: six species, not six jitters
+// ---------------------------------------------------------------------------
+//
+// There is more tree on the screen of this game than anything else, and until
+// now there was one drawing of it — the same three-circle broccoli canopy on
+// the same brown post, taken 14% smaller and leant 1.6px left for "variant 1".
+// A forest built out of that reads as a repeating tile pattern, which is
+// exactly what the review saw: forty trees, two silhouettes.
+//
+// WHAT MAKES A TREE VARIANT WORK, in the order the eye gets to it:
+//
+//   1. THE OUTLINE. At 0.7 zoom a tree is about thirty screen pixels of dark
+//      green against light green grass, so the outline is 90% of the read. A
+//      cone, a dome, a wide low disc, a bare fork and a narrow column are five
+//      different outlines; three circles at three sizes are one.
+//   2. THE PROPORTION. Tall-and-narrow versus wide-and-low survives being shrunk
+//      to a minimap dot. This is why each variant gets its own frame box (see
+//      TREE_TEX) rather than sharing one.
+//   3. THE HUE. Only third, and only ever a shift — a conifer is blue-green, a
+//      birch and a poplar are yellow-green, an oak is warm mid-green. Woods are
+//      not monochrome and a mixed stand of three greens looks like a wood
+//      rather than like a colour ramp.
+//
+// One rule holds across all six, because it is what makes them a set rather
+// than five unrelated objects: the same dark keyline, the same sun from the
+// upper right, the same soft contact shadow, and canopy mass built as a filled
+// silhouette first with a lit lobe pushed up-right into it. That shared grammar
+// is what lets a birch stand next to a pine without either looking imported.
 
-  // trunk
-  g.fillStyle(0x6f4c2a, 1);
-  g.fillRoundedRect(cx - 3.5 + lean * 0.3, ft - 22 * scale, 7, 22 * scale, 2);
-  g.lineStyle(1.8, OUT, 1);
-  g.strokeRoundedRect(cx - 3.5 + lean * 0.3, ft - 22 * scale, 7, 22 * scale, 2);
-
-  // canopy — three overlapping blobs, dark outline, light from upper-left
-  const cy = ft - 36 * scale;
-  const blobs = [
-    { x: cx - 9 * scale + lean, y: cy + 6 * scale, r: 12 * scale },
-    { x: cx + 9 * scale + lean, y: cy + 5 * scale, r: 11.5 * scale },
-    { x: cx + lean, y: cy - 4 * scale, r: 14 * scale },
-  ];
+/**
+ * A canopy blob group: silhouette, body, lit lobe, and one specular.
+ *
+ * Broken out because all four leafy variants want it and because doing the
+ * shading in one place is what keeps six trees looking like the same world.
+ * `blobs` is a list of {x, y, r}; `base` is the species' own green.
+ */
+function canopy(g, blobs, base, specAt) {
   g.fillStyle(OUT, 1);
   for (const b of blobs) g.fillCircle(b.x, b.y, b.r + 1.8);
-  g.fillStyle(0x2f6130, 1);
+  g.fillStyle(shade(base, -0.22), 1);
   for (const b of blobs) g.fillCircle(b.x, b.y, b.r);
-  // Lit from the upper RIGHT, like every other solid in the game. These three
-  // circles used to be offset up and to the LEFT — the file's resources and its
-  // architecture disagreed about where the sun was, which is the sort of thing
-  // nobody can name but everybody can feel. See THE LIGHT at the top.
-  g.fillStyle(0x3f7a3a, 1);
+  g.fillStyle(base, 1);
   for (const b of blobs) g.fillCircle(b.x + b.r * 0.16, b.y - b.r * 0.2, b.r * 0.74);
-  g.fillStyle(0x559347, 0.85);
-  g.fillCircle(blobs[2].x + 4 * scale, blobs[2].y - 5 * scale, 5.5 * scale);
-  g.fillStyle(mix(0x7ab060, RIM, 0.35), 0.7);
-  g.fillCircle(blobs[2].x + 7 * scale, blobs[2].y - 7 * scale, 2.8 * scale);
+  g.fillStyle(shade(base, 0.16), 0.85);
+  for (const b of blobs) g.fillCircle(b.x + b.r * 0.3, b.y - b.r * 0.36, b.r * 0.38);
+  if (specAt) {
+    g.fillStyle(mix(shade(base, 0.4), RIM, 0.35), 0.7);
+    g.fillCircle(specAt.x, specAt.y, specAt.r);
+  }
+}
+
+/** A tapering trunk from (x, base) up to (x + lean, base - h), with bark. */
+function trunk(g, x, base, h, wBot, wTop, lean, col) {
+  const pts = [
+    { x: x - wBot / 2, y: base },
+    { x: x + lean - wTop / 2, y: base - h },
+    { x: x + lean + wTop / 2, y: base - h },
+    { x: x + wBot / 2, y: base },
+  ];
+  g.fillStyle(OUT, 1);
+  g.fillPoints(pts.map((p, i) => ({
+    x: p.x + (i === 0 || i === 1 ? -1.6 : 1.6), y: p.y,
+  })), true, true);
+  g.fillStyle(shade(col, -0.28), 1);
+  g.fillPoints(pts, true, true);
+  g.fillStyle(col, 1);
+  g.fillPoints([
+    { x: x + wBot * 0.05, y: base },
+    { x: x + lean + wTop * 0.05, y: base - h },
+    pts[2], pts[3],
+  ], true, true);
+  rimLine(g, x + wBot / 2 - 0.8, base - 2, x + lean + wTop / 2 - 0.8, base - h + 2, 1.3, 0.3);
+}
+
+/** One limb of a bare tree: a tapering stroke that forks at the end. */
+function bough(g, x, y, ang, len, w, col, depth) {
+  const ex = x + Math.cos(ang) * len;
+  const ey = y + Math.sin(ang) * len;
+  g.lineStyle(w + 2, OUT, 1);
+  g.beginPath();
+  g.moveTo(x, y);
+  g.lineTo(ex, ey);
+  g.strokePath();
+  g.lineStyle(w, col, 1);
+  g.beginPath();
+  g.moveTo(x, y);
+  g.lineTo(ex, ey);
+  g.strokePath();
+  if (depth > 0) {
+    bough(g, ex, ey, ang - 0.5 - depth * 0.1, len * 0.62, w * 0.6, col, depth - 1);
+    bough(g, ex, ey, ang + 0.45 + depth * 0.08, len * 0.58, w * 0.6, col, depth - 1);
+  }
+}
+
+function drawTree(g, t, v, rng) {
+  const { cx, ft } = t;
+
+  // --- 0. the round oak: the tree this file already had, tightened up --------
+  //
+  // Kept in slot 0 deliberately. It is the commonest tree on the map and the
+  // one every screenshot of this game has in it, so it is the one variant that
+  // should not change out from under a player. What it does gain is a canopy
+  // built from five blobs instead of three, with two of them small and pushed
+  // out to break the perfect dome — the old outline was a circle with two
+  // bumps, and a circle is the single most repetitive silhouette available.
+  if (v === 0) {
+    groundShadow(g, cx, ft - 1, 27, 10);
+    trunk(g, cx, ft, 24, 8, 6, 0.5, 0x6f4c2a);
+    canopy(g, [
+      { x: cx - 10, y: ft - 30, r: 11.5 },
+      { x: cx + 10, y: ft - 31, r: 11 },
+      { x: cx + 1, y: ft - 40, r: 13.5 },
+      { x: cx - 13, y: ft - 40, r: 7 },
+      { x: cx + 12, y: ft - 42, r: 6.5 },
+    ], 0x3f7a3a, { x: cx + 8, y: ft - 47, r: 3 });
+    return;
+  }
+
+  // --- 1. the conifer: the only cone in the wood -----------------------------
+  //
+  // Four stacked skirts rather than one triangle, because a single triangle is
+  // a road sign and a stack of skirts is a spruce. Each skirt is drawn as a
+  // shallow arc of points with a serrated lower edge, so the outline has teeth
+  // in it at the size the player sees — a smooth-sided cone at 30px reads as a
+  // solid wedge and loses the whole species.
+  if (v === 1) {
+    const NEEDLE = 0x2f5b3f; // blue-green: the coldest foliage on the map
+    groundShadow(g, cx, ft - 1, 24, 9);
+    trunk(g, cx, ft, 16, 8, 6, 0, 0x5c4327);
+    // Bottom skirt first, so each one overlaps the one above it the way real
+    // branches shingle downwards; the topmost is the tree's tip, drawn last and
+    // sharpest. There is no separate spike on top: a leader drawn over the
+    // finished crown reads as an aerial, not as a tree.
+    for (let k = 0; k < 5; k++) {
+      const t0 = k / 4;
+      const yBot = ft - 10 - t0 * 44;
+      const halfW = 19.5 - t0 * 15;
+      const rise = 13 + t0 * 10;
+      const teeth = [];
+      const N = 7;
+      for (let i = 0; i <= N; i++) {
+        const s = i / N;
+        teeth.push({
+          x: cx - halfW + halfW * 2 * s,
+          y: yBot - (i % 2 ? 4.5 : 0) * (1 - t0 * 0.6) - Math.abs(s - 0.5) * 4,
+        });
+      }
+      const skirt = [{ x: cx, y: yBot - rise }, ...teeth];
+      g.fillStyle(OUT, 1);
+      g.fillPoints(skirt.map((p) => ({
+        x: cx + (p.x - cx) * 1.1, y: p.y + (p.y < yBot - rise * 0.6 ? -1.8 : 1.8),
+      })), true, true);
+      g.fillStyle(shade(NEEDLE, -0.24), 1);
+      g.fillPoints(skirt, true, true);
+      // Lit half: the same skirt pulled in on its shaded side. Cheaper than a
+      // real clip and indistinguishable from one at this size.
+      g.fillStyle(NEEDLE, 1);
+      g.fillPoints(skirt.map((p) => ({
+        x: cx + (p.x - cx) * (p.x > cx ? 0.92 : 0.3) + 1.5, y: p.y - 1.2,
+      })), true, true);
+      g.fillStyle(shade(NEEDLE, 0.2), 0.75);
+      g.fillTriangle(cx + 1.5, yBot - rise * 0.85, cx + halfW * 0.62, yBot - 3, cx + 1.5, yBot - 4);
+    }
+    return;
+  }
+
+  // --- 2. the birch: pale trunk, airy crown ---------------------------------
+  //
+  // The one tree in the set whose TRUNK is the identifying mark rather than its
+  // canopy: a near-white bar with black scars on it, tall and bare for most of
+  // its length. Against dark green grass a pale vertical is the highest-contrast
+  // thing a tree can offer, and it survives to a much smaller size than any
+  // canopy shape does. The crown is deliberately sparse and high — five small
+  // clusters with sky between them, not a solid mass.
+  if (v === 2) {
+    const LEAF = 0x6f9c3c; // yellow-green
+    groundShadow(g, cx, ft - 1, 20, 8);
+    // Warm off-white, not white. The first version used 0xdfd9cc and at the one
+    // tree in three the map generator currently places it turned a wood into a
+    // picket fence: a near-white vertical is the highest-contrast mark on this
+    // palette, and forty of them in one frame is all the eye sees. Dropped a
+    // shade and narrowed by a fifth, it still reads as birch and stops
+    // shouting over the canopy it belongs to.
+    const BARK = 0xcbc2b0;
+    g.fillStyle(OUT, 1);
+    g.fillPoints([
+      { x: cx - 4.6, y: ft }, { x: cx - 1.4, y: ft - 52 },
+      { x: cx + 3.8, y: ft - 52 }, { x: cx + 4.6, y: ft },
+    ], true, true);
+    g.fillStyle(shade(BARK, -0.26), 1);
+    g.fillPoints([
+      { x: cx - 3.2, y: ft }, { x: cx - 0.8, y: ft - 51 },
+      { x: cx + 2.4, y: ft - 51 }, { x: cx + 3.2, y: ft },
+    ], true, true);
+    g.fillStyle(BARK, 1);
+    g.fillPoints([
+      { x: cx - 0.4, y: ft }, { x: cx + 0.5, y: ft - 51 },
+      { x: cx + 2.4, y: ft - 51 }, { x: cx + 3.2, y: ft },
+    ], true, true);
+    // The scars. Five short dark dashes, alternating sides.
+    g.fillStyle(0x3a352c, 0.9);
+    for (let k = 0; k < 5; k++) {
+      const yy = ft - 8 - k * 9;
+      g.fillRect(cx - 2.8 + (k % 2 ? 2.9 : 0), yy, 3, 2);
+    }
+    // Two boughs lifting out of the top of the trunk into the crown.
+    bough(g, cx + 1, ft - 48, -2.5, 12, 2.4, shade(BARK, -0.3), 0);
+    bough(g, cx + 2, ft - 48, -0.7, 11, 2.4, shade(BARK, -0.3), 0);
+    canopy(g, [
+      { x: cx - 9, y: ft - 58, r: 8 },
+      { x: cx + 9, y: ft - 57, r: 7.5 },
+      { x: cx, y: ft - 66, r: 9.5 },
+      { x: cx - 4, y: ft - 51, r: 5.5 },
+      { x: cx + 8, y: ft - 68, r: 5 },
+    ], LEAF, { x: cx + 5, y: ft - 71, r: 2.6 });
+    return;
+  }
+
+  // --- 3. the spreading oak: wide and low ------------------------------------
+  //
+  // A mature field oak: short thick trunk that forks low, and a crown far wider
+  // than it is tall. This is the variant that changes the *proportion* of the
+  // forest — put next to the conifer it is the same tree turned on its side,
+  // and a stand containing both stops looking like a repeated stamp
+  // immediately. Its frame box is wider than it is tall, which no other
+  // resource in the game is.
+  if (v === 3) {
+    groundShadow(g, cx, ft - 1, 38, 12);
+    trunk(g, cx, ft, 15, 11, 8, 0, 0x6b4a2c);
+    bough(g, cx - 1, ft - 13, -2.5, 12, 4.5, 0x6b4a2c, 0);
+    bough(g, cx + 1, ft - 13, -0.6, 13, 4.5, 0x6b4a2c, 0);
+    canopy(g, [
+      { x: cx - 20, y: ft - 24, r: 10 },
+      { x: cx + 20, y: ft - 24, r: 9.5 },
+      { x: cx - 8, y: ft - 30, r: 13 },
+      { x: cx + 9, y: ft - 31, r: 12.5 },
+      { x: cx + 1, y: ft - 36, r: 10 },
+    ], 0x4d7f2f, { x: cx + 10, y: ft - 40, r: 3.2 });
+    return;
+  }
+
+  // --- 4. the dead snag: no canopy at all ------------------------------------
+  //
+  // The most valuable variant in the set and the cheapest, because it is the
+  // only one that is not a green blob: a grey forked skeleton, mostly holes.
+  // One of these every dozen trees does more to break up a wood than any amount
+  // of jitter applied to the other five, precisely because it is not a
+  // variation on them — it is a hole in the pattern.
+  if (v === 4) {
+    const DEAD = 0x8a7c66;
+    groundShadow(g, cx, ft - 1, 22, 9);
+    trunk(g, cx, ft, 30, 10, 6, -1, DEAD);
+    bough(g, cx - 1, ft - 28, -2.35, 17, 4.4, DEAD, 2);
+    bough(g, cx + 1, ft - 26, -0.72, 16, 4.2, DEAD, 2);
+    bough(g, cx - 2, ft - 20, -2.9, 11, 3.2, DEAD, 1);
+    // A stub where a limb came off, and the split that killed it.
+    g.fillStyle(0x40372a, 1);
+    g.fillEllipse(cx + 4, ft - 22, 5, 4);
+    g.lineStyle(1.4, 0x40372a, 0.8);
+    g.beginPath();
+    g.moveTo(cx - 1, ft - 4);
+    g.lineTo(cx + 0.5, ft - 24);
+    g.strokePath();
+    return;
+  }
+
+  // --- 5. the poplar: a green column ----------------------------------------
+  //
+  // Two tiles wide and five tall in feel, if not in fact: the narrowest thing
+  // on the map. Drawn as a stack of small blobs down a central spine rather
+  // than as one long ellipse, so the edge is ragged — a smooth capsule reads as
+  // a bush someone stretched.
+  const POP = 0x5f8b34;
+  groundShadow(g, cx, ft - 1, 18, 7);
+  trunk(g, cx, ft, 20, 7, 5, 0, 0x64492c);
+  const col = [];
+  for (let k = 0; k < 7; k++) {
+    const s = k / 6;
+    col.push({
+      x: cx + (k % 2 ? 2.6 : -2.6) * (1 - s * 0.5),
+      y: ft - 16 - k * 9.5,
+      r: 10.5 - Math.abs(s - 0.35) * 8.5,
+    });
+  }
+  canopy(g, col, POP, { x: cx + 3, y: ft - 74, r: 2.4 });
 }
 
 function drawBerry(g, b, v, rng) {
@@ -8030,6 +9318,37 @@ function buildGlyphs(putCanvas, measure) {
  * them.
  */
 function buildFx(put) {
+  // --- the chimney plume ----------------------------------------------------
+  //
+  // Five puffs on one shared lifecycle, offset a fifth of a cycle apart, and
+  // the frame index advances the whole set by a quarter of that fifth. Because
+  // the fifth puff's phase is the first puff's plus one, the fourth frame runs
+  // straight back into the first with nothing jumping — a loop that has to be
+  // crossfaded is a loop that was built wrong.
+  //
+  // Each puff grows, drifts to the sunward side and fades as it climbs, which
+  // is the whole of what makes a column of ellipses read as smoke rather than
+  // as a string of beads. It fades IN over the first fifth of its life too:
+  // without that, a puff appears at full opacity out of nothing at the flue,
+  // and the eye catches the pop every cycle.
+  const SW = 52;
+  const SH = 66;
+  for (let f = 0; f < SMOKE_FRAMES; f++) {
+    put(smokeFrame(f), SW, SH, 15, SH - 2, (g) => {
+      for (let k = 0; k < 5; k++) {
+        const t = ((k + f / SMOKE_FRAMES) / 5) % 1;
+        const x = 15 + t * 21 + Math.sin(t * 5.2) * 3.5;
+        const y = SH - 4 - t * 58;
+        const r = 4.5 + t * 10;
+        const a = 0.4 * Math.min(1, t * 5) * (1 - t) ** 0.75;
+        g.fillStyle(0xe8e2d6, a);
+        g.fillEllipse(x, y, r * 2, r * 1.5);
+        g.fillStyle(0xffffff, a * 0.55);
+        g.fillEllipse(x + r * 0.24, y - r * 0.28, r * 1.05, r * 0.75);
+      }
+    });
+  }
+
   put('fx_spark', 20, 20, 10, 10, (g) => {
     g.fillStyle(0xffffff, 1);
     const pts = [];

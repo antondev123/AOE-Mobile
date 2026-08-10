@@ -388,12 +388,23 @@ const run = async () => {
     // get their own sheet, laid out so that the failure mode (all n columns
     // identical) is impossible to miss.
     if (want('variants')) {
+      // EIGHT HOUSES IN ONE ROW, which is the exact picture the review failed
+      // the game on: "eight pixel-identical red-roofed houses in one frame".
+      // Eight of whatever the house set actually is, alternating owners the way
+      // a contested map does, laid out so the failure mode — eight copies of
+      // one drawing — is the first thing you see and cannot argue with.
+      const nHouse = await page.evaluate(() => {
+        const f = window.__phaser.textures.get('aoe-gfx').frames;
+        let n = 1;
+        while (f[`b_house_0_v${n}`]) n++;
+        return n;
+      });
+      const houseFrame = (v, p) => (v ? `b_house_${p}_v${v}` : `b_house_${p}`);
       const houses = [];
-      for (let v = 0; v < 4; v++) houses.push(`b_house${v ? v : ''}_0`);
-      for (let v = 0; v < 4; v++) houses.push(`b_house${v ? v : ''}_1`);
+      for (let i = 0; i < 8; i++) houses.push(houseFrame(i % nHouse, (i >> 1) & 1));
       await page.evaluate(SHEET, {
-        frames: houses, cols: 4, scale: 1.4, bg: '#4a6b34', grass: true, smooth: true,
-        label: 'house variants at play size — blue, then red',
+        frames: houses, cols: 8, scale: 1.4, bg: '#4a6b34', grass: true, smooth: true,
+        label: `eight houses at play size — ${nHouse} drawings, two owners`,
       });
       await page.locator('#__sheet').screenshot({
         path: path.join(SHOT_DIR, 'art-variants-house.png'),
@@ -411,8 +422,58 @@ const run = async () => {
       await page.locator('#__sheet').screenshot({
         path: path.join(SHOT_DIR, 'art-variants-tree.png'),
       });
+      // THE SIX MILITARY AND RESEARCH BUILDINGS, SIDE BY SIDE.
+      //
+      // The companion picture to the eight houses, and the one that answers the
+      // other half of the review: "The Archery Range and the Stable are the
+      // same building... Blacksmith is a third instance of the same shed."
+      // These six are all 3x3, all cost within a few tens of wood of each
+      // other, and all get built in the same corner of a base, so this row is
+      // the exact comparison a player is asked to make and fails to.
+      //
+      // Read it as SHAPES, not as pictures. Squint until the props blur out and
+      // only the outlines remain — if two of the six still have the same
+      // outline, the decals on them are not going to save it, and the fix is a
+      // different mass rather than a bigger badge.
+      const MIL = ['archeryrange', 'stable', 'blacksmith', 'siegeworkshop',
+        'university', 'monastery'];
+      await page.evaluate(SHEET, {
+        frames: MIL.map((t) => `b_${t}_0`), cols: MIL.length, scale: 1.4,
+        bg: '#4a6b34', grass: true, smooth: true,
+        label: 'the six 3x3 halls at play size — range, stable, smith, siege, '
+          + 'university, monastery',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-variants-military.png'),
+      });
+      // And the three that were "the same shed", in the other player's colours
+      // and twice the size, for reading what the shapes are actually made of
+      // once the row above has said whether they differ at all.
+      await page.evaluate(SHEET, {
+        frames: MIL.slice(0, 3).map((t) => `b_${t}_1`), cols: 3, scale: 2.4,
+        bg: '#3f5a2e', label: 'range / stable / smith at 2.4x — a bar, an L, a point',
+      });
+      await page.locator('#__sheet').screenshot({
+        path: path.join(SHOT_DIR, 'art-variants-military-3x.png'),
+      });
+      // The one thing on a building that moves. Four frames of chimney plume,
+      // meant to be stacked over the Blacksmith's own flue — read left to
+      // right, each puff should have climbed and spread a little, and frame 3
+      // should run back into frame 0 without anything popping into existence.
+      const smoke = await page.evaluate(() => Object.keys(
+        window.__phaser.textures.get('aoe-gfx').frames,
+      ).filter((n) => /^fx_smoke_\d+$/.test(n)).sort());
+      if (smoke.length) {
+        await page.evaluate(SHEET, {
+          frames: smoke, cols: smoke.length, scale: 2, bg: '#3f5a2e',
+          label: `${smoke.length} frames of chimney plume — one full loop`,
+        });
+        await page.locator('#__sheet').screenshot({
+          path: path.join(SHOT_DIR, 'art-variants-smoke.png'),
+        });
+      }
       await page.evaluate(CLEAR_SHEET);
-      console.log('  wrote the variant sheets (houses, trees)');
+      console.log('  wrote the variant sheets (houses, trees, military, smoke)');
     }
 
     // --- 3. every unit on the ground, at the zoom the game actually uses -----
