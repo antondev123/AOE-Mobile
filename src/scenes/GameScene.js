@@ -13,7 +13,7 @@
 import { createWorld, ownedBy, recomputePop } from '../core/world.js';
 import { generateMap } from '../core/mapgen.js';
 import {
-  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, ENEMY, MILITARY_TYPES,
+  SIM_DT, MAX_STEPS_PER_FRAME, PLAYER, MILITARY_TYPES,
 } from '../core/constants.js';
 import { EV } from '../core/events.js';
 import { serializeGame, restoreGame, writeSave, clearSave } from '../core/save.js';
@@ -75,6 +75,9 @@ export class GameScene extends Phaser.Scene {
     // Which seat we are. Always PLAYER in a skirmish; whatever the server gave
     // us in a match.
     this.seat = this.net && this.net.playerId != null ? this.net.playerId : PLAYER;
+    // Who is in every chair: [{ kind, team }], seat-indexed. The server sends it
+    // with the start signal; a skirmish makes the classic one up.
+    this.roster = (data && data.roster) || null;
     // Point the client's whole view — HUD, fog, selection, minimap — at that
     // seat. This must happen in init() and not in create(): the renderer and
     // the HUD read the binding as they are constructed, so a player two who
@@ -134,8 +137,36 @@ export class GameScene extends Phaser.Scene {
     this.audioAdapter = createAudioAdapter(world, this.audio, { playerId: this.seat });
     this.hud = createHud(this, world, this.audio);
     this.input2 = createInput(this, world, this.renderer, this.hud);
-    this.enemyAI = createEnemyAI(world, ENEMY);
-    if (restored && restored.ai) this.enemyAI.restore(restored.ai);
+    // ONE AI PER 'ai' SEAT, stepped in seat order — and now in a networked match
+    // too, which used to be refused because a snapshot carried a single AI blob.
+    // Both ends build the same list from the same roster and step it at the same
+    // point in the step; that is the whole of the agreement.
+    // NEVER GUESS THIS OVER A NETWORK. The fallback below — "everybody who is
+    // not me is an AI" — is right for an offline skirmish and catastrophic in a
+    // match: two clients would each build a different set of brains, neither
+    // matching the server's, and every think would be a fresh divergence. It
+    // cost 109 desyncs in a two-browser 1v1 the first time it shipped. A
+    // networked match with no roster runs no AI at all, which is what an
+    // unclaimed seat has always done.
+    const roster = this.roster
+      || (restored && restored.roster)
+      || (this.net
+        ? world.players.map(() => ({ kind: 'human' }))
+        : world.players.map((p) => ({ kind: p.id === this.seat ? 'human' : 'ai' })));
+    this.roster = roster;
+    this.ais = [];
+    for (let i = 0; i < world.players.length; i++) {
+      if (roster[i] && roster[i].kind === 'ai') this.ais[i] = createEnemyAI(world, i);
+    }
+    // Restore their memory if we were rebuilt from a save or a resync. Without
+    // this an AI wakes up with the world it is in and no recollection of what it
+    // was doing — which on one machine only is a desync.
+    const blobs = restored && (restored.ais || (restored.ai ? [null, restored.ai] : null));
+    if (Array.isArray(blobs)) {
+      for (let i = 0; i < this.ais.length; i++) {
+        if (this.ais[i] && blobs[i]) this.ais[i].restore(blobs[i]);
+      }
+    }
 
     // Expose for the headless test harness and for debugging in the console.
     window.__game = {
@@ -160,6 +191,10 @@ export class GameScene extends Phaser.Scene {
       bus: this.bus,
       net: this.net,
       seat: this.seat,
+      // One per 'ai' seat, seat-indexed and sparse. Was `enemyAI`, singular,
+      // when a match could only have one.
+      ais: this.ais,
+      roster: this.roster,
       checksum: () => checksum(world),
       // Fog of war, for the console: masks, remembered objects and the timing
       // counters (see visionStats in systems/vision.js).
@@ -235,7 +270,8 @@ export class GameScene extends Phaser.Scene {
       if (c) view = { x: c.x, y: c.y, zoom: cam.zoom };
     }
     return serializeGame(this.world, {
-      ai: this.enemyAI && this.enemyAI.serialize ? this.enemyAI.serialize() : null,
+      ais: this.ais.map((a) => (a && a.serialize ? a.serialize() : null)),
+      roster: this.roster,
       view,
     });
   }
@@ -319,7 +355,9 @@ export class GameScene extends Phaser.Scene {
     // seat note in server/server.js), and an AI whose memory is absent from the
     // snapshot a client rebuilds from would diverge within seconds of joining.
     const _tAI = perfBegin('sim.enemyAI');
-    if (!this.net) this.enemyAI.update(dt);
+    for (let i = 0; i < this.ais.length; i++) {
+      if (this.ais[i]) this.ais[i].update(dt);
+    }
     perfEnd('sim.enemyAI', _tAI);
     // Vision last, after everything has finished moving, dying and being built,
     // so the masks the renderer reads this frame describe the world the player

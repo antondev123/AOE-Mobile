@@ -723,7 +723,8 @@ async function attackMoveRun() {
       const { spawnUnit } = await import('/src/core/world.js');
       const { findPath, nearestWalkable } = await import('/src/systems/pathfinding.js');
       const w = window.__game.world;
-      window.__game.scene.enemyAI.update = () => {};
+      // Every AI seat, not "the" AI: a match has one brain per 'ai' seat now.
+      for (const ai of window.__game.scene.ais || []) if (ai) ai.update = () => {};
 
       const tc = w.buildings.find((b) => b.player === 0 && b.type === 'towncenter');
       const etc = w.buildings.find((b) => b.player === 1 && b.type === 'towncenter');

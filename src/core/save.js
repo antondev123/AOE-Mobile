@@ -255,8 +255,20 @@ export function serializeGame(world, extra = {}) {
       }))
       : null,
 
-    ai: extra.ai || null,
+    // One blob per seat, not one blob.
+    //
+    // This carried a single `ai` because a match had a single AI, which is what
+    // stopped server/match.js running AI seats in a networked room at all: a
+    // client rebuilding from a snapshot would inherit the world but not the
+    // brains about to act on it, and drift within seconds. `ai` is still
+    // accepted and still written, so a save from before this loads unchanged.
+    ais: extra.ais || (extra.ai ? [extra.ai] : null),
+    ai: extra.ai || (extra.ais && extra.ais[0]) || null,
     view: extra.view || null,
+    // Who was in which chair. A save without it is the classic skirmish and is
+    // reconstructed as one on load; carrying it is what lets an eight-player
+    // offline match come back with the same seats on the same sides.
+    roster: extra.roster || null,
   };
 }
 
@@ -408,7 +420,12 @@ export function restoreGame(data) {
     recomputePop(world, i);
   }
 
-  return { world, ai: data.ai || null, view: data.view || null };
+  const ais = Array.isArray(data.ais) ? data.ais : (data.ai ? [data.ai] : []);
+  return {
+    world, ais, ai: ais[0] || data.ai || null,
+    view: data.view || null,
+    roster: Array.isArray(data.roster) ? data.roster : null,
+  };
 }
 
 // --- Storage -----------------------------------------------------------------

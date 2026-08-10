@@ -29,14 +29,16 @@
 /** The local player's seat. 0 until a match says otherwise. */
 export let ME = 0;
 
-/** The seat opposite, in a 1v1. Kept in step with ME. */
-export let THEM = 1;
+// There was a THEM here — `(ME + 1) % seatCount`, "the seat opposite". It was
+// exported, never used, and true only in a 1v1: with a roster, the opposite of
+// you is a side rather than a chair, and a name that answers confidently in one
+// word is exactly how that assumption would have got picked up again. Ask
+// core/teams.js instead: foesOf(world, ME), or sameTeam(world, ME, other).
 
 /**
  * Point the client at a seat. Called once, by GameScene, before the renderer
  * and the HUD are built — they read the binding as they construct.
  */
-export function setViewpoint(seat, seatCount = 2) {
+export function setViewpoint(seat) {
   ME = Number.isInteger(seat) && seat >= 0 ? seat : 0;
-  THEM = (ME + 1) % Math.max(2, seatCount);
 }

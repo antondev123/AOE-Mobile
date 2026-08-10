@@ -134,6 +134,14 @@ export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = 
     return () => scheduleListeners.delete(fn);
   }
 
+  /** Restore every AI seat's memory, after a rebuild from a snapshot. */
+  function restoreAis(blobs) {
+    if (!Array.isArray(blobs)) return;
+    for (let i = 0; i < ais.length; i++) {
+      if (blobs[i] && ais[i] && typeof ais[i].restore === 'function') ais[i].restore(blobs[i]);
+    }
+  }
+
   /** Hand a seat to its AI (disconnect) or back to a human (reconnect). */
   function takeOver(playerId, kind) {
     if (!roster[playerId]) return false;
@@ -171,12 +179,17 @@ export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = 
     updateUnits(world, SIM_DT);
     updateCombat(world, SIM_DT);
     updateEconomy(world, SIM_DT);
-    // Only seats explicitly marked 'ai' are stepped. A networked room uses
-    // 'human' and 'open' and so runs no AI at all, deliberately: an AI's memory
-    // is not in snapshot() (serializeGame takes one `ai` blob, and the match has
-    // one per seat), so a client rebuilding from a snapshot would inherit the
-    // world but not the AI that is about to act on it, and drift within
-    // seconds. An unclaimed seat therefore stands still rather than desyncing.
+    // Only seats explicitly marked 'ai' are stepped, in seat order, and clients
+    // step exactly the same list at exactly this point (see GameScene.simStep).
+    //
+    // This used to refuse to run AI in a networked room at all, because
+    // snapshot() carried one AI blob for a match that has one per seat — so a
+    // client rebuilding from a resync inherited the world without the brains
+    // about to act on it, and drifted within seconds. The snapshot carries all
+    // of them now.
+    //
+    // An 'open' seat still runs nothing. A chair nobody is sitting in should
+    // stand still, not play itself.
     for (let i = 0; i < roster.length; i++) {
       if (roster[i].kind === 'ai') ais[i].update(SIM_DT);
     }
@@ -197,6 +210,7 @@ export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = 
     get over() { return over; },
     submit,
     onSchedule,
+    restoreAis,
     step,
     takeOver,
     checksum: () => checksum(world),
@@ -204,8 +218,14 @@ export function createMatch({ seed = 1, seats = null, width = 0, height = 0 } = 
     snapshot: () => ({
       seed,
       tick: world.tick,
-      state: serializeGame(world, { ai: null }),
-      roster: roster.map((s) => ({ kind: s.kind })),
+      // Every AI seat's memory rides along. Without it a client rebuilding from
+      // this would get the world and not the brains, which is exactly why AI
+      // seats used to be refused in a networked room.
+      state: serializeGame(world, {
+        ais: ais.map((a, i) => (roster[i].kind === 'ai' ? a.serialize() : null)),
+        roster: roster.map((s2, i) => ({ kind: s2.kind, team: world.players[i].team })),
+      }),
+      roster: roster.map((s, i) => ({ kind: s.kind, team: world.players[i].team })),
     }),
     /** Commands stamped for ticks at or after `fromTick`, for catch-up. */
     since: (fromTick) => history.filter((h) => h.at >= fromTick),

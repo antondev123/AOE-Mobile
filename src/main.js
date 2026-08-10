@@ -31,7 +31,7 @@ window.addEventListener('unhandledrejection', (e) => fail('Startup error', e.rea
 let game = null;
 let net = null;
 
-function launch(seed, resume = null, netClient = null) {
+function launch(seed, resume = null, netClient = null, roster = null) {
   if (game) {
     game.destroy(true);
     game = null;
@@ -62,7 +62,7 @@ function launch(seed, resume = null, netClient = null) {
   };
 
   game = new Phaser.Game(config);
-  game.scene.start('game', { seed, resume, net: netClient });
+  game.scene.start('game', { seed, resume, net: netClient, roster });
   window.__phaser = game;
   return game;
 }
@@ -122,16 +122,24 @@ function joinMatch(matchId, { onFail = null } = {}) {
       // Only ever called once the match is actually running — the lobby holds
       // the world back until both players have said go. See net/client.js.
       if (!snap || !snap.state) return;
+      // The roster travels with the snapshot and MUST be handed on. It says
+      // which seats are AI, and the scene runs one brain per 'ai' seat: a client
+      // left to guess would run brains the server is not running, and two
+      // clients would each guess differently. That is a desync per think.
       if (!started) {
         started = true;
         enterGame();
-        launch(snap.state.seed, snap.state, client);
+        launch(snap.state.seed, snap.state, client, snap.roster);
       } else {
         // Rebuild in place. The scene reads `net` and `resume` out of its init
         // data, so restarting it with the new payload is a full, correct reset
         // of every system that holds a reference to the old world.
         const scene = game && game.scene.getScene('game');
-        if (scene) scene.scene.restart({ seed: snap.state.seed, resume: snap.state, net: client });
+        if (scene) {
+          scene.scene.restart({
+            seed: snap.state.seed, resume: snap.state, net: client, roster: snap.roster,
+          });
+        }
       }
     },
     onWelcome: (info) => {

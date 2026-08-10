@@ -7,7 +7,7 @@
 // 0.5 s "think" cadence, and the expensive villager rebalance on a 2 s cadence.
 //
 // No Phaser imports — this module is pure logic and runs headlessly under Node.
-// Every random draw goes through `world.rng`, never Math.random, so a seed
+// Every random draw goes through this AI's OWN rng, never Math.random, so a seed
 // reproduces a match exactly.
 //
 // The shape of the game it plays:
@@ -37,6 +37,18 @@ import {
 } from '../core/constants.js';
 import { foesOf, isHostile } from '../core/teams.js';
 import { EV } from '../core/events.js';
+import { makeRng } from '../core/rng.js';
+
+/**
+ * A per-seat seed. Math.imul is exactly defined by the spec, unlike anything
+ * trigonometric, so this mixes identically on every engine — see core/iso.js.
+ */
+function mixSeed(seed, playerId) {
+  let h = (seed >>> 0) ^ Math.imul(playerId + 1, 0x9e3779b1);
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0 || 1;
+}
 import {
   ownedBy, findNearestGlobal, forEachNear, canPlace,
 } from '../core/world.js';
@@ -411,7 +423,24 @@ class EnemyAI {
     // Everything downstream still reads this one field.
     this.foeId = null;
 
-    this.acc = 0;
+    // A PRIVATE GENERATOR, not world.rng.
+    //
+    // Two reasons, and the first is the one that bites. Drawing from the shared
+    // stream makes every AI's decisions depend on how many *other* AIs are in
+    // the match and what order they thought in: add a seat and everybody else's
+    // build spots move. Second, checksum() mixes world.rng.getState(), so with
+    // the AI drawing from it the digest stops being a pure function of the
+    // simulation and starts encoding how many times the brains happened to roll
+    // — which is exactly the signal you need to be clean when bisecting a
+    // desync. Seeded off the world seed and the seat, so it still replays.
+    this.rng = makeRng(mixSeed(world.seed, playerId));
+
+    // Thinks are staggered across the roster. THINK_PERIOD is the same for
+    // everyone, so seven AIs built in one breath would land every think on the
+    // same tick — a 25-35ms spike twice a second, which on a phone is a visible
+    // hitch rather than a cost. Spreading the initial accumulator spreads them
+    // for the whole match, and costs one multiplication at construction.
+    this.acc = (playerId * THINK_PERIOD) / Math.max(1, world.players.length);
     this.rebalanceAcc = 0;
     this.think = 0;
 
@@ -616,7 +645,7 @@ class EnemyAI {
     for (let i = 0; i < 6; i++) {
       // A seeded direction from the literal table rather than a seeded angle
       // through cos/sin, which are not identical across engines.
-      const d = dirVec(w.rng.int(0, DIR_COUNT - 1));
+      const d = dirVec(this.rng.int(0, DIR_COUNT - 1));
       const gx = Math.round(u.x + d[0] * 2.5);
       const gy = Math.round(u.y + d[1] * 2.5);
       if (gx < 1 || gy < 1 || gx >= w.width - 1 || gy >= w.height - 1) continue;
@@ -1217,7 +1246,7 @@ class EnemyAI {
     if (!s) return null;
     // Deterministic rotating start point, shared by both bands so successive
     // buildings fan around the base instead of stacking on one side.
-    this.placeCursor = (this.placeCursor + this.world.rng.int(1, 17)) % 4096;
+    this.placeCursor = (this.placeCursor + this.rng.int(1, 17)) % 4096;
     return this.scanBand(s, anchor, PLACEMENT_NEAR, MAX_REACH_CHECKS)
       || this.scanBand(s, anchor, PLACEMENT_FAR, FAR_REACH_CHECKS);
   }
@@ -2363,7 +2392,7 @@ class EnemyAI {
   }
 
   waveInterval() {
-    return this.world.rng.range(WAVE_INTERVAL_MIN, WAVE_INTERVAL_MAX);
+    return this.rng.range(WAVE_INTERVAL_MIN, WAVE_INTERVAL_MAX);
   }
 
   /** Record how close our soldiers actually get to the enemy base. */
@@ -2432,6 +2461,7 @@ class EnemyAI {
       motion: Array.from(this.motion.entries()).map(([id, r]) => [id, { ...r }]),
       lastDamageTime: this.lastDamageTime,
       lastAggressor: this.lastAggressor,
+      rng: this.rng.getState(),
       foeId: this.foeId,
       lastDamageAt: this.lastDamageAt ? { ...this.lastDamageAt } : null,
       defendingUntil: this.defendingUntil,
@@ -2501,6 +2531,7 @@ class EnemyAI {
     );
     this.lastDamageTime = Number.isFinite(data.lastDamageTime) ? data.lastDamageTime : -999;
     this.lastAggressor = Number.isInteger(data.lastAggressor) ? data.lastAggressor : null;
+    if (Number.isFinite(data.rng)) this.rng.setState(data.rng);
     this.foeId = Number.isInteger(data.foeId) ? data.foeId : null;
     this.lastDamageAt = data.lastDamageAt ? { ...data.lastDamageAt } : null;
     this.defendingUntil = Number.isFinite(data.defendingUntil) ? data.defendingUntil : -999;
