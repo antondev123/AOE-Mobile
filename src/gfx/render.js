@@ -156,6 +156,22 @@ const CULL_PAD = 140;
 // oscillate within a frame. Forty-eight is a fight of about two dozen a side,
 // which is where the bars stop being individually readable anyway.
 const BAR_PLAIN_ABOVE = 48;
+// Above this many bars in a frame, a full-health bar stops being drawn at all
+// and only the wounded and the selected keep theirs.
+//
+// The reason is a photograph. A whole-game review caught a 45-unit army in a
+// fight and reported that it was "literally a mosaic of ~45 overlapping green
+// rectangles; you cannot see a single soldier under them" — which was correct,
+// and is the honest failure mode of the rule below it (bars come up across the
+// army whenever combat is happening, because during a battle "who is about to
+// die" is the only question). That rule is right at ten units and self-defeating
+// at forty-five: forty-five full bars are forty-five identical shapes that
+// answer the question for nobody, drawn over the only thing that could.
+//
+// 26 is roughly where the bars of a clumped group start to touch at the default
+// zoom. Below it you get the whole picture; above it you get exactly the units
+// the picture was for, which is the ones losing.
+const BAR_CROWD_ABOVE = 26;
 
 const TERRAIN_CHUNK = 512;
 
@@ -455,6 +471,7 @@ export function createRenderer(scene, world) {
   // switch to the plain form. See BAR_PLAIN_ABOVE.
   let barCount = 0;
   let plainBars = false;
+  let barsCrowded = false;
 
   // --- combat feedback ------------------------------------------------------
   // Two facts, both read straight off the damage event: which units were hit
@@ -739,6 +756,10 @@ export function createRenderer(scene, world) {
 
     overlay.clear();
     plainBars = barCount > BAR_PLAIN_ABOVE;
+    // Both of these read *last* frame's count, for the same reason: the count
+    // is not known until the frame has been drawn, and a bar that appears and
+    // disappears on alternate frames is worse than either choice.
+    barsCrowded = barCount > BAR_CROWD_ABOVE;
     barCount = 0;
     // Bars and dots are only *partially* zoom-compensated: fully compensating
     // makes them swamp the units when zoomed out, not compensating at all makes
@@ -1257,7 +1278,7 @@ export function createRenderer(scene, world) {
       //    question "who is about to die" is the only question, and answering
       //    it only for units that have already been hit answers it too late.
       const hurt = u.hp < u.maxHp;
-      if (hurt || selected || (barsWanted && u.player === PLAYER)) {
+      if (hurt || selected || (barsWanted && u.player === PLAYER && !barsCrowded)) {
         barCount++;
         // The stem. A bar floating above a head in this projection is also
         // floating over the *chest* of whatever stands two tiles behind, and at

@@ -366,12 +366,36 @@ export function createMinimap(canvas, world) {
     ctx.globalAlpha = 1;
   }
 
-  /** One resource pip. Shared by the live pass and the memory pass. */
+  /**
+   * One resource pip. Shared by the live pass and the memory pass.
+   *
+   * DRAWN FAINT, AND THAT IS THE WHOLE POINT. The colours above are carefully
+   * separated from each other and from the team colours, and separating them
+   * was not enough: a whole-game review looked at a midgame minimap and called
+   * it "confetti — a rainbow of pink/yellow/purple dots. You cannot find your
+   * own army on it."
+   *
+   * That is a hierarchy problem, not a hue problem. A map holds around 114
+   * berry bushes, dozens of gold and stone piles and 1600 trees, against maybe
+   * twenty things that are alive and matter this second. Painting all of them
+   * at full strength gives the standing scenery the same voice as the moving
+   * army, and the army loses because it is outnumbered fifty to one.
+   *
+   * So resources are laid down as *texture*: enough to tell you where the wood
+   * and the gold are when you go looking, not enough to compete with a unit pip
+   * for attention. Units and buildings keep full opacity and are now the only
+   * things on this surface that do.
+   */
+  const NODE_ALPHA = 0.5;
+
   function node(type, gx, gy) {
     const p = gridToMini(gx, gy, size);
     const s = NODE_SIZE[type] || NODE_SIZE_DEFAULT;
+    const prev = ctx.globalAlpha;
+    ctx.globalAlpha = prev * NODE_ALPHA;
     ctx.fillStyle = RES_COLOR[type] || '#888';
     ctx.fillRect(p.x - s / 2, p.y - s / 2, s, s);
+    ctx.globalAlpha = prev;
   }
 
   /** One building block. Shared by the live pass and the memory pass. */
