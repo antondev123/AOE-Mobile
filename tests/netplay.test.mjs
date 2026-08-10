@@ -27,9 +27,19 @@ function connect(port, matchId) {
         inbox,
         send: (msg) => ws.send(JSON.stringify(msg)),
         close: () => new Promise((r) => { ws.once('close', r); ws.close(); }),
-        /** Wait for a message matching `pred`, or reject after `ms`. */
-        await: (pred, ms = 4000) => new Promise((res, rej) => {
-          const found = inbox.find(pred);
+        /** The current inbox depth, to await only what arrives after this point. */
+        mark: () => inbox.length,
+        /**
+         * Wait for a message matching `pred`, or reject after `ms`.
+         *
+         * The inbox is searched first so a message that arrived before the call
+         * is not missed. `from` bounds that search: a client sees a lobby
+         * broadcast for every roster change including its own arrival, and an
+         * earlier one carrying the state we are waiting for is not evidence the
+         * later change happened. Pass `c.mark()` taken before the action.
+         */
+        await: (pred, { ms = 4000, from = 0 } = {}) => new Promise((res, rej) => {
+          const found = inbox.slice(from).find(pred);
           if (found) return res(found);
           const t = setTimeout(() => {
             ws.off('message', onMsg);
@@ -152,8 +162,9 @@ test('a disconnect frees the seat without letting an AI desync it, and rejoining
   const room = rooms.get(id);
   assert.deepEqual(room.config.slots.map((s) => s.kind), ['human', 'human']);
 
+  const mark = a.mark();
   await b.close();
-  await a.await((m) => m.type === 'lobby' && m.slots[1].kind === 'open');
+  await a.await((m) => m.type === 'lobby' && m.slots[1].kind === 'open', { from: mark });
   assert.equal(room.config.slots[1].kind, 'open', 'the empty seat was not freed');
 
   const b2 = await connect(port, id);

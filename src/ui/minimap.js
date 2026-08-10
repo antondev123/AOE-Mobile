@@ -588,7 +588,7 @@ function bake(g, world, size) {
     for (let ty = 0; ty < MAP_H; ty++) {
       for (let tx = 0; tx < MAP_W; tx++) {
         if (!world.cliff[ty * MAP_W + tx]) continue;
-        tileDiamond(g, tx, ty, size);
+        tileDiamond(g, tx, ty, size, d);
         g.fill();
       }
     }
