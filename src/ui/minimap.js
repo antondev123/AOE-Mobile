@@ -16,10 +16,11 @@
 // costs 9216 byte writes — a rounding error next to the ~2000 node pips this
 // map already paints.
 
-import { HALF_W, HALF_H, TERRAIN } from '../core/constants.js';
+import { HALF_W, HALF_H, TERRAIN, PLAYER_COLORS, PLAYER_COLORS_DARK } from '../core/constants.js';
 // The local player's seat, as a live binding — see src/core/viewpoint.js for
 // why this is imported under the old name instead of threading a parameter.
 import { ME as PLAYER } from '../core/viewpoint.js';
+import { sameTeam } from '../core/teams.js';
 
 /**
  * The minimap's projection, for one world.
@@ -61,8 +62,25 @@ const RES_COLOR = {
 const NODE_SIZE = { tree: 1 };
 const NODE_SIZE_DEFAULT = 2;
 
-const TEAM = ['#5aa2ff', '#ff5a5a'];
-const TEAM_DARK = ['#1c56ab', '#a01f1f'];
+// Player colours, derived rather than restated.
+//
+// These were two hand-written hex pairs — a second copy of PLAYER_COLORS that
+// happened to be slightly different shades, and that indexed `undefined` the
+// moment a third player existed. Deriving them means one table to keep honest
+// and eight entries for free. The minimap lifts them slightly: a three-pixel pip
+// under a fog wash needs more punch than a forty-pixel sprite in daylight.
+const hex = (n) => `#${n.toString(16).padStart(6, '0')}`;
+const TEAM = PLAYER_COLORS.map((c) => hex(lift(c, 0.18)));
+const TEAM_DARK = PLAYER_COLORS_DARK.map((c) => hex(c));
+
+/** Move a colour toward white by `t`, so a pip reads against dark ground. */
+function lift(c, t) {
+  const r = (c >> 16) & 255;
+  const g = (c >> 8) & 255;
+  const b = c & 255;
+  const up = (v) => Math.round(v + (255 - v) * t);
+  return (up(r) << 16) | (up(g) << 8) | up(b);
+}
 
 // --- Unit pips ---------------------------------------------------------------
 // Units are binned rather than drawn one per unit. A ten-strong raid used to be
@@ -246,12 +264,16 @@ export function createMinimap(canvas, world) {
   const binRows = Math.ceil(MAP_H / UNIT_BIN);
   const binCount = binCols * binRows;
   const binStamp = new Int32Array(binCount);
-  const binN = [new Int16Array(binCount), new Int16Array(binCount)];
-  const binSx = [new Float32Array(binCount), new Float32Array(binCount)];
-  const binSy = [new Float32Array(binCount), new Float32Array(binCount)];
+  // One set per seat. These were literal two-element arrays, which indexed
+  // undefined and threw the moment a third player owned a unit.
+  const seats = world.players.length;
+  const perSeat = (Type) => Array.from({ length: seats }, () => new Type(binCount));
+  const binN = perSeat(Int16Array);
+  const binSx = perSeat(Float32Array);
+  const binSy = perSeat(Float32Array);
   // Set when any unit in the bin is a soldier, so an incoming raid can be drawn
   // hotter than a line of villagers walking to a woodline.
-  const binMil = [new Uint8Array(binCount), new Uint8Array(binCount)];
+  const binMil = perSeat(Uint8Array);
   const binTouched = [];
   let binGen = 0;
 
@@ -272,10 +294,12 @@ export function createMinimap(canvas, world) {
       const i = by * binCols + bx;
       if (binStamp[i] !== binGen) {
         binStamp[i] = binGen;
-        binN[0][i] = binN[1][i] = 0;
-        binSx[0][i] = binSx[1][i] = 0;
-        binSy[0][i] = binSy[1][i] = 0;
-        binMil[0][i] = binMil[1][i] = 0;
+        for (let p = 0; p < seats; p++) {
+          binN[p][i] = 0;
+          binSx[p][i] = 0;
+          binSy[p][i] = 0;
+          binMil[p][i] = 0;
+        }
         binTouched.push(i);
       }
       const p = u.player;
@@ -289,7 +313,7 @@ export function createMinimap(canvas, world) {
     ctx.save();
     ctx.lineWidth = 1;
     for (const i of binTouched) {
-      for (let p = 0; p < 2; p++) {
+      for (let p = 0; p < seats; p++) {
         const n = binN[p][i];
         if (!n) continue;
         const c = gridToMini(binSx[p][i] / n, binSy[p][i] / n, size, d);
@@ -300,7 +324,9 @@ export function createMinimap(canvas, world) {
         const x = c.x - s / 2;
         const y = c.y - s / 2;
         // Threat ring first, so the pip sits inside it rather than under it.
-        if (p !== PLAYER && binMil[p][i]) {
+        // Hostile, not merely "not mine": an ally's army marching past should
+        // not read as an incoming raid, which is the one thing this ring means.
+        if (binMil[p][i] && !sameTeam(world, PLAYER, p)) {
           ctx.beginPath();
           ctx.arc(c.x, c.y, s * THREAT_RING_SCALE, 0, Math.PI * 2);
           ctx.strokeStyle = THREAT_RING;

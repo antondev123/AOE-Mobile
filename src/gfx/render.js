@@ -466,8 +466,19 @@ export function createRenderer(scene, world) {
   // Other systems own the entity types; if one ever grows a type we have no
   // art for, fall back rather than spraying missing-frame warnings.
   const has = (frame) => origins.has(frame);
-  /** Clamp an owner id into the range we generated colours for. */
-  const pi = (player) => (player === 1 ? 1 : 0);
+  /**
+   * Clamp an owner id into the range we generated colours for.
+   *
+   * It used to be `player === 1 ? 1 : 0`, which is a clamp to {0,1} and was
+   * exactly right while the atlas held two colours: anything else drew as player
+   * 0, silently, so a third player's army would have been indistinguishable from
+   * your own. The atlas now bakes one variant per seat in the match (see
+   * buildTextures), so the clamp is against that count. Neutral things — a tree,
+   * a bush — arrive here as null and take seat 0's frame, which is what they
+   * always did and never shows, because nothing player-coloured is drawn for them.
+   */
+  const seatCount = world.players.length;
+  const pi = (player) => (player >= 0 && player < seatCount ? player : 0);
 
   /**
    * Which frame a unit shows, memoised on (type, player, back, pose).

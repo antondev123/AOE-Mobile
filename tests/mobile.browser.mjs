@@ -285,12 +285,34 @@ async function gestures() {
       g.world.events.emit('selection', { ids: [...g.world.selection] });
       const lead = own[0];
       g.input.centerOnGrid(lead.x, lead.y);
-      // ~26px away: outside the 18px order radius, well inside the 34px
-      // selection radius that used to swallow this tap and replace the whole
-      // selection with whichever of your own bodies was nearest.
       const p = g.input._toScreen(lead.x, lead.y);
-      ev('pointerdown', 1, p.x + 26, p.y + 4);
-      ev('pointerup', 1, p.x + 26, p.y + 4, window);
+
+      // FIND GROUND, rather than assuming a fixed offset is ground.
+      //
+      // This used to tap a flat 26px right and 4px down from the lead villager:
+      // outside the 18px order radius, inside the 34px selection radius, which
+      // is precisely the gap the check exists to defend. But it is only ground
+      // if no OTHER villager happens to be standing there, and the sim runs
+      // between these statements, so on a slower machine the crowd has walked
+      // somewhere else and the tap lands on a body — which selects it, correctly,
+      // and reports "1 of 3 selected" as though the contract were broken. It
+      // failed exactly that way on CI while passing locally.
+      //
+      // So: sweep a ring at the same distance and take the first point that is
+      // clear of every one of our own units by more than the order radius. Same
+      // gesture, same gap, no longer a test of where the crowd is standing.
+      const screens = own.map((u) => g.input._toScreen(u.x, u.y));
+      const CLEAR = 22;   // ORDER_PICK_RADIUS is 18; a little air on top
+      let aim = null;
+      for (let deg = 0; deg < 360 && !aim; deg += 15) {
+        const a = (deg * Math.PI) / 180;
+        const q = { x: p.x + Math.cos(a) * 26, y: p.y + Math.sin(a) * 26 };
+        if (screens.every((s) => Math.hypot(s.x - q.x, s.y - q.y) > CLEAR)) aim = q;
+      }
+      if (!aim) return { skip: true, why: 'no clear ground beside the crowd' };
+
+      ev('pointerdown', 1, aim.x, aim.y);
+      ev('pointerup', 1, aim.x, aim.y, window);
       return {
         want: own.length,
         selected: g.world.selection.size,
