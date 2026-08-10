@@ -1932,7 +1932,7 @@ function makeFog(scene, world, rect) {
   quad.setRotation(Math.PI / 4);
   root.add(quad);
 
-  const st = vision.state(PLAYER);
+  const st = vision.viewState(PLAYER);
   let paintedRevision = -1;
   let since = FOG_REFRESH_INTERVAL;
 

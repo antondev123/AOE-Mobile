@@ -184,7 +184,8 @@ export function createMinimap(canvas, world) {
 
   // --- Fog layer ----------------------------------------------------------
   const vision = world.vision || null;
-  const fogState = vision ? vision.state(PLAYER) : null;
+  // The team's mask, not the seat's — see viewState in systems/vision.js.
+  const fogState = vision ? vision.viewState(PLAYER) : null;
   const fogW = MAP_W + FOG_PAD * 2;
   const fogH = MAP_H + FOG_PAD * 2;
   let fogCanvas = null;

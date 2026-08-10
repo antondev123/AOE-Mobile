@@ -266,7 +266,7 @@ export function createFx(scene, world, opts) {
   // The mask is read straight off the vision system each time rather than
   // cached, because effects are spawned from events and the events arrive
   // between frames.
-  const visMask = world.vision ? world.vision.state(PLAYER).visible : null;
+  const visMask = world.vision ? world.vision.viewState(PLAYER).visible : null;
 
   const MW = world.width;
   const MH = world.height;
