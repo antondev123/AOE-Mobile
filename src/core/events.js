@@ -96,6 +96,11 @@ export const EV = {
   // that resource, after the trade moved it. See systems/market.js.
   TRADE: 'trade',
 
+  // { from, to, resource, sent, received } — an ally was given something. `sent`
+  // is what left the giver and `received` is what arrived, which differ by the
+  // tithe: see TRIBUTE_TAX in systems/market.js.
+  TRIBUTE: 'tribute',
+
   // { building } — construction finished
   BUILT: 'built',
   // { building, builder } — foundation placed

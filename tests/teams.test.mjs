@@ -16,6 +16,8 @@ import {
 } from '../src/core/teams.js';
 import { checkVictory } from '../src/core/victory.js';
 import { canAttack } from '../src/systems/combat.js';
+import { applyCommand } from '../src/core/command.js';
+import { tributeArrives } from '../src/systems/market.js';
 import { isWalkable } from '../src/systems/pathfinding.js';
 import { setGateOpen } from '../src/core/world.js';
 import { mapSizeFor, MAX_PLAYERS, DEFAULT_MAP_W } from '../src/core/constants.js';
@@ -199,6 +201,42 @@ test('shared vision keeps up as an ally moves', () => {
   assert.equal(ours.visible[i(30, 30)], 1, 'the new ground is lit');
   assert.equal(ours.visible[i(60, 60)], 0, 'and the old ground went dark');
   assert.equal(ours.explored[i(60, 60)], 1, 'but stays explored');
+});
+
+// --- Tribute -----------------------------------------------------------------
+
+test('a gift reaches an ally, minus the tithe', () => {
+  const w = twoVtwo();
+  const before = w.players[1].resources.food;
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 1, resource: 'food', amount: 100 }).ok, true);
+  assert.equal(w.players[0].resources.food, 150, 'the giver pays the full amount');
+  assert.equal(w.players[1].resources.food, before + tributeArrives(100),
+    'and the ally receives what survives the tithe');
+  assert.ok(tributeArrives(100) < 100, 'a gift must cost something');
+});
+
+test('you cannot fund an enemy, or yourself, or the dead', () => {
+  const w = twoVtwo();
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 2, resource: 'food', amount: 100 }).reason,
+    'not-an-ally', 'the other side is not a recipient');
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 0, resource: 'food', amount: 100 }).reason,
+    'not-an-ally', 'nor are you');
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 9, resource: 'food', amount: 100 }).reason,
+    'no-such-player');
+  w.players[1].defeated = true;
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 1, resource: 'food', amount: 100 }).reason,
+    'defeated');
+});
+
+test('a gift you cannot afford is refused outright, not part-paid', () => {
+  const w = twoVtwo();
+  const had = w.players[0].resources.stone;
+  const res = applyCommand(w, { t: 'tribute', p: 0, to: 1, resource: 'stone', amount: had + 1 });
+  assert.equal(res.ok, false);
+  assert.equal(w.players[0].resources.stone, had, 'nothing left the giver');
+  // And nonsense amounts do nothing at all.
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 1, resource: 'food', amount: -50 }).ok, false);
+  assert.equal(applyCommand(w, { t: 'tribute', p: 0, to: 1, resource: 'nonsense', amount: 50 }).ok, false);
 });
 
 // --- The map -----------------------------------------------------------------

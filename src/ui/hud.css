@@ -1853,6 +1853,40 @@ body {
 }
 
 .market-sheet .why { font-size: 10px; line-height: 1.35; color: var(--parch-dim); }
+/* Giving something to an ally. One row per ally, four things you can send. The
+   buttons are deliberately the same height as everything else that a thumb has
+   to hit, which on four-across at 390px leaves them narrow but not short. */
+.tribute-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 5px;
+}
+.tribute-row .who {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--parch);
+}
+.tribute-give {
+  flex: 0 0 auto;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 5px;
+  border-radius: 6px;
+  border: 1px solid var(--edge);
+  background: rgba(0, 0, 0, 0.3);
+  color: var(--parch);
+  font-size: 11px;
+  font-weight: 800;
+}
+.tribute-give .n { margin-left: 2px; }
+.tribute-give:disabled { opacity: 0.4; }
+
 .market-sheet .foot { display: flex; gap: 5px; }
 .market-sheet .foot button { flex: 1 1 0; min-height: var(--tap); font-size: 12px; font-weight: 800; }
 

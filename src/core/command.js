@@ -36,7 +36,8 @@ import {
 import { queueResearch, cancelResearch } from '../systems/tech.js';
 import { setAllocationOn, setSplit, resetSplit } from '../systems/allocation.js';
 import { ungarrisonAll } from '../systems/combat.js';
-import { buy as marketBuy, sell as marketSell } from '../systems/market.js';
+import { buy as marketBuy, sell as marketSell, tribute } from '../systems/market.js';
+import { areAllies } from './teams.js';
 
 /** Orders that unitAI.commandUnits() understands, as a set we can validate against. */
 const UNIT_ORDERS = new Set([
@@ -251,6 +252,21 @@ export function applyCommand(world, cmd) {
         ? marketBuy(world, p, cmd.resource)
         : marketSell(world, p, cmd.resource);
       return done ? ok({ side: cmd.side, resource: cmd.resource }) : no('refused');
+    }
+
+    // ---- tribute -----------------------------------------------------------
+    //
+    // Only to a live ALLY, which is the whole point: without teams there is
+    // nobody to give anything to, and with teams a gift to an enemy would be a
+    // way to hand a losing match away. Ownership lives here like every other
+    // "may this player do this"; the arithmetic and the tithe live in market.js.
+    case 'tribute': {
+      const to = cmd.to;
+      if (!Number.isInteger(to) || to < 0 || to >= world.players.length) return no('no-such-player');
+      if (world.players[to].defeated) return no('defeated');
+      if (!areAllies(world, { player: p }, { player: to })) return no('not-an-ally');
+      if (!tribute(world, p, to, cmd.resource, cmd.amount)) return no('refused');
+      return ok({ to, resource: cmd.resource, amount: cmd.amount });
     }
 
     // ---- villager allocation ----------------------------------------------

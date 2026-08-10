@@ -2006,6 +2006,8 @@ function bakeTerrain(scene, world, rect) {
         ox: minX + cx * TERRAIN_CHUNK - CHUNK_PAD,
         oy: minY + cy * TERRAIN_CHUNK - CHUNK_PAD,
         rt: null,
+        // When this chunk was last within reach of the camera. Drives eviction.
+        used: 0,
       });
     }
   }
@@ -2049,21 +2051,63 @@ function bakeTerrain(scene, world, rect) {
    * stress scenario with twenty chunks resident, hiding the off-screen ones took
    * the frame from 27 draw calls to 13.
    */
+  /**
+   * How many baked chunks may exist at once.
+   *
+   * Lazy baking bounds what is resident only if something also lets go. Nothing
+   * did: a chunk painted on the way past was kept for the life of the scene, so
+   * a match that visited most of the map ended up holding most of the map. On
+   * the two-player 96x96 that is 91 chunks and about 100MB, which the comment
+   * above has always said and which a phone survives. On the eight-player
+   * 192x192 it is ~325 chunks and something like 350MB of GPU texture, which it
+   * does not — the context is lost, and a lost context is a black screen rather
+   * than a slow one.
+   *
+   * 64 is comfortably more than the viewport plus its prebake margin can want at
+   * the widest zoom, so in ordinary play nothing is ever evicted and this costs
+   * nothing. It only bites when the camera has been somewhere else entirely, and
+   * what it costs then is one re-bake of a chunk that is off screen anyway.
+   */
+  const MAX_RESIDENT = 64;
+  let paintClock = 0;
+
+  /** Throw away the chunks touched longest ago, keeping the budget. */
+  function evict(keepFrom) {
+    const live = [];
+    for (let i = 0; i < planned.length; i++) if (planned[i].rt) live.push(planned[i]);
+    if (live.length <= MAX_RESIDENT) return;
+    live.sort((a, b) => a.used - b.used);
+    for (let i = 0; i < live.length - MAX_RESIDENT; i++) {
+      const c = live[i];
+      // Never evict something the camera is looking at right now: re-baking it
+      // in the same frame would be a stutter for no memory saved.
+      if (c.used >= keepFrom) continue;
+      c.rt.destroy();
+      c.rt = null;
+    }
+  }
+
   function ensure(view) {
     const bx0 = view.x - PREBAKE_PAD;
     const by0 = view.y - PREBAKE_PAD;
     const bx1 = view.r + PREBAKE_PAD;
     const by1 = view.b + PREBAKE_PAD;
+    const now = ++paintClock;
+    let baked = 0;
     for (let i = 0; i < planned.length; i++) {
       const c = planned[i];
+      const near = !(c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0);
       if (!c.rt) {
-        if (c.ox > bx1 || c.ox + size < bx0 || c.oy > by1 || c.oy + size < by0) continue;
+        if (!near) continue;
         paint(c);
+        baked++;
       }
+      if (near) c.used = now;
       const on = !(c.ox > view.r || c.ox + size < view.x
         || c.oy > view.b || c.oy + size < view.y);
       if (c.rt.visible !== on) c.rt.setVisible(on);
     }
+    if (baked) evict(now);
   }
 
   function destroy() {

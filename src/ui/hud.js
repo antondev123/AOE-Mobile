@@ -11,7 +11,7 @@
 // systems, and it reads world state. Selection changes go through ui/selection.js.
 
 import {
-  BUILDABLE, UNIT_STATS, BUILDING_STATS, HALF_W, HALF_H,
+  BUILDABLE, UNIT_STATS, BUILDING_STATS, HALF_W, HALF_H, PLAYER_COLORS,
   MILITARY_TYPES, STANCE_ORDER, STANCE_LABEL, STANCE_BLURB,
   FORMATION_ORDER, FORMATION_LABEL, FORMATION_BLURB, DEFAULT_FORMATION,
   isWallType, isGateType,
@@ -34,6 +34,7 @@ import {
 } from '../systems/combat.js';
 
 import { createLocalBus } from '../net/bus.js';
+import { alliesOf } from '../core/teams.js';
 import { createMinimap } from './minimap.js';
 import { createPortraits } from './portraits.js';
 import {
@@ -2707,6 +2708,8 @@ export function createHud(scene, world, audio = null) {
       'that commission is the market’s cut, and it is why trading is the ' +
       'expensive way to get a resource.'));
 
+    renderTribute(marketSheet);
+
     const foot = el('div', 'foot');
     const close = el('button', null, 'Close');
     close.addEventListener('click', (ev) => { ev.stopPropagation(); toggleMarket(false); });
@@ -2715,6 +2718,61 @@ export function createHud(scene, world, audio = null) {
 
     state.liveMarket = { rows, gold };
     refreshMarket();
+  }
+
+  /**
+   * Giving something to an ally.
+   *
+   * It lives in the Market sheet rather than in a panel of its own because it is
+   * the same kind of act — turning what you have into what somebody needs — and
+   * a phone has no room for a second sheet that opens twice a match. In a
+   * free-for-all there is nobody to give anything to and this draws nothing at
+   * all, which is why the whole section is behind the ally check.
+   */
+  function renderTribute(sheet) {
+    const mates = alliesOf(world, PLAYER);
+    if (!mates.length) return;
+
+    sheet.appendChild(el('div', 'menu-head', 'Send to an ally'));
+    for (const mate of mates) {
+      const row = el('div', 'tribute-row');
+      const who = el('span', 'who', `Player ${mate + 1}`);
+      const swatch = el('i', 'lobby-swatch');
+      swatch.style.background = `#${PLAYER_COLORS[mate % PLAYER_COLORS.length].toString(16).padStart(6, '0')}`;
+      row.append(swatch, who);
+
+      for (const res of ['food', 'wood', 'gold', 'stone']) {
+        const b = el('button', `tribute-give ${res}`);
+        b.type = 'button';
+        // The same icon the resource bar uses, so a stockpile and a gift of it
+        // are recognisably the same thing.
+        b.appendChild(el('i', `ico ico-${res}`));
+        b.appendChild(el('span', 'n', String(market.TRIBUTE_LOTS[0])));
+        const have = world.players[PLAYER].resources[res] || 0;
+        b.disabled = have < market.TRIBUTE_LOTS[0];
+        b.setAttribute('aria-label',
+          `Send ${market.TRIBUTE_LOTS[0]} ${res} to player ${mate + 1}. `
+          + `They receive ${market.tributeArrives(market.TRIBUTE_LOTS[0])} after the tithe.`);
+        b.addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          click();
+          const amount = market.TRIBUTE_LOTS[0];
+          const res2 = bus.dispatch({ t: 'tribute', to: mate, resource: res, amount });
+          if (!res2.ok) return;
+          toast(`Sent ${amount} ${res} — Player ${mate + 1} gets `
+            + `${market.tributeArrives(amount)}`, 'info');
+          state.marketSig = '';
+          state.resSig = '';
+          refreshMarket();
+        });
+        row.appendChild(b);
+      }
+      sheet.appendChild(row);
+    }
+    sheet.appendChild(el('div', 'why',
+      `A gift costs the giver the full amount; ${Math.round(market.TRIBUTE_TAX * 100)}% is `
+      + 'taken on the way. Without that, two allies are one player with two '
+      + 'stockpiles and nothing you gather ever has to be the right thing.'));
   }
 
   function refreshMarket() {
